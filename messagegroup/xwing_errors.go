@@ -9,7 +9,7 @@
 // X-Wing key, so an error it cannot reach is one that would widen its allowlist with a name no
 // server can match. That is the same rule errors.go applies to the four it keeps off the block,
 // applied one file over.
-package message
+package messagegroup
 
 import "errors"
 
@@ -18,18 +18,18 @@ var (
 	// makes an X-Wing private key. It is the G9 hazard's front door: the ML-KEM seed this
 	// expands to is sixty four, and a caller holding one of those has a value that is neither
 	// an X-Wing seed nor a refusal unless the length is checked here.
-	ErrXwingBadSeedSize = errors.New("message: xwing seed must be 32 bytes")
+	ErrXwingBadSeedSize = errors.New("messagegroup: xwing seed must be 32 bytes")
 	// Fires when an encapsulation key is not the 1216 octets the draft gives it. Checked before
 	// any parsing, so a truncated or over long key never reaches ML-KEM's own decoder, which
 	// would report the ML-KEM half's length rather than the X-Wing key's.
-	ErrXwingBadPublicKeySize = errors.New("message: xwing public key must be 1216 bytes")
+	ErrXwingBadPublicKeySize = errors.New("messagegroup: xwing public key must be 1216 bytes")
 	// Fires when a ciphertext is not the 1120 octets the draft gives it. A wrap ciphertext
 	// arrives from the server, so every octet of it is attacker controlled and its length is the
 	// one thing that must be settled before any arithmetic runs over it.
-	ErrXwingBadCiphertextSize = errors.New("message: xwing ciphertext must be 1120 bytes")
+	ErrXwingBadCiphertextSize = errors.New("messagegroup: xwing ciphertext must be 1120 bytes")
 	// Fires when the x25519 half of an encapsulation or a decapsulation produced no usable
 	// secret, which crypto/ecdh answers for a low order point. The draft states no such check;
 	// spec A section 5.4 requires one, and refusing is the only answer that does not combine an
 	// all zero shared secret into a key both ends would agree on and neither would have chosen.
-	ErrXwingInvalidPoint = errors.New("message: xwing x25519 produced an invalid shared secret")
+	ErrXwingInvalidPoint = errors.New("messagegroup: xwing x25519 produced an invalid shared secret")
 )

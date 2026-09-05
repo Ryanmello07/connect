@@ -22,7 +22,7 @@ xwing=9b6ce9e614811dba8d46841052f3883cbc4c1a65
 | `ghcr.io/urnetwork/mls-peer-mlspp` | digest `sha256:<...>` | interop peer |
 | `ghcr.io/urnetwork/mls-peer-mls-rs` | digest `sha256:<...>` | interop peer |
 | `testdata/vectors/rfc/hpke-rfc9180-x25519.json` | the `hpke=` line above, filtered; sha256 `3cc5f951dea0b7dbe80419215e64c810498ee4dd76c376763bbe6860c346b11a` | the RFC 9180 base-mode known answers that hold the HPKE instantiation to the RFC rather than to itself; see the section below |
-| `../../message/testdata/vectors/rfc/xwing-draft10.json` | the `xwing=` line above, whole; sha256 `409efe197550b22985b4a0419418a0c5f2c2b193426c55bd998399ec8d3e614d` | the three draft-connolly-cfrg-xwing-kem known answers that hold the X-Wing combiner, its label position and the seed expansion to the draft rather than to themselves; see the section below |
+| `../../messagegroup/testdata/vectors/rfc/xwing-draft10.json` | the `xwing=` line above, whole; sha256 `409efe197550b22985b4a0419418a0c5f2c2b193426c55bd998399ec8d3e614d` | the three draft-connolly-cfrg-xwing-kem known answers that hold the X-Wing combiner, its label position and the seed expansion to the draft rather than to themselves; see the section below |
 
 Peer images are prebuilt and pushed to GHCR by the weekly `peer-image-bump` job, which opens a
 digest-bump PR. CI never compiles Rust or C++ on a per-commit path.
@@ -80,7 +80,7 @@ corruptions of this section left all 82 tests in the package green.
 itself, so the rule going missing fails on the commit that removes it rather than on the next
 person's fresh clone.
 
-## message/testdata/vectors/rfc/xwing-draft10.json
+## messagegroup/testdata/vectors/rfc/xwing-draft10.json
 
 | Field | Value |
 |---|---|
@@ -105,18 +105,23 @@ a different seed expansion would show up as a decapsulation mismatch on all thre
 the failure mode we want rather than a silent divergence. Nothing else in this tree can see any of those
 three defects: X-Wing round trips with itself under every one of them.
 
-Not an mlswg family, hence `rfc/`, and it lives under `message/` rather than beside the HPKE corpus because
-the KEM it holds is `connect/message`'s. `mls/testdata/vectors/*.json` stays exactly the sixteen mlswg files
-p8 Task 6 vendors and asserts over, and that count is unaffected by this row.
+Not an mlswg family, hence `rfc/`, and it lives under `messagegroup/` rather than beside the HPKE corpus
+because the KEM it holds is `connect/messagegroup`'s. It lived under `message/` until the 2026-09-06 split
+moved X-Wing out of `connect/message` -- that package's import of `connect/mls` was the whole of what spec B
+Â§2.2 forbids the message server from linking -- and the corpus follows the test that reads it, because both
+paths are resolved relative to the package directory. `mls/testdata/vectors/*.json` stays exactly the sixteen
+mlswg files p8 Task 6 vendors and asserts over, and that count is unaffected by this row.
 
 `core.autocrlf` is `true` at system scope on at least one machine that writes to this repository, and a
 smudged corpus verifies against bytes upstream never published.
-`message/testdata/vectors/rfc/.gitattributes` carries `* -text`; `git ls-files --eol` reports
-`i/lf w/lf attr/-text`, `TestXwingVectorFileWasNotSmudgedOnTheWayIn` refuses a carriage return in the file at
+`messagegroup/testdata/vectors/rfc/.gitattributes` carries `* -text`; `git ls-files --eol` reports
+`i/none w/none attr/-text` -- `none` rather than the HPKE corpus's `lf` because this file is one line and a
+trailing newline, so git sees no line ending to classify; what matters is `attr/-text`, which is what stops
+the smudge. `TestXwingVectorFileWasNotSmudgedOnTheWayIn` refuses a carriage return in the file at
 all, and `TestXwingVectorDirectoryDisablesGitsTextConversion` reads the attributes file itself so the rule
 going missing fails on the commit that removes it rather than on the next person's fresh clone.
 
-Every value above is pinned a second time in `message/xwing_vectors_test.go` — the vendored digest as
+Every value above is pinned a second time in `messagegroup/xwing_vectors_test.go` — the vendored digest as
 `xwingVectorSha256`, the repository, commit, path and vector count as the constants beside it — and
 `TestXwingVectorProvenanceIsRecordedInThePinFile` compares the two copies field by field, parsing this
 section's table rather than grepping the file, for the reason the section above records: the commit appears

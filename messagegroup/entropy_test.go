@@ -1,7 +1,7 @@
 // The refusal of a nil entropy source, held where mls cannot hold it.
 //
 // mls owns the equivalent rule for its own package and derives the class off io.Reader with the
-// type checker, but mls may not import message, so a function declared here that takes an
+// type checker, but mls may not import this package, so a function declared here that takes an
 // entropy source is outside every gate over there that can CALL one. That gap is not left as a
 // sentence: mls's TestNoEntropyTakingFunctionLivesWhereThisGateCannotCallIt derives the class
 // over this directory by type, requires a row naming the test that holds each member's refusal,
@@ -15,7 +15,7 @@
 // built over a nil reader sealed twice under two different ephemeral keys because the draw
 // underneath it silently fell back. A fallback onto a deterministic source is the same defect
 // with the opposite symptom, and in a key encapsulation it is the worse one.
-package message
+package messagegroup
 
 import (
 	"bytes"

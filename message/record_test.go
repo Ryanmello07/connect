@@ -632,13 +632,21 @@ func TestClassIsPrunableAnswersSpecBSection35(t *testing.T) {
 // rules are asleep".
 
 // The trees the ban covers, relative to this package's directory. connect itself is not
-// among them and cannot be: it is the parent, it may not import either of these
+// among them and cannot be: it is the parent, it may not import any of these
 // packages, and its data path is full of unrelated bit arithmetic these rules would
 // report on.
+//
+// messagegroupRoot joined on the commit that split this package in two. The class and the
+// bucket are most naturally at hand together in the sealer, and the sealer is over there, so
+// a scope that stopped at this directory would have covered the one place the crossing is
+// hardest to make and left the one place it is easiest. Nothing would have reported it:
+// scanJoinSources reads the roots it is given and finds no offender in a directory it never
+// opened.
 const (
-	messageRoot    = "."
-	mlsRoot        = "../mls"
-	joinControlDir = "testdata/forbidden"
+	messageRoot      = "."
+	mlsRoot          = "../mls"
+	messagegroupRoot = "../messagegroup"
+	joinControlDir   = "testdata/forbidden"
 )
 
 // The one file allowed to cross between the two shapes, as the scan keys it: a path
@@ -672,7 +680,7 @@ func joinSdkRoot(t *testing.T) string {
 // because a root that is present and uncovered is the failure this logging hides.
 func joinScanRoots(t *testing.T) []string {
 	t.Helper()
-	roots := []string{messageRoot, mlsRoot}
+	roots := []string{messageRoot, mlsRoot, messagegroupRoot}
 	sdkRoot := joinSdkRoot(t)
 	if entry, err := os.Stat(sdkRoot); err == nil && entry.IsDir() {
 		roots = append(roots, sdkRoot)

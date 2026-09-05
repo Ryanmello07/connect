@@ -47,9 +47,17 @@ var productPlatforms = []string{
 	"js/wasm",
 }
 
-// The package trees the obligation covers. sdk is a separate module and is not reachable from
-// here; spec A names it too, and its own repository owes the same gate.
-var crossPlatformPackages = []string{"./mls/...", "./message/..."}
+// The package trees the obligation covers, spelled the way the go tool takes a pattern rather
+// than the way every other scope in this suite spells a directory. That spelling is why the
+// split of connect/message went two rounds with this scope missed: a grep for "../message"
+// does not find it. sdk is a separate module and is not reachable from here; spec A names it
+// too, and its own repository owes the same gate.
+//
+// A package tree left off this list is not a failure. It is nine platforms silently no longer
+// built for it -- the quietest of the scopes the split moved, and the only one with no
+// observable consequence at all until a platform breaks. The count in the t.Logf below is
+// the only thing that reports it.
+var crossPlatformPackages = []string{"./mls/...", "./message/...", "./messagegroup/..."}
 
 // Every product platform builds every covered package, with cgo off.
 func TestTheCryptoBuildsForEveryPlatformTheProductShipsOn(t *testing.T) {

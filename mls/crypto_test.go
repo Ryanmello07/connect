@@ -7911,6 +7911,13 @@ func cryptoSourcePaths(t *testing.T) []string {
 // and mls now reaches it too, in errors_key_schedule.go and key_schedule.go, under the
 // same restriction.
 //
+// The list is a union over forbiddenScanRoots, which since the 2026-09-06 split is three roots
+// and not two. So every production import added anywhere in connect/messagegroup -- the
+// package the record layer's key schedule, both ratchets, the sealer and the epoch fan-out
+// all land in -- has to be written down here, in mls, on the commit that adds it. That is a
+// standing tax on a plan whose files are all in the other package, and it is stated here
+// because the failure is a test of THIS package going red over an edit made in that one.
+//
 // It is the mechanical half of the claim that the deterministic provider is reachable only
 // by an explicit caller. Nothing here can consult the environment, and the constraint gate
 // below says nothing here can be swapped out by a build tag either, so the only way to a
@@ -7930,7 +7937,7 @@ var cryptoImportPaths = []string{
 	`"crypto/ed25519"`,
 	`"crypto/hkdf"`,
 	`"crypto/hmac"`,
-	// crypto/mlkem and crypto/sha3 are ../message's X-Wing: ML-KEM-768 with the seed
+	// crypto/mlkem and crypto/sha3 are ../messagegroup's X-Wing: ML-KEM-768 with the seed
 	// construction draft-connolly-cfrg-xwing-kem section 5.2 needs, the SHAKE-256 that expands
 	// that seed, and the SHA3-256 the combiner is. Both are standard library, both are pure go
 	// and neither consults the environment, which is the property this list exists to keep true.
@@ -7943,7 +7950,7 @@ var cryptoImportPaths = []string{
 	`"encoding/binary"`,
 	`"errors"`,
 	`"fmt"`,
-	// mls itself, reached from ../message and in that direction only. It is what keeps the one
+	// mls itself, reached from ../messagegroup and in that direction only. It is what keeps the one
 	// reviewed ECDH call site in the tree: X-Wing's x25519 half goes through X25519GenerateKey,
 	// X25519PrivateKey, X25519PublicKey and X25519DH rather than through crypto/ecdh, so the
 	// low order point refusal those wrap cannot be bypassed by writing the exchange again.

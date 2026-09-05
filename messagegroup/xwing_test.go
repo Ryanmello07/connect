@@ -1,4 +1,4 @@
-package message
+package messagegroup
 
 import (
 	"bytes"

@@ -1,5 +1,5 @@
 // The mechanical half of master section 7.2 and spec A section 5.9, guardrails 1 and 3.
-// These walk the source of mls and message rather than grepping in continuous
+// These walk the source of mls, message and messagegroup rather than grepping in continuous
 // integration, so a developer sees the failure before pushing and so the rule travels
 // with the code. The banned primitives share one property: for a low order point they
 // hand back an all zero shared secret instead of an error, and a caller that logs it and
@@ -40,10 +40,21 @@ import (
 	"testing"
 )
 
-// The two package trees the guardrails cover, relative to this package's directory.
-// connect itself is not among them: it is the parent, it may not import either of these
+// The three package trees the guardrails cover, relative to this package's directory.
+// connect itself is not among them: it is the parent, it may not import any of these
 // packages, and its own legacy call sites are a separate migration.
-var forbiddenScanRoots = []string{".", "../message"}
+//
+// ../messagegroup joined on the commit that split connect/message in two. It is the client
+// half -- the half that holds the group and may import mls -- and it is where the record
+// layer's key schedule now lands, so a root that stopped at ../message would have left every
+// file of that schedule outside the hkdf and .ECDH( confinements. That loss is NOT silent,
+// which was measured rather than assumed: reverting this line to the two roots turns three
+// tests of this package red, because TestNoEntropyTakingFunctionLivesWhereThisGateCannotCallIt
+// resolves its rows against the declaring package and cryptoSourcePaths fatals on a root it
+// read no production file of. The hkdf and .ECDH( confinements are the half that would go
+// quiet. Five other gates alias this value rather than restating it, so they gained the root
+// with it.
+var forbiddenScanRoots = []string{".", "../message", "../messagegroup"}
 
 // The fixture tree the positive controls scan. It sits under testdata on purpose, which
 // is what makes it unreachable from the roots above and unbuildable by the go tool.

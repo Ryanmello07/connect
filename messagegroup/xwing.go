@@ -25,7 +25,7 @@
 // than combining a secret the peer chose. Spec A section 5.4 requires exactly that, and it costs
 // nothing in conformance: no draft vector carries a low order ct_X, X-Wing is used only in this
 // project's own storage layer, and there is no peer implementation to diverge from.
-package message
+package messagegroup
 
 import (
 	"crypto/ecdh"
@@ -62,7 +62,7 @@ const XwingAlgId uint16 = 0x0014
 
 // The 1216 and the 0x0014 are each stated twice in this tree -- once in mls, where LeafNode
 // validation range checks a device's wrap key, and once here, where the KEM that produces it
-// lives -- because mls must never import message. The duplication is deliberate and one
+// lives -- because mls must never import messagegroup. The duplication is deliberate and one
 // directional; these four lines are what stop it becoming a drift.
 //
 // An array length is a non negative constant, so declaring the difference in both directions

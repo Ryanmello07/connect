@@ -7,11 +7,26 @@
 //     to import its own subpackages, so this is a design rule the toolchain will not
 //     catch. Violating it makes the data path depend on the messenger, which is the
 //     opposite of the intended direction.
-//   - connect/mls must not import connect or connect/message, and connect/message
-//     must not import connect. mls is the protocol core and has to stay linkable
-//     without the data path.
+//   - connect/mls must not import connect, connect/message or connect/messagegroup, and
+//     connect/message must not import connect. mls is the protocol core and has to stay
+//     linkable without the data path.
+//   - connect/message must not import connect/mls, and must not import
+//     connect/messagegroup. This is the 2026-09-06 split stated as a rule rather than as a
+//     habit: spec B section 2.2 forbids the message server from linking an MLS parser at
+//     all, and connect/message is the half that server links. The edge runs the other way
+//     -- connect/messagegroup imports connect/message and connect/mls, because it is the
+//     client half and the client holds the group.
 //
-// Both rules were satisfied when this file was written and neither was checked. That
+// The last of those is the one the compiler cannot hold yet, and that is why it is here
+// rather than left to a build failure. At the commit that created connect/messagegroup it
+// imports connect/mls and does NOT import connect/message, so there is no cycle for the
+// compiler to refuse; it starts holding the direction at the first file over there that
+// calls into connect/message, and an assertion written then would be one nobody could
+// watch fail. connect/message importing connect/mls compiles cleanly forever and is held
+// by nothing else in this tree at all -- msgrepo's dependency gate sees it, in another
+// repository, on a run nobody makes before pushing.
+//
+// The rules were satisfied when each was written and none was checked. That
 // is the state a rule is in just before it stops being true, so this is the check.
 //
 // Imports are read with go/parser rather than matched as text: a parser reports the
@@ -32,9 +47,10 @@ import (
 )
 
 const (
-	modulePath  = "github.com/urnetwork/connect"
-	mlsPath     = modulePath + "/mls"
-	messagePath = modulePath + "/message"
+	modulePath       = "github.com/urnetwork/connect"
+	mlsPath          = modulePath + "/mls"
+	messagePath      = modulePath + "/message"
+	messagegroupPath = modulePath + "/messagegroup"
 )
 
 // importsInDir returns every import path appearing in the go files directly inside
@@ -95,7 +111,7 @@ var knownSubpackageImports = map[string]string{
 
 func TestConnectDoesNotImportItsOwnSubpackages(t *testing.T) {
 	imports := importsInDir(t, ".")
-	for _, forbidden := range []string{mlsPath, messagePath} {
+	for _, forbidden := range []string{mlsPath, messagePath, messagegroupPath} {
 		if files, ok := imports[forbidden]; ok {
 			t.Errorf("connect imports %s from %v: the data path must not depend on the messenger", forbidden, files)
 		}
@@ -124,9 +140,12 @@ func TestSubpackagesDoNotImportBack(t *testing.T) {
 		dir       string
 		forbidden []string
 	}{
-		{"mls", []string{modulePath, messagePath}},
-		{"mls/syntax", []string{modulePath, mlsPath, messagePath}},
-		{"message", []string{modulePath}},
+		{"mls", []string{modulePath, messagePath, messagegroupPath}},
+		{"mls/syntax", []string{modulePath, mlsPath, messagePath, messagegroupPath}},
+		// the split: the server-safe half links no MLS parser and does not depend on the
+		// client half either
+		{"message", []string{modulePath, mlsPath, messagegroupPath}},
+		{"messagegroup", []string{modulePath}},
 	}
 	for _, c := range cases {
 		if _, err := os.Stat(c.dir); err != nil {
@@ -146,7 +165,7 @@ func TestSubpackagesDoNotImportBack(t *testing.T) {
 // nothing, which is indistinguishable from a scanner that cannot find anything —
 // exactly the failure this project has hit repeatedly. So the same function is pointed
 // at a fixture that does contain a forbidden import, and must report it. The fixture
-// covers a plain import, an aliased one and a dot import, because a text search would
+// covers a plain import, an aliased one, a blank one and a dot import, because a text search would
 // catch the first and miss the other two.
 func TestImportScannerFindsAForbiddenImport(t *testing.T) {
 	dir := t.TempDir()
@@ -154,13 +173,14 @@ func TestImportScannerFindsAForbiddenImport(t *testing.T) {
 		"import (\n" +
 		"\t\"" + mlsPath + "\"\n" +
 		"\talias \"" + messagePath + "\"\n" +
+		"\t_ \"" + messagegroupPath + "\"\n" +
 		"\t. \"" + mlsPath + "/syntax\"\n" +
 		")\n"
 	if err := os.WriteFile(filepath.Join(dir, "fixture.go"), []byte(source), 0o600); err != nil {
 		t.Fatalf("writing the fixture: %v", err)
 	}
 	imports := importsInDir(t, dir)
-	for _, want := range []string{mlsPath, messagePath, mlsPath + "/syntax"} {
+	for _, want := range []string{mlsPath, messagePath, messagegroupPath, mlsPath + "/syntax"} {
 		if _, ok := imports[want]; !ok {
 			t.Errorf("the scanner missed %s, so the gates above prove nothing", want)
 		}

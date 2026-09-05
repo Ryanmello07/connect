@@ -14,7 +14,7 @@
 // Which side of a comparison runs production code is DERIVED here and not typed, and so are the
 // DECLARATIONS each side ran. Both were typed once. A bool on each row made the count wrong by
 // three: the ct_X rows claimed to hold this package while the value on their got side came out of
-// x25519PublicKeyOfScalar, a helper declared in message/xwing_test.go that reaches
+// x25519PublicKeyOfScalar, a helper declared in messagegroup/xwing_test.go that reaches
 // mls.X25519PrivateKey, and XwingEncapsulate was called nowhere in this file at all. Replacing the
 // bool with a derivation over a HAND WRITTEN LIST OF PRODUCER NAMES left the second half of that
 // defect standing: a row whose got was changed to read the corpus back out of itself, while its
@@ -49,7 +49,7 @@
 //
 // The gap above is the one place this file cannot hold the draft, and it is stated rather than
 // left for a reader to discover by counting.
-package message
+package messagegroup
 
 import (
 	"bytes"
@@ -111,7 +111,7 @@ const (
 // walk has to start somewhere; everything it FINDS is derived, and a rename of either one fails
 // the reading with "declares no ..." rather than quietly reading nothing.
 const (
-	xwingPackageImportPath = "github.com/urnetwork/connect/message"
+	xwingPackageImportPath = "github.com/urnetwork/connect/messagegroup"
 	xwingCollectorName     = "xwingHoldAgainstTheDraft"
 	xwingAnswerTypeName    = "xwingPublishedAnswer"
 )
@@ -179,7 +179,7 @@ func loadXwingVectorObjects(t *testing.T) []map[string]string {
 	return objects
 }
 
-// package message cannot see p8's MustHex: it is declared in mls/vectors_test.go, and a _test.go
+// package messagegroup cannot see p8's MustHex: it is declared in mls/vectors_test.go, and a _test.go
 // file's symbols are not exported across a package boundary. this is the only hex decoder in the
 // slice that is not p8's, and only for that reason.
 func mustHexBytes(t *testing.T, s string) []byte {
@@ -283,7 +283,7 @@ func TestXwingVectorEncapsulateProducesThePublishedCtX(t *testing.T) {
 //
 // It was called TestXwingVectorEncapsulateX25519Half, and it never called XwingEncapsulate: the
 // value on its got side comes out of x25519PublicKeyOfScalar, a helper declared in
-// message/xwing_test.go which reaches mls.X25519PrivateKey, so what it observed was mls's one ECDH
+// messagegroup/xwing_test.go which reaches mls.X25519PrivateKey, so what it observed was mls's one ECDH
 // wrapper and the corpus and none of this package's X-Wing code. It is worth keeping, because it
 // says eseed[32:64] really is the scalar behind the published ct_X, and that is the premise the
 // encapsulation direction above is driven on -- but under a name that says what it holds.
@@ -852,7 +852,7 @@ func TestTheProducerDerivationSeparatesProductionFromTestDeclarations(t *testing
 	} {
 		production, declaredHere := declared[name]
 		if !declaredHere {
-			t.Errorf("%s is declared in message/xwing.go and the derivation did not see it, so an answer produced by it would be fatal rather than counted", name)
+			t.Errorf("%s is declared in messagegroup/xwing.go and the derivation did not see it, so an answer produced by it would be fatal rather than counted", name)
 			continue
 		}
 		if !production {
@@ -950,7 +950,7 @@ func xwingHoldAgainstTheDraft(t *testing.T) ([]xwingPublishedAnswer, map[string]
 
 		// and the corpus's second claim about itself: eseed[32:64] is the scalar behind ct_X,
 		// which is the premise the row above is driven on. the walk goes THROUGH
-		// x25519PublicKeyOfScalar -- it is declared in message/xwing_test.go, so it is harness --
+		// x25519PublicKeyOfScalar -- it is declared in messagegroup/xwing_test.go, so it is harness --
 		// and everything it reaches from there is mls's, so this row's producer set comes back
 		// empty and it holds none of this package. that is the whole of the first correction,
 		// because this row is the one that was counted as three of nine
@@ -1003,7 +1003,7 @@ func xwingHoldAgainstTheDraft(t *testing.T) ([]xwingPublishedAnswer, map[string]
 // derived but the producer NAMES still typed by hand, a row whose got was changed to read the
 // corpus back out of itself went on counting towards the nine with the whole tree green. Nine is
 // now nine pk, ss and ct_X answers, three of each, each of them traced through the collector's own
-// source to a function declared in message/xwing.go.
+// source to a function declared in messagegroup/xwing.go.
 //
 // The DIRECTIONS are counted too, and separately. A direction is a producer set, so three answers
 // per vector that all came out of one path collapse to one direction and fail here even while the
@@ -1272,7 +1272,7 @@ func TestXwingVectorProvenanceIsRecordedInThePinFile(t *testing.T) {
 			xwingVectorPinFilePath, xwingVectorUpstreamCommit)
 	}
 
-	rows := xwingPinFileRows(t, text, "## message/"+xwingVectorPath)
+	rows := xwingPinFileRows(t, text, "## messagegroup/"+xwingVectorPath)
 	want := map[string]string{
 		"Upstream repository": xwingVectorUpstreamRepository,
 		"Upstream commit":     xwingVectorUpstreamCommit,
@@ -1308,8 +1308,8 @@ func TestXwingVectorProvenanceIsRecordedInThePinFile(t *testing.T) {
 			want: "https://raw.githubusercontent.com/" + xwingVectorUpstreamRepository +
 				"/" + xwingVectorUpstreamCommit + "/" + xwingVectorUpstreamPath,
 		},
-		{what: "the attributes file", want: "message/" + xwingVectorAttributesPath},
-		{what: "the file holding the second copy of the digest", want: "message/xwing_vectors_test.go"},
+		{what: "the attributes file", want: "messagegroup/" + xwingVectorAttributesPath},
+		{what: "the file holding the second copy of the digest", want: "messagegroup/xwing_vectors_test.go"},
 		{what: "the constant holding it", want: "xwingVectorSha256"},
 		{what: "the smudge detector", want: "TestXwingVectorFileWasNotSmudgedOnTheWayIn"},
 		{what: "the attributes check", want: "TestXwingVectorDirectoryDisablesGitsTextConversion"},
@@ -1323,7 +1323,7 @@ func TestXwingVectorProvenanceIsRecordedInThePinFile(t *testing.T) {
 	// the row in the summary table at the top, which records the vendored digest a second time
 	row := ""
 	for _, line := range strings.Split(text, "\n") {
-		if strings.HasPrefix(strings.TrimSpace(line), "|") && strings.Contains(line, "`../../message/"+xwingVectorPath+"`") {
+		if strings.HasPrefix(strings.TrimSpace(line), "|") && strings.Contains(line, "`../../messagegroup/"+xwingVectorPath+"`") {
 			row = line
 			break
 		}

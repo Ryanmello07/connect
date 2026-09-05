@@ -2244,7 +2244,7 @@ func TestSupportsRefusalAnswersOnlyItsOwnSentinel(t *testing.T) {
 //
 // Every other statement of that number in this tree is prose or a copy of prose:
 // draft-connolly-cfrg-xwing-kem-06 section 5.1 says 1216, Spec A section 3.4 says 1216, the
-// interface registry says 1216, and p2 task 22 will assert that message.XwingPublicKeySize
+// interface registry says 1216, and p2 task 22 will assert that messagegroup.XwingPublicKeySize
 // says 1216 too. A digit copied wrong out of any of them is invisible to all of the others,
 // and it is invisible to every round trip and length test in this file as well, because those
 // build their inputs out of XwingPublicKeyLen and would agree with a constant of 1217 exactly
@@ -3554,10 +3554,20 @@ func TestAWrapTargetReadOffALeafSharesNoStorageWithTheLeafsBytes(t *testing.T) {
 // the one number nothing in this tree pins across a package boundary
 // ---------------------------------------------------------------------------
 
-// messagePackageDir is the sibling package the X-Wing key size will eventually be stated in a
-// second time. It is the same directory mls's other cross package guardrails scan, and the
-// relative path is this package's directory to that one.
-const messagePackageDir = "../message"
+// messagePackageDir and messagegroupPackageDir are the two sibling packages the X-Wing key
+// size is stated in a second time. They are the same directories mls's other cross package
+// guardrails scan, and each relative path is this package's directory to that one.
+//
+// The scope question is answered separately from the class question. The CLASS is every
+// X-Wing named package level declaration; the SCOPE is every sibling directory one could be
+// declared in, which was one directory until connect/message was split in two and is two
+// now. Deriving the class and then writing its scope down against a single directory is what
+// made this gate report 26 errors on the commit that moved those declarations one directory
+// over: the table was right and the walk had stopped covering where they went.
+const (
+	messagePackageDir      = "../message"
+	messagegroupPackageDir = "../messagegroup"
+)
 
 // xwingNamedDeclarationsIn is every package level declaration of one directory's non test
 // source whose name mentions X-Wing.
@@ -3604,28 +3614,28 @@ func xwingNamedDeclarationsIn(t *testing.T, dir string) map[string]string {
 	return found
 }
 
-// Every X-Wing named declaration of this package and of ../message, with what each one is.
+// Every X-Wing named declaration of this package and of ../messagegroup, with what each one is.
 //
 // This is a table and it is held to the derived set in BOTH directions below, which is what
 // makes it a classification rather than a list: a new one cannot land without being written
 // down here, and one written down here cannot survive the declaration going away.
 //
 // The reason it is worth a gate at all is that XwingPublicKeyLen is stated twice, once here and
-// once as message.XwingPublicKeySize, and nothing the compiler does across a package boundary
+// once as messagegroup.XwingPublicKeySize, and nothing the compiler does across a package boundary
 // notices a disagreement on its own. The second copy landed with p2 tasks 19 and 20 and brought
-// its pin with it: message/xwing.go declares the difference in both directions as an array
+// its pin with it: messagegroup/xwing.go declares the difference in both directions as an array
 // length, so a tree in which the two disagree fails to build. This gate is what forced that to
 // be written on the commit that landed the copy rather than on a later one, and it is what will
 // force the same of a third statement of the size, in either package, whenever one arrives.
 var xwingNamedDeclarationsOfBothPackages = map[string]string{
 	"AlgIdXwing":                "the wrap KEM code point, 0x0014, and not a size",
 	"XwingPublicKeyLen":         "the encapsulation key size, derived against crypto/mlkem and crypto/ecdh by TestXwingPublicKeyLenIsTheMlKem768AndX25519KeySizesAdded",
-	"XwingPublicKeySize":        "../message's second statement of the encapsulation key size, pinned to XwingPublicKeyLen at COMPILE time by the array length declarations in message/xwing.go",
-	"XwingAlgId":                "../message's second statement of the wrap KEM code point, pinned to AlgIdXwing at COMPILE time beside it",
+	"XwingPublicKeySize":        "../messagegroup's second statement of the encapsulation key size, pinned to XwingPublicKeyLen at COMPILE time by the array length declarations in messagegroup/xwing.go",
+	"XwingAlgId":                "../messagegroup's second statement of the wrap KEM code point, pinned to AlgIdXwing at COMPILE time beside it",
 	"XwingSeedSize":             "the storable X-Wing private key size, 32, and not the encapsulation key size",
 	"XwingExpandedSize":         "the SHAKE-256 seed expansion length, 96, and not a key size",
 	"XwingMlkemSeedSize":        "the ML-KEM d and z seed length, 64, which is the half of the expansion that is NOT the encapsulation key size",
-	"XwingMlkemPublicKeySize":   "the ML-KEM-768 encapsulation key size, 1184; one addend of XwingPublicKeySize, and held to a key crypto/mlkem actually produced by ../message's own tests",
+	"XwingMlkemPublicKeySize":   "the ML-KEM-768 encapsulation key size, 1184; one addend of XwingPublicKeySize, and held to a key crypto/mlkem actually produced by ../messagegroup's own tests",
 	"XwingMlkemCiphertextSize":  "the ML-KEM-768 ciphertext size, 1088, and not a key size",
 	"XwingCiphertextSize":       "the X-Wing ciphertext size, 1120, and not a key size",
 	"XwingSharedSize":           "the shared secret size, 32, and not a key size",
@@ -3664,14 +3674,14 @@ var xwingNamedDeclarationsOfBothPackages = map[string]string{
 // point -- classify it here and it is no longer this gate's business.
 func TestNoXwingNamedDeclarationLandsInEitherPackageWithoutBeingClassifiedHere(t *testing.T) {
 	found := map[string]string{}
-	for _, dir := range []string{".", messagePackageDir} {
+	for _, dir := range []string{".", messagePackageDir, messagegroupPackageDir} {
 		for name, file := range xwingNamedDeclarationsIn(t, dir) {
 			found[name] = file
 		}
 	}
 	if file, declared := found["XwingPublicKeyLen"]; !declared || file != "extension.go" {
-		t.Fatalf("the scan of . and %s read %v, and XwingPublicKeyLen is not in extension.go among them; it certainly is, so this scan is reading something other than these two packages",
-			messagePackageDir, slices.Sorted(maps.Keys(found)))
+		t.Fatalf("the scan of ., %s and %s read %v, and XwingPublicKeyLen is not in extension.go among them; it certainly is, so this scan is reading something other than these three packages",
+			messagePackageDir, messagegroupPackageDir, slices.Sorted(maps.Keys(found)))
 	}
 	for _, name := range slices.Sorted(maps.Keys(found)) {
 		if _, classified := xwingNamedDeclarationsOfBothPackages[name]; !classified {
@@ -3681,8 +3691,8 @@ func TestNoXwingNamedDeclarationLandsInEitherPackageWithoutBeingClassifiedHere(t
 	}
 	for _, name := range slices.Sorted(maps.Keys(xwingNamedDeclarationsOfBothPackages)) {
 		if _, declared := found[name]; !declared {
-			t.Errorf("xwingNamedDeclarationsOfBothPackages classifies %s and neither this package nor %s declares it, so this table is describing a tree that no longer exists",
-				name, messagePackageDir)
+			t.Errorf("xwingNamedDeclarationsOfBothPackages classifies %s and none of this package, %s and %s declares it, so this table is describing a tree that no longer exists",
+				name, messagePackageDir, messagegroupPackageDir)
 		}
 	}
 }

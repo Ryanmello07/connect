@@ -71,6 +71,7 @@ import (
 	"go/printer"
 	"go/token"
 	"go/types"
+	"io/fs"
 	"maps"
 	"os"
 	"path/filepath"
@@ -1334,7 +1335,7 @@ func TestNothingComputesUnderAKeyThatIsNotThirtyTwoOctets(t *testing.T) {
 // verifiers somebody remembered.
 func authAssertVerifiersCovered(t testing.TB, covered ...string) {
 	t.Helper()
-	derived := authVerifierNames(mustScanAuthSources(t, authScanDir))
+	derived := authVerifierNames(mustScanAuthSources(t, authOwnScanDir))
 	slices.Sort(covered)
 	if !slices.Equal(derived, covered) {
 		t.Fatalf("this test covers %v and the package declares %v; a verifier outside the covered set is one nothing here observes",
@@ -1617,13 +1618,53 @@ func TestTheWriteAuthBuilderRefusesAHeaderItCannotUse(t *testing.T) {
 
 // ── the syntax tree gates ───────────────────────────────────────────────────────────
 
-// The two directories the gates read: this package's own, and the control fixture's. The
-// fixture is under testdata, which is what keeps it out of every other scan in this
-// repository and unbuildable by the go tool.
+// This package's own directory, and the control fixture's. The fixture is under testdata,
+// which is what keeps it out of every other scan in this repository and unbuildable by the
+// go tool.
 const (
-	authScanDir        = "."
+	authOwnScanDir     = "."
 	authControlScanDir = "testdata/writeauth"
 )
+
+// Every directory the constant time rules run over, which is a LIST because the split of
+// connect/message made it one and because a single directory cannot be added to.
+//
+// The scope question, answered separately from the class question as R3a requires. The CLASS
+// is derived twice over -- the comparators off the scanned code's own imports, the verifiers
+// off every function whose name begins with Verify -- and neither derivation says anything
+// about WHERE to look. Until the split the answer was one directory, written as authScanDir,
+// and it was right by accident: there was one package. After it there are two halves of the
+// record layer, connect/messagegroup holds the key schedule, both ratchets, the sealer and
+// the epoch fan-out, and a scope of "." would have covered the half with two comparisons in
+// it and left the half where every new comparison of this plan is going to be written.
+// Nothing would have reported that: this file's rules find no offender in a directory they
+// never open, which is the same clean report a genuinely clean tree gets.
+//
+// Each root is scanned SEPARATELY and never merged into one authScan, which matters for one
+// rule in particular. TestAVerifierReachesOutOfItsPackageOnlyForTheConstantTimeComparison is
+// about calls leaving a verifier's own package, so a merged scan would read a call from
+// connect/message into connect/messagegroup as a local one and stop reporting it. Merging
+// would have widened the coverage claim and narrowed the rule at the same time.
+//
+// The list is written down and the check on it is derived:
+// TestEveryPackageBuiltOnThisOneIsUnderTheConstantTimeGate walks this module for the
+// production packages that import this one and requires each to be a root here. That half is
+// silent today on purpose and it says so -- connect/messagegroup does not import this package
+// until the first file that calls message.AADHead -- and it arms itself on that commit.
+var authScanRoots = []string{authOwnScanDir, "../messagegroup"}
+
+// Every root, scanned on its own.
+func mustScanAuthRoots(t testing.TB) []authScan {
+	t.Helper()
+	if len(authScanRoots) == 0 {
+		t.Fatal("the gates read no root at all, so every rule below cleared every function having read nothing")
+	}
+	scans := []authScan{}
+	for _, root := range authScanRoots {
+		scans = append(scans, mustScanAuthSources(t, root))
+	}
+	return scans
+}
 
 // One directory's declarations: every function and method in it, the package level constants
 // beside them, and where each came from.
@@ -1902,7 +1943,7 @@ func authWriteKeyDerivers(scan authScan, label string) []string {
 // a package this scan does not read. It sees this package's own source, which is where the
 // defect would be written.
 func TestReadAuthNeverUsesWriteKey(t *testing.T) {
-	scan := mustScanAuthSources(t, authScanDir)
+	scan := mustScanAuthSources(t, authOwnScanDir)
 	derivers := authWriteKeyDerivers(scan, writeKeyInfo)
 	if !slices.Contains(derivers, "WriteKey") {
 		t.Fatalf("the derived class of write key derivations is %v, which does not include WriteKey; the rule is looking for the wrong thing", derivers)
@@ -2443,21 +2484,38 @@ func authReachesConstantTimeCompare(t testing.TB, scan authScan, name string) bo
 	return false
 }
 
-// The verifiers of this package, and the class they are, reported rather than trusted.
-func authVerifiersUnderGate(t testing.TB, scan authScan) []string {
+// The verifiers under the gate, per root, and the class they are, reported rather than
+// trusted.
+//
+// The emptiness refusal is asked of the UNION and not of each root, and that is the whole
+// difference between this shape and copying the gate into the other package. The class is
+// the scope's, not one directory's: connect/messagegroup declares no Verify function and,
+// per spec A section 12.1, may never declare one while every published verifier stays here,
+// so a per-root refusal would fatal on arrival on correct code -- twice, once on the empty
+// set and once on VerifyWriteAuth being absent -- and the only repair available would have
+// been to retune the refusal that measures this gate. A root with no verifier contributes
+// none and is judged over nothing, which is the truth about it; the day it declares its
+// first Verify function it is judged, with nobody remembering to add it anywhere.
+func authVerifiersUnderGate(t testing.TB, scans []authScan) map[string][]string {
 	t.Helper()
-	verifiers := authVerifierNames(scan)
-	if len(verifiers) == 0 {
-		t.Fatal("the gate found no verifier at all, so it is reporting clean having read nothing")
+	byRoot := map[string][]string{}
+	union := []string{}
+	for _, scan := range scans {
+		found := authVerifierNames(scan)
+		byRoot[scan.dir] = found
+		union = append(union, found...)
+	}
+	if len(union) == 0 {
+		t.Fatalf("no root of %v declares a verifier at all, so this gate is reporting clean having read nothing", authScanRoots)
 	}
 	// the coverage claim, checked rather than assumed: the two this file is about have to be
 	// among the ones being judged
 	for _, want := range []string{"VerifyWriteAuth", "VerifyRequestAuth"} {
-		if !slices.Contains(verifiers, want) {
-			t.Fatalf("the gate is judging %v, which does not include %s", verifiers, want)
+		if !slices.Contains(union, want) {
+			t.Fatalf("the gate is judging %v, which does not include %s", union, want)
 		}
 	}
-	return verifiers
+	return byRoot
 }
 
 // Guardrail G8 at the scope its own text gives it: nothing this package ships compares data
@@ -2471,32 +2529,35 @@ func authVerifiersUnderGate(t testing.TB, scan authScan) []string {
 // spelled with crypto/subtle, which is why this rule needs no exemption written into it and why
 // nothing here has to decide which comparison is over a tag.
 func TestNoProductionFunctionComparesDataOutsideConstantTime(t *testing.T) {
-	scan := mustScanAuthSources(t, authScanDir)
-	comparators := authDataComparators(t, scan)
-	t.Logf("%d go files, %d functions, %d imports, %d comparators in the derived class: %v",
-		scan.fileCount, len(scan.decls), len(scan.imports), len(comparators), comparators)
-	// the comparator half only. The == between two values is the other shape of the same
-	// defect and it is asserted over the verifiers rather than here, because two values
-	// compared with == are ordinary in a codec and a header and everything else this package
-	// ships, and a gate that fired on all of them would be a gate with exemptions.
-	for _, name := range slices.Sorted(maps.Keys(scan.decls)) {
-		for _, comparison := range authComparatorCalls(scan, name, comparators) {
-			t.Errorf("%s compares data outside constant time: %s; every comparison of data in this package goes through %s",
-				name, comparison, authConstantTimeComparator)
+	for _, scan := range mustScanAuthRoots(t) {
+		comparators := authDataComparators(t, scan)
+		t.Logf("%s: %d go files, %d functions, %d imports, %d comparators in the derived class: %v",
+			scan.dir, scan.fileCount, len(scan.decls), len(scan.imports), len(comparators), comparators)
+		// the comparator half only. The == between two values is the other shape of the same
+		// defect and it is asserted over the verifiers rather than here, because two values
+		// compared with == are ordinary in a codec and a header and everything else these
+		// packages ship, and a gate that fired on all of them would be a gate with exemptions.
+		for _, name := range slices.Sorted(maps.Keys(scan.decls)) {
+			for _, comparison := range authComparatorCalls(scan, name, comparators) {
+				t.Errorf("%s in %s compares data outside constant time: %s; every comparison of data in these packages goes through %s",
+					name, scan.dir, comparison, authConstantTimeComparator)
+			}
 		}
 	}
 }
 
 // Guardrail G8, the ban half over the verifiers: no verifier decides equality in variable time.
 func TestNoVerifierDecidesEqualityInVariableTime(t *testing.T) {
-	scan := mustScanAuthSources(t, authScanDir)
-	comparators := authDataComparators(t, scan)
-	verifiers := authVerifiersUnderGate(t, scan)
-	t.Logf("%d verifiers under the gate: %v", len(verifiers), verifiers)
-	for _, name := range verifiers {
-		for _, comparison := range authVariableTimeComparisons(scan, name, comparators) {
-			t.Errorf("%s decides equality in variable time: %s; every tag comparison goes through %s",
-				name, comparison, authConstantTimeComparator)
+	scans := mustScanAuthRoots(t)
+	verifiers := authVerifiersUnderGate(t, scans)
+	for _, scan := range scans {
+		comparators := authDataComparators(t, scan)
+		t.Logf("%s: %d verifiers under the gate: %v", scan.dir, len(verifiers[scan.dir]), verifiers[scan.dir])
+		for _, name := range verifiers[scan.dir] {
+			for _, comparison := range authVariableTimeComparisons(scan, name, comparators) {
+				t.Errorf("%s in %s decides equality in variable time: %s; every tag comparison goes through %s",
+					name, scan.dir, comparison, authConstantTimeComparator)
+			}
 		}
 	}
 }
@@ -2512,11 +2573,14 @@ func TestNoVerifierDecidesEqualityInVariableTime(t *testing.T) {
 // Under this rule the fast path is not reported for being a comparator. It is reported for
 // being a call out of the package that is not the one exception.
 func TestAVerifierReachesOutOfItsPackageOnlyForTheConstantTimeComparison(t *testing.T) {
-	scan := mustScanAuthSources(t, authScanDir)
-	for _, name := range authVerifiersUnderGate(t, scan) {
-		for _, foreign := range authForeignCalls(scan, name) {
-			t.Errorf("%s calls %s; a verifier's answer is decided by %s and by nothing else, and what it needs from elsewhere belongs behind a function of this package",
-				name, foreign, authConstantTimeComparator)
+	scans := mustScanAuthRoots(t)
+	verifiers := authVerifiersUnderGate(t, scans)
+	for _, scan := range scans {
+		for _, name := range verifiers[scan.dir] {
+			for _, foreign := range authForeignCalls(scan, name) {
+				t.Errorf("%s in %s calls %s; a verifier's answer is decided by %s and by nothing else, and what it needs from elsewhere belongs behind a function of its own package",
+					name, scan.dir, foreign, authConstantTimeComparator)
+			}
 		}
 	}
 }
@@ -2526,11 +2590,14 @@ func TestAVerifierReachesOutOfItsPackageOnlyForTheConstantTimeComparison(t *test
 // moved its comparison into a helper and then wrote the helper wrong, passes the bans and fails
 // here.
 func TestEveryVerifierReachesAConstantTimeComparison(t *testing.T) {
-	scan := mustScanAuthSources(t, authScanDir)
-	for _, name := range authVerifiersUnderGate(t, scan) {
-		if !authReachesConstantTimeCompare(t, scan, name) {
-			t.Errorf("%s reaches no %s; a verifier that compares nothing in constant time is not a verifier",
-				name, authConstantTimeComparator)
+	scans := mustScanAuthRoots(t)
+	verifiers := authVerifiersUnderGate(t, scans)
+	for _, scan := range scans {
+		for _, name := range verifiers[scan.dir] {
+			if !authReachesConstantTimeCompare(t, scan, name) {
+				t.Errorf("%s in %s reaches no %s; a verifier that compares nothing in constant time is not a verifier",
+					name, scan.dir, authConstantTimeComparator)
+			}
 		}
 	}
 }
@@ -2651,7 +2718,7 @@ func TestTheAuthScanRefusesADirectoryItCannotCover(t *testing.T) {
 		}
 	}
 	// and the real ones must pass it, or the refusal above is just "everything fails"
-	for _, dir := range []string{authScanDir, authControlScanDir} {
+	for _, dir := range append(slices.Clone(authScanRoots), authControlScanDir) {
 		scan, err := scanAuthSources(dir)
 		if err != nil {
 			t.Errorf("scanning %s failed: %v", dir, err)
@@ -2661,12 +2728,100 @@ func TestTheAuthScanRefusesADirectoryItCannotCover(t *testing.T) {
 	}
 	// the gates read production source and not tests, which is why this file is not the
 	// loudest violation of both of them
-	scan := mustScanAuthSources(t, authScanDir)
-	for name, paths := range scan.pathOf {
-		for _, path := range paths {
-			if strings.HasSuffix(path, "_test.go") {
-				t.Errorf("the scan read %s from %s; the rules are about what ships", name, path)
+	for _, scan := range mustScanAuthRoots(t) {
+		for name, paths := range scan.pathOf {
+			for _, path := range paths {
+				if strings.HasSuffix(path, "_test.go") {
+					t.Errorf("the scan read %s from %s; the rules are about what ships", name, path)
+				}
 			}
 		}
 	}
+}
+
+// The scope's derived half: every production package of this module that is built on this
+// one is under the constant time gate.
+//
+// authScanRoots is written down, and a written down scope is the defect ledger 21 names, so
+// it is not left as the only statement. The reason it cannot simply BE this derivation is
+// measured rather than argued: at the commit that created connect/messagegroup that package
+// imports crypto/ecdh, crypto/mlkem, crypto/sha3, io and connect/mls and does not import this
+// package at all, so a scope derived from the import graph alone would have returned exactly
+// this directory and covered nothing new -- while the whole point of the split is that the
+// key schedule lands over there. So the list leads and this check follows it, and it starts
+// biting on the first file of connect/messagegroup that calls into this package.
+//
+// Non test source only. A test that imports this package is not code an auditor reads for a
+// timing leak, and the rules above read production files for the same reason.
+//
+// It reports what it walked. A walk that found no directory at all would clear every package
+// in the module having read nothing, which is the failure mode every gate in this file is
+// written against, so an empty walk is fatal and the counts are logged either way.
+func TestEveryPackageBuiltOnThisOneIsUnderTheConstantTimeGate(t *testing.T) {
+	root, module := authModuleOf(t, authOwnScanDir)
+	self := module + "/message"
+	covered := map[string]bool{}
+	for _, named := range authScanRoots {
+		resolved, err := filepath.Abs(named)
+		if err != nil {
+			t.Fatalf("resolving the root %s: %v", named, err)
+		}
+		covered[filepath.Clean(resolved)] = true
+	}
+	directories, importers := 0, []string{}
+	fileSet := token.NewFileSet()
+	walked := map[string]bool{}
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			// testdata holds fixtures that are deliberately not buildable, and .git is not
+			// source at all
+			if entry.Name() == "testdata" || entry.Name() == ".git" {
+				return filepath.SkipDir
+			}
+			directories++
+			return nil
+		}
+		if !strings.HasSuffix(entry.Name(), ".go") || strings.HasSuffix(entry.Name(), "_test.go") {
+			return nil
+		}
+		parsed, err := parser.ParseFile(fileSet, path, nil, parser.ImportsOnly)
+		if err != nil {
+			return fmt.Errorf("parse %s: %w", path, err)
+		}
+		for _, spec := range parsed.Imports {
+			imported, err := strconv.Unquote(spec.Path.Value)
+			if err != nil {
+				return fmt.Errorf("%s: an import path that is not a string: %s", path, spec.Path.Value)
+			}
+			if imported != self {
+				continue
+			}
+			directory := filepath.Clean(filepath.Dir(path))
+			if walked[directory] {
+				continue
+			}
+			walked[directory] = true
+			importers = append(importers, directory)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walking %s for the packages built on this one: %v", root, err)
+	}
+	if directories == 0 {
+		t.Fatalf("the walk of %s entered no directory, so it would clear every package in the module having read nothing", root)
+	}
+	slices.Sort(importers)
+	for _, directory := range importers {
+		if covered[directory] {
+			continue
+		}
+		t.Errorf("%s imports %s and is not one of authScanRoots %v, so nothing holds its comparisons to constant time; add it as a root rather than copying these rules into it",
+			directory, self, authScanRoots)
+	}
+	t.Logf("%d directories walked under %s, %d production packages import %s: %v; authScanRoots covers %v",
+		directories, root, len(importers), self, importers, authScanRoots)
 }
