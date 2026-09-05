@@ -826,6 +826,13 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		// MaxVectorLength is one no peer running the default limit could have verified a
 		// signature over, and a restore that admitted it would put this client in an epoch it
 		// can never speak in.
+		// the persisted state's path secret vector, at the DEFAULT limit on both halves and
+		// deliberately NOT the raised one the blob around it is written at. The raised limit is
+		// there for one field -- the ratchet tree -- and it is a capacity for a 500 member group;
+		// this vector is one entry per LEVEL of that tree, nine entries at the same 500 members,
+		// so a raised bound here would be a bound this field can never approach and would say
+		// nothing true about what it holds.
+		"group.go: syntax.ReadVector(r, readOnePathSecret)",
 		"group.go: syntax.Unmarshal(blob.Context, &context)",
 		// the key package a ProposeAdd is handed, decoded at the DEFAULT limit and not the raised
 		// one. These are octets a caller FETCHED -- from a directory, from a peer, from whatever
@@ -855,6 +862,7 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		// them that ARE structures a peer could have influenced, the group context and the tree,
 		// are decoded at their own limits by the two entries around this one.
 		"group.go: syntax.UnmarshalLimit(raw, &blob, syntax.MaxRatchetTreeLength)",
+		"group.go: syntax.WriteVector(w, self.PathSecrets, writeOnePathSecret)",
 		"group_context_verified.go: syntax.Marshal(&self.GroupContext)",
 		"group_context_verified.go: syntax.Unmarshal(signed, decoded)",
 		// the urmessage_group_policy body of MASTER section 6: its two vectors, the structure

@@ -26,6 +26,21 @@
 // THE INDEX MAY BE AN EXPRESSION and not only the bare variable, which is what keeps this rule
 // reading a site after somebody mispairs it: out.Roles[len(self.Roles)-1-i] names no bare i, and a
 // reading that demanded one would drop the site out of the class on the very commit that broke it.
+//
+// AND A KEY NAMES A SITE RATHER THAN A NAME, which is a repair. The key was the function plus the
+// sorted sequence names and nothing else, so a SECOND loop pairing the same two sequences inside an
+// already-named function collided with the first and was certified by its row -- the coverage table
+// is a map, one row cleared both loops, and the discrepancy between the loop count and the distinct
+// key count was written into a t.Logf and asserted nowhere. Repeated keys now carry an occurrence
+// ordinal, " #2" onward in source order, so the second loop is a key with no row and fails on the
+// commit that adds it. TestEveryIndexPairedLoopIsHeldByATestThatSeesItsPairing asserts the two counts
+// are equal as well, which is what says the numbering really made them unique.
+//
+// THE ORDINAL IS POSITIONAL WITHIN ITS FUNCTION, and the cost of that is worth stating: a new loop
+// inserted ABOVE an existing one takes the unsuffixed key and pushes the existing loop to " #2", so
+// the row that was measured against the old loop then names the new one and a " #2" row is missing.
+// That fails rather than passes, which is the direction that matters, and the repair is to re-measure
+// both.
 package mls
 
 import (
@@ -36,6 +51,7 @@ import (
 	"go/token"
 	"go/types"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -152,8 +168,12 @@ func indexPairingKeyOf(function string, sequences []string) string {
 }
 
 // Every loop of the class in one set of type checked files.
+//
+// The occurrence counter is what keeps two loops that pair the same sequences inside one function
+// from sharing a key. See the header for why that mattered and for what the ordinal costs.
 func indexPairedLoopsIn(fileSet *token.FileSet, files []*ast.File, info *types.Info) []indexPairedLoop {
 	found := []indexPairedLoop{}
+	occurrences := map[string]int{}
 	for _, file := range files {
 		for _, declaration := range file.Decls {
 			function, isFunction := declaration.(*ast.FuncDecl)
@@ -200,8 +220,14 @@ func indexPairedLoopsIn(fileSet *token.FileSet, files []*ast.File, info *types.I
 					return true
 				}
 				slices.Sort(sequences)
+				base := indexPairingKeyOf(name, sequences)
+				occurrences[base] += 1
+				key := base
+				if at := occurrences[base]; at != 1 {
+					key = base + " #" + strconv.Itoa(at)
+				}
 				found = append(found, indexPairedLoop{
-					key:   indexPairingKeyOf(name, sequences),
+					key:   key,
 					where: fileSet.Position(node.Pos()).String(),
 				})
 				return true

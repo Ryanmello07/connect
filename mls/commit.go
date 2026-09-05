@@ -149,6 +149,16 @@ type StagedCommit struct {
 	confirmTag  []byte
 	plan        *UpdatePathPlan
 
+	// erased once Zeroize has run, so a staged epoch whose key material is gone REFUSES to be
+	// installed rather than being installed as zeros. (*TreeKEMPrivate).erased and
+	// (*SecretTree).Zeroize carry the same flag for the same reason, and here the flag is the ONLY
+	// thing that can say it: groupId, priorEpoch, epoch, committer and selfRemoved all survive the
+	// erase -- they are not key material -- so the provenance pair ApplyCommit reads passes over an
+	// erased value exactly as it passes over a live one. Measured through the exported API alone:
+	// processed.Commit.Zeroize() and then receiver.ApplyCommit(processed) advanced the member an
+	// epoch and left it answering a 32-zero epoch authenticator.
+	erased bool
+
 	// which constructor the new epoch's schedule came from, which is what task 19's LoadGroup
 	// needs in order to know what to rebuild it from. THE SECRET ITSELF IS NOT HERE, for the
 	// reason (*Group).restoreKind states one file over: the schedule already retains it, its
@@ -191,6 +201,7 @@ func (self *StagedCommit) Zeroize() {
 	}
 	self.ownPriv.Zeroize()
 	self.plan.Zeroize()
+	self.erased = true
 }
 
 // Epoch is the epoch this commit opens.
@@ -236,6 +247,18 @@ func (self *StagedCommit) GroupContextExtensions() []Extension {
 }
 
 // EpochAuthenticator is the new epoch's fork-detection value, as storage the caller owns.
+//
+// An ERASED staged commit answers nothing rather than the KDF.Nh zero bytes its erased schedule
+// holds, which is (*TreeKEMPrivate).NodePrivateKey's rule at the one other exit door of this type
+// that reads key material. The value this method answers is the one two members compare to decide
+// whether they have forked, and zeros are what every erased staged commit in every process on
+// earth answers -- so without this line the erase turns the fork detector into a function that
+// says "no fork" about two members who have nothing in common. Nothing else this type exports
+// reads erased storage: the four leaf vectors, the two provenance fields and the context are
+// public facts about the commit and survive the erase on purpose.
 func (self *StagedCommit) EpochAuthenticator() []byte {
+	if self.erased {
+		return nil
+	}
 	return cloneBytes(self.schedule.Secrets().EpochAuthenticator)
 }

@@ -75,6 +75,49 @@ var (
 	errGroupStateRestoreSecret = errors.New(
 		"mls: this epoch's key schedule cannot answer the secret it was built from")
 
+	// errGroupStatePathSecret is a persisted state whose TreeKEM ladder does not derive the
+	// public keys the tree in the same blob carries.
+	//
+	// A SEPARATE VALUE from errGroupStateTranscript, which is the block's rule and here it is
+	// load bearing: the interim transcript hash is a commitment to the restore secret and to the
+	// kind that says how to use it, and it says NOTHING about the path secrets -- they are not an
+	// input to the key schedule at all. So the two refusals name two different halves of one blob,
+	// and a caller told "the transcript disagrees" about a corrupted path secret would go looking
+	// at the schedule.
+	errGroupStatePathSecret = errors.New(
+		"mls: the persisted group state's path secrets do not derive the keys the tree it names carries")
+
+	// errGroupStateLadderOrder is a persisted ladder that is not in strictly increasing node order.
+	//
+	// It is a SEPARATE VALUE from the one above because it is a different fault with a different
+	// cause, which is this block's rule: a secret that does not derive its node's key is a rung that
+	// was corrupted, and an out-of-order vector is a vector this build did not write -- marshalState
+	// sorts, and the keys of a map are unique, so strictly increasing is exactly the shape that
+	// leaves this process.
+	//
+	// AND IT IS THE ONLY THING THAT CATCHES A REPEATED NODE, which is the reason it is a door rather
+	// than a comment on the encoder. Two entries naming one node collapse into ONE map entry when
+	// the ladder is rebuilt, so the restored member silently holds one fewer rung than it persisted
+	// -- and if the surviving entry is the correct one, the whole state passes the derivation check
+	// below and produces a member that is right about everything it holds and missing the rung it
+	// needed. Measured: with only the derivation check, a state whose first entry had been refiled
+	// under the last entry's node restored with a nil error.
+	errGroupStateLadderOrder = errors.New(
+		"mls: the persisted group state's path secrets are not in strictly increasing node order")
+
+	// errStagedCommitErased is a staged commit whose key material has been erased, handed to a
+	// door that installs one.
+	//
+	// ONE VALUE FOR TWO DOORS because it is one rule: ApplyCommit and MergePendingCommit are the
+	// two ways a staged epoch becomes live, and what the rule says at both is that an erased
+	// staged commit installs nothing. MEASURED through the exported API alone --
+	// processed.Commit.Zeroize() and then receiver.ApplyCommit(processed) -- the group advanced to
+	// the next epoch and answered a 32-zero epoch authenticator, because the group id and the
+	// prior epoch SURVIVE Zeroize and were the only two fields this door read. Two members that
+	// both took that path compare equal, which is a fork detector answering "no fork" out of
+	// erased storage.
+	errStagedCommitErased = errors.New("mls: the staged commit's key material has been erased")
+
 	errCreationConfirmationTag = errors.New("mls: the epoch 0 confirmation tag is not a tag of this suite's width")
 
 	// and the same refusal one epoch on. A SECOND VALUE and not errCreationConfirmationTag,
@@ -915,7 +958,92 @@ func (self *Group) persist() error {
 // build is REFUSED rather than misread. The two are not the same failure: a misread blob decodes
 // into a group whose secrets nobody agrees with, and the first symptom of one is a member whose
 // every message is refused by peers that are all behaving correctly.
-const groupStateBlobVersion uint16 = 1
+// Version 2 carries this member's TreeKEM path secrets. Version 1 did not, and a state written at
+// it restores a member holding its own leaf key and nothing above it -- which is a working group
+// of TWO, where every ciphertext a commit addresses to this member stands at its own leaf, and a
+// member of a group of FOUR OR MORE that cannot open the next commit from the far side of the
+// tree. Refused rather than read with an empty ladder, because that restore is the defect.
+const groupStateBlobVersion uint16 = 2
+
+// pathSecretEntry is one rung of this member's TreeKEM ladder as the persisted state carries it:
+// the node the secret belongs to, and the secret.
+//
+// A VECTOR OF PAIRS AND NOT A POSITIONAL LIST, which is (*TreeKEMPrivate).PathSecrets' own reason
+// read one layer out. That map is keyed by node rather than by depth because a member's filtered
+// direct path gains and loses nodes as members are added and removed, so a secret written down by
+// its position in a path is a secret silently RENAMED the first time it is read back against a
+// differently filtered path -- and a restore is exactly a read-back at a distance, where nothing
+// on either side of the write can compare the two shapes.
+type pathSecretEntry struct {
+	Node   NodeIndex
+	Secret []byte
+}
+
+// The element halves, named rather than written as closures at the call site, for
+// writeOneHpkeCiphertext's stated reason: TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit
+// pins every syntax entry point of this package by the SOURCE TEXT of the call.
+func writeOnePathSecret(w *syntax.Writer, entry pathSecretEntry) error {
+	w.WriteUint32(uint32(entry.Node))
+	w.WriteOpaque(entry.Secret)
+	return w.Err()
+}
+
+func readOnePathSecret(r *syntax.Reader) (pathSecretEntry, error) {
+	node, err := r.ReadUint32()
+	if err != nil {
+		return pathSecretEntry{}, err
+	}
+	secret, err := r.ReadOpaque()
+	if err != nil {
+		return pathSecretEntry{}, err
+	}
+	return pathSecretEntry{Node: NodeIndex(node), Secret: secret}, nil
+}
+
+// zeroizePathSecretEntries erases every secret in a DECODED path secret vector.
+//
+// Only ever called on the read side, and the asymmetry is the point. On the write side each entry
+// is a view of the live private state's own storage, so an erase there would destroy the ladder
+// the group is running on -- the drop defect pointing backwards. On the read side every entry is
+// storage syntax.Reader allocated for this one call, and LoadGroup owes it the erase it already
+// owes the other two secrets the blob carries.
+func zeroizePathSecretEntries(entries []pathSecretEntry) {
+	for _, entry := range entries {
+		zeroizeSecret(entry.Secret)
+	}
+}
+
+// pathSecretsOf is a member's TreeKEM ladder as the vector the blob carries, IN NODE ORDER.
+//
+// SORTED, because a map has no order and these octets go to a disk. Two persists of one unchanged
+// epoch that answered different octets would make every comparison anybody makes over a stored
+// state -- did this epoch change, is this the state I wrote, do two devices hold the same one --
+// report a difference that is nothing but Go's map iteration seed.
+//
+// Insertion sorted rather than through slices.SortFunc, and the IMPORT is the reason rather than
+// the cost: this package's constant-time gate derives its banned comparator class out of the
+// imports each production file makes, so an import added here for a sort widens that class over
+// the file holding every door onto this group's secrets. The vector is one entry per level of the
+// tree -- nine at five hundred members -- so writing the sort out costs nothing.
+//
+// NO SECRET IS COPIED, which is marshalState's rule for every field of this blob: the slice is new
+// and each Secret in it is a view of the live private state's storage, so this adds no second copy
+// of any path secret to the heap. The one copy is the encoder's output, and persist erases that.
+func pathSecretsOf(priv *TreeKEMPrivate) []pathSecretEntry {
+	if priv == nil {
+		return nil
+	}
+	out := make([]pathSecretEntry, 0, len(priv.PathSecrets))
+	for node, secret := range priv.PathSecrets {
+		out = append(out, pathSecretEntry{Node: node, Secret: secret})
+	}
+	for i := 1; i < len(out); i += 1 {
+		for j := i; 0 < j && out[j].Node < out[j-1].Node; j -= 1 {
+			out[j], out[j-1] = out[j-1], out[j]
+		}
+	}
+	return out
+}
 
 // groupStateBlob is one epoch of one group as it is handed to the StateStore.
 //
@@ -948,11 +1076,16 @@ type groupStateBlob struct {
 	OwnEncPriv    []byte
 	RestoreKind   uint8
 	RestoreSecret []byte
+	// this member's own TreeKEM ladder. LAST, so that the version 1 layout is a strict prefix of
+	// this one and a build reading a version 1 state stops at the version check rather than at a
+	// truncated vector -- which is the difference between "migrate or discard this state" and a
+	// decode failure that says nothing about why.
+	PathSecrets []pathSecretEntry
 }
 
 var _ syntax.Codec = (*groupStateBlob)(nil)
 
-// MarshalMLS writes the blob. The version is FIRST so that a decoder can refuse a layout it does
+// MarshalMLS writes the blob. The version is FIRST so that the decoder can refuse a layout it does
 // not read before it has interpreted one octet of the rest as anything.
 func (self *groupStateBlob) MarshalMLS(w *syntax.Writer) error {
 	w.WriteUint16(self.Version)
@@ -964,7 +1097,7 @@ func (self *groupStateBlob) MarshalMLS(w *syntax.Writer) error {
 	w.WriteOpaque(self.OwnEncPriv)
 	w.WriteUint8(self.RestoreKind)
 	w.WriteOpaque(self.RestoreSecret)
-	return nil
+	return syntax.WriteVector(w, self.PathSecrets, writeOnePathSecret)
 }
 
 // UnmarshalMLS reads the blob. It STAGES -- every field into a local, the receiver assigned whole
@@ -974,6 +1107,17 @@ func (self *groupStateBlob) UnmarshalMLS(r *syntax.Reader) error {
 	version, err := r.ReadUint16()
 	if err != nil {
 		return err
+	}
+	// REFUSED HERE AND NOT BY THE CALLER, which is what the version being written first is for and
+	// what it was not doing. LoadGroup used to make this comparison after the whole decode had
+	// succeeded, which works for exactly as long as every layout is the same LENGTH: the moment
+	// version 2 appended the path secret vector, a version 1 state stopped decoding at all and the
+	// caller's named refusal -- "this is a state to migrate or discard" -- was replaced by a
+	// truncation error that says nothing about why. The check belongs at the first field that can
+	// answer it.
+	if version != groupStateBlobVersion {
+		return fmt.Errorf("%w: the state is version %d and this build writes %d",
+			errGroupStateBlobVersion, version, groupStateBlobVersion)
 	}
 	context, err := r.ReadOpaque()
 	if err != nil {
@@ -1007,6 +1151,21 @@ func (self *groupStateBlob) UnmarshalMLS(r *syntax.Reader) error {
 	if err != nil {
 		return err
 	}
+	pathSecrets, err := syntax.ReadVector(r, readOnePathSecret)
+	if err != nil {
+		return err
+	}
+	// STRICTLY INCREASING, which is the shape marshalState writes and therefore the only shape this
+	// build can have produced. It refuses a reordered vector and, more importantly, a REPEATED node:
+	// two entries naming one node collapse into one map entry when the ladder is rebuilt, so the
+	// restored member holds one fewer rung than it persisted and nothing downstream can tell.
+	// See errGroupStateLadderOrder.
+	for i := 1; i < len(pathSecrets); i += 1 {
+		if pathSecrets[i].Node <= pathSecrets[i-1].Node {
+			return fmt.Errorf("%w: entry %d names node %d after node %d",
+				errGroupStateLadderOrder, i, pathSecrets[i].Node, pathSecrets[i-1].Node)
+		}
+	}
 	*self = groupStateBlob{
 		Version:       version,
 		Context:       context,
@@ -1017,6 +1176,7 @@ func (self *groupStateBlob) UnmarshalMLS(r *syntax.Reader) error {
 		OwnEncPriv:    ownEncPriv,
 		RestoreKind:   kind,
 		RestoreSecret: secret,
+		PathSecrets:   pathSecrets,
 	}
 	return nil
 }
@@ -1066,6 +1226,13 @@ func (self *Group) marshalState() ([]byte, error) {
 		OwnEncPriv:    self.ownPriv.EncryptionPriv,
 		RestoreKind:   uint8(self.restoreKind),
 		RestoreSecret: restoreSecret,
+		// AND THE LADDER, which is what makes this state a restore of a member rather than of a
+		// group. Without it a restored member holds its own leaf key alone: every ciphertext a
+		// commit addresses to it stands at its own leaf in a group of two -- which is why nothing
+		// reported this for as long as the corpus had no larger group -- and stands at a copath
+		// node it can no longer derive a key for the moment the group has four members and the
+		// next commit comes from the other side of the tree.
+		PathSecrets: pathSecretsOf(self.ownPriv),
 	}
 	return syntax.MarshalLimit(blob, syntax.MaxRatchetTreeLength)
 }
@@ -2141,6 +2308,18 @@ func (self *Group) MergePendingCommit() error {
 	if self.pending == nil {
 		return ErrNoPendingCommit
 	}
+	// the SECOND door of errStagedCommitErased's one rule, and it is here rather than only in
+	// ApplyCommit because the rule is about installing a staged epoch and this is the method that
+	// installs one -- ApplyCommit reaches live state through this call. A guard written only at the
+	// caller is a guard that holds for the callers somebody enumerated.
+	//
+	// The pending commit is LEFT WHERE IT IS rather than dropped, which is this method's discipline
+	// at every other refusal: what to do with a staged epoch this group could not enter is
+	// ClearPendingCommit's decision and the caller's, and a merge that erased it on the way out
+	// would be the same defect one door along.
+	if self.pending.erased {
+		return errStagedCommitErased
+	}
 	staged := self.pending
 	// THE EPOCH THIS MERGE CLOSES IS ERASED AS IT IS DROPPED. There is no past-epoch window in
 	// this build -- task 19 adds one -- so the schedule, the secret tree and the leaf private
@@ -2255,10 +2434,14 @@ func LoadGroup(cfg *GroupConfig, epoch uint64, signer SignaturePrivateKey) (*Gro
 	// and says why.
 	defer zeroizeSecret(blob.RestoreSecret)
 	defer zeroizeSecret(blob.OwnEncPriv)
-	if blob.Version != groupStateBlobVersion {
-		return nil, fmt.Errorf("%w: the state is version %d and this build writes %d",
-			errGroupStateBlobVersion, blob.Version, groupStateBlobVersion)
-	}
+	// and the ladder, which is the same obligation over the field this version added. It is one
+	// call rather than a loop written here for the erase class's reason: the drop sites of this
+	// package name a function that erases, so a site somebody adds later erases the whole of what
+	// it holds rather than the fields whoever wrote it remembered.
+	defer zeroizePathSecretEntries(blob.PathSecrets)
+	// the version is NOT compared here. The decoder refuses a layout this build does not read at the
+	// first field of the blob, which is where the version is written for that purpose; a second
+	// comparison here would be a line no state can reach and therefore a line no test can hold.
 
 	var context GroupContext
 	if err := syntax.Unmarshal(blob.Context, &context); err != nil {
@@ -2272,6 +2455,42 @@ func LoadGroup(cfg *GroupConfig, epoch uint64, signer SignaturePrivateKey) (*Gro
 	leaf := tree.Leaf(ownLeaf)
 	if leaf == nil {
 		return nil, ErrWelcomeLeafNotFound
+	}
+	// THE PRIVATE HALF OF THE TREE THIS MEMBER HOLDS: its leaf HPKE key, and every path secret it
+	// had derived when the state was written.
+	//
+	// THE LADDER IS THE HALF A TWO MEMBER CORPUS CANNOT SEE MISSING, and it was missing here. In a
+	// group of two the only node of a sender's filtered direct path that covers the receiver is the
+	// root, and the receiver's own leaf is the whole of that node's copath resolution -- so every
+	// commit is sealed to the leaf key, an empty ladder answers every question anybody asks, and a
+	// restore that dropped it passes every test there is. At FOUR members a commit from the far side
+	// of the tree is sealed to the receiver's sibling subtree root, which is a node no leaf key
+	// derives, and a member restored without its ladder answers ErrNoPathSecret to the very next
+	// commit it is sent. Persistence is the whole point of this function, so a restore that produces
+	// a member who cannot stay in the group is the defect rather than a limitation.
+	//
+	// EVERY SECRET IS CLONED OUT OF THE BLOB, for the reason the two defers above give: the decoded
+	// vector is erased on every path out of this function, and a private state built over those
+	// arrays would hold key material its own constructor is about to wipe -- a ladder of zeros,
+	// deriving one wrong node key per rung, with nothing anywhere to point at.
+	//
+	// This is done BEFORE the schedule so the refusal below has nothing to unwind.
+	ownPriv := NewTreeKEMPrivate(ownLeaf, HpkePrivateKey(blob.OwnEncPriv))
+	for _, entry := range blob.PathSecrets {
+		ownPriv.PathSecrets[entry.Node] = cloneBytes(entry.Secret)
+	}
+	// AND THE LADDER IS CHECKED AGAINST THE TREE IT IS ABOUT TO BE USED WITH. The interim transcript
+	// comparison further down is a commitment to the restore secret and to the kind that says how to
+	// use it, and it commits to NOTHING about these secrets: a path secret is not an input to the key
+	// schedule at all. So this is the only thing between a ladder that was corrupted, truncated or
+	// written for another epoch and a member that derives private keys nobody's public half matches,
+	// decrypts nothing, and reports a decryption failure against commits that are perfectly well
+	// formed. (*TreeKEMPrivate).Consistent is that check and its own comment names the same symptom.
+	if err := ownPriv.Consistent(crypto, tree); err != nil {
+		// erased before it is dropped, for (*Group).ClearPendingCommit's reason: those clones are
+		// this call's own copies of this member's key material.
+		ownPriv.Zeroize()
+		return nil, fmt.Errorf("%w: %w", errGroupStatePathSecret, err)
 	}
 
 	var schedule *KeySchedule
@@ -2379,7 +2598,7 @@ func LoadGroup(cfg *GroupConfig, epoch uint64, signer SignaturePrivateKey) (*Gro
 		signer:      SignaturePrivateKey(cloneBytes(signer)),
 		cred:        Credential{CredentialType: leaf.Credential.CredentialType, Identity: cloneBytes(leaf.Credential.Identity)},
 		ownLeaf:     ownLeaf,
-		ownPriv:     NewTreeKEMPrivate(ownLeaf, HpkePrivateKey(blob.OwnEncPriv)),
+		ownPriv:     ownPriv,
 		tree:        tree,
 		context:     &context,
 		verified:    verified,
@@ -3768,6 +3987,15 @@ func (self *Group) ApplyCommit(processed *Processed) error {
 		return errGroupClosed
 	}
 	staged := processed.Commit
+	// AN ERASED STAGED COMMIT INSTALLS NOTHING, and it is read FIRST because it is the one
+	// condition none of the checks below can see. Everything they read -- the group id, the prior
+	// epoch, the removal flag -- survives Zeroize, so an erased commit walks the whole door and
+	// installs an erased key schedule, an erased secret tree and an erased leaf private state as
+	// this group's live epoch. See errStagedCommitErased for the measurement.
+	if staged.erased {
+		self.stateLock.Unlock()
+		return errStagedCommitErased
+	}
 	// through crypto/subtle for guardrail 8 class reason, which is the class and not this line: a
 	// group id is public, and every comparison of octets in this package is spelled the one way.
 	if subtle.ConstantTimeCompare(staged.groupId, self.context.GroupId) != 1 {

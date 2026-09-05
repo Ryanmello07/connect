@@ -14,7 +14,11 @@ import (
 	"bytes"
 	"errors"
 	"go/ast"
+	"go/parser"
+	"go/token"
+	"go/types"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -141,54 +145,269 @@ func TestApplyCommitRefusesACommitStagedAgainstAnotherEpoch(t *testing.T) {
 	}
 }
 
-// TestEveryStagedCommitCarriesTheGroupAndEpochThatStagedIt is the gate over the CLASS rather than
-// over the two doors this task closed: a staged commit built anywhere in this package without its
-// provenance is a value ApplyCommit clears by comparing two zero values, and the site that builds
-// one need not be one of the three that exist today.
+// ---------------------------------------------------------------------------
+// the construction class
+// ---------------------------------------------------------------------------
+
+// stagedCommitProvenanceFields is what ApplyCommit compares a staged commit against the group it is
+// handed to. A construction that names neither is a value that door clears by comparing two zero
+// values.
+var stagedCommitProvenanceFields = []string{"groupId", "priorEpoch"}
+
+// One site that brings a StagedCommit VALUE into existence: how it is spelled, the function or type
+// it stands in, and -- for the one spelling this rule can read -- the fields it names.
+type stagedCommitConstruction struct {
+	key   string
+	how   string
+	named []string
+	where string
+}
+
+// stagedCommitConstructionsIn derives the class off the TYPE CHECKER rather than off the source text
+// of a literal's type expression, and the difference is two whole spellings.
 //
-// DERIVED off the source rather than counted: every composite literal of the type in every
-// production file, whatever function it stands in. A construction spelled some other way --
-// new(StagedCommit), or a positional literal -- is refused outright rather than skipped, because it
-// is a construction this rule cannot read and a rule that cannot read a construction clears it.
-func TestEveryStagedCommitCarriesTheGroupAndEpochThatStagedIt(t *testing.T) {
-	required := []string{"groupId", "priorEpoch"}
-	found := 0
-	for _, parsed := range parsedProductionSourcesOfThisPackage(t) {
-		ast.Inspect(parsed.file, func(node ast.Node) bool {
-			if call, isCall := node.(*ast.CallExpr); isCall {
-				if name, isIdent := call.Fun.(*ast.Ident); isIdent && name.Name == "new" &&
-					len(call.Args) == 1 && parsed.render(call.Args[0]) == "StagedCommit" {
-					t.Errorf("%s builds a StagedCommit through new(), which this rule cannot read; build it as a keyed composite literal so its provenance is visible here",
-						parsed.fileSet.Position(call.Pos()))
-				}
-				return true
-			}
-			literal, isLiteral := node.(*ast.CompositeLit)
-			if !isLiteral || literal.Type == nil || parsed.render(literal.Type) != "StagedCommit" {
-				return true
-			}
-			found += 1
-			named := []string{}
-			for _, element := range literal.Elts {
-				pair, isPair := element.(*ast.KeyValueExpr)
-				if !isPair {
-					t.Errorf("%s builds a StagedCommit positionally, so this rule cannot say which field is which",
-						parsed.fileSet.Position(element.Pos()))
+// The reading this replaces matched a composite literal whose written type rendered as the string
+// "StagedCommit" and a call to new() whose written argument did the same. That reads two of the four
+// ways this package can bring one into existence, and it was the SPELLING it could not read that was
+// dangerous: `var staged StagedCommit` followed by field assignment is precisely the shape that
+// yields a nil groupId and a zero priorEpoch, and the old rule cleared it in silence. It also missed
+// an elided literal -- []StagedCommit{{...}} writes no type at the element at all -- so a literal
+// inside a slice or a map was invisible to the half of the rule that checks the fields.
+//
+// The four members of the class, and why each is in it:
+//
+//   - a composite literal, which is the one spelling this rule can READ the fields of;
+//   - new(StagedCommit), which names nothing;
+//   - a var declaration of the value type with no initialiser, which is the zero value plus whatever
+//     the next lines happen to assign;
+//   - a struct field of the value type, which is a zero StagedCommit inside somebody else's value and
+//     travels wherever that value does.
+//
+// A PARAMETER OF THE VALUE TYPE IS NOT IN THE CLASS and a `var staged *StagedCommit` is not either,
+// which is the rule's own boundary rather than an exemption written beside it: a parameter receives a
+// value that was constructed somewhere this rule already reads, and a nil pointer is not a
+// StagedCommit. The control fixture holds one of each so that a reading which widened to flag them
+// fails there rather than issuing findings against correct code.
+func stagedCommitConstructionsIn(fileSet *token.FileSet, files []*ast.File,
+	info *types.Info) []stagedCommitConstruction {
+
+	isStagedCommit := func(one types.Type) bool {
+		if one == nil {
+			return false
+		}
+		named, isNamed := types.Unalias(one).(*types.Named)
+		return isNamed && named.Obj() != nil && named.Obj().Name() == "StagedCommit"
+	}
+	found := []stagedCommitConstruction{}
+	for _, file := range files {
+		for _, declaration := range file.Decls {
+			switch spelled := declaration.(type) {
+			case *ast.FuncDecl:
+				if spelled.Body == nil {
 					continue
 				}
-				named = append(named, parsed.render(pair.Key))
-			}
-			for _, want := range required {
-				if !slices.Contains(named, want) {
-					t.Errorf("%s stages a commit without %s; ApplyCommit compares that field against the group it is handed to, and a zero one is a commit any group at epoch 0 adopts",
-						parsed.fileSet.Position(literal.Pos()), want)
+				name := spelled.Name.Name
+				if spelled.Recv != nil && len(spelled.Recv.List) != 0 {
+					name = "(" + indexPairingRender(fileSet, spelled.Recv.List[0].Type) + ")." + name
+				}
+				ast.Inspect(spelled.Body, func(node ast.Node) bool {
+					switch inner := node.(type) {
+					case *ast.CallExpr:
+						builtin, isIdent := inner.Fun.(*ast.Ident)
+						if isIdent && builtin.Name == "new" && len(inner.Args) == 1 &&
+							isStagedCommit(info.Types[inner.Args[0]].Type) {
+							found = append(found, stagedCommitConstruction{
+								key: name + " new []", how: "new",
+								where: fileSet.Position(inner.Pos()).String(),
+							})
+						}
+					case *ast.ValueSpec:
+						if len(inner.Values) != 0 || inner.Type == nil ||
+							!isStagedCommit(info.Types[inner.Type].Type) {
+							return true
+						}
+						found = append(found, stagedCommitConstruction{
+							key: name + " var []", how: "var",
+							where: fileSet.Position(inner.Pos()).String(),
+						})
+					case *ast.CompositeLit:
+						if !isStagedCommit(info.Types[inner].Type) {
+							return true
+						}
+						named := []string{}
+						positional := false
+						for _, element := range inner.Elts {
+							pair, isPair := element.(*ast.KeyValueExpr)
+							if !isPair {
+								positional = true
+								continue
+							}
+							named = append(named, indexPairingRender(fileSet, pair.Key))
+						}
+						how := "literal"
+						if positional {
+							how = "positional literal"
+						}
+						slices.Sort(named)
+						found = append(found, stagedCommitConstruction{
+							key: name + " " + how + " [" + strings.Join(named, " ") + "]",
+							how: how, named: named,
+							where: fileSet.Position(inner.Pos()).String(),
+						})
+					}
+					return true
+				})
+			case *ast.GenDecl:
+				for _, specification := range spelled.Specs {
+					typed, isType := specification.(*ast.TypeSpec)
+					if !isType {
+						continue
+					}
+					structure, isStruct := typed.Type.(*ast.StructType)
+					if !isStruct || structure.Fields == nil {
+						continue
+					}
+					for _, field := range structure.Fields.List {
+						if !isStagedCommit(info.Types[field.Type].Type) {
+							continue
+						}
+						for _, fieldName := range field.Names {
+							found = append(found, stagedCommitConstruction{
+								key: typed.Name.Name + " field " + fieldName.Name, how: "field",
+								where: fileSet.Position(field.Pos()).String(),
+							})
+						}
+					}
 				}
 			}
-			return true
-		})
+		}
 	}
-	if found == 0 {
+	return found
+}
+
+// A fixture holding one of every spelling the rule has to tell apart, so a reading that stopped
+// matching fails here rather than issuing the real source the clean bill a working one issues.
+//
+// Every member is here because some half of the rule has to be the only thing reporting it, or the
+// only thing NOT reporting it. ThroughVar and InsideASlice are the two the previous reading missed;
+// APointerVarIsNotAConstruction and AParameterIsNotAConstruction are the negative half, and a rule
+// that widened to flag either would issue findings against correct code.
+const stagedCommitConstructionControl = `package control
+
+type StagedCommit struct {
+	groupId    []byte
+	priorEpoch uint64
+	epoch      uint64
+}
+
+type Holder struct {
+	staged StagedCommit
+}
+
+func KeyedLiteralCarryingBoth() *StagedCommit {
+	return &StagedCommit{groupId: nil, priorEpoch: 0}
+}
+
+func KeyedLiteralMissingProvenance() *StagedCommit {
+	return &StagedCommit{epoch: 1}
+}
+
+func PositionalLiteral() *StagedCommit {
+	return &StagedCommit{nil, 0, 1}
+}
+
+func ThroughNew() *StagedCommit {
+	return new(StagedCommit)
+}
+
+func ThroughVar() *StagedCommit {
+	var staged StagedCommit
+	staged.epoch = 1
+	return &staged
+}
+
+func InsideASlice() []StagedCommit {
+	return []StagedCommit{{groupId: nil, priorEpoch: 0}}
+}
+
+func APointerVarIsNotAConstruction() *StagedCommit {
+	var staged *StagedCommit
+	return staged
+}
+
+func AParameterIsNotAConstruction(staged StagedCommit) uint64 {
+	return staged.epoch
+}
+`
+
+// What the rule must report over the fixture, EXACTLY rather than as a floor: a reading that widened
+// to flag every declaration fails here as surely as one that stopped matching.
+var stagedCommitConstructionControlReports = []string{
+	"Holder field staged",
+	"InsideASlice literal [groupId priorEpoch]",
+	"KeyedLiteralCarryingBoth literal [groupId priorEpoch]",
+	"KeyedLiteralMissingProvenance literal [epoch]",
+	"PositionalLiteral positional literal []",
+	"ThroughNew new []",
+	"ThroughVar var []",
+}
+
+// TestTheStagedCommitConstructionRuleFlagsItsControlFixture runs before the rule over the real
+// source, so a reading that stopped matching fails here rather than certifying the package.
+func TestTheStagedCommitConstructionRuleFlagsItsControlFixture(t *testing.T) {
+	fileSet := token.NewFileSet()
+	parsed, err := parser.ParseFile(fileSet, "staged_commit_construction_control.go",
+		stagedCommitConstructionControl, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parse the staged commit construction control: %v", err)
+	}
+	info := &types.Info{Types: map[ast.Expr]types.TypeAndValue{}}
+	if _, err := (&types.Config{}).Check("control", fileSet, []*ast.File{parsed}, info); err != nil {
+		t.Fatalf("type check the staged commit construction control: %v", err)
+	}
+	reported := []string{}
+	for _, one := range stagedCommitConstructionsIn(fileSet, []*ast.File{parsed}, info) {
+		reported = append(reported, one.key)
+	}
+	slices.Sort(reported)
+	if !slices.Equal(reported, stagedCommitConstructionControlReports) {
+		t.Errorf("the rule reported %v over the control, want %v", reported, stagedCommitConstructionControlReports)
+	}
+}
+
+// TestEveryStagedCommitCarriesTheGroupAndEpochThatStagedIt is the gate over the CLASS rather than
+// over the two doors this task closed: a staged commit built anywhere in this package without its
+// provenance is a value ApplyCommit clears by comparing two zero values, and the site that builds one
+// need not be one of the three that exist today.
+//
+// A construction spelled any way but a keyed composite literal is refused OUTRIGHT rather than
+// skipped, because it is a construction whose fields this rule cannot read, and a rule that cannot
+// read a construction clears it.
+func TestEveryStagedCommitCarriesTheGroupAndEpochThatStagedIt(t *testing.T) {
+	source := typeCheckedPackageWithBodies(t)
+	constructions := stagedCommitConstructionsIn(source.fileSet, source.files, source.info)
+	literals := 0
+	for _, one := range constructions {
+		switch one.how {
+		case "literal":
+			literals += 1
+			for _, want := range stagedCommitProvenanceFields {
+				if !slices.Contains(one.named, want) {
+					t.Errorf("%s at %s stages a commit without %s; ApplyCommit compares that field against the group it is handed to, and a zero one is a commit any group at epoch 0 adopts",
+						one.key, one.where, want)
+				}
+			}
+		case "positional literal":
+			t.Errorf("%s at %s builds a StagedCommit positionally, so this rule cannot say which field is which; write it keyed",
+				one.key, one.where)
+		default:
+			t.Errorf("%s at %s brings a StagedCommit into existence as a %s, which names no field at all and yields a nil groupId and a zero priorEpoch; build it as a keyed composite literal so its provenance is visible here",
+				one.key, one.where, one.how)
+		}
+	}
+	if literals == 0 {
 		t.Fatal("no StagedCommit literal was found in this package's production source, so this rule demanded nothing")
 	}
-	t.Logf("%d StagedCommit construction site(s), each carrying %v", found, required)
+	t.Logf("%d StagedCommit construction site(s), %d of them keyed literals carrying %v",
+		len(constructions), literals, stagedCommitProvenanceFields)
 }
