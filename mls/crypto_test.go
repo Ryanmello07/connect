@@ -1805,15 +1805,7 @@ var providerMethodSourcePaths = []string{"crypto.go", "crypto_labels.go"}
 // does not read is a file the rule does not reach.
 func packageSourcePaths(t *testing.T) []string {
 	t.Helper()
-	paths, err := filepath.Glob("*.go")
-	if err != nil {
-		t.Fatalf("list the package source: %v", err)
-	}
-	if len(paths) == 0 {
-		t.Fatalf("the package holds no go files, so nothing below scanned anything")
-	}
-	slices.Sort(paths)
-	return paths
+	return packageSourcePathsIn(t, ".")
 }
 
 // Every method the interface names, read off the type rather than typed out.

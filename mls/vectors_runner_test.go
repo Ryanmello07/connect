@@ -47,9 +47,11 @@ import (
 	"errors"
 	"fmt"
 	"go/ast"
+	"go/parser"
 	"go/token"
 	"maps"
 	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strconv"
@@ -1274,66 +1276,270 @@ func TestPublishedCorpusSegmentStepsIntoTheShapeThePublishedValueHas(t *testing.
 	}
 }
 
-// TestThePackageSourceIsOneLineEndingThroughout refuses a working tree in which some file of this
-// package disagrees with the rest about how a line ends.
+// ── the line ending gate, and the scope it derives ──────────────────────────────────
+
+// packageSourcePathsIn is every go file at the top level of one package directory, sorted.
 //
-// Not a style rule. Every gate in this file and in the family runners reads this package's own
-// source, and every repair to this package is made as an exact-string edit over it -- and an edit
-// anchored on one line ending matches nothing at all in a file that uses the other. It edits
-// nothing, the suite then passes, and that reads as "the change was made and was harmless". Three
-// wrong conclusions on this tree came from exactly that, and one of them also rewrote a whole
-// file's endings while its own substitution matched nothing, so the evidence pointed two ways at
-// once.
+// It does not recurse. What sits under testdata is either fixture source that only ever
+// reaches a go/parser -- which has no opinion at all about how a line ends -- or bytes that
+// .gitattributes marks -text so no checkout rewrites them. Neither is read by an anchored
+// string edit, which is the thing the gate below exists to protect.
 //
-// DERIVED and pinned to NEITHER ending, because which one is right belongs to the checkout and
-// not to this package: a clone with core.autocrlf off is LF throughout, one with it on is CRLF
-// throughout, and both are fine to work in. What is refused is the mixture. Written as a
-// derivation rather than as the one file somebody noticed, for guardrail 5's reason and with the
-// usual result -- the review that raised this named a single file, and reading the class off the
-// directory found sixteen.
+// A directory holding no go source is a fatal and not an empty result, because a scope that
+// resolved to nothing is what "every file agreed" looks like when nothing was read.
+func packageSourcePathsIn(t *testing.T, dir string) []string {
+	t.Helper()
+	paths, err := filepath.Glob(filepath.Join(dir, "*.go"))
+	if err != nil {
+		t.Fatalf("list the source of %s: %v", dir, err)
+	}
+	if len(paths) == 0 {
+		t.Fatalf("%s holds no go files, so whatever scans it scanned nothing", dir)
+	}
+	slices.Sort(paths)
+	return paths
+}
+
+// moduleRootDir is the directory this module's go.mod sits in, walked up to rather than
+// written down, so the closure below can tell a package of this checkout from a sibling
+// repository beside it.
+func moduleRootDir(t *testing.T) string {
+	t.Helper()
+	dir, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatalf("resolve this package's own directory: %v", err)
+	}
+	for range 8 {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	t.Fatalf("no go.mod above %s, so this module's root cannot be derived", dir)
+	return ""
+}
+
+// namedSiblingPaths is every "../..." path one go file hands to something as a path.
 //
-// A file carrying no line ending at all belongs to neither class and is counted apart, so an
-// empty file cannot make a mixed package look uniform, and a file mixed WITHIN itself is its own
-// report: that one is never a checkout and is always a tool that wrote part of a file.
-func TestThePackageSourceIsOneLineEndingThroughout(t *testing.T) {
-	byEnding := map[string][]string{}
-	empty := 0
-	for _, path := range packageSourcePaths(t) {
-		source, err := os.ReadFile(path)
+// Read off the syntax tree and not off the text, so a directory that prose merely mentions is
+// not mistaken for one a gate opens. That distinction carries most of the mentions: this
+// package's comments name ../message and ../messagegroup far more often than its code hands
+// either of them to anything, because nearly every mention is a sentence explaining a rule.
+// What puts a directory in the scope below is a path LITERAL, because a literal is what a
+// scan is actually given. No count is written here on purpose -- a number in a comment about
+// how often a comment says something is the most perishable sentence this file could hold.
+//
+// A literal that cleans to ".." is not one of them. It names the step up and not a sibling,
+// and the derivation's own prefix -- the "../" three lines below -- is exactly such a
+// literal, so without this the gate reads its own implementation as an instruction to judge
+// connect's root package. That is not a hypothetical: it is what the first run of this
+// closure over its own source did.
+func namedSiblingPaths(t *testing.T, path string) []string {
+	t.Helper()
+	fileSet := token.NewFileSet()
+	parsed, err := parser.ParseFile(fileSet, path, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", path, err)
+	}
+	found := []string{}
+	ast.Inspect(parsed, func(node ast.Node) bool {
+		literal, isLiteral := node.(*ast.BasicLit)
+		if !isLiteral || literal.Kind != token.STRING {
+			return true
+		}
+		text, err := strconv.Unquote(literal.Value)
 		if err != nil {
-			t.Fatalf("read %s: %v", path, err)
+			return true
 		}
-		lines := bytes.Count(source, []byte("\n"))
-		carried := bytes.Count(source, []byte("\r\n"))
-		switch {
-		case lines == 0:
-			empty += 1
-		case carried == lines:
-			byEnding["crlf"] = append(byEnding["crlf"], path)
-		case carried == 0:
-			byEnding["lf"] = append(byEnding["lf"], path)
-		default:
-			t.Errorf("%s holds %d lines of which %d end crlf, so the file is mixed within itself and no anchored edit over it can be trusted either way",
-				path, lines, carried)
+		if strings.HasPrefix(text, "../") && filepath.Clean(text) != ".." {
+			found = append(found, text)
 		}
-	}
-	if len(byEnding) == 0 {
-		t.Fatalf("none of this package's source files carries a line ending at all (%d were empty), so this gate read nothing", empty)
-	}
-	if len(byEnding) > 1 {
-		// the smaller class is named rather than the larger, because bringing those files over is
-		// the repair.
-		smaller := ""
-		for ending := range byEnding {
-			if smaller == "" || len(byEnding[ending]) < len(byEnding[smaller]) {
-				smaller = ending
+		return true
+	})
+	return found
+}
+
+// lineEndingScanRoots is the set of package directories the gate below judges, DERIVED as a
+// closure rather than listed.
+//
+// The scope question, answered separately from the class question as R3a requires. The CLASS is
+// derived per package off the files themselves -- which ending each file carries -- and says
+// nothing about WHERE to look. This is where.
+//
+// Start at this package, follow every "../..." path its own source names, and do the same again
+// in whatever that reaches. The closure lands on exactly the packages that read each other's
+// TEXT: mls scans ../message and ../messagegroup for the forbidden primitives, ../message scans
+// ../messagegroup for the constant time rules and ../mls for the join rule, and ../messagegroup
+// names ../mls back. Those are the packages an anchored edit can lie about, so those are the
+// packages that have to be uniform, and a root added to any of those scans is added here with
+// nobody remembering to.
+//
+// Written as a derivation for guardrail 5's reason and with guardrail 5's usual result. The six
+// gates widened by the split were widened one hand-written list at a time; this gate was not in
+// that set, so it was not widened at all, and it went on judging one directory of three while
+// being the gate that catches this repository's most persistent failure.
+//
+// Three things the closure declines, each because the rule declines them rather than because
+// anybody excused them:
+//
+//   - a path that resolves to nothing on disk. "../elsewhere", "../nowhere", "../this" and
+//     "../message/a_forge.go" are names handed to control fixtures, not directories. The parent
+//     of a name that does not resolve is never followed either, or every unresolved fixture
+//     name would drag the module root into scope.
+//   - a path outside this module. joinScanRoots reaches the sdk repository beside connect,
+//     which is a different checkout with its own core.autocrlf and is not this working tree.
+//   - ".." on its own, which is a step in a walk up to the module root and not a scan root.
+//     connect's own package and connect/mls/syntax are outside for that reason: no gate of
+//     these three opens either of them by path. That is a real limit and not a clean bill --
+//     measured 2026-09-05, mls/syntax is 6 files crlf and 17 lf.
+//
+// The coverage claim is checked rather than asserted, against a scope this package already
+// declares: every root of forbiddenScanRoots -- which five further gates alias rather than
+// restate -- has to fall out of the closure. A derivation that stopped following the coupling
+// goes red here instead of quietly judging one directory.
+func lineEndingScanRoots(t *testing.T) []string {
+	t.Helper()
+	moduleRoot := moduleRootDir(t)
+	seen := map[string]bool{}
+	roots := []string{}
+	frontier := []string{"."}
+	for len(frontier) > 0 {
+		dir := frontier[0]
+		frontier = frontier[1:]
+		absolute, err := filepath.Abs(dir)
+		if err != nil {
+			t.Fatalf("resolve %s: %v", dir, err)
+		}
+		if seen[absolute] {
+			continue
+		}
+		inside, err := filepath.Rel(moduleRoot, absolute)
+		if err != nil || inside == ".." || strings.HasPrefix(inside, ".."+string(filepath.Separator)) {
+			continue
+		}
+		seen[absolute] = true
+		entry, err := os.Stat(absolute)
+		if err != nil || !entry.IsDir() {
+			continue
+		}
+		sources, err := filepath.Glob(filepath.Join(dir, "*.go"))
+		if err != nil {
+			t.Fatalf("list the source of %s: %v", dir, err)
+		}
+		if len(sources) == 0 {
+			continue
+		}
+		roots = append(roots, filepath.ToSlash(dir))
+		for _, path := range sources {
+			for _, named := range namedSiblingPaths(t, path) {
+				candidate := filepath.Join(dir, named)
+				reached, err := os.Stat(candidate)
+				switch {
+				case err == nil && reached.IsDir():
+					frontier = append(frontier, candidate)
+				case err == nil:
+					frontier = append(frontier, filepath.Dir(candidate))
+				}
 			}
 		}
-		t.Errorf("this package's source is not one line ending throughout: %v end their lines %s and the other %d files do not; an exact-string edit anchored on one ending matches nothing in a file using the other and reports the change as made",
-			byEnding[smaller], smaller, len(packageSourcePaths(t))-len(byEnding[smaller])-empty)
-		return
 	}
-	for ending, paths := range byEnding {
-		t.Logf("all %d source files of this package end their lines %s, and %d carry no line ending", len(paths), ending, empty)
+	if len(roots) == 0 {
+		t.Fatal("the closure found no package with go source in it, so the gate below judged nothing")
+	}
+	for _, declared := range forbiddenScanRoots {
+		want := filepath.ToSlash(filepath.Clean(declared))
+		if !slices.Contains(roots, want) {
+			t.Fatalf("the closure returned %v, which does not reach %s; forbiddenScanRoots scans that directory's text, so a scope that cannot reach it is a scope that has stopped following the coupling this gate is about",
+				roots, want)
+		}
+	}
+	slices.Sort(roots)
+	return roots
+}
+
+// TestThePackageSourceIsOneLineEndingThroughout refuses a working tree in which some file of a
+// package disagrees with the rest of that package about how a line ends.
+//
+// Not a style rule. Every gate in this file and in the family runners reads source, and every
+// repair to these packages is made as an exact-string edit over it -- and an edit anchored on
+// one line ending matches nothing at all in a file that uses the other. It edits nothing, the
+// suite then passes, and that reads as "the change was made and was harmless". Three wrong
+// conclusions on this tree came from exactly that, and one of them also rewrote a whole file's
+// endings while its own substitution matched nothing, so the evidence pointed two ways at once.
+// The sharper form of it is a gate rather than an edit: a scanner anchored on a brace at the
+// start of a line finds no match at all in a crlf file, reads the whole file as one body, and
+// reports clean having found nothing -- which is exactly what a clean file looks like too.
+//
+// Judged PER PACKAGE and never globally, and pinned to NEITHER ending, because which one is
+// right belongs to the checkout and not to this repository: a clone with core.autocrlf off is
+// lf throughout, one with it on is crlf throughout, and both are fine to work in. mls being
+// crlf while message is lf costs nobody anything, because no edit is anchored across a package
+// boundary. message being half of each is the defect.
+//
+// DERIVED at both ends -- the class off each package's own files, the scope by
+// lineEndingScanRoots. Until 2026-09-05 the scope was this one directory, and the consequence
+// was measurable: mls was 137 files crlf and 0 lf while connect/message had drifted to 6 crlf
+// and 7 lf and connect/messagegroup to 5 and 1. mls stayed uniform BECAUSE of this gate, and
+// the two packages with no gate are what a package with no gate looks like after a fortnight.
+// The review that first raised this named a single file; reading the class off the directory
+// found sixteen, which is guardrail 5's point made by the same defect a second time.
+//
+// None of that was visible in git. core.autocrlf=true cleans on the way in, so every blob of
+// all three packages was already lf and `git diff` was empty across the whole drift. The
+// working tree is the only place it shows, and the working tree is what an anchored edit reads.
+//
+// A file carrying no line ending at all belongs to neither class and is counted apart, so an
+// empty file cannot make a mixed package look uniform, and a file mixed WITHIN itself is its
+// own report: that one is never a checkout and is always a tool that wrote part of a file.
+func TestThePackageSourceIsOneLineEndingThroughout(t *testing.T) {
+	roots := lineEndingScanRoots(t)
+	t.Logf("the derived scope is %v", roots)
+	for _, root := range roots {
+		paths := packageSourcePathsIn(t, root)
+		byEnding := map[string][]string{}
+		empty := 0
+		for _, path := range paths {
+			source, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("read %s: %v", path, err)
+			}
+			lines := bytes.Count(source, []byte("\n"))
+			carried := bytes.Count(source, []byte("\r\n"))
+			switch {
+			case lines == 0:
+				empty += 1
+			case carried == lines:
+				byEnding["crlf"] = append(byEnding["crlf"], path)
+			case carried == 0:
+				byEnding["lf"] = append(byEnding["lf"], path)
+			default:
+				t.Errorf("%s holds %d lines of which %d end crlf, so the file is mixed within itself and no anchored edit over it can be trusted either way",
+					path, lines, carried)
+			}
+		}
+		if len(byEnding) == 0 {
+			t.Errorf("none of %s's source files carries a line ending at all (%d were empty), so this gate read nothing of that package", root, empty)
+			continue
+		}
+		if len(byEnding) > 1 {
+			// the smaller class is named rather than the larger, because bringing those files
+			// over is the repair.
+			smaller := ""
+			for ending := range byEnding {
+				if smaller == "" || len(byEnding[ending]) < len(byEnding[smaller]) {
+					smaller = ending
+				}
+			}
+			t.Errorf("%s's source is not one line ending throughout: %v end their lines %s and the other %d files do not; an exact-string edit anchored on one ending matches nothing in a file using the other and reports the change as made",
+				root, byEnding[smaller], smaller, len(paths)-len(byEnding[smaller])-empty)
+			continue
+		}
+		for ending, paths := range byEnding {
+			t.Logf("all %d source files of %s end their lines %s, and %d carry no line ending", len(paths), root, ending, empty)
+		}
 	}
 }

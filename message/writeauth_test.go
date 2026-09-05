@@ -1651,6 +1651,15 @@ const (
 // production packages that import this one and requires each to be a root here. That half is
 // silent today on purpose and it says so -- connect/messagegroup does not import this package
 // until the first file that calls message.AADHead -- and it arms itself on that commit.
+//
+// The honest consequence of that, measured and written down rather than left to be
+// rediscovered: narrowing this back to {authOwnScanDir} is SILENT today. Nothing in this
+// suite goes red for it, because the derived check above has no importer to demand a root
+// for and because connect/messagegroup contributes no verifier and no comparator to either
+// rule yet. What the narrowing would remove is coverage of the half of the record layer that
+// every new comparison of M1 is going to be written in. So this root stands on the argument
+// above and not on a test's say-so, and it stops being unfalsifiable on the same commit that
+// arms the derived check.
 var authScanRoots = []string{authOwnScanDir, "../messagegroup"}
 
 // Every root, scanned on its own.
@@ -2518,6 +2527,53 @@ func authVerifiersUnderGate(t testing.TB, scans []authScan) map[string][]string 
 	return byRoot
 }
 
+// authReportAnEmptyComparatorClass says which KIND of empty a root's comparator class is.
+//
+// The round that built this gate was told not to ship one that passes by reading nothing, and
+// the bare line above -- "0 comparators in the derived class: []" -- is indistinguishable
+// from one that does. The design behind it is deliberate and is not being undone: the class
+// is DERIVED from the scanned code's own imports, which is the property that makes it self
+// extending, and a derivation over a package that imports no comparator honestly yields
+// none. But a reader has no way to tell that from a scan that broke, and "it is fine, I
+// checked" is not a thing a log line can say a year later. So the empty case states what
+// kind of empty it is, what will populate it, and which half of guardrail G8 is doing work
+// over that directory today.
+//
+// It prints the imports it read rather than asserting that it read some, because that count
+// is the number the honesty rests on: a class derived from six imports and finding nothing
+// is a measurement, while a class derived from zero imports is a broken scan -- which
+// authDataComparators refuses one step earlier, and which this line makes visible without
+// having to trust that refusal.
+func authReportAnEmptyComparatorClass(t testing.TB, scan authScan, comparators []string) {
+	t.Helper()
+	if len(comparators) > 0 {
+		return
+	}
+	paths := []string{}
+	for _, imported := range scan.imports {
+		paths = append(paths, imported.path)
+	}
+	slices.Sort(paths)
+	paths = slices.Compact(paths)
+	t.Logf("%s: that class is empty BY CONSTRUCTION and not because the scan read nothing. Its %d imported packages were read (%v) and none of them exports a function that answers a question about two data shaped arguments, which is the whole of what the class is. That makes this an ARMED TRIPWIRE and not a dead gate: a comparator cannot be called without its package being imported, so the edit that first compares data over there brings that package's entire comparator surface into this class on the same run, with nobody remembering to add it. The half of G8 that is LIVE over that directory today is TestEveryPackageBuiltOnThisOneIsUnderTheConstantTimeGate, which walks this module and requires every production importer of connect/message to be a root here. The residual is recorded as M1-50.",
+		scan.dir, len(paths), paths)
+}
+
+// authReportAnEmptyVerifierSet is the same sentence for the other half of guardrail G8.
+//
+// authVerifiersUnderGate already refuses an empty UNION, so a scan that read nothing cannot
+// reach this line at all. What that refusal does not say is why one ROOT of the union is
+// empty, and "0 verifiers under the gate: []" reads like a rule with nothing left to judge
+// rather than like a rule waiting for its first subject.
+func authReportAnEmptyVerifierSet(t testing.TB, scan authScan, verifiers []string) {
+	t.Helper()
+	if len(verifiers) > 0 {
+		return
+	}
+	t.Logf("%s: that set is empty BY CONSTRUCTION and not because the scan read nothing -- %d declarations were read there and none of them is named Verify... . Per spec A section 12.1 every published verifier stays in connect/message, so this root is EXPECTED to contribute none, which is why the emptiness refusal is asked of the union over all roots and never of one root: asked per root it would fatal on arrival, on correct code, and the only repair available would have been to retune the thing that measures this gate. The day that directory declares its first Verify function it is judged, with nobody remembering to add it anywhere.",
+		scan.dir, len(scan.decls))
+}
+
 // Guardrail G8 at the scope its own text gives it: nothing this package ships compares data
 // with a variable time call, in any file and in any function.
 //
@@ -2533,6 +2589,7 @@ func TestNoProductionFunctionComparesDataOutsideConstantTime(t *testing.T) {
 		comparators := authDataComparators(t, scan)
 		t.Logf("%s: %d go files, %d functions, %d imports, %d comparators in the derived class: %v",
 			scan.dir, scan.fileCount, len(scan.decls), len(scan.imports), len(comparators), comparators)
+		authReportAnEmptyComparatorClass(t, scan, comparators)
 		// the comparator half only. The == between two values is the other shape of the same
 		// defect and it is asserted over the verifiers rather than here, because two values
 		// compared with == are ordinary in a codec and a header and everything else these
@@ -2553,6 +2610,7 @@ func TestNoVerifierDecidesEqualityInVariableTime(t *testing.T) {
 	for _, scan := range scans {
 		comparators := authDataComparators(t, scan)
 		t.Logf("%s: %d verifiers under the gate: %v", scan.dir, len(verifiers[scan.dir]), verifiers[scan.dir])
+		authReportAnEmptyVerifierSet(t, scan, verifiers[scan.dir])
 		for _, name := range verifiers[scan.dir] {
 			for _, comparison := range authVariableTimeComparisons(scan, name, comparators) {
 				t.Errorf("%s in %s decides equality in variable time: %s; every tag comparison goes through %s",

@@ -13,9 +13,10 @@
 //   - connect/message must not import connect/mls, and must not import
 //     connect/messagegroup. This is the 2026-09-06 split stated as a rule rather than as a
 //     habit: spec B section 2.2 forbids the message server from linking an MLS parser at
-//     all, and connect/message is the half that server links. The edge runs the other way
-//     -- connect/messagegroup imports connect/message and connect/mls, because it is the
-//     client half and the client holds the group.
+//     all, and connect/message is the half that server links. The edge is ALLOWED to run
+//     the other way -- connect/messagegroup may import connect/message and connect/mls,
+//     because it is the client half and the client holds the group -- and today only the
+//     second of those is an import it actually has.
 //
 // The last of those is the one the compiler cannot hold yet, and that is why it is here
 // rather than left to a build failure. At the commit that created connect/messagegroup it
@@ -34,6 +35,20 @@
 // in a comment or a string, and would miss an aliased or dot import entirely. Build
 // tags are deliberately not applied — a forbidden import inside a _windows.go file is
 // still a forbidden import.
+//
+// One thing this file does NOT measure, written here because this is where a reader comes
+// to find out which way these packages depend on each other. The import graph is one way
+// and stays that way; the TEST BINARIES are not one way. connect/message's suite reaches
+// connect/messagegroup by FILESYSTEM PATH -- writeauth_test.go's authScanRoots for the
+// constant time rules, record_test.go's messagegroupRoot for the join rule -- and mls's
+// suite reaches both by path in forbiddenScanRoots. Those are os.ReadDir and go/parser
+// calls over a sibling directory rather than imports, so they add no edge to the graph
+// this file guards and cannot create a cycle for the compiler to refuse. What they do
+// create is a coupling to the sibling DIRECTORY existing on disk: `go test ./message/` in
+// a tree where connect/messagegroup has been deleted or renamed fails outright rather than
+// passing over a quietly smaller scope, which is what those gates are written for. It is a
+// real property of the design and not a defect, and it is the reason one of these packages
+// can be moved only by moving the roots that name it in the same commit.
 package connect
 
 import (

@@ -16,10 +16,15 @@
 // become easy to create. It must never import connect/mls either, and that is the rule the
 // split exists to make true rather than to state: what it reads and writes wire vectors
 // with is connect/mls/syntax, which spec B section 2.2 allows by name and which is not an
-// MLS implementation. connect/messagegroup imports this package and is where the one
-// reviewed x25519 call site is reached from; this package must never import
-// connect/messagegroup, and connect/mls must not reach back into either — connect/mls
-// imports only the standard library, golang.org/x/crypto, and its own child mls/syntax.
+// MLS implementation. connect/messagegroup is where the one reviewed x25519 call site is
+// reached from, and it MAY import this package — but as of 2026-09-05 it does not, which
+// is measured rather than remembered. writeauth_test.go's
+// TestEveryPackageBuiltOnThisOneIsUnderTheConstantTimeGate walks this module for the
+// production packages that import connect/message and reports none of them, and
+// connect/layering_test.go holds the same direction as a rule from the other side. This
+// package must never import connect/messagegroup, and connect/mls must not reach back into
+// either — connect/mls imports only the standard library, golang.org/x/crypto, and its own
+// child mls/syntax.
 //
 // What is here so far is the record and its two ladders, in record.go: the go form of
 // the record master section 8 defines, the size ladder a body is padded to, the eph
@@ -37,8 +42,8 @@
 // of a record the server may read, its four kinds and their kind discriminator, and every
 // question spec B section 5.1 check 3 asks of a parsed one, so that the server asks rather
 // than re-derives. The key schedule does NOT land beside them: it lands in
-// connect/messagegroup, which imports this package for these types and which no message
-// server links.
+// connect/messagegroup, which is where it will take these types from when it lands and
+// which no message server links.
 // Nothing in this package logs a failure and carries on: every error here is one of the
 // sentinels in errors.go, and the only bare bools are the three constant time verifiers
 // of spec A section 5.7 and that class predicate, none of which reports a failure. The
