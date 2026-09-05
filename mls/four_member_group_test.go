@@ -34,14 +34,22 @@
 // state any of this -- it was written that way twice in group.go and has been corrected there -- and
 // the true statement is about a member having a copath node above its own leaf.
 //
-// WHAT THIS FIXTURE STILL DOES NOT REACH, recorded rather than repaired. It SETTLES -- every member
-// commits once, in leaf order -- so it holds ZERO UNMERGED LEAVES at every size, which is measured
-// in the same table. No group fixture in this package therefore puts a member in a resolution
-// reached through an UNMERGED LEAF, and that is the other half of RFC 9420 section 7.4's resolution
-// rule: an Add between commits leaves the joiner listed at each of its new ancestors, and a
-// resolution that walks one of those reaches leaves the subtree root does not otherwise cover.
-// Anything that mispairs a ciphertext with an unmerged leaf is invisible to every case built on this
-// file, and this file is the corpus most likely to be reached for when such a case is written.
+// WHAT THIS FIXTURE STILL DOES NOT REACH, recorded rather than repaired. It holds ZERO UNMERGED
+// LEAVES at every size, measured in the same table, so no group fixture in this package puts a
+// member in a resolution reached through an UNMERGED LEAF -- which is the other half of RFC 9420
+// section 7.4's resolution rule: a leaf added by a commit that also carries an update path is listed
+// at each of that path's nodes until the next commit merges it, and a resolution that walks one of
+// those reaches leaves the subtree root does not otherwise cover. Anything that mispairs a
+// ciphertext with an unmerged leaf is invisible to every case built on this file, and this file is
+// the corpus most likely to be reached for when such a case is written.
+//
+// AND THE SETTLING IS NOT WHAT DOES THAT, which is worth separating because the two are easy to
+// confuse. Measured, by removing the settling loop and rerunning the table: the unmerged count stays
+// at zero at every size and only the blank node count moves. What keeps it at zero is that this
+// build's Add commits carry no update path at all, so there is no path for an added leaf to be
+// listed against. The assertion is therefore a guard on that -- a change that gave an Add-carrying
+// commit a path would put unmerged leaves in this fixture and be reported here -- rather than a
+// property the settling buys.
 //
 // The BLANK NODES are the other half of that measurement, and they are not zero at every size --
 // which is worth stating because the settling invites the opposite assumption. At four, and at every
@@ -380,13 +388,17 @@ func TestFourIsTheSmallestGroupWhoseMembersEnterTheLadderAboveTheirOwnLeaf(t *te
 		unmerged, blanks, overFull := testSettledTreeShape(t, fixture)
 		// ZERO AT EVERY SIZE, and it is the fixture's own limit written as an assertion rather
 		// than as prose: nothing built on this file observes a member reached through an unmerged
-		// leaf, because there is no unmerged leaf here to reach through.
+		// leaf, because there is no unmerged leaf here to reach through. See the header for what
+		// keeps it at zero -- an Add commit with no update path -- which is a property of the
+		// commit generator rather than of the settling.
 		if unmerged != 0 {
 			t.Errorf("size %d: the settled tree carries %d unmerged leaf entries, and this file's header records that it carries none; a fixture that grew one reaches a resolution nothing here was written for",
 				row.size, unmerged)
 		}
-		// and every blank node it does carry stands over an unfilled leaf slot. A blank node over
-		// a FULL subtree is a direct path something blanked, which is what the settling removes.
+		// and every blank node it does carry stands over an unfilled leaf slot. A blank node over a
+		// FULL subtree is a direct path something blanked, which IS what the settling removes:
+		// measured, with the settling loop taken out every size reports one -- three of three at
+		// four members, seven of seven at eight.
 		if overFull != 0 {
 			t.Errorf("size %d: %d of the %d blank nodes stand over a fully populated subtree, so the settling left a real member's direct path blanked",
 				row.size, overFull, blanks)
