@@ -125,6 +125,11 @@ var (
 	// MaxGenerationSkip beyond the ratchet head. Without that bound a forged generation
 	// number in a received message is an unbounded KDF loop an attacker chooses the
 	// length of.
+	//
+	// It is a refusal of THIS message and not of the sender: the head catches up by
+	// MaxGenerationSkip before this is returned, so the next message from that sender is
+	// that much nearer. A refusal that left the head where it was made the same answer the
+	// answer for every later generation of the epoch.
 	ErrRatchetGenerationTooFarAhead = errors.New("mls: ratchet generation too far ahead")
 
 	// ErrRatchetExhausted is returned when a ratchet has produced generation 2^32-1 and

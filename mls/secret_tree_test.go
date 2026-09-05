@@ -2211,25 +2211,46 @@ func TestReceiverKeyIsSingleUse(t *testing.T) {
 // TestReceiverKeyRefusesUnboundedSkip asserts a forged generation number cannot force
 // an unbounded KDF loop. Without this bound a single 32-bit field is a denial of
 // service that costs the sender nothing.
+//
+// WHAT THIS STOPPED OBSERVING, said out loud rather than quietly rewritten. It used to end
+// "the ratchet must be untouched by a refused request", requiring a head of 0 after two refusals.
+// That is no longer true and the change is deliberate: (*ratchet).peekFor now advances the head by
+// MaxGenerationSkip before it refuses, because a refusal that left the head alone made a member
+// restored behind a busy peer deaf to that peer for the whole epoch -- see peekFor's own comment
+// for the measurement. So the head-of-zero assertion is gone and nothing here observes it any
+// more.
+//
+// WHAT REPLACES IT IS THE STRONGER HALF OF THE SAME QUESTION. "Untouched" was never the property
+// this case is named for; the property is that the work a peer buys with one generation number is
+// a function of the BOUND and not of the number. The head after two refusals is therefore required
+// to be exactly two catch-ups, DERIVED from MaxGenerationSkip and the count of refusals -- so a
+// build that resynchronised to the generation asked for fails here at 2^32-1 rather than passing
+// with a bigger number, which is the denial of service the bound exists to refuse.
 func TestReceiverKeyRefusesUnboundedSkip(t *testing.T) {
 	tree, err := NewSecretTree(stTestCrypto(t), 8, MustHex(t, stVectorEncryptionSecret))
 	if err != nil {
 		t.Fatalf("NewSecretTree: %v", err)
 	}
+	refusals := uint32(0)
 	_, _, err = tree.ReceiverKey(1, RatchetApplication, MaxGenerationSkip+1)
 	if !errors.Is(err, ErrRatchetGenerationTooFarAhead) {
 		t.Fatalf("err = %v, want ErrRatchetGenerationTooFarAhead", err)
 	}
+	refusals += 1
 	if _, _, err := tree.ReceiverKey(1, RatchetApplication, ^uint32(0)); !errors.Is(err, ErrRatchetGenerationTooFarAhead) {
 		t.Fatalf("err = %v, want ErrRatchetGenerationTooFarAhead", err)
 	}
-	// the ratchet must be untouched by a refused request
+	refusals += 1
+	// the head has moved by the BOUND per refusal and by nothing else. The second call asked for
+	// 2^32-1, so a head anywhere near it is a ratchet that derived four billion generations for
+	// the price of one header.
 	generation, err := tree.SenderGeneration(1, RatchetApplication)
 	if err != nil {
 		t.Fatalf("SenderGeneration: %v", err)
 	}
-	if generation != 0 {
-		t.Fatalf("a refused request advanced the ratchet to %d", generation)
+	if generation != refusals*MaxGenerationSkip {
+		t.Fatalf("%d refused requests left the head at %d, want %d: the catch-up is bounded by MaxGenerationSkip (%d) per refusal and by nothing the caller chose",
+			refusals, generation, refusals*MaxGenerationSkip, MaxGenerationSkip)
 	}
 }
 
@@ -5617,4 +5638,264 @@ func TestMessageKeyNeverAnswersWithKeyMaterialTheRetainedBoundHasZeroized(t *tes
 		t.Errorf("MessageKey answered %x and %x for generation 0, and generation 0's key and nonce are %x and %x",
 			answered, answeredNonce, trueKey, trueNonce)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// a receiver that fell behind, and the two halves of the restore's own read
+// ---------------------------------------------------------------------------
+
+// TestAReceiverPastTheSkipBoundCatchesUpInsteadOfGoingDeafForTheEpoch is the defect the catch-up
+// closes, at the level the ratchet lives at.
+//
+// WHAT IT IS ABOUT. A refusal that leaves the head where it was is not one dropped message; it is
+// the SAME refusal for every later generation that sender reaches, because nothing else in this
+// package moves a receiving head. So a member whose receiving ratchet is behind a busy peer -- the
+// arrangement a restore produces, since the persisted state carries this member's own sender
+// position and no peer's -- is deaf to that peer until the next commit opens a new epoch.
+//
+// THE ASSERTION IS THAT THE NEXT MESSAGE OPENS, and the key it opens under is compared against the
+// SENDER's own for that generation. A catch-up that had moved the head without moving the secret
+// with it would answer a key of the right length that decrypts nothing, and "the second call did
+// not return an error" cannot tell those apart.
+//
+// The vacuity guard is the first statement of the body: a fixture whose gap had fallen inside the
+// bound would assert the ordinary in-bound skip and report it as this.
+func TestAReceiverPastTheSkipBoundCatchesUpInsteadOfGoingDeafForTheEpoch(t *testing.T) {
+	const ahead = uint32(1026)
+	if ahead <= MaxGenerationSkip {
+		t.Fatalf("a peer %d generations ahead is inside the bound of %d, so this case observes an ordinary skip",
+			ahead, MaxGenerationSkip)
+	}
+	sender, receiver := stNewTree(t, 8), stNewTree(t, 8)
+	// the sender walks past the bound. The last generation it draws is the message a deaf
+	// receiver never reads.
+	//
+	// The loop is bounded by the distance it is walking and reports its own failure rather than
+	// spinning: "step until the counter reaches n" over a build whose counter stopped moving is a
+	// hang, and a fixture that answers a hang where it could answer a finding reports the same
+	// thing for a defect and for a broken machine -- which is the reason testStore's own
+	// DeleteGroupStateBefore is written the way it is.
+	var nextKey, nextNonce []byte
+	for draws := uint32(0); draws <= ahead+1; draws += 1 {
+		generation, key, nonce, err := sender.NextSenderKey(1, RatchetApplication)
+		if err != nil {
+			t.Fatalf("NextSenderKey at generation %d: %v", generation, err)
+		}
+		if generation == ahead+1 {
+			nextKey, nextNonce = bytes.Clone(key), bytes.Clone(nonce)
+			break
+		}
+	}
+	if nextKey == nil {
+		t.Fatalf("the sender did not reach generation %d in %d draws, so its ratchet is not handing out consecutive generations",
+			ahead+1, ahead+2)
+	}
+
+	if _, _, err := receiver.ReceiverKey(1, RatchetApplication, ahead); !errors.Is(err, ErrRatchetGenerationTooFarAhead) {
+		t.Fatalf("a receiver at head 0 asked for generation %d answered %v, want ErrRatchetGenerationTooFarAhead",
+			ahead, err)
+	}
+	// and THIS is the half a refusal that left the head alone could not do.
+	gotKey, gotNonce, err := receiver.ReceiverKey(1, RatchetApplication, ahead+1)
+	if err != nil {
+		t.Fatalf("the message after the refused one answered %v; a receiver that cannot catch up answers this for every later generation of the epoch, which is unbounded message loss and not one dropped message",
+			err)
+	}
+	if !bytes.Equal(gotKey, nextKey) || !bytes.Equal(gotNonce, nextNonce) {
+		t.Fatalf("the caught-up receiver answered key %x nonce %x for generation %d, and the sender drew %x and %x: the head moved without the secret moving with it",
+			gotKey, gotNonce, ahead+1, nextKey, nextNonce)
+	}
+	// the generations the catch-up walked past are RETAINED rather than discarded, which is what
+	// keeps a catch-up from being worse for the honest case than the in-bound skip a peer can
+	// force by asking for head+MaxGenerationSkip. The refused generation itself is one of them.
+	stillKey, stillNonce, err := receiver.ReceiverKey(1, RatchetApplication, ahead-1)
+	if err != nil {
+		t.Fatalf("a generation the catch-up walked past answered %v, want the key it retained", err)
+	}
+	if stAllZero(stillKey) || stAllZero(stillNonce) {
+		t.Fatalf("the retained generation answered key %x and nonce %x", stillKey, stillNonce)
+	}
+}
+
+// TestRestoreSenderRatchetsRefusesTheSecretAnErasedEpochWouldHaveWritten is the read side of
+// SenderRatchets' own refuseIfErased.
+//
+// THE TWO SIDES ARE ONE RULE AND THE READ HAD HALF OF IT. SenderRatchets refuses to WRITE a vector
+// taken off an erased tree, because Zeroize overwrites every ratchet secret in place and leaves the
+// ratchets in the table -- so the vector would be one run of Nh zeros per ratchet. The read checked
+// the LENGTH of each secret and nothing else, so those same octets, arriving from a store rather
+// than from this process, installed cleanly. Measured before the repair: the restore returned a nil
+// error and the very next NextSenderKey answered a key expanded from a public constant.
+//
+// THE CONTROL IS THE SAME VECTOR WITH ITS REAL SECRETS, so a build whose restore refused everything
+// would fail here rather than pass as a build that refuses the right thing.
+func TestRestoreSenderRatchetsRefusesTheSecretAnErasedEpochWouldHaveWritten(t *testing.T) {
+	live := stNewTree(t, 8)
+	if _, _, _, err := live.NextSenderKey(1, RatchetApplication); err != nil {
+		t.Fatalf("NextSenderKey: %v", err)
+	}
+	entries, err := live.SenderRatchets(1)
+	if err != nil {
+		t.Fatalf("SenderRatchets: %v", err)
+	}
+	if len(entries) == 0 {
+		t.Fatal("the live tree answered no sender ratchets for a leaf that has sent, so there is nothing here to restore")
+	}
+
+	// the control first: this vector restores.
+	if err := stNewTree(t, 8).RestoreSenderRatchets(1, entries); err != nil {
+		t.Fatalf("the live tree's own vector was refused: %v; this case would then observe a restore that refuses everything", err)
+	}
+
+	// and the vector an erased epoch would have produced, built by zeroing the secrets exactly as
+	// Zeroize does and leaving everything else where it stood.
+	erased := make([]senderRatchetEntry, 0, len(entries))
+	for _, entry := range entries {
+		erased = append(erased, senderRatchetEntry{
+			Kind: entry.Kind, Consumed: entry.Consumed, Secret: make([]byte, len(entry.Secret))})
+	}
+	if err := stNewTree(t, 8).RestoreSenderRatchets(1, erased); !errors.Is(err, ErrEpochErased) {
+		t.Fatalf("a vector of %d right-length all-zero ratchet secrets restored with %v, want ErrEpochErased: what comes out of installing it is a sender whose every generation any party in the world can derive",
+			len(erased), err)
+	}
+	// and the write side refuses the same octets at their source, which is the sentence this case
+	// pairs with rather than a second copy of it.
+	live.Zeroize()
+	if _, err := live.SenderRatchets(1); !errors.Is(err, ErrEpochErased) {
+		t.Fatalf("SenderRatchets over an erased tree = %v, want ErrEpochErased", err)
+	}
+}
+
+// TestRestoreSenderRatchetsRefusesAnUnknownKindBeforeItTakesTheLeafSecret is the paragraph
+// "every entry is checked before any ratchet is built", held to what the code does.
+//
+// It was false. The validation loop read the secret's length, the consumed count and the ordering,
+// and the field it did not read was the one ratchetFor refuses -- so a vector whose SECOND entry
+// named a kind this build does not have walked the whole loop, and the refusal arrived after the
+// first entry's ratchetFor had already taken the leaf node secret out of the tree and built both of
+// that leaf's ratchets over it. takeLeafSecret is destructive and there is no way to put it back.
+//
+// SO WHAT IS ASSERTED IS THE TREE AFTERWARDS AND NOT THE ERROR. An assertion written as "the
+// restore refused" is satisfied by both builds; only the leaf still being answerable tells them
+// apart.
+func TestRestoreSenderRatchetsRefusesAnUnknownKindBeforeItTakesTheLeafSecret(t *testing.T) {
+	crypto := stTestCrypto(t)
+	secret := make([]byte, crypto.HashSize())
+	for i := range secret {
+		secret[i] = byte(i + 1)
+	}
+	// an unknown kind DERIVED as one this build does not have rather than typed as a number
+	// somebody hopes stays unregistered.
+	//
+	// THE SWEEP IS BOUNDED BY THE WIDTH OF THE TYPE and reports its own failure, which this file
+	// pays for elsewhere too: a loop written as "walk upward until one is refused" runs FOREVER
+	// over a build whose door stopped refusing -- RatchetType wraps -- and a fixture that answers
+	// a hang where it could answer a finding reports the same thing for a defect and for a broken
+	// machine. Measured while writing this: with refuseUnknownRatchetType neutralised, the
+	// unbounded version of this loop took the test binary out on the runner's timeout instead of
+	// failing on the line below.
+	unknown, held := RatchetType(0), false
+	for code := 0; code < stRatchetTypeCodePoints(); code += 1 {
+		if refuseUnknownRatchetType(RatchetType(code)) != nil {
+			unknown, held = RatchetType(code), true
+			break
+		}
+	}
+	if !held {
+		t.Fatalf("this build admits all %d ratchet type code points, so there is no unknown kind to offer and this case observes nothing",
+			stRatchetTypeCodePoints())
+	}
+	entries := []senderRatchetEntry{
+		{Kind: RatchetHandshake, Consumed: 3, Secret: bytes.Clone(secret)},
+		{Kind: unknown, Consumed: 1, Secret: bytes.Clone(secret)},
+	}
+	tree := stNewTree(t, 8)
+	if err := tree.RestoreSenderRatchets(1, entries); !errors.Is(err, ErrSecretTreeLeafOutOfRange) {
+		t.Fatalf("a vector naming ratchet type %d restored with %v, want ErrSecretTreeLeafOutOfRange", unknown, err)
+	}
+	// the leaf is still answerable, which is the whole claim: nothing was built and the leaf node
+	// secret is still in the tree.
+	if _, err := tree.ratchetFor(1, RatchetApplication); err != nil {
+		t.Fatalf("the leaf could not be reached after a refused restore: %v; the refusal ran after ratchetFor had consumed the leaf node secret, so this leaf can never answer again",
+			err)
+	}
+	// and it stands where a leaf nothing restored stands, rather than where the accepted first
+	// entry would have put it.
+	head, err := tree.SenderGeneration(1, RatchetHandshake)
+	if err != nil {
+		t.Fatalf("SenderGeneration: %v", err)
+	}
+	if head != 0 {
+		t.Fatalf("the handshake ratchet came back at generation %d after a REFUSED restore, so the first entry was installed before the second was judged",
+			head)
+	}
+}
+
+// stOrderingRounds is how many times the case below asks SenderRatchets for one unchanged leaf.
+//
+// The number is here rather than in the body because both halves of that case read it: the
+// assertion runs on every round, and the vacuity guard is stated over the same count.
+const stOrderingRounds = 512
+
+// TestSenderRatchetsAnswersOneOrderWhateverTheMapHandsBack pins the ordering that decides whether a
+// persisted state can be loaded back at all.
+//
+// WHY IT IS A CASE OF ITS OWN. RestoreSenderRatchets refuses a vector that is not in strictly
+// increasing RatchetType order, and SenderRatchets is the only thing in this build that writes one.
+// Its entries come out of a range over a map, so without the sort the order is whatever the
+// runtime's iteration randomisation hands back on that call -- and for the two entries a leaf of
+// this build holds, that is the descending order about one time in eight, MEASURED. A build that
+// lost the sort would write an unloadable state roughly one persist in eight, and any case that
+// called SenderRatchets once would report it no more often than that: it would be a test that
+// passes seven runs in eight over a state its own package refuses to read.
+//
+// SO THIS ASKS MANY TIMES AND GUARDS ITS OWN VACUITY. Every answer must be ascending, and the raw
+// map iteration must have been seen DESCENDING at least once across the same rounds -- otherwise
+// every round happened to hand back the order the sort would have produced anyway, requiring
+// ascending observed nothing, and the case says so instead of passing.
+func TestSenderRatchetsAnswersOneOrderWhateverTheMapHandsBack(t *testing.T) {
+	tree := stNewTree(t, 8)
+	if _, _, _, err := tree.NextSenderKey(1, RatchetApplication); err != nil {
+		t.Fatalf("NextSenderKey: %v", err)
+	}
+	entries, err := tree.SenderRatchets(1)
+	if err != nil {
+		t.Fatalf("SenderRatchets: %v", err)
+	}
+	if len(entries) < 2 {
+		t.Fatalf("this leaf holds %d ratchet(s), so no two entries can be out of order and this case observes nothing",
+			len(entries))
+	}
+	sawDescending := 0
+	for round := 0; round < stOrderingRounds; round += 1 {
+		answered, err := tree.SenderRatchets(1)
+		if err != nil {
+			t.Fatalf("SenderRatchets at round %d: %v", round, err)
+		}
+		for i := 1; i < len(answered); i += 1 {
+			if answered[i].Kind <= answered[i-1].Kind {
+				t.Fatalf("round %d answered ratchet type %d after %d, which is the order RestoreSenderRatchets refuses: a state written from it cannot be loaded",
+					round, answered[i].Kind, answered[i-1].Kind)
+			}
+		}
+		// the raw order the sort was handed, read the same way SenderRatchets reads it
+		raw := []RatchetType{}
+		for key := range tree.ratchets {
+			if key.leaf == 1 {
+				raw = append(raw, key.kind)
+			}
+		}
+		for i := 1; i < len(raw); i += 1 {
+			if raw[i] < raw[i-1] {
+				sawDescending += 1
+				break
+			}
+		}
+	}
+	if sawDescending == 0 {
+		t.Fatalf("over %d rounds the map never handed this leaf's ratchets back out of order, so every ascending answer above is one the sort did not have to produce and this case observed nothing",
+			stOrderingRounds)
+	}
+	t.Logf("%d of %d rounds saw the map hand back the descending order, and every SenderRatchets answer was ascending",
+		sawDescending, stOrderingRounds)
 }

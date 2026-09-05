@@ -470,8 +470,38 @@ func (self *ratchet) peekFor(generation uint32) (*generationKeys, error) {
 	}
 	// generation is at or above head here, so the subtraction cannot wrap.
 	if generation-self.head > MaxGenerationSkip {
-		return nil, fmt.Errorf("%w: generation %d, head %d, bound %d",
-			ErrRatchetGenerationTooFarAhead, generation, self.head, MaxGenerationSkip)
+		// AND THE HEAD CATCHES UP BY THE BOUND BEFORE THIS REFUSES, which is what keeps a
+		// receiver that fell behind from being deaf to that sender for the rest of the epoch.
+		//
+		// WHY IT IS NEEDED, measured on a settled group of four: alice Protects 1026 times, live
+		// bob opens all of them, bob is restored from its persisted state -- which carries bob's
+		// OWN sender position and nothing about where bob's receiving ratchets for its peers
+		// stood -- and alice Protects once more. Restored bob answers "generation too far ahead:
+		// generation 1026, head 0, bound 1024". A refusal that left the head at 0 answers that
+		// same sentence for generation 1027, 1028 and every generation alice reaches for the rest
+		// of the epoch, because nothing else in this package moves a receiving head. The
+		// disclosure that called this a lost replay guard was materially incomplete: it is
+		// unbounded message loss until the next commit.
+		//
+		// IT GRANTS NOTHING A SENDER DID NOT ALREADY HAVE, which is the whole reason it is safe to
+		// do it on the refusal path. A generation number reaches this function only after
+		// openSenderData has opened an AEAD under the epoch's sender_data_secret, so the party
+		// choosing it is a member of this group; and that party can already advance any leaf's
+		// head by MaxGenerationSkip for the price of one header, by asking for head+1024 -- which
+		// this function ACCEPTS, steps to, and retains the whole skipped run of. So the work here
+		// is bounded by the same constant the accepted path is bounded by, and the retention is
+		// the same retention: what changes is only that the refusal is no longer free of both.
+		//
+		// THE KEYS IT PASSES ARE RETAINED RATHER THAN DISCARDED, for that same parity. Discarding
+		// them would make a catch-up strictly worse for the honest case than the in-bound skip an
+		// attacker can force -- the generations between the old head and the new one would stop
+		// being openable at all -- so the catch-up is exactly an accepted skip of MaxGenerationSkip
+		// with the target refused at the end of it.
+		if err := self.catchUpLocked(); err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("%w: generation %d, head %d after a catch-up of %d, bound %d",
+			ErrRatchetGenerationTooFarAhead, generation, self.head, MaxGenerationSkip, MaxGenerationSkip)
 	}
 	// the loop is bounded by the same distance the check above admits, rather than left to
 	// terminate on an argument about step advancing the head. It cannot run away for a
@@ -501,6 +531,43 @@ func (self *ratchet) peekFor(generation uint32) (*generationKeys, error) {
 		self.window[stepped] = keys
 		self.prune()
 	}
+}
+
+// catchUpLocked advances this ratchet by exactly MaxGenerationSkip generations, retaining and
+// pruning each one it passes exactly as an accepted skip does.
+//
+// IT IS THE ACCEPTED PATH WITH NO TARGET, and it is written as its own function rather than as a
+// second loop inside peekFor so that the bound is stated once: the work a peer can buy with one
+// generation number is MaxGenerationSkip steps whether the number is inside the bound or outside
+// it. A version that jumped the head to the generation ASKED FOR would be the unbounded KDF loop
+// the bound exists to refuse -- a hash ratchet has no way to reach generation n without deriving
+// the n-head secrets between, so "resynchronise to whatever was asked" is four billion expansions
+// for the price of one header.
+//
+// A step that refuses -- the ratchet is exhausted -- stops the catch-up and is answered as itself.
+// That is the honest answer to the caller: there is no generation past 2^32-1 to catch up TO, and
+// ErrRatchetExhausted says the epoch needs a rekey rather than a bigger skip.
+//
+// The caller holds stateLock.
+//
+// The noinline directive is the erase-helper class's, carried for peekFor's reason: prune erases
+// through storage that outlives this call, and the directive is what keeps those stores across a
+// boundary the compiler cannot see through. This declaration is outside the class
+// TestEveryEraseHelperCarriesTheNoInlineDirective derives -- that class is closed under the
+// hand-off through ARGUMENTS and this one takes none -- so the line is this package's convention
+// rather than something that gate demands.
+//
+//go:noinline
+func (self *ratchet) catchUpLocked() error {
+	for steps := uint32(0); steps < MaxGenerationSkip; steps += 1 {
+		stepped, keys, err := self.step()
+		if err != nil {
+			return err
+		}
+		self.window[stepped] = keys
+		self.prune()
+	}
+	return nil
 }
 
 // keyFor is peekFor plus consumption: a generation already handed out is deleted from the
@@ -683,6 +750,26 @@ func (self *ratchet) zeroize() {
 	}
 }
 
+// refuseUnknownRatchetType is the one door onto "is this a ratchet type this build has".
+//
+// ONE DOOR AND NOT TWO ENUMERATIONS. ratchetFor asks it because a kind it does not recognise has
+// no root to store; RestoreSenderRatchets asks it because a persisted vector is a corrupted store's
+// choice and its entries are installed one at a time. A second copy of the same two names is how a
+// kind added to this file joins one of the two readings and not the other, and the reading it
+// missed then decides that a well formed value is unknown -- or, worse, that an unknown one is
+// well formed.
+//
+// The sentinel is ErrSecretTreeLeafOutOfRange for the reason it was already ratchetFor's: a caller
+// asking for a ratchet names a leaf and a kind, and this package answers "there is no such ratchet
+// in this tree" under one value however the pair failed. errRatchetTypeHasNoRoot is what tells the
+// two apart for a test, and it belongs to the arm below rather than to this one.
+func refuseUnknownRatchetType(kind RatchetType) error {
+	if kind != RatchetHandshake && kind != RatchetApplication {
+		return fmt.Errorf("%w: unknown ratchet type %d", ErrSecretTreeLeafOutOfRange, kind)
+	}
+	return nil
+}
+
 // ratchetFor returns the leaf's ratchet, creating BOTH of a leaf's ratchets together so the
 // leaf node secret is taken from the tree exactly once and erased immediately. Taking it
 // twice is refused by the tree, so creating them one at a time would make the second kind
@@ -703,8 +790,8 @@ func (self *SecretTree) ratchetFor(leaf LeafIndex, kind RatchetType) (*ratchet, 
 	if self.erased {
 		return nil, fmt.Errorf("%w: leaf %d", ErrEpochErased, leaf)
 	}
-	if kind != RatchetHandshake && kind != RatchetApplication {
-		return nil, fmt.Errorf("%w: unknown ratchet type %d", ErrSecretTreeLeafOutOfRange, kind)
+	if err := refuseUnknownRatchetType(kind); err != nil {
+		return nil, err
 	}
 	key := ratchetKey{leaf: leaf, kind: kind}
 	if existing, ok := self.ratchets[key]; ok {
@@ -743,6 +830,13 @@ const (
 	// MaxGenerationSkip bounds how far ahead of the current head a receiver will ratchet in
 	// one step. A generation number is attacker supplied, and without a bound a single
 	// uint32 buys four billion KDF calls for the price of one forged header.
+	//
+	// IT IS ALSO WHAT A REFUSAL ADVANCES BY, which is the same number for the same reason. A
+	// generation past the bound is refused and the head catches up by exactly this much before
+	// the refusal returns -- see (*ratchet).peekFor -- so the work one generation number can buy
+	// is this constant whether the number is inside the bound or outside it, and a receiver that
+	// fell behind a busy peer reaches it again in ceil(distance/MaxGenerationSkip) messages
+	// instead of being deaf to that peer for the rest of the epoch.
 	MaxGenerationSkip uint32 = 1024
 
 	// RatchetWindowSize bounds the skipped keys retained for out of order receipt BY ONE
@@ -923,15 +1017,47 @@ func (self *SecretTree) SenderRatchets(leaf LeafIndex) ([]senderRatchetEntry, er
 // blob that was not already derivable from it: the same state carries the restore secret, and the
 // encryption secret expanded out of that derives every leaf's every ratchet from generation 0.
 //
+// AND IT REFUSES WHAT THE WRITE SIDE REFUSES, which is the half this read had missing. SenderRatchets
+// opens with refuseIfErased, and its own comment says why: Zeroize overwrites every ratchet secret
+// in place and leaves the ratchets in the table, so a persist taken from an erased epoch writes one
+// run of Nh zeros per ratchet, and "a state written from an erased tree restores a member sending
+// under a ratchet every party in the world can compute". This function checked the LENGTH of each
+// secret and nothing else. Measured: two right-length all-zero secrets restored with a nil error,
+// and the very next NextSenderKey handed out a key expanded from a public constant. A read that
+// admits what its own write refuses is a door only for the callers that came through the door.
+//
+// The refusal is ErrEpochErased and not a new sentinel, because it is not a new condition: it is
+// the state SenderRatchets names, reached from a store rather than from this process. The check is
+// an OR over the octets rather than a comparison against a zero array, which costs nothing and is
+// the shape this package's comparator gate cannot read either way -- see constant_time_test.go's
+// own statement of that limit.
+//
 // EVERY ENTRY IS CHECKED BEFORE ANY RATCHET IS BUILT. ratchetFor takes the leaf's node secret to
 // build its two ratchets and there is no way to put it back, so a refusal discovered halfway would
 // leave a tree that can never answer for this leaf again.
 //
+// THAT SENTENCE WAS FALSE UNTIL THE KIND JOINED THE LOOP, and it is worth recording rather than
+// quietly fixing. The loop checked the secret's length, the consumed count and the ordering, and
+// the one field it did not check was the one ratchetFor refuses: an entry naming a Kind this build
+// does not have passed the whole validation loop and was refused on the second pass -- AFTER the
+// first entry's ratchetFor had taken the leaf node secret out of the tree and installed a restored
+// secret over one of the two ratchets it built. The refusal reached the caller either way, because
+// LoadGroup drops and erases everything it holds on any refusal, so nothing shipped wrong; what
+// was wrong was this paragraph, which claimed a property the code below did not have.
+// refuseUnknownRatchetType is the door both passes now ask.
+//
 // BOTH OF THE LEAF'S RATCHETS ARE MATERIALISED by the first ratchetFor here, which is that
-// function's own rule and is what makes a partial record safe: a member that sent application
-// messages and no handshake message persists one entry, and the handshake ratchet it did not
-// persist is rebuilt at generation 0 from the leaf secret -- which is exactly where the live tree
-// had it.
+// function's own rule and is what makes a SHORT record safe: an entry vector holding fewer than the
+// leaf's ratchets leaves the rest standing at generation 0, derived from the leaf secret, which is
+// where a tree that had never stepped them had them.
+//
+// A ONE ENTRY RECORD CANNOT ARISE FROM THIS BUILD, and the sentence that stood here said it could
+// -- "a member that sent application messages and no handshake message persists one entry". It
+// does not: ratchetFor creates BOTH of a leaf's ratchets on the first call for either kind, so a
+// leaf that has sent anything at all holds two ratchets and SenderRatchets answers two entries,
+// and a leaf that has sent nothing holds none and it answers zero. The short case is reachable
+// only from a store that truncated the vector or from a future kind, which is exactly why the
+// handling is stated as a rule rather than removed.
 func (self *SecretTree) RestoreSenderRatchets(leaf LeafIndex, entries []senderRatchetEntry) error {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -943,6 +1069,21 @@ func (self *SecretTree) RestoreSenderRatchets(leaf LeafIndex, entries []senderRa
 		if len(entry.Secret) != nh {
 			return fmt.Errorf("%w: entry %d carries a %d byte ratchet secret, want %d",
 				ErrSecretLength, i, len(entry.Secret), nh)
+		}
+		if err := refuseUnknownRatchetType(entry.Kind); err != nil {
+			return fmt.Errorf("entry %d: %w", i, err)
+		}
+		// the erased epoch's own value, refused here rather than expanded from. See this
+		// function's comment: SenderRatchets will not WRITE this and a store can still hand it
+		// back, and what comes out the other side of installing it is a sender whose every
+		// generation is derivable by anybody.
+		var octets byte
+		for _, b := range entry.Secret {
+			octets |= b
+		}
+		if octets == 0 {
+			return fmt.Errorf("%w: entry %d carries a ratchet secret of %d zero octets, which is what an erased epoch holds and what every party in the world can compute",
+				ErrEpochErased, i, len(entry.Secret))
 		}
 		if _, _, err := generationsConsumed(entry.Consumed); err != nil {
 			return fmt.Errorf("%w: entry %d: %w", errGroupStateSenderRatchet, i, err)

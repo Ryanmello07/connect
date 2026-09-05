@@ -7,10 +7,39 @@
 // cached an Add its own ValidateProposalList refuses; ApplyCommit accepted another group's staged
 // commit and derived byte identical authenticators from it; a restored member restarted its ratchet
 // at generation 0 and reused a nonce; the Welcome's joiner pairing was checked by a count its own
-// comment ruled out. Not one of the four is visible from inside the piece that holds it, and every
-// one of them is visible to a second member reading what the first produced.
+// comment ruled out. Not one of the four is visible from inside the piece that holds it.
 //
-// SO EVERY CASE HERE HAS THE SAME SHAPE: n views of one group, each a DIFFERENT *Group with its own
+// HOW MANY OF THE FOUR THIS FILE REPRODUCES, MEASURED BY REINTRODUCING EACH ONE. It is now all
+// four. It was ONE when the file shipped, and this paragraph replaces a sentence that said the
+// opposite by implication -- "every one of them is visible to a second member reading what the
+// first produced", which is a statement about what a second member COULD see and was read as a
+// statement about what this file does see. Three of the four were unreachable by any arrangement
+// the file built, and each needed a fixture it did not have:
+//
+//   - THE CACHED ADD. Every add here was a fresh valid identity, so no case could offer the group
+//     a key package any list rule refuses. TestTheGeneratorRefusesAnAddThisGroupsOwnListRuleRefuses
+//     offers back one the group already carries. It is also held by the generator gates in
+//     group_test.go, and was before this; what this adds is the consequence -- a poisoned cache is
+//     a commit every OTHER member refuses, which is a statement only n views can make.
+//   - THE CROSS-GROUP STAGED COMMIT. A staged commit was only ever handed to the group whose
+//     ProcessMessage produced it, because the file drove one cohort.
+//     TestAStagedCommitFromAnotherGroupOrAnotherEpochInstallsNothingHere drives two.
+//   - THE WELCOME'S JOINER PAIRING. Every commit here added exactly ONE member, and with one entry
+//     on each side of the pairing, entry 0 of one is entry 0 of the other under every permutation.
+//     TestOneCommitAdmitsTwoJoinersAndEachOpensTheEntryAddressedToIt admits two in one commit --
+//     and asks for an update path, because section 12.4 lets an add-only commit omit one and a
+//     Welcome with no path secret in it carries nothing a swapped pairing could misdeliver.
+//     Measured: with the pairing swapped, a two-joiner case on an add-only commit passed.
+//   - THE RESTORED RATCHET is the one that was already caught, by
+//     TestEveryMemberSendsAndReceivesAcrossARestore, which sends after the restore.
+//
+// WHAT IT STILL DOES NOT REACH, so the count above stays a count of what was measured. The
+// RECEIVING half of a restore is not here: the persisted state carries no peer position, and what
+// that costs is held by group_restore_generation_test.go's
+// TestARestoredMemberFollowsAPeerThatMovedPastTheSkipBound and by (*ratchet).peekFor's own comment.
+// Reaching it from a cohort would mean a case that sends a thousand messages between two views.
+//
+// MOST CASES HERE HAVE ONE SHAPE: n views of one group, each a DIFFERENT *Group with its own
 // StateStore, its own tree private state and its own key schedule, and the assertion is that all n
 // answer one epoch authenticator. That value is DeriveSecret(epoch_secret, "authentication"), so an
 // agreement on it is an agreement about the tree, the transcript and the key schedule together --
@@ -18,6 +47,11 @@
 // first message somebody could not open. Membership is compared beside it, because two views can
 // agree on an epoch secret while disagreeing about who is in the group only if one of them derived
 // the secret over a tree it did not publish, and saying both is what tells those apart.
+//
+// AND THE THREE ADDED ABOVE DELIBERATELY DO NOT. Two of them need something an agreement between n
+// views of one group cannot contain -- a SECOND group, and a second JOINER of one commit -- and the
+// header used to say every case had the one shape, which is how the file came to have no case that
+// could hold three of the four defects it is named for.
 //
 // FOUR MEMBERS IS THE FLOOR AND SEVERAL SIZES ARE RUN. four_member_group_test.go measures why: four
 // is the smallest size at which EVERY member has a copath node above its own leaf, and at two the
@@ -181,41 +215,95 @@ func (self *testCohort) assertLockstep(t *testing.T) {
 	}
 }
 
-// addMember admits one new identity, committed by the view the caller names, and joins it out of
-// the Welcome that commit produced.
+// addMembersInOneCommit admits n new identities in ONE commit, committed by the view the caller
+// names, and joins every one of them out of the single Welcome that commit produced. It hands back
+// the joined views and the octets each key package was published as.
 //
-// The Add proposal is DELIVERED before it is committed, because a commit names its proposals by
-// reference and every receiver resolves those references out of its own cache; a cohort that
+// The Add proposals are DELIVERED before they are committed, because a commit names its proposals
+// by reference and every receiver resolves those references out of its own cache; a cohort that
 // skipped the delivery would be asserting about a commit the other members cannot even read.
-func (self *testCohort) addMember(t *testing.T, committer *Group, name string) *Group {
+//
+// WHY THE MULTI-JOINER FORM IS THE ONE THAT IS WRITTEN and the single add is a call to it. One
+// Welcome per joiner is a message where the pairing between the leaves a commit added and the Add
+// proposals it names cannot be got wrong: with one of each, entry 0 of one is entry 0 of the other
+// under EVERY permutation. That pairing is one of the four defects this package has shipped -- it
+// was checked by comparing two LENGTHS, which errWelcomeAddPairing's own comment says a count
+// cannot do -- and the arrangement that can see it is a commit carrying two Adds and a Welcome
+// carrying two entries. Making it the general form means the cohort builds it wherever a case asks
+// for it rather than only where somebody wrote a second helper.
+//
+// The key package octets come back because a case that wants to offer the group a key package it
+// ALREADY CARRIES has no other way to hold one: testPublishedKeyPackage mints a fresh identity per
+// call, so a second call is a different member and not a duplicate of this one.
+//
+// AND THE COMMIT OPTIONS ARE THE CALLER'S, which is not a convenience either. RFC 9420 section 12.4
+// lets an ADD-ONLY commit omit the update path, and this build takes it: CommitPathRequired answers
+// false for a list of Adds, so the plan is nil and (*StagedCommit).welcomeMessage hands every joiner
+// a GroupSecrets with NO path secret in it. Every entry of such a Welcome then carries the same one
+// field, the joiner secret, and which entry a joiner opens cannot be observed at all. MEASURED: with
+// the joiner pairing swapped, a two joiner case built on an add-only commit passed. A case about the
+// pairing therefore has to ask for the path -- CommitOptions.Force is that ask, and it is what a
+// client wanting post compromise security for its committer sends anyway.
+func (self *testCohort) addMembersInOneCommit(t *testing.T, committer *Group, opts *CommitOptions,
+	names ...string) ([]*Group, [][]byte) {
+
 	t.Helper()
-	member := testIdentity(t, self.crypto, name)
-	kp, initPriv, encPriv, encoded := testPublishedKeyPackage(t, self.crypto, member)
-	proposal, err := committer.ProposeAdd(encoded)
-	if err != nil {
-		t.Fatalf("ProposeAdd(%s): %v", name, err)
+	if len(names) == 0 {
+		t.Fatal("a commit adding nobody carries no Welcome, so this helper has nothing to join")
 	}
-	self.deliver(t, committer, proposal, false)
-	result, err := committer.CreateCommit(nil, nil, nil)
+	members := []*testMember{}
+	packages := []*KeyPackage{}
+	initPrivs := []HpkePrivateKey{}
+	encPrivs := []HpkePrivateKey{}
+	published := [][]byte{}
+	for _, name := range names {
+		member := testIdentity(t, self.crypto, name)
+		kp, initPriv, encPriv, encoded := testPublishedKeyPackage(t, self.crypto, member)
+		proposal, err := committer.ProposeAdd(encoded)
+		if err != nil {
+			t.Fatalf("ProposeAdd(%s): %v", name, err)
+		}
+		self.deliver(t, committer, proposal, false)
+		members = append(members, member)
+		packages = append(packages, kp)
+		initPrivs = append(initPrivs, initPriv)
+		encPrivs = append(encPrivs, encPriv)
+		published = append(published, encoded)
+	}
+	result, err := committer.CreateCommit(nil, nil, opts)
 	if err != nil {
-		t.Fatalf("CreateCommit adding %s: %v", name, err)
+		t.Fatalf("CreateCommit adding %v: %v", names, err)
 	}
 	if result.Welcome == nil {
-		t.Fatalf("the commit adding %s carried no Welcome", name)
+		t.Fatalf("the commit adding %v carried no Welcome", names)
 	}
 	self.deliver(t, committer, result.Commit, true)
 
-	cfg := testGroupConfig(t, self.crypto, member, self.groupId)
-	joined, err := JoinFromWelcome(cfg, result.Welcome, result.RatchetTree, &JoinKeyMaterial{
-		KeyPackage: *kp, InitPrivate: initPriv, EncryptPrivate: encPriv, SignPrivate: member.SigPriv,
-	})
-	if err != nil {
-		t.Fatalf("JoinFromWelcome(%s): %v", name, err)
+	joined := []*Group{}
+	for i, member := range members {
+		cfg := testGroupConfig(t, self.crypto, member, self.groupId)
+		one, err := JoinFromWelcome(cfg, result.Welcome, result.RatchetTree, &JoinKeyMaterial{
+			KeyPackage: *packages[i], InitPrivate: initPrivs[i], EncryptPrivate: encPrivs[i],
+			SignPrivate: member.SigPriv,
+		})
+		if err != nil {
+			t.Fatalf("JoinFromWelcome(%s) out of a welcome carrying %d entries: %v",
+				member.Name, len(names), err)
+		}
+		self.groups = append(self.groups, one)
+		self.members = append(self.members, member)
+		self.configs = append(self.configs, cfg)
+		joined = append(joined, one)
 	}
-	self.groups = append(self.groups, joined)
-	self.members = append(self.members, member)
-	self.configs = append(self.configs, cfg)
-	return joined
+	return joined, published
+}
+
+// addMember is the one-joiner case of the above, kept as its own name because most of this file
+// admits one member at a time and `joined[0]` at every one of those sites says nothing.
+func (self *testCohort) addMember(t *testing.T, committer *Group, name string) (*Group, []byte) {
+	t.Helper()
+	joined, published := self.addMembersInOneCommit(t, committer, nil, name)
+	return joined[0], published[0]
 }
 
 // commitFrom builds a commit at one view, delivers it to every other and merges the committer's.
@@ -485,7 +573,7 @@ func TestJoinAtAnAdvancedEpoch(t *testing.T) {
 	if root.Epoch() != 5 {
 		t.Fatalf("Epoch = %d, want 5", root.Epoch())
 	}
-	late := cohort.addMember(t, root, "late")
+	late, _ := cohort.addMember(t, root, "late")
 	if late.Epoch() != root.Epoch() {
 		t.Fatalf("late joiner epoch = %d, committer = %d", late.Epoch(), root.Epoch())
 	}
@@ -663,7 +751,7 @@ func TestAMemberThatJoinedMidHistoryFollowsEveryOtherMember(t *testing.T) {
 	cohort.exchange(t, 1, "history the joiner will never see")
 	behind := cohort.groups[0].Epoch()
 
-	late := cohort.addMember(t, cohort.groups[2], "late")
+	late, _ := cohort.addMember(t, cohort.groups[2], "late")
 	cohort.assertLockstep(t)
 	if late.Epoch() != behind+1 {
 		t.Fatalf("the late joiner came up at epoch %d, want %d", late.Epoch(), behind+1)
@@ -987,7 +1075,7 @@ func TestACommitReachesTheNewestMemberThroughAnUnmergedLeaf(t *testing.T) {
 	cohort.settle(t)
 	cohort.assertLockstep(t)
 
-	newest := cohort.addMember(t, cohort.groups[0], "newest")
+	newest, _ := cohort.addMember(t, cohort.groups[0], "newest")
 	cohort.assertLockstep(t)
 
 	sender := cohort.groups[0]
@@ -1027,5 +1115,264 @@ func TestACommitReachesTheNewestMemberThroughAnUnmergedLeaf(t *testing.T) {
 	// and the group goes on from there, with the tree it merged into
 	cohort.exchange(t, 0, "after the merge")
 	cohort.commitFrom(t, 3)
+	cohort.assertLockstep(t)
+}
+
+// ---------------------------------------------------------------------------
+// the shipped defects this file could not see, each in the arrangement that sees it
+// ---------------------------------------------------------------------------
+
+// TestTheGeneratorRefusesAnAddThisGroupsOwnListRuleRefuses is the FIRST of the four defects this
+// package has shipped, reached from the cohort for the first time.
+//
+// THE DEFECT was (*Group).ProposeAdd caching an Add that (*Group).ValidateProposalList refuses.
+// What makes it a cross-member fault rather than a generator one is what happens next: the entry
+// sits in this member's cache, its own next commit names it by reference, and every OTHER member
+// runs section 12.2 over the resolved list and refuses the commit. The proposer is then a client
+// whose every commit is rejected by a group that is behaving correctly, and nothing at the point of
+// the mistake says so.
+//
+// WHY THIS FILE COULD NOT SEE IT UNTIL NOW, measured: every add the cohort makes is a FRESH valid
+// identity, so no arrangement it built could offer the group a key package any list rule refuses.
+// The header of this file nonetheless named the cached Add among the defects it is written for.
+// This is the arrangement that reaches it -- a key package the group ALREADY CARRIES, which is
+// ValSem101 and ValSem103 at once and is the shape a client re-fetching a stale directory entry
+// produces in the field.
+//
+// AND THE SECOND HALF IS THE CACHE. A refusal that had happened after the entry was stored would
+// satisfy an assertion written as "ProposeAdd returned an error", so the cohort commits afterwards
+// and requires every member to follow: a poisoned cache is a commit nobody accepts, and that is a
+// statement only n views can make.
+func TestTheGeneratorRefusesAnAddThisGroupsOwnListRuleRefuses(t *testing.T) {
+	crypto := testCrypto(t)
+	cohort := testNewCohort(t, crypto, "cached-add", 4)
+	defer cohort.closeAll()
+	cohort.settle(t)
+	cohort.assertLockstep(t)
+
+	// a member admitted through the cohort's own door, and the octets its key package was
+	// published as. The group now carries that leaf's signature key and its encryption key.
+	admitted, published := cohort.addMember(t, cohort.groups[0], "already here")
+	cohort.assertLockstep(t)
+	if _, found := cohort.groups[0].MemberAt(admitted.OwnLeafIndex()); !found {
+		t.Fatalf("the group holds no member at leaf %d, so the key package below is not one it carries",
+			admitted.OwnLeafIndex())
+	}
+
+	// offered back to the group that already carries it, at a DIFFERENT member from the one that
+	// admitted it -- so what refuses is a rule about the tree and not a memory of the call.
+	proposer := cohort.groups[2]
+	if _, err := proposer.ProposeAdd(published); !errors.Is(err, ErrAddDuplicateSignatureKey) {
+		t.Fatalf("ProposeAdd of a key package this group already carries = %v, want ErrAddDuplicateSignatureKey; an Add this group's own ValidateProposalList refuses is one every OTHER member refuses the committing member's next commit for",
+			err)
+	}
+
+	// and the cache is clean, which is the half the refusal alone does not say: the proposer's
+	// next commit is one every member follows.
+	cohort.commitFrom(t, 2)
+	cohort.assertLockstep(t)
+	cohort.exchange(t, 2, "the proposer still commits for this group")
+}
+
+// TestAStagedCommitFromAnotherGroupOrAnotherEpochInstallsNothingHere is the SECOND of the four,
+// and it needs a thing this file did not have: a second group.
+//
+// THE DEFECT was (*Group).ApplyCommit accepting a staged commit that ANOTHER GROUP derived, and
+// deriving byte identical authenticators from it. A member that entered a stranger's epoch is a
+// member whose every later message is sealed under keys the group it thinks it is in has never
+// heard of, and whose epoch authenticator agrees with the stranger rather than with its peers.
+//
+// WHY THIS FILE COULD NOT SEE IT UNTIL NOW, measured: every case here drove ONE cohort, and a
+// staged commit is only ever handed to the group whose ProcessMessage produced it, so no
+// arrangement it built could offer a group a commit that came from anywhere else.
+//
+// BOTH HALVES ARE RUN AND NEITHER ALONE IS THE RULE, which is (*Group).ApplyCommit's own comment:
+// every group this client is in runs an epoch 7, so the epoch is not an identity; and the group id
+// alone would admit a staged epoch of this group that some other epoch of it derived.
+//
+// AND BOTH HALVES CARRY THEIR CONTROL. A build that refused every staged commit would satisfy the
+// two refusals perfectly, so each refused value is afterwards installed WHERE IT BELONGS and the
+// cohort it belongs to is required to converge on it. That is what says the refusal is about
+// provenance rather than about the commit.
+func TestAStagedCommitFromAnotherGroupOrAnotherEpochInstallsNothingHere(t *testing.T) {
+	crypto := testCrypto(t)
+	here := testNewCohort(t, crypto, "provenance-here", 4)
+	defer here.closeAll()
+	here.settle(t)
+	here.assertLockstep(t)
+
+	elsewhere := testNewCohort(t, crypto, "provenance-elsewhere", 4)
+	defer elsewhere.closeAll()
+	elsewhere.settle(t)
+	elsewhere.assertLockstep(t)
+
+	// a perfectly good commit of the OTHER group, staged by a member of the other group
+	foreign, err := elsewhere.groups[0].CreateCommit(nil, nil, nil)
+	if err != nil {
+		t.Fatalf("CreateCommit in the other group: %v", err)
+	}
+	foreignStaged, err := elsewhere.groups[1].ProcessMessage(foreign.Commit)
+	if err != nil {
+		t.Fatalf("the other group could not process its own commit: %v", err)
+	}
+
+	subject := here.groups[1]
+	beforeEpoch := subject.Epoch()
+	beforeAuthenticator := bytes.Clone(subject.EpochAuthenticator())
+	if err := subject.ApplyCommit(foreignStaged); !errors.Is(err, errApplyCommitNotThisGroups) {
+		t.Fatalf("ApplyCommit of another group's staged commit = %v, want errApplyCommitNotThisGroups",
+			err)
+	}
+	if subject.Epoch() != beforeEpoch {
+		t.Fatalf("the refused apply moved leaf %d from epoch %d to %d",
+			subject.OwnLeafIndex(), beforeEpoch, subject.Epoch())
+	}
+	if !bytes.Equal(subject.EpochAuthenticator(), beforeAuthenticator) {
+		t.Fatalf("the refused apply changed leaf %d's epoch authenticator, so something of the stranger's epoch reached this one",
+			subject.OwnLeafIndex())
+	}
+	here.assertLockstep(t)
+
+	// the control: that same staged commit installs in the group that staged it, and its cohort
+	// converges on the epoch it opened.
+	if err := elsewhere.groups[1].ApplyCommit(foreignStaged); err != nil {
+		t.Fatalf("the other group could not apply its own staged commit: %v; this case would then be observing a build that refuses every staged commit",
+			err)
+	}
+	for _, group := range elsewhere.groups[2:] {
+		processed, err := group.ProcessMessage(foreign.Commit)
+		if err != nil {
+			t.Fatalf("leaf %d could not process the other group's commit: %v", group.OwnLeafIndex(), err)
+		}
+		if err := group.ApplyCommit(processed); err != nil {
+			t.Fatalf("leaf %d could not apply the other group's commit: %v", group.OwnLeafIndex(), err)
+		}
+	}
+	if err := elsewhere.groups[0].MergePendingCommit(); err != nil {
+		t.Fatalf("MergePendingCommit in the other group: %v", err)
+	}
+	elsewhere.assertLockstep(t)
+
+	// and the epoch half, in ONE group: a staged commit of this group derived against the epoch
+	// that has just closed. Two views stage the same commit; one of them applies it and has moved
+	// on, and the other's staged value is then a value of this group and of no epoch it is in.
+	author := here.groups[0]
+	result, err := author.CreateCommit(nil, nil, nil)
+	if err != nil {
+		t.Fatalf("CreateCommit: %v", err)
+	}
+	stagedAt := []*Processed{}
+	for _, group := range here.groups[1:] {
+		processed, err := group.ProcessMessage(result.Commit)
+		if err != nil {
+			t.Fatalf("leaf %d could not process the commit: %v", group.OwnLeafIndex(), err)
+		}
+		stagedAt = append(stagedAt, processed)
+	}
+	if err := here.groups[1].ApplyCommit(stagedAt[0]); err != nil {
+		t.Fatalf("leaf %d could not apply the commit: %v", here.groups[1].OwnLeafIndex(), err)
+	}
+	if err := here.groups[1].ApplyCommit(stagedAt[1]); !errors.Is(err, errApplyCommitNotThisEpochs) {
+		t.Fatalf("ApplyCommit of a staged commit of this group's CLOSED epoch = %v, want errApplyCommitNotThisEpochs",
+			err)
+	}
+	// and its control: the same value installs at the view that staged it and has not moved.
+	for at, processed := range stagedAt[1:] {
+		group := here.groups[2+at]
+		if err := group.ApplyCommit(processed); err != nil {
+			t.Fatalf("leaf %d could not apply its own staged commit after another view refused it: %v",
+				group.OwnLeafIndex(), err)
+		}
+	}
+	if err := author.MergePendingCommit(); err != nil {
+		t.Fatalf("MergePendingCommit: %v", err)
+	}
+	here.assertLockstep(t)
+	here.exchange(t, 3, "after both refusals the group is one group")
+}
+
+// TestOneCommitAdmitsTwoJoinersAndEachOpensTheEntryAddressedToIt is the THIRD of the four, and it
+// needs the thing the cohort could not build either: a second joiner.
+//
+// THE DEFECT was the Welcome's joiner pairing checked by a COUNT. (*StagedCommit).welcomeMessage
+// pairs the leaves a commit added with the Add proposals it names, entry i with entry i, and what
+// held those two readings together was len(adds) != len(self.added). errWelcomeAddPairing's own
+// comment says why that is not enough -- "a COUNT is what a dual representation gets held together
+// by and a count is what let four forks through" -- and a build where the two parted company seals
+// each joiner's group secrets to some OTHER joiner's material, silently, with every length equal
+// and every seal well formed.
+//
+// WHY THIS FILE COULD NOT SEE IT UNTIL NOW, measured: every commit it built added exactly ONE
+// member, and with one entry on each side, entry 0 of one is entry 0 of the other under every
+// permutation there is. A pairing defect is unreachable from a one joiner Welcome however the
+// pairing is written.
+//
+// THREE MEMBERS AND THEN TWO, AND THE SIZE IS THE POINT. A joiner's Welcome entry carries the path
+// secret for the LOWEST NODE ITS LEAF AND THE COMMITTER'S SHARE, so two joiners whose leaves share
+// the SAME node with the committer are handed the same secret and a swapped pairing is invisible.
+// A settled cohort of three leaves leaf 3 empty in a width four tree: the first Add refills leaf 3,
+// under the committer's own subtree, and the second doubles the tree and lands at leaf 4, under the
+// other one. Their common ancestors with leaf 0 are then different nodes -- which this case DERIVES
+// off the tree and requires, rather than drawing it and hoping.
+func TestOneCommitAdmitsTwoJoinersAndEachOpensTheEntryAddressedToIt(t *testing.T) {
+	crypto := testCrypto(t)
+	cohort := testNewCohort(t, crypto, "two-joiners", 3)
+	defer cohort.closeAll()
+	cohort.settle(t)
+	cohort.assertLockstep(t)
+
+	committer := cohort.groups[0]
+	committerLeaf := committer.OwnLeafIndex()
+	before := len(committer.Members())
+	// Force, for addMembersInOneCommit's stated reason: an add-only commit carries no update path,
+	// so its Welcome entries carry no path secret and there is nothing in them a swapped pairing
+	// could put in the wrong joiner's hands.
+	joined, _ := cohort.addMembersInOneCommit(t, committer, &CommitOptions{Force: true},
+		"first", "second")
+	if len(joined) != 2 {
+		t.Fatalf("one commit admitted %d joiner(s), want 2", len(joined))
+	}
+	cohort.assertLockstep(t)
+	if now := len(committer.Members()); now != before+2 {
+		t.Fatalf("the group holds %d members after a commit adding two, want %d", now, before+2)
+	}
+
+	// the arrangement, derived and required BEFORE anything is claimed about the pairing. Two
+	// joiners that share one node with the committer are handed one path secret, and a swapped
+	// pairing between them is then a swap of two equal values.
+	first := CommonAncestor(joined[0].OwnLeafIndex().NodeIndex(), committerLeaf.NodeIndex())
+	second := CommonAncestor(joined[1].OwnLeafIndex().NodeIndex(), committerLeaf.NodeIndex())
+	if joined[0].OwnLeafIndex() == joined[1].OwnLeafIndex() {
+		t.Fatalf("both joiners came up at leaf %d", joined[0].OwnLeafIndex())
+	}
+	if first == second {
+		t.Fatalf("leaf %d and leaf %d both share node %d with the committer at leaf %d, so their Welcome entries carry the same path secret and this case observes nothing about which entry went to which joiner",
+			joined[0].OwnLeafIndex(), joined[1].OwnLeafIndex(), first, committerLeaf)
+	}
+	t.Logf("leaf %d shares node %d with the committer and leaf %d shares node %d",
+		joined[0].OwnLeafIndex(), first, joined[1].OwnLeafIndex(), second)
+
+	// each joiner is the member the GROUP holds at the leaf that joiner thinks is its own, which
+	// is the statement a count cannot make. The identities are the cohort's own, in the order
+	// they were admitted.
+	identities := cohort.members[len(cohort.members)-2:]
+	for at, one := range joined {
+		member, found := committer.MemberAt(one.OwnLeafIndex())
+		if !found {
+			t.Fatalf("the group holds no member at leaf %d, which joiner %d came up at",
+				one.OwnLeafIndex(), at)
+		}
+		if !bytes.Equal(member.IdentityPub, identities[at].IdentityPub) {
+			t.Fatalf("joiner %d (%s) came up at leaf %d, and the group holds a different identity there: the Welcome entry it opened was addressed to somebody else",
+				at, identities[at].Name, one.OwnLeafIndex())
+		}
+	}
+
+	// and both halves of being a member, for each of them, at the epoch they joined at
+	cohort.exchange(t, len(cohort.groups)-2, "the first joiner speaks")
+	cohort.exchange(t, len(cohort.groups)-1, "the second joiner speaks")
+	cohort.commitFrom(t, 1)
+	cohort.assertLockstep(t)
+	cohort.commitFrom(t, len(cohort.groups)-1)
 	cohort.assertLockstep(t)
 }

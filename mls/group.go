@@ -2767,6 +2767,34 @@ func LoadGroup(cfg *GroupConfig, epoch uint64, signer SignaturePrivateKey) (*Gro
 	// without this the very next Protect draws a generation every peer is already past: each peer
 	// answers ErrRatchetGenerationConsumed and drops the message, and two different plaintexts of
 	// this epoch have been sealed under one (key, base nonce) pair for this leaf and generation.
+	//
+	// THE SENDER POSITION AND NOT THE RECEIVING ONE, and what that costs is stated here rather
+	// than left to be met. This blob carries where THIS member's own two ratchets stand and
+	// nothing about where its receiving ratchets for its PEERS stood, so every peer's head comes
+	// back at 0. Two consequences, and the second is the one the earlier disclosure did not say.
+	//
+	//   - the replay guard for that epoch is gone: a message from a peer at a generation this
+	//     member had already opened is opened again, because the head that would have called it
+	//     consumed is back at zero. That is a lost guard and it is not key reuse -- no key of this
+	//     member's own is drawn twice by it.
+	//   - and a peer that is more than MaxGenerationSkip generations ahead is REFUSED, which was
+	//     unbounded message loss until (*ratchet).peekFor learned to catch up. Measured on a
+	//     settled four before that: alice Protects 1026 times, live bob opens all of them, bob is
+	//     restored, alice Protects once more, and bob answers "generation too far ahead:
+	//     generation 1026, head 0, bound 1024" -- and answers it again for every later message
+	//     alice sends in that epoch, because a refusal left the head where it was. It is now
+	//     bounded: the refusal advances that peer's head by MaxGenerationSkip, so a member behind
+	//     by n generations loses ceil(n/MaxGenerationSkip) messages from that peer and then reads
+	//     it again. In the measured case that is one.
+	//
+	// WHY NOT PERSIST THE PEERS TOO, since the blob could hold them and they are no more secret
+	// than what it already carries -- the encryption secret it rebuilds derives every leaf's every
+	// ratchet from generation 0. Because the write points are wrong for it: persist runs at an
+	// epoch boundary and inside sealAndRecordLocked, and RECEIVING writes nothing. Bob in the
+	// measured case never sent, so a blob with peer heads in it would have recorded the zeros it
+	// already assumes. Making it true would mean one PutGroupState per message RECEIVED, which is
+	// a durability boundary this package has not chosen; the catch-up is what bounds the cost of
+	// not choosing it.
 	if err := secretTree.RestoreSenderRatchets(ownLeaf, blob.SenderRatchets); err != nil {
 		return nil, fmt.Errorf("%w: %w", errGroupStateSenderRatchet, err)
 	}

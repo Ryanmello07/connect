@@ -3238,6 +3238,15 @@ func (self *refusingPutStore) PutGroupState(groupId []byte, epoch uint64, state 
 // The failure is reached through the store because that is where it comes from in the field -- a
 // disk that is full, a keychain that is locked, a sealed store whose key is not yet available at
 // start-up -- and none of those is a reason to wedge the group.
+//
+// WHAT THIS CASE STOPPED OBSERVING WHEN THE SEAL LEARNED TO PERSIST, and where that went. It used
+// to arm the store BEFORE CreateCommit and never disarm it, so a refusing store ran across the
+// commit's seal and across the proposal's; the commit that made (*Group).sealAndRecordLocked
+// persist moved the arming to after CreateCommit and disarmed it before ProposeUpdate, which is the
+// right shape for a case about an epoch boundary and left NO test in the package running a refusing
+// store across any seal site. seal_persist_test.go is the case that was missing:
+// TestEverySealSiteRefusesWhenTheStoreRefusesToRecordWhatItSpent derives every declaration that
+// reaches sealAndRecordLocked out of the source and drives a refusing store through each.
 func TestAFailedPersistLeavesTheGroupAbleToProposeInTheEpochItMovedTo(t *testing.T) {
 	crypto := testCrypto(t)
 	owner := testIdentity(t, crypto, "owner")
