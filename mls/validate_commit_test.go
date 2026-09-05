@@ -2443,8 +2443,12 @@ func testCommitWideEnoughToPrice(t *testing.T, crypto CryptoProvider) *CommitVal
 // two: the same walk, over the same entries, through the same comparisons, encoding what the
 // commit names and comparing it with itself.
 //
-// A WITNESS THAT IS A COPY OF THE IMPLEMENTATION, which is
-// TestAPerTypeViewIsLinearInTheCommitOrder's shape one file over and is here for its reason. The
+// A WITNESS THAT IS A COPY OF THE IMPLEMENTATION, which was
+// TestAPerTypeViewIsLinearInTheCommitOrder's shape one file over until that case was deleted on
+// 2026-09-05. The witness is why it is here and the deletion is no verdict on this case; what
+// that one was -- a wall-clock ratio whose blocks sat on the vacuity floor beneath it, so that it
+// skipped rather than measured in one run in five -- is written down in mls/UNOBSERVED.md, and
+// anyone tightening the bracket below should read it first. The
 // claim being measured is "the join reads each entry twice and no more", and a claim that one
 // program costs what another costs needs the other program written down. What it is NOT standing
 // in for is the join's ANSWER -- every test above holds that.

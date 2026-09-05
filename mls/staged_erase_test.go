@@ -39,6 +39,11 @@
 // row says. And the erase of a SUB-field of a value being moved out is read by the callee's bare
 // name, so a namesake of an erase would certify one -- the install half beside it is resolved
 // exactly, and it is the half that says a merge moved rather than dropped.
+//
+// Two further holes in the same reading are measured, and each is written down beside the code
+// that has it rather than only here: a method call on the receiver is resolved by NAME AND ARITY
+// and not by the receiver's type, and the widened position reaches one hop rather than a closure.
+// Both are entries in mls/UNOBSERVED.md, with the mutation that survives each.
 package mls
 
 import (
@@ -1661,10 +1666,17 @@ func eraseSubFieldOn(expr ast.Expr, receiver string, alias map[string]string, fi
 // What is still excluded is what the old sentence was actually protecting.
 // CreateUpdatePathSecrets writes private.EncryptionPriv over the nil a constructor two statements
 // up put there, and that local IS constructed here, so it is sourced from no receiver and stays
-// out. The widening is stated as PROVENANCE rather than as a ban on locals -- a value this
-// declaration took out of the receiver, by calling one of its methods, by reading one of its
-// fields, or by walking one of them -- which is the same question the receiver and parameter
-// positions ask, asked one hop further in.
+// out. The widening reaches ONE HOP AND NOT PROVENANCE, and the difference is the whole of what
+// it does not see. The local has to be bound from the RECEIVER itself -- a call on it, a field of
+// it, or a walk over one of those -- and a local taken out of THAT local is outside the class
+// again. Measured on 2026-09-05 at the site this widening was written for: delete the
+// zeroizeSecret in front of RestoreSenderRatchets' assignment and the gate below names it, at
+// fourteen sites; delete it and write the same assignment as `holder := r` followed by
+// `holder.secret = ...`, which is the same pointer and the same store, and the gate passes and
+// the whole of ./mls/... and ./message/... comes back 7,485 passing. Taking the reading to the
+// fixpoint -- a local out of a tracked local is tracked -- is what would close it, and until
+// somebody does, mls/UNOBSERVED.md carries it as a hole rather than this comment carrying it as a
+// property.
 func declarationsHolding(files []parsedSource, typeName string) []eraseMethod {
 	held := []eraseMethod{}
 	structs := map[string]*ast.StructType{}
@@ -1819,8 +1831,27 @@ func eraseReceiverSourcedTypes(expr ast.Expr, receiver string, receiverType stri
 		if !isSelector || selector.Sel == nil || rootIdentifierOf(selector.X) != receiver {
 			return nil
 		}
-		// every declaration of that name is tried, because a name can be a method of two types
-		// and a reading that took the first would be answering for the wrong one.
+		// NAME AND ARITY, AND NOT THE RECEIVER'S TYPE. Every declaration of that name is tried and
+		// the first whose RESULT COUNT matches is taken, so where two members share a method name
+		// this answers for whichever declaration's file sorts first. Clone is declared on eight
+		// types in this package and every one of them answers one result, so a Clone called on any
+		// of them reads *GroupContext's, out of group_context.go. Measured on 2026-09-05: the same
+		// two line drop of a live leaf private key placed inside (*TreeKEMPrivate).Consistent is
+		// reported by the gate below when the local comes out of a uniquely named method, and NOT
+		// reported when the only change is that it comes out of self.Clone() -- and the second
+		// leaves the whole of ./mls/... and ./message/... at 7,485 passing. Clone is not the only
+		// shared name that answers a result: Encode, Epoch, EpochAuthenticator, Export, LeafCount,
+		// Members, Validate, MarshalMLS and UnmarshalMLS are each declared by more than one
+		// production type, and each of them binding a local is resolved the same way. Zeroize is
+		// declared eight times as well and answers nothing, so it binds no local and is not a hazard
+		// here.
+		//
+		// AND THIS IS WHY A BARE NAME IS SAFE NEXT DOOR AND NOT HERE. labelledDeclarationsIn and
+		// newCommitSourceReader index by bare name too and say so, and both WALK EVERY match, so
+		// their over-reach costs work rather than accuracy. This one RETURNS THE FIRST, which is a
+		// choice between declarations rather than a union of them, and a choice made on arity alone
+		// can be the wrong one. The hole is carried in mls/UNOBSERVED.md; resolving the receiver
+		// expression's own type and keying the lookup on (type, name) is what would close it.
 		for _, results := range answers[selector.Sel.Name] {
 			if len(results) == want {
 				return results
