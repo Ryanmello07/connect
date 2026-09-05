@@ -34,7 +34,18 @@
 // key count was written into a t.Logf and asserted nowhere. Repeated keys now carry an occurrence
 // ordinal, " #2" onward in source order, so the second loop is a key with no row and fails on the
 // commit that adds it. TestEveryIndexPairedLoopIsHeldByATestThatSeesItsPairing asserts the two counts
-// are equal as well, which is what says the numbering really made them unique.
+// are equal as well, which is what says the numbering really made them unique; and the CONTROL holds
+// the colliding pair -- PairsTwoSlicesTwiceInOneFunction is two loops over one pair of sequences
+// inside one function, and both of its keys stand in the expected report -- so a build that stopped
+// numbering fails at the control before it reaches this package's own source.
+//
+// NEITHER OF THOSE TWO SENTENCES WAS TRUE WHEN THIS PARAGRAPH FIRST CLAIMED THEM, which is recorded
+// here rather than quietly repaired. The control contained no colliding pair, and len(derived)
+// appeared exactly once in this file, inside the closing t.Logf -- so neutralising the ordinal and
+// adding a second mispaired loop to an already-named function left the gate logging "20 index paired
+// loop(s) at 19 distinct site(s)" and PASSING. A claim written into the record that the code does
+// not support is the same defect this whole file is about, pointed at the gate instead of at the
+// package.
 //
 // THE ORDINAL IS POSITIONAL WITHIN ITS FUNCTION, and the cost of that is worth stating: a new loop
 // inserted ABOVE an existing one takes the unsuffixed key and pushes the existing loop to " #2", so
@@ -256,6 +267,11 @@ func indexPairedLoopsIn(fileSet *token.FileSet, files []*ast.File, info *types.I
 //     in the package.
 //   - RangesOverAnInteger indexes ONE sequence and ranges over a count; a reading that took every
 //     range expression for a sequence would report it as a pair.
+//   - PairsTwoSlicesTwiceInOneFunction is the COLLIDING PAIR, and it is the only member here whose
+//     job is the key rather than the class: two loops over one pair of sequences inside one
+//     function, which under the pre-ordinal key were one key and are now two. It is what makes a
+//     build that stopped numbering fail at the control, and the expected report below carries both
+//     of its keys rather than one.
 const indexPairedLoopControl = `package control
 
 type entry struct {
@@ -310,6 +326,15 @@ func RangesOverAnInteger(out []byte, n int) {
 		out[i] = 0
 	}
 }
+
+func PairsTwoSlicesTwiceInOneFunction(out []byte, in []byte) {
+	for i := range in {
+		out[i] = in[i]
+	}
+	for i := range in {
+		out[i] = out[i] ^ in[i]
+	}
+}
 `
 
 // What the rule must report over the fixture, exactly rather than as a floor: a reading that
@@ -319,6 +344,8 @@ var indexPairedLoopControlReports = []string{
 	"PairsAStringWithASlice [in out]",
 	"PairsThroughAnOffsetIndex [in out]",
 	"PairsTwoSlices [in out]",
+	"PairsTwoSlicesTwiceInOneFunction [in out]",
+	"PairsTwoSlicesTwiceInOneFunction [in out] #2",
 }
 
 // TestTheIndexPairingRuleFlagsItsControlFixture runs before the rule over the real source, so a
@@ -384,6 +411,16 @@ func TestEveryIndexPairedLoopIsHeldByATestThatSeesItsPairing(t *testing.T) {
 			t.Errorf("the row for %s names %s, which this package declares no test by; a row naming no test covers nothing",
 				key, named)
 		}
+	}
+	// AND THE TWO COUNTS ARE COMPARED, which is the half this file claimed and did not have. The
+	// coverage table is a MAP, so a second loop sharing a key with the first is certified by the
+	// first loop's row and the only trace of it is that there are more loops than keys. Measured on
+	// the shape this closes: with the occurrence ordinal neutralised and a second mispaired loop
+	// added to an already-named function, this gate logged "20 index paired loop(s) at 19 distinct
+	// site(s)" and passed.
+	if len(loops) != len(derived) {
+		t.Errorf("%d loops of this class stand at %d distinct keys, so at least two of them share one row and one measurement is certifying a loop it was never made against; the occurrence ordinal is what keeps them apart",
+			len(loops), len(derived))
 	}
 	slices.Sort(derived)
 	t.Logf("%d index paired loop(s) at %d distinct site(s), %d of them named by a declared test: %v",

@@ -23,13 +23,37 @@
 // restore that member.
 //
 // TestFourIsTheSmallestGroupWhoseMembersEnterTheLadderAboveTheirOwnLeaf holds all of that, over sizes
-// two, three and four together and with the counts pinned EXACTLY rather than as floors, so a later
-// change that made a two member group seal to a parent -- which would make every case in this file
-// vacuous while leaving it green -- is reported there.
+// two to eight together and with the counts pinned EXACTLY rather than as floors, so a later change
+// that made a two member group seal to a parent -- which would make every case in this file vacuous
+// while leaving it green -- is reported there.
+//
+// AND THE PROPERTY IS THE MEMBER'S POSITION RATHER THAN THE GROUP'S SIZE, which the sizes above four
+// are in that table to say. At FIVE, leaf 4 stands alone under the right subtree exactly as leaf 2
+// does at three: it enters every sender's commit at its own leaf and restores correctly with an
+// empty ladder, while the other four members do not. So "a group of four or more" is a false way to
+// state any of this -- it was written that way twice in group.go and has been corrected there -- and
+// the true statement is about a member having a copath node above its own leaf.
+//
+// WHAT THIS FIXTURE STILL DOES NOT REACH, recorded rather than repaired. It SETTLES -- every member
+// commits once, in leaf order -- so it holds ZERO UNMERGED LEAVES at every size, which is measured
+// in the same table. No group fixture in this package therefore puts a member in a resolution
+// reached through an UNMERGED LEAF, and that is the other half of RFC 9420 section 7.4's resolution
+// rule: an Add between commits leaves the joiner listed at each of its new ancestors, and a
+// resolution that walks one of those reaches leaves the subtree root does not otherwise cover.
+// Anything that mispairs a ciphertext with an unmerged leaf is invisible to every case built on this
+// file, and this file is the corpus most likely to be reached for when such a case is written.
+//
+// The BLANK NODES are the other half of that measurement, and they are not zero at every size --
+// which is worth stating because the settling invites the opposite assumption. At four, and at every
+// other power of two, the settled tree carries none. At the sizes in between, every blank node is
+// one the member count leaves empty: an unfilled leaf slot, or a parent with one of those somewhere
+// under it. That is asserted rather than described, so a settling that started leaving a real
+// member's direct path blanked would be reported there instead of being assumed away here.
 package mls
 
 import (
 	"bytes"
+	"slices"
 	"testing"
 
 	"github.com/urnetwork/connect/mls/syntax"
@@ -293,15 +317,27 @@ func TestFourIsTheSmallestGroupWhoseMembersEnterTheLadderAboveTheirOwnLeaf(t *te
 		pairs        int
 		abovePairs   int
 		aboveMembers int
+		// the leaves that enter EVERY sender's commit at their own leaf, NAMED rather than
+		// counted. This is the column the sizes above four were added for: it is what says the
+		// property is the member's position, and a count alone would let leaf 4 at five trade
+		// places with some other leaf and go on reading as "one of them".
+		lone []LeafIndex
 	}{
-		{size: 2, pairs: 2, abovePairs: 0, aboveMembers: 0},
-		{size: 3, pairs: 6, abovePairs: 2, aboveMembers: 2},
-		{size: 4, pairs: 12, abovePairs: 8, aboveMembers: 4},
+		{size: 2, pairs: 2, abovePairs: 0, aboveMembers: 0, lone: []LeafIndex{0, 1}},
+		{size: 3, pairs: 6, abovePairs: 2, aboveMembers: 2, lone: []LeafIndex{2}},
+		{size: 4, pairs: 12, abovePairs: 8, aboveMembers: 4, lone: []LeafIndex{}},
+		// FIVE, and it is the row that makes "four or more" false: leaf 4 stands alone under the
+		// right subtree exactly as leaf 2 does at three.
+		{size: 5, pairs: 20, abovePairs: 12, aboveMembers: 4, lone: []LeafIndex{4}},
+		{size: 6, pairs: 30, abovePairs: 24, aboveMembers: 6, lone: []LeafIndex{}},
+		{size: 7, pairs: 42, abovePairs: 34, aboveMembers: 7, lone: []LeafIndex{}},
+		{size: 8, pairs: 56, abovePairs: 48, aboveMembers: 8, lone: []LeafIndex{}},
 	} {
 		fixture := testGroupOfSize(t, crypto, "ladder-entry", row.size)
 		abovePairs := 0
 		aboveMembers := 0
 		pairs := 0
+		lone := []LeafIndex{}
 		for _, receiver := range fixture.members {
 			separates := false
 			for _, sender := range fixture.members {
@@ -322,6 +358,8 @@ func TestFourIsTheSmallestGroupWhoseMembersEnterTheLadderAboveTheirOwnLeaf(t *te
 			}
 			if separates {
 				aboveMembers += 1
+			} else {
+				lone = append(lone, receiver.leaf)
 			}
 		}
 		if pairs != row.pairs {
@@ -335,9 +373,64 @@ func TestFourIsTheSmallestGroupWhoseMembersEnterTheLadderAboveTheirOwnLeaf(t *te
 			t.Errorf("size %d: %d of %d members enter above their own leaf for at least one sender, want %d",
 				row.size, aboveMembers, len(fixture.members), row.aboveMembers)
 		}
-		t.Logf("size %d: %d of %d pairs and %d of %d members enter the ladder above the receiver's own leaf",
-			row.size, abovePairs, pairs, aboveMembers, len(fixture.members))
+		if !slices.Equal(lone, row.lone) {
+			t.Errorf("size %d: leaves %v enter every sender's commit at their OWN leaf, want %v; this column is what says the property is the member's position rather than the group's size",
+				row.size, lone, row.lone)
+		}
+		unmerged, blanks, overFull := testSettledTreeShape(t, fixture)
+		// ZERO AT EVERY SIZE, and it is the fixture's own limit written as an assertion rather
+		// than as prose: nothing built on this file observes a member reached through an unmerged
+		// leaf, because there is no unmerged leaf here to reach through.
+		if unmerged != 0 {
+			t.Errorf("size %d: the settled tree carries %d unmerged leaf entries, and this file's header records that it carries none; a fixture that grew one reaches a resolution nothing here was written for",
+				row.size, unmerged)
+		}
+		// and every blank node it does carry stands over an unfilled leaf slot. A blank node over
+		// a FULL subtree is a direct path something blanked, which is what the settling removes.
+		if overFull != 0 {
+			t.Errorf("size %d: %d of the %d blank nodes stand over a fully populated subtree, so the settling left a real member's direct path blanked",
+				row.size, overFull, blanks)
+		}
+		t.Logf("size %d: %d of %d pairs and %d of %d members enter the ladder above the receiver's own leaf; %v enter at their own leaf for every sender; %d blank nodes and %d unmerged leaves",
+			row.size, abovePairs, pairs, aboveMembers, len(fixture.members), lone, blanks, unmerged)
 		fixture.closeAll()
 	}
-	t.Log("four is the smallest size at which EVERY member enters above its own leaf for some sender; three does it for two of its three, which is why a three member corpus would hide the missing ladder for whichever member a case happened to restore")
+	t.Log("four is the smallest size at which EVERY member enters above its own leaf for some sender; three does it for two of its three and five for four of its five, which is why the property is a member's position and not the group's size")
+}
+
+// testSettledTreeShape counts what a settled tree holds: unmerged leaf entries, blank nodes, and
+// the blank nodes standing over a subtree with no unfilled leaf slot in it.
+//
+// THE THIRD COUNT IS THE ONE THAT CARRIES THE CLAIM. A tree whose member count is not a power of
+// two has blank nodes by construction -- the array is padded up to the next power of two, and the
+// parents above the padding have nothing under them -- so "no blank nodes" is false at five and
+// says nothing at four. What is true at every size is that no blank node stands over a full
+// subtree, which is "no direct path has been blanked" written in terms a count can check.
+func testSettledTreeShape(t *testing.T, fixture *testSizedGroup) (unmerged int, blanks int, overFull int) {
+	t.Helper()
+	tree := fixture.members[0].group.tree
+	filled := map[NodeIndex]bool{}
+	for _, leaf := range tree.NonBlankLeaves() {
+		filled[leaf.NodeIndex()] = true
+	}
+	for x := uint32(0); x < tree.NodeWidth(); x += 1 {
+		at := NodeIndex(x)
+		if parent := tree.ParentAt(at); parent != nil {
+			unmerged += len(parent.UnmergedLeaves)
+		}
+		if !tree.IsBlank(at) {
+			continue
+		}
+		blanks += 1
+		empty := 0
+		for slot := uint32(0); slot < tree.NodeWidth(); slot += 2 {
+			if CommonAncestor(NodeIndex(slot), at) == at && !filled[NodeIndex(slot)] {
+				empty += 1
+			}
+		}
+		if empty == 0 {
+			overFull += 1
+		}
+	}
+	return unmerged, blanks, overFull
 }

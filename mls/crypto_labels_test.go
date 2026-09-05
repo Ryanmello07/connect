@@ -833,6 +833,12 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		// so a raised bound here would be a bound this field can never approach and would say
 		// nothing true about what it holds.
 		"group.go: syntax.ReadVector(r, readOnePathSecret)",
+		// the sender ratchet vector version 3 of the persisted state appended, the same decision
+		// as the ladder above it and reached the same way: both halves take the caller's Reader or
+		// Writer, so this runs under whichever limit the caller opened -- the raised one, because
+		// the blob it sits in carries a ratchet tree. The vector itself is bounded by the number of
+		// ratchets ONE leaf has, which is two.
+		"group.go: syntax.ReadVector(r, readOneSenderRatchet)",
 		"group.go: syntax.Unmarshal(blob.Context, &context)",
 		// the key package a ProposeAdd is handed, decoded at the DEFAULT limit and not the raised
 		// one. These are octets a caller FETCHED -- from a directory, from a peer, from whatever
@@ -863,6 +869,7 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		// are decoded at their own limits by the two entries around this one.
 		"group.go: syntax.UnmarshalLimit(raw, &blob, syntax.MaxRatchetTreeLength)",
 		"group.go: syntax.WriteVector(w, self.PathSecrets, writeOnePathSecret)",
+		"group.go: syntax.WriteVector(w, self.SenderRatchets, writeOneSenderRatchet)",
 		"group_context_verified.go: syntax.Marshal(&self.GroupContext)",
 		"group_context_verified.go: syntax.Unmarshal(signed, decoded)",
 		// the urmessage_group_policy body of MASTER section 6: its two vectors, the structure

@@ -2593,7 +2593,11 @@ func TestAClosedGroupProposesNothing(t *testing.T) {
 // below while observing nothing.
 type windowStore struct {
 	*testStore
-	putIds    [][]byte
+	putIds [][]byte
+	// the epoch each write named. It used to be left to the INDEX of the write, which was right
+	// only while a group happened to write once per epoch -- and a group now records the
+	// generation each seal spent, so it writes at the commit as well as at the merge.
+	putEpochs []uint64
 	putStates [][]byte
 	putLive   []bool
 	getIds    [][]byte
@@ -2607,6 +2611,7 @@ func newWindowStore() *windowStore {
 
 func (self *windowStore) PutGroupState(groupId []byte, epoch uint64, state []byte) error {
 	self.putIds = append(self.putIds, groupId)
+	self.putEpochs = append(self.putEpochs, epoch)
 	self.putStates = append(self.putStates, state)
 	self.putLive = append(self.putLive,
 		slices.ContainsFunc(state, func(b byte) bool { return b != 0 }))
@@ -2785,8 +2790,15 @@ func TestPersistErasesTheEncodedStateItHandedTheStore(t *testing.T) {
 	defer group.Close()
 	advanceEpochs(t, group, 2)
 
-	if len(store.putStates) != 3 {
-		t.Fatalf("the store was handed %d states and this group founded and merged twice", len(store.putStates))
+	// FIVE and not three, and the number moved because the group now writes MORE often rather than
+	// because this reading was loosened: a seal spends a generation of this leaf's ratchet, and
+	// (*Group).sealAndRecordLocked records what it spent before the ciphertext leaves. So each of
+	// the two epochs costs a persist at the commit it sealed as well as one at the merge, beside
+	// the founding write. The assertion below is unchanged and now runs over five states instead
+	// of three.
+	if len(store.putStates) != 5 {
+		t.Fatalf("the store was handed %d states and this group founded, then sealed and merged two commits",
+			len(store.putStates))
 	}
 	for at, state := range store.putStates {
 		// the live control: every one of them was non-zero INSIDE the call, so an all-zero
@@ -2806,8 +2818,9 @@ func TestPersistErasesTheEncodedStateItHandedTheStore(t *testing.T) {
 		}
 		// and the store's own copy is intact, which is what says the erase reached the group's
 		// buffer rather than the persisted state
-		if _, err := store.GetGroupState([]byte("group-1"), uint64(at)); err != nil {
-			t.Fatalf("epoch %d state is not in the store after the erase: %v", at, err)
+		if _, err := store.GetGroupState([]byte("group-1"), store.putEpochs[at]); err != nil {
+			t.Fatalf("the epoch %d state written at %d is not in the store after the erase: %v",
+				store.putEpochs[at], at, err)
 		}
 	}
 }
@@ -3249,10 +3262,14 @@ func TestAFailedPersistLeavesTheGroupAbleToProposeInTheEpochItMovedTo(t *testing
 	}
 
 	advanceEpochs(t, group, 1)
-	store.refusing = true
+	// the commit is BUILT before the store starts refusing, which it did not have to be until a
+	// seal began recording the generation it spent: (*Group).sealAndRecordLocked persists inside
+	// CreateCommit, so a store refusing from here would refuse the commit itself and this case
+	// would never reach the merge it is about.
 	if _, err := group.CreateCommit(nil, nil, nil); err != nil {
 		t.Fatalf("CreateCommit: %v", err)
 	}
+	store.refusing = true
 	before := group.Epoch()
 	if err := group.MergePendingCommit(); !errors.Is(err, errTheStoreRefusedThisWrite) {
 		t.Fatalf("MergePendingCommit over a refusing store = %v, want the store's own refusal", err)
@@ -3262,7 +3279,14 @@ func TestAFailedPersistLeavesTheGroupAbleToProposeInTheEpochItMovedTo(t *testing
 		t.Fatalf("Epoch = %d after a refused persist, want %d; this test is about a group that moved",
 			group.Epoch(), before+1)
 	}
-	// and the cache moved with it, which is the whole claim
+	// and the cache moved with it, which is the whole claim.
+	//
+	// The store is let go first, for the reason the commit was built before it started refusing: a
+	// proposal is sealed and the seal is recorded, so a refusing store refuses ProposeUpdate for a
+	// reason that has nothing to do with the epoch its cache is bound to -- and this case would
+	// then be satisfied by a refusal that says nothing. What it observes is unchanged: after a
+	// merge whose persist was refused, the group proposes in the epoch it moved to.
+	store.refusing = false
 	if _, err := group.ProposeUpdate(); err != nil {
 		t.Fatalf("a group whose persist was refused cannot propose in the epoch it moved to: %v; the cache is bound to the epoch that closed and nothing in this package releases it",
 			err)

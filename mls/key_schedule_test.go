@@ -10309,6 +10309,32 @@ var epochSecretMethodsTheSweepDrivesInstead = map[string]string{
 	"(*Group).Unprotect": "is (*Group).ProcessMessage with the application arm taken out of it, so it " +
 		"reaches the parent secret through the same call and answers the plaintext that call " +
 		"decrypted; bytesTheGroupHandsOut drives it over a real inbound message and compares it",
+	// THE FIVE SENDING DOORS, and they are here because of what a seal now costs. Sealing a message
+	// spends a generation of this leaf's ratchet, and a generation spent and not RECORDED is a
+	// generation a restored member draws again -- two plaintexts under one key and one base nonce.
+	// So (*Group).sealAndRecordLocked persists before the ciphertext leaves, persist reaches
+	// marshalState, and marshalState asks the schedule for the secret this epoch is rebuilt from.
+	// Every one of these five is on that path and none of them was before.
+	//
+	// The exemption is the same one CreateCommit rests on and it rests on the same sweep: each of
+	// these answers the message it sealed, bytesTheGroupHandsOut drives all five with the arguments
+	// a caller would use -- ProposeUpdate takes none and is called directly -- and compares every
+	// octet each of them hands out against the epoch secret the fixture was founded over.
+	"(*Group).Protect": "seals an application message and records the generation it spent, so it " +
+		"reaches the parent secret through persist and answers the ciphertext; " +
+		"bytesTheGroupHandsOut drives it and compares every octet of that",
+	"(*Group).ProposeAdd": "seals a proposal and records the generation it spent, so it reaches " +
+		"the parent secret through persist and answers the encoded message; " +
+		"bytesTheGroupHandsOut drives it and compares every octet of that",
+	"(*Group).ProposeRemove": "seals a proposal and records the generation it spent, so it reaches " +
+		"the parent secret through persist and answers the encoded message; " +
+		"bytesTheGroupHandsOut drives it and compares every octet of that",
+	"(*Group).ProposeUpdate": "seals a proposal and records the generation it spent, so it reaches " +
+		"the parent secret through persist and answers the encoded message; it takes no arguments " +
+		"and bytesTheGroupHandsOut calls it directly and compares every octet of that",
+	"(*Group).ProposeGroupContextExtensions": "seals a proposal and records the generation it " +
+		"spent, so it reaches the parent secret through persist and answers the encoded message; " +
+		"bytesTheGroupHandsOut drives it and compares every octet of that",
 }
 
 // bytesTheStagedCommitHandsOut is every byte slice reachable through *StagedCommit's own exported

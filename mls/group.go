@@ -105,6 +105,31 @@ var (
 	errGroupStateLadderOrder = errors.New(
 		"mls: the persisted group state's path secrets are not in strictly increasing node order")
 
+	// errGroupStateSenderRatchetOrder is a persisted sender ratchet vector that is not in strictly
+	// increasing RatchetType order.
+	//
+	// A SEPARATE VALUE from the one above for that value's own reason -- a different fault with a
+	// different cause is a different door -- and the cause here is the one an ordering rule over
+	// the ladder has no equivalent of. Two ladder entries naming one node COLLAPSE into one map
+	// entry; two ratchet entries naming one kind OVERWRITE, so the restored member stands wherever
+	// the entry that happened to come last says. When that is the earlier of the two, the member
+	// has been handed back a generation it has already sent under -- which is the key reuse the
+	// sender ratchet field exists to prevent, reached from a corrupted store rather than from a
+	// missing field.
+	errGroupStateSenderRatchetOrder = errors.New(
+		"mls: the persisted group state's sender ratchets are not in strictly increasing ratchet type order")
+
+	// errGroupStateSenderRatchet is a persisted sender ratchet vector the restored epoch's secret
+	// tree refused.
+	//
+	// It wraps whatever the secret tree said -- a secret of the wrong length, a leaf outside the
+	// tree, a ratchet type this build does not have -- for errGroupStatePathSecret's reason one
+	// field over: a caller needs to be able to ask "is this state's own sender position the thing
+	// that is wrong" and get the true answer, rather than reading a secret tree range failure and
+	// going to look at the group's size.
+	errGroupStateSenderRatchet = errors.New(
+		"mls: the persisted group state's sender ratchets do not install into the epoch it names")
+
 	// errStagedCommitErased is a staged commit whose key material has been erased, handed to a
 	// door that installs one.
 	//
@@ -962,6 +987,46 @@ func (self *Group) persist() error {
 	return err
 }
 
+// sealAndRecordLocked seals one message under this epoch and RECORDS what the seal spent before the
+// ciphertext leaves this group.
+//
+// THE PERSIST IS WHAT MAKES A SEAL SURVIVABLE. A seal consumes a generation of this leaf's ratchet,
+// and the persisted state is what a later LoadGroup rebuilds that ratchet from -- so a send that
+// did not write the new position back leaves the stored state standing where the ratchet was
+// BEFORE it. The restored member then draws a generation it has already used: every peer answers
+// ErrRatchetGenerationConsumed and drops the message, and, one layer worse, two different
+// plaintexts of this epoch have gone out under one (key, base nonce) pair for this leaf and
+// generation. The only thing between that and an AEAD nonce collision is the 32 bit reuse_guard.
+//
+// ONE DOOR AND NOT THREE PERSISTS, because there are three seal sites in this file -- a proposal, a
+// commit and an application message -- and all three draw from the same two ratchets of the same
+// leaf. A site somebody adds later records what it spent by calling this rather than by remembering
+// to, which is the same argument the erase helpers of this package are written under.
+//
+// IT RUNS BEFORE THE CALLER IS HANDED ANYTHING, AND ITS FAILURE IS THE CALL'S. The alternative --
+// answer the ciphertext and report the store's refusal some other way -- hands out a message whose
+// generation nothing has recorded, which is the defect above reached one step later. A refusal here
+// costs the generation and nothing else: the ciphertext is dropped inside this function, so nothing
+// under that generation ever reaches a peer, and what is left behind is the ordinary out-of-order
+// gap every receiver already handles.
+//
+// WHAT IT COSTS is one PutGroupState per message sent, and marshalState re-encodes the ratchet tree
+// each time. That is the price of the store being the durability boundary; the alternative is a
+// client whose crash recovery reuses a nonce.
+//
+// The caller holds stateLock.
+func (self *Group) sealAndRecordLocked(authenticated *AuthenticatedContent) (*PrivateMessage, error) {
+	private, err := SealPrivateMessage(self.crypto, self.secretTree,
+		self.senderDataSecretLocked(), authenticated, PaddingSizeV1)
+	if err != nil {
+		return nil, err
+	}
+	if err := self.persist(); err != nil {
+		return nil, err
+	}
+	return private, nil
+}
+
 // groupStateBlobVersion is bumped when the blob layout changes, so a state written by an older
 // build is REFUSED rather than misread. The two are not the same failure: a misread blob decodes
 // into a group whose secrets nobody agrees with, and the first symptom of one is a member whose
@@ -969,9 +1034,28 @@ func (self *Group) persist() error {
 // Version 2 carries this member's TreeKEM path secrets. Version 1 did not, and a state written at
 // it restores a member holding its own leaf key and nothing above it -- which is a working group
 // of TWO, where every ciphertext a commit addresses to this member stands at its own leaf, and a
-// member of a group of FOUR OR MORE that cannot open the next commit from the far side of the
-// tree. Refused rather than read with an empty ladder, because that restore is the defect.
-const groupStateBlobVersion uint16 = 2
+// member WITH A COPATH NODE ABOVE ITS OWN LEAF that cannot open the next commit from the far side
+// of the tree.
+//
+// THAT IS A PROPERTY OF THE MEMBER'S POSITION AND NOT OF THE GROUP'S SIZE, which is worth spelling
+// out because this comment used to say "a group of four or more" and that is false. Measured over
+// sizes two to eight by TestFourIsTheSmallestGroupWhoseMembersEnterTheLadderAboveTheirOwnLeaf: at
+// FIVE members leaf 4 stands alone under the right subtree exactly as leaf 2 does at three, so it
+// enters every sender's commit at its own leaf and restores correctly with an empty ladder, while
+// four of its five neighbours do not. Four is the smallest size at which EVERY member is affected,
+// which is a different sentence from the one this said.
+//
+// Refused rather than read with an empty ladder, because that restore is the defect.
+//
+// Version 3 carries this member's own SENDER RATCHET POSITION beside the ladder. Version 2 did
+// not, and a state written at it restores a member whose next Protect draws generation 0 of a
+// ratchet every peer is already past: each peer answers ErrRatchetGenerationConsumed and drops the
+// message -- and the head differs per peer, so the recovery is not even uniform -- while two
+// different plaintexts of that epoch have been sealed under one (key, base nonce) pair for this
+// leaf and generation. The only thing between that and an AEAD nonce collision is the 32 bit
+// reuse_guard. Refused rather than read at generation 0, for the reason version 1 is refused
+// rather than read with an empty ladder: the restore IS the defect.
+const groupStateBlobVersion uint16 = 3
 
 // pathSecretEntry is one rung of this member's TreeKEM ladder as the persisted state carries it:
 // the node the secret belongs to, and the secret.
@@ -1016,6 +1100,65 @@ func readOnePathSecret(r *syntax.Reader) (pathSecretEntry, error) {
 // storage syntax.Reader allocated for this one call, and LoadGroup owes it the erase it already
 // owes the other two secrets the blob carries.
 func zeroizePathSecretEntries(entries []pathSecretEntry) {
+	for _, entry := range entries {
+		zeroizeSecret(entry.Secret)
+	}
+}
+
+// senderRatchetEntry is one of this member's OWN sender ratchets as the persisted state carries
+// it: which ratchet, how many generations it has handed out, and the secret the next one comes
+// out of.
+//
+// A COUNT AND NOT THE (head, exhausted) PAIR the ratchet itself holds, and (*ratchet).consumed
+// says why: the pair has a state it must never be in, and a field a corrupted store can write is
+// a field that will one day hold it.
+//
+// THE SECRET IS HERE RATHER THAN THE COUNT ALONE, which is the trade this entry makes and the one
+// worth reading. A count on its own is enough -- a fresh ratchet stepped forward that many times
+// reaches the same secret -- and it would make a restore cost one KDF call per message this member
+// has ever sent in the epoch, a number the store's contents choose, up to 2^32. Carrying the
+// secret makes the restore O(1) and adds NO secret to the blob that was not already derivable from
+// it: the same state carries the restore secret, and the encryption secret expanded out of that
+// derives every leaf's every ratchet from generation 0. What it does add is a second copy on the
+// DISK, which is the store's obligation to seal -- spec A section 3.5 -- exactly as for the two
+// secrets this blob already carried.
+type senderRatchetEntry struct {
+	Kind     RatchetType
+	Consumed uint64
+	Secret   []byte
+}
+
+// The element halves, named rather than written as closures at the call site, for
+// writeOnePathSecret's reason.
+func writeOneSenderRatchet(w *syntax.Writer, entry senderRatchetEntry) error {
+	w.WriteUint8(uint8(entry.Kind))
+	w.WriteUint64(entry.Consumed)
+	w.WriteOpaque(entry.Secret)
+	return w.Err()
+}
+
+func readOneSenderRatchet(r *syntax.Reader) (senderRatchetEntry, error) {
+	kind, err := r.ReadUint8()
+	if err != nil {
+		return senderRatchetEntry{}, err
+	}
+	consumed, err := r.ReadUint64()
+	if err != nil {
+		return senderRatchetEntry{}, err
+	}
+	secret, err := r.ReadOpaque()
+	if err != nil {
+		return senderRatchetEntry{}, err
+	}
+	return senderRatchetEntry{Kind: RatchetType(kind), Consumed: consumed, Secret: secret}, nil
+}
+
+// zeroizeSenderRatchetEntries erases every secret in a DECODED sender ratchet vector.
+//
+// Read side only, for zeroizePathSecretEntries' reason and it is the same asymmetry: on the write
+// side each Secret is a view of the live ratchet's own storage, so an erase there would destroy
+// the ratchet this group is sending under.
+func zeroizeSenderRatchetEntries(entries []senderRatchetEntry) {
 	for _, entry := range entries {
 		zeroizeSecret(entry.Secret)
 	}
@@ -1089,6 +1232,11 @@ type groupStateBlob struct {
 	// truncated vector -- which is the difference between "migrate or discard this state" and a
 	// decode failure that says nothing about why.
 	PathSecrets []pathSecretEntry
+	// and where this member's own two ratchets stand, which is what makes this state a restore of
+	// a SENDER rather than only of a receiver. LAST for the reason the ladder is last: each layout
+	// is a strict prefix of the next, so a state written by an older build stops at the version
+	// check rather than at a truncated vector.
+	SenderRatchets []senderRatchetEntry
 }
 
 var _ syntax.Codec = (*groupStateBlob)(nil)
@@ -1105,12 +1253,49 @@ func (self *groupStateBlob) MarshalMLS(w *syntax.Writer) error {
 	w.WriteOpaque(self.OwnEncPriv)
 	w.WriteUint8(self.RestoreKind)
 	w.WriteOpaque(self.RestoreSecret)
-	return syntax.WriteVector(w, self.PathSecrets, writeOnePathSecret)
+	if err := syntax.WriteVector(w, self.PathSecrets, writeOnePathSecret); err != nil {
+		return err
+	}
+	return syntax.WriteVector(w, self.SenderRatchets, writeOneSenderRatchet)
 }
 
-// UnmarshalMLS reads the blob. It STAGES -- every field into a local, the receiver assigned whole
-// at the end -- for the reason every decoder in this package stages: a truncated state has to
-// leave the caller holding what it had rather than a composite of two epochs.
+// refuseDecodedGroupState erases the key material a REFUSED decode has already read, and answers
+// the refusal.
+//
+// IT EXISTS BECAUSE THE RECEIVER IS NOT ASSIGNED ON THESE PATHS, which is what makes a refusal
+// here the one door in this file whose caller cannot clean up after it. LoadGroup installs three
+// deferred erases over the blob it passes in, and every one of them runs over the value the caller
+// still holds -- so a decode that read this member's leaf key, its restore secret and its whole
+// ladder and then refused leaves those three defers erasing nil, while the octets themselves are
+// storage syntax.Reader allocated for this one call and nothing in the process can reach again.
+//
+// ONE FUNCTION AND NOT AN ERASE WRITTEN AT EACH RETURN, which is this package's rule for drop
+// sites and is the half that was wrong here: the ladder order refusal was added as a fourth exit
+// past the first secret and erased nothing, beside three read failures that erased nothing either.
+// A site somebody adds later erases the whole of what the decode holds rather than the fields
+// whoever wrote it remembered.
+//
+// The noinline directive is the erase-helper class's: every store is inside zeroizeSecret and the
+// two vector helpers, reached with storage of the staged value handed over as an argument.
+//
+//go:noinline
+func refuseDecodedGroupState(staged *groupStateBlob, err error) error {
+	zeroizeSecret(staged.OwnEncPriv)
+	zeroizeSecret(staged.RestoreSecret)
+	zeroizePathSecretEntries(staged.PathSecrets)
+	zeroizeSenderRatchetEntries(staged.SenderRatchets)
+	return err
+}
+
+// UnmarshalMLS reads the blob. It STAGES -- every field into one local value, the receiver
+// assigned whole at the end -- for the reason every decoder in this package stages: a truncated
+// state has to leave the caller holding what it had rather than a composite of two epochs.
+//
+// ONE STAGED VALUE AND NOT NINE LOCALS, which is the shape the erase below needs. Every refusal
+// past the first secret drops this member's leaf key, its restore secret and its whole ladder, and
+// a refusal is the one exit whose caller cannot erase them -- see refuseDecodedGroupState. With
+// nine locals each such exit would carry its own list of what to erase, which is the enumeration
+// that was already wrong here in four places.
 func (self *groupStateBlob) UnmarshalMLS(r *syntax.Reader) error {
 	version, err := r.ReadUint16()
 	if err != nil {
@@ -1127,65 +1312,70 @@ func (self *groupStateBlob) UnmarshalMLS(r *syntax.Reader) error {
 		return fmt.Errorf("%w: the state is version %d and this build writes %d",
 			errGroupStateBlobVersion, version, groupStateBlobVersion)
 	}
-	context, err := r.ReadOpaque()
+	staged := groupStateBlob{Version: version}
+	staged.Context, err = r.ReadOpaque()
 	if err != nil {
 		return err
 	}
-	tree, err := r.ReadOpaque()
+	staged.Tree, err = r.ReadOpaque()
 	if err != nil {
 		return err
 	}
-	confirmed, err := r.ReadOpaque()
+	staged.Confirmed, err = r.ReadOpaque()
 	if err != nil {
 		return err
 	}
-	interim, err := r.ReadOpaque()
+	staged.Interim, err = r.ReadOpaque()
 	if err != nil {
 		return err
 	}
-	ownLeaf, err := r.ReadUint32()
+	staged.OwnLeaf, err = r.ReadUint32()
 	if err != nil {
 		return err
 	}
-	ownEncPriv, err := r.ReadOpaque()
+	// EVERY REFUSAL FROM HERE ON DROPS KEY MATERIAL, AND A DROPPED DECODE IS AN ERASED ONE. The
+	// four fields below are this member's leaf HPKE private key, the secret its whole epoch is
+	// rebuilt from, every rung of its TreeKEM ladder and the secret both of its sender ratchets
+	// stand on. This read is the last one that can fail with nothing yet to erase.
+	staged.OwnEncPriv, err = r.ReadOpaque()
 	if err != nil {
 		return err
 	}
-	kind, err := r.ReadUint8()
+	staged.RestoreKind, err = r.ReadUint8()
 	if err != nil {
-		return err
+		return refuseDecodedGroupState(&staged, err)
 	}
-	secret, err := r.ReadOpaque()
+	staged.RestoreSecret, err = r.ReadOpaque()
 	if err != nil {
-		return err
+		return refuseDecodedGroupState(&staged, err)
 	}
-	pathSecrets, err := syntax.ReadVector(r, readOnePathSecret)
+	staged.PathSecrets, err = syntax.ReadVector(r, readOnePathSecret)
 	if err != nil {
-		return err
+		return refuseDecodedGroupState(&staged, err)
+	}
+	staged.SenderRatchets, err = syntax.ReadVector(r, readOneSenderRatchet)
+	if err != nil {
+		return refuseDecodedGroupState(&staged, err)
 	}
 	// STRICTLY INCREASING, which is the shape marshalState writes and therefore the only shape this
 	// build can have produced. It refuses a reordered vector and, more importantly, a REPEATED node:
 	// two entries naming one node collapse into one map entry when the ladder is rebuilt, so the
 	// restored member holds one fewer rung than it persisted and nothing downstream can tell.
 	// See errGroupStateLadderOrder.
-	for i := 1; i < len(pathSecrets); i += 1 {
-		if pathSecrets[i].Node <= pathSecrets[i-1].Node {
-			return fmt.Errorf("%w: entry %d names node %d after node %d",
-				errGroupStateLadderOrder, i, pathSecrets[i].Node, pathSecrets[i-1].Node)
+	//
+	// THE SENDER RATCHET VECTOR HAS THE SAME RULE AND IT IS NOT MADE HERE, which is a difference
+	// worth writing down rather than leaving to be noticed. A repeated node in the ladder is
+	// invisible after this function, because the vector becomes a MAP one statement into LoadGroup
+	// and the collapse has already happened; a repeated ratchet type is invisible at the point it
+	// is INSTALLED, because installing is what overwrites. So that check stands in
+	// (*SecretTree).RestoreSenderRatchets, beside the store it protects, and this one stands here.
+	for i := 1; i < len(staged.PathSecrets); i += 1 {
+		if staged.PathSecrets[i].Node <= staged.PathSecrets[i-1].Node {
+			return refuseDecodedGroupState(&staged, fmt.Errorf("%w: entry %d names node %d after node %d",
+				errGroupStateLadderOrder, i, staged.PathSecrets[i].Node, staged.PathSecrets[i-1].Node))
 		}
 	}
-	*self = groupStateBlob{
-		Version:       version,
-		Context:       context,
-		Tree:          tree,
-		Confirmed:     confirmed,
-		Interim:       interim,
-		OwnLeaf:       ownLeaf,
-		OwnEncPriv:    ownEncPriv,
-		RestoreKind:   kind,
-		RestoreSecret: secret,
-		PathSecrets:   pathSecrets,
-	}
+	*self = staged
 	return nil
 }
 
@@ -1216,6 +1406,13 @@ func (self *Group) marshalState() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	// asked SECOND and for the first field's reason: an erased secret tree refuses here rather
+	// than answering one zero secret per ratchet, and the alternative is persisting a sender
+	// position every party in the world can derive keys from.
+	senderRatchets, err := self.secretTree.SenderRatchets(self.ownLeaf)
+	if err != nil {
+		return nil, err
+	}
 	tree, err := syntax.MarshalLimit(self.tree, syntax.MaxRatchetTreeLength)
 	if err != nil {
 		return nil, err
@@ -1238,9 +1435,21 @@ func (self *Group) marshalState() ([]byte, error) {
 		// group. Without it a restored member holds its own leaf key alone: every ciphertext a
 		// commit addresses to it stands at its own leaf in a group of two -- which is why nothing
 		// reported this for as long as the corpus had no larger group -- and stands at a copath
-		// node it can no longer derive a key for the moment the group has four members and the
-		// next commit comes from the other side of the tree.
+		// node it can no longer derive a key for as soon as this member HAS a copath node above
+		// its own leaf and the next commit comes from the other side of the tree.
+		//
+		// That is a property of the member's POSITION and not of the group's size, and this
+		// comment used to say "four members" as though it were the second. Leaf 4 of a group of
+		// FIVE stands alone under the right subtree, enters every sender's commit at its own leaf,
+		// and restores correctly with an empty ladder; leaf 0 of a group of THREE does not. Four
+		// is the smallest size at which every member is affected, which is a different sentence.
 		PathSecrets: pathSecretsOf(self.ownPriv),
+		// AND WHERE THIS MEMBER'S OWN RATCHETS STAND, which is what makes the state a restore of a
+		// SENDER. Without it a restored member draws generation 0 of a ratchet every peer is past:
+		// each peer refuses the message as a replay, and two different plaintexts of this epoch go
+		// out under one (key, base nonce) pair for this leaf and generation. See the version
+		// constant, and (*SecretTree).SenderRatchets for why nothing is created to answer it.
+		SenderRatchets: senderRatchets,
 	}
 	return syntax.MarshalLimit(blob, syntax.MaxRatchetTreeLength)
 }
@@ -1670,8 +1879,7 @@ func (self *Group) propose(proposal *Proposal) ([]byte, error) {
 	}
 	// A-ASSUME-4: handshake traffic travels as a PrivateMessage, so the transport learns neither
 	// which member proposed nor what was proposed.
-	private, err := SealPrivateMessage(self.crypto, self.secretTree,
-		self.senderDataSecretLocked(), authenticated, PaddingSizeV1)
+	private, err := self.sealAndRecordLocked(authenticated)
 	if err != nil {
 		return nil, err
 	}
@@ -2051,8 +2259,7 @@ func (self *Group) CreateCommit(byReference [][]byte, byValue []Proposal, opts *
 	//
 	// LAST, because it is the first thing here that cannot be undone: the seal consumes a
 	// generation of this leaf's ratchet whether or not the commit is ever sent.
-	private, err := SealPrivateMessage(self.crypto, self.secretTree,
-		self.senderDataSecretLocked(), authenticated, PaddingSizeV1)
+	private, err := self.sealAndRecordLocked(authenticated)
 	if err != nil {
 		return nil, err
 	}
@@ -2447,6 +2654,9 @@ func LoadGroup(cfg *GroupConfig, epoch uint64, signer SignaturePrivateKey) (*Gro
 	// package name a function that erases, so a site somebody adds later erases the whole of what
 	// it holds rather than the fields whoever wrote it remembered.
 	defer zeroizePathSecretEntries(blob.PathSecrets)
+	// and the same obligation over the sender ratchet vector, which carries the secret both of
+	// this member's own ratchets are standing on.
+	defer zeroizeSenderRatchetEntries(blob.SenderRatchets)
 	// the version is NOT compared here. The decoder refuses a layout this build does not read at the
 	// first field of the blob, which is where the version is written for that purpose; a second
 	// comparison here would be a line no state can reach and therefore a line no test can hold.
@@ -2487,6 +2697,38 @@ func LoadGroup(cfg *GroupConfig, epoch uint64, signer SignaturePrivateKey) (*Gro
 	for _, entry := range blob.PathSecrets {
 		ownPriv.PathSecrets[entry.Node] = cloneBytes(entry.Secret)
 	}
+	// EVERY REFUSAL FROM HERE ON DROPS KEY MATERIAL THIS CALL BUILT, and a dropped epoch is an
+	// erased one. ownPriv holds this device's leaf key and a clone of every rung of its ladder;
+	// the schedule below holds the init secret, the confirmation key, the encryption secret, the
+	// epoch authenticator, the exporter and the resumption PSK; the secret tree holds every
+	// message key derived from that encryption secret. After the return nothing in this process
+	// can reach any of it, and unreachable is not erased.
+	//
+	// IT IS ONE DEFERRED ERASE AND NOT A LIST AT EACH REFUSAL, which is JoinFromWelcome's `handedOn`
+	// one function over, and it is here because the list shape had already failed. COUNTED off the
+	// body this replaces: TEN refusals stood after this statement, ONE of them erased ownPriv --
+	// the Consistent arm, which is the only one anybody wrote it into -- and the other nine
+	// dropped this device's leaf key and its whole ladder unerased, two of them dropping the
+	// schedule as well. A refusal somebody adds later erases the whole of what this call is
+	// holding rather than the values whoever wrote it remembered.
+	//
+	// The nil guards are the price of a defer installed before the values exist, and they are the
+	// honest shape: this runs on the refusals ABOVE the constructors as well.
+	handedOn := false
+	var schedule *KeySchedule
+	var secretTree *SecretTree
+	defer func() {
+		if handedOn {
+			return
+		}
+		ownPriv.Zeroize()
+		if schedule != nil {
+			schedule.Zeroize()
+		}
+		if secretTree != nil {
+			secretTree.Zeroize()
+		}
+	}()
 	// AND THE LADDER IS CHECKED AGAINST THE TREE IT IS ABOUT TO BE USED WITH. The interim transcript
 	// comparison further down is a commitment to the restore secret and to the kind that says how to
 	// use it, and it commits to NOTHING about these secrets: a path secret is not an input to the key
@@ -2495,13 +2737,9 @@ func LoadGroup(cfg *GroupConfig, epoch uint64, signer SignaturePrivateKey) (*Gro
 	// decrypts nothing, and reports a decryption failure against commits that are perfectly well
 	// formed. (*TreeKEMPrivate).Consistent is that check and its own comment names the same symptom.
 	if err := ownPriv.Consistent(crypto, tree); err != nil {
-		// erased before it is dropped, for (*Group).ClearPendingCommit's reason: those clones are
-		// this call's own copies of this member's key material.
-		ownPriv.Zeroize()
 		return nil, fmt.Errorf("%w: %w", errGroupStatePathSecret, err)
 	}
 
-	var schedule *KeySchedule
 	switch restoreKind(blob.RestoreKind) {
 	case restoreFromEpochSecret:
 		schedule, err = NewKeyScheduleFromEpochSecret(crypto, blob.RestoreSecret, &context)
@@ -2520,13 +2758,17 @@ func LoadGroup(cfg *GroupConfig, epoch uint64, signer SignaturePrivateKey) (*Gro
 		return nil, err
 	}
 
-	secretTree, err := NewSecretTree(crypto, tree.LeafWidth(), schedule.Secrets().Encryption)
+	secretTree, err = NewSecretTree(crypto, tree.LeafWidth(), schedule.Secrets().Encryption)
 	if err != nil {
-		// a fully derived epoch that no group will ever hold, dropped here rather than left for
-		// the collector. Every refusal below does the same, for (*Group).ClearPendingCommit's
-		// reason: a derived epoch is a derived epoch whether or not anybody entered it.
-		schedule.Zeroize()
 		return nil, err
+	}
+	// AND THE SENDER POSITION, which is the difference between restoring a member and restoring a
+	// member that can still speak. A fresh secret tree starts every ratchet at generation 0, so
+	// without this the very next Protect draws a generation every peer is already past: each peer
+	// answers ErrRatchetGenerationConsumed and drops the message, and two different plaintexts of
+	// this epoch have been sealed under one (key, base nonce) pair for this leaf and generation.
+	if err := secretTree.RestoreSenderRatchets(ownLeaf, blob.SenderRatchets); err != nil {
+		return nil, fmt.Errorf("%w: %w", errGroupStateSenderRatchet, err)
 	}
 	transcript := InitialTranscriptHashes()
 	transcript.Confirmed = blob.Confirmed
@@ -2537,8 +2779,6 @@ func LoadGroup(cfg *GroupConfig, epoch uint64, signer SignaturePrivateKey) (*Gro
 	// both of those are already here.
 	confirmationTag := schedule.ConfirmationTag(transcript.Confirmed)
 	if len(confirmationTag) != crypto.HashSize() {
-		schedule.Zeroize()
-		secretTree.Zeroize()
 		return nil, fmt.Errorf("%w: the restored schedule answered %d octets, want %d",
 			errCreationConfirmationTag, len(confirmationTag), crypto.HashSize())
 	}
@@ -2565,13 +2805,9 @@ func LoadGroup(cfg *GroupConfig, epoch uint64, signer SignaturePrivateKey) (*Gro
 	// every comparison this package ships and not only over the ones whose operands are secret.
 	interim, err := InterimTranscriptHash(crypto, transcript.Confirmed, confirmationTag)
 	if err != nil {
-		schedule.Zeroize()
-		secretTree.Zeroize()
 		return nil, err
 	}
 	if subtle.ConstantTimeCompare(interim, transcript.Interim) != 1 {
-		schedule.Zeroize()
-		secretTree.Zeroize()
 		return nil, errGroupStateTranscript
 	}
 	groupInfo := &GroupInfo{
@@ -2580,24 +2816,18 @@ func LoadGroup(cfg *GroupConfig, epoch uint64, signer SignaturePrivateKey) (*Gro
 		Signer:          ownLeaf,
 	}
 	if err := groupInfo.Sign(crypto, signer); err != nil {
-		schedule.Zeroize()
-		secretTree.Zeroize()
 		return nil, err
 	}
 	verified, err := groupInfo.VerifiedContext(crypto, tree)
 	if err != nil {
-		schedule.Zeroize()
-		secretTree.Zeroize()
 		return nil, err
 	}
 	proposals, err := NewProposalCache(verified)
 	if err != nil {
-		schedule.Zeroize()
-		secretTree.Zeroize()
 		return nil, err
 	}
 
-	return &Group{
+	group := &Group{
 		store:  cfg.Store,
 		crypto: crypto,
 		// the signing key and the credential are COPIED, for NewGroup's reason: the key is an
@@ -2615,7 +2845,11 @@ func LoadGroup(cfg *GroupConfig, epoch uint64, signer SignaturePrivateKey) (*Gro
 		transcript:  transcript,
 		proposals:   proposals,
 		restoreKind: restoreKind(blob.RestoreKind),
-	}, nil
+	}
+	// the one path that does not drop what this call derived: the group owns all three now and
+	// owes them its own Close.
+	handedOn = true
+	return group, nil
 }
 
 
@@ -4065,8 +4299,7 @@ func (self *Group) Protect(aad, plaintext []byte) ([]byte, error) {
 	}
 	// LAST, because it is the first thing here that cannot be undone: the seal consumes a
 	// generation of this leaf's ratchet whether or not the message is ever sent.
-	private, err := SealPrivateMessage(self.crypto, self.secretTree,
-		self.senderDataSecretLocked(), authenticated, PaddingSizeV1)
+	private, err := self.sealAndRecordLocked(authenticated)
 	if err != nil {
 		return nil, err
 	}

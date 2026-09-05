@@ -841,6 +841,179 @@ func (self *SecretTree) SenderGeneration(leaf LeafIndex, kind RatchetType) (uint
 	return r.head, nil
 }
 
+// SenderRatchets is where this leaf's OWN ratchets stand, as the persisted epoch state carries
+// them: one entry per ratchet of that leaf THAT ALREADY EXISTS, in ascending RatchetType order.
+//
+// EXPORTED AND ANSWERING AN UNEXPORTED TYPE, which is a shape worth explaining rather than
+// leaving to be noticed. This type's lock discipline is that an exported entry point takes
+// stateLock and an unexported helper assumes its caller holds it -- and the caller here is
+// (*Group).marshalState, which holds the GROUP's lock and not this one. So the door has to be an
+// exported one. What keeps it from being a new exported way to reach key material is the return
+// type: senderRatchetEntry is unexported, so no caller outside this package can read a Secret out
+// of one, build one, or do anything with the answer except hand it back to RestoreSenderRatchets
+// on a tree it built itself.
+//
+// IT CREATES NOTHING, which is the whole difference between this and SenderGeneration. That one
+// reaches ratchetFor in order to answer, and ratchetFor takes the leaf's node secret out of the
+// tree -- so a persist asking it would consume this leaf's secret on behalf of a member that has
+// never sent, and would then record a position of zero for two ratchets the live tree had not
+// built either. A leaf with no ratchet has sent nothing under this epoch, and the ABSENCE is the
+// honest record of that.
+//
+// THE KINDS ARE READ OFF THE TABLE AND NOT LISTED HERE. What has to be recorded is every ratchet
+// this leaf is drawing from, so the class is derived from the ratchets the tree holds rather than
+// from the two RatchetType constants a reader remembers; a third kind added to this file joins
+// the persisted state by existing, rather than on the day somebody notices this function.
+//
+// SORTED, and pathSecretsOf's two reasons hold unchanged: a map has no order and these octets go
+// to a disk, so two persists of one unchanged epoch must not answer different octets; and the sort
+// is written out rather than imported, because this package's constant-time gate derives its
+// banned comparator class out of the imports each production file makes.
+//
+// NO SECRET IS COPIED, which is marshalState's rule for every field of the blob this fills. Each
+// Secret here is the live ratchet's own storage, and that is safe for exactly as long as the
+// caller encodes before anything can step the ratchet again: step ZEROIZES the secret it replaces,
+// so a blob built here and marshalled after a later send would persist a run of zeros -- a ratchet
+// secret every party in the world can compute. (*Group).persist is that caller, it holds the
+// group's own lock, and it runs in the same statement list as the seal it is recording.
+func (self *SecretTree) SenderRatchets(leaf LeafIndex) ([]senderRatchetEntry, error) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	// AN ERASED EPOCH REFUSES RATHER THAN ANSWERING, which is this type's rule everywhere and here
+	// it is the difference between a refused persist and a persisted run of zeros. Zeroize
+	// overwrites every ratchet secret in place and leaves the ratchets in the table, so without
+	// this the vector below is one zero secret per ratchet -- and a state written from it restores
+	// a member sending under a ratchet every party in the world can compute.
+	if err := self.refuseIfErased(leaf); err != nil {
+		return nil, err
+	}
+	out := []senderRatchetEntry{}
+	for key, r := range self.ratchets {
+		if key.leaf != leaf {
+			continue
+		}
+		out = append(out, senderRatchetEntry{
+			Kind: key.kind, Consumed: r.consumed(), Secret: r.secret})
+	}
+	for i := 1; i < len(out); i += 1 {
+		for j := i; 0 < j && out[j].Kind < out[j-1].Kind; j -= 1 {
+			out[j], out[j-1] = out[j-1], out[j]
+		}
+	}
+	return out, nil
+}
+
+// RestoreSenderRatchets puts this leaf's own ratchets back where the persisted state left them.
+//
+// Exported for SenderRatchets' reason and on the same terms: the caller is (*Group).LoadGroup,
+// which holds no lock of this type, and the argument is a vector of an unexported element type, so
+// the only value anything outside this package could pass is one this package answered.
+//
+// WITHOUT IT A RESTORED MEMBER SENDS UNDER A GENERATION IT HAS ALREADY USED. A fresh SecretTree
+// starts every ratchet at generation 0, so a member restored into an epoch it has already spoken
+// in draws 0 again: each peer answers ErrRatchetGenerationConsumed and drops the message -- and
+// the head differs per peer, so the recovery is not even uniform -- while two different plaintexts
+// of that epoch have been sealed under one (key, base nonce) pair for this leaf and generation.
+// The only thing between that and an AEAD nonce collision is the 32 bit reuse_guard.
+//
+// THE POSITION IS INSTALLED RATHER THAN REPLAYED. Stepping a fresh ratchet forward head times
+// would reach the same secret, and it would also make a restore cost one KDF call per message this
+// member has ever sent in the epoch -- a number a corrupted store chooses, up to 2^32. The
+// persisted secret is the ratchet's CURRENT one, so this is O(1), and it adds no secret to the
+// blob that was not already derivable from it: the same state carries the restore secret, and the
+// encryption secret expanded out of that derives every leaf's every ratchet from generation 0.
+//
+// EVERY ENTRY IS CHECKED BEFORE ANY RATCHET IS BUILT. ratchetFor takes the leaf's node secret to
+// build its two ratchets and there is no way to put it back, so a refusal discovered halfway would
+// leave a tree that can never answer for this leaf again.
+//
+// BOTH OF THE LEAF'S RATCHETS ARE MATERIALISED by the first ratchetFor here, which is that
+// function's own rule and is what makes a partial record safe: a member that sent application
+// messages and no handshake message persists one entry, and the handshake ratchet it did not
+// persist is rebuilt at generation 0 from the leaf secret -- which is exactly where the live tree
+// had it.
+func (self *SecretTree) RestoreSenderRatchets(leaf LeafIndex, entries []senderRatchetEntry) error {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.erased {
+		return fmt.Errorf("%w: leaf %d", ErrEpochErased, leaf)
+	}
+	nh := self.crypto.HashSize()
+	for i, entry := range entries {
+		if len(entry.Secret) != nh {
+			return fmt.Errorf("%w: entry %d carries a %d byte ratchet secret, want %d",
+				ErrSecretLength, i, len(entry.Secret), nh)
+		}
+		if _, _, err := generationsConsumed(entry.Consumed); err != nil {
+			return fmt.Errorf("%w: entry %d: %w", errGroupStateSenderRatchet, i, err)
+		}
+		// STRICTLY INCREASING, which is the shape SenderRatchets writes and therefore the only
+		// shape this build can have produced. It refuses a reordered vector and, more importantly,
+		// a REPEATED kind: two entries naming one ratchet would install the second OVER the first,
+		// so the restored member would stand wherever the entry that happened to come last says --
+		// and when that is the earlier of the two, what has been discarded is the record of the
+		// generations this member has already sent under.
+		if 0 < i && entry.Kind <= entries[i-1].Kind {
+			return fmt.Errorf("%w: entry %d names ratchet type %d after type %d",
+				errGroupStateSenderRatchetOrder, i, entry.Kind, entries[i-1].Kind)
+		}
+	}
+	for _, entry := range entries {
+		head, exhausted, err := generationsConsumed(entry.Consumed)
+		if err != nil {
+			return fmt.Errorf("%w: %w", errGroupStateSenderRatchet, err)
+		}
+		r, err := self.ratchetFor(leaf, entry.Kind)
+		if err != nil {
+			return err
+		}
+		// the freshly derived root is ERASED rather than dropped. It is the value generation 0 of
+		// this ratchet comes out of, this epoch has already spent generations past it, and after
+		// the assignment below nothing in this process can reach it to erase it.
+		zeroizeSecret(r.secret)
+		r.secret = append([]byte(nil), entry.Secret...)
+		r.head = head
+		r.exhausted = exhausted
+	}
+	return nil
+}
+
+// consumed is how many generations this ratchet has handed out, which is the ONE number a
+// persisted state needs in order to put it back.
+//
+// One number and not the pair, because the pair has a state it must never be in. head is the next
+// generation and exhausted says the counter has stopped, so (head 5, exhausted true) describes
+// nothing this type can reach -- and a blob that could encode it would be a blob a corrupted store
+// could hand back as "this ratchet is finished" over a ratchet with four billion generations left,
+// or the other way about. A count has no such pair to disagree with itself.
+//
+// The count runs one past the counter: a ratchet parked on 2^32-1 with exhausted set has handed
+// out that generation as well, so it has consumed 2^32 of them, which is why this is a uint64.
+func (self *ratchet) consumed() uint64 {
+	if self.exhausted {
+		return uint64(1) << 32
+	}
+	return uint64(self.head)
+}
+
+// generationsConsumed is consumed read backwards: the (head, exhausted) pair a persisted count
+// describes, or a refusal for a count no ratchet can have reached.
+//
+// The refusal is not a formality. A count above 2^32 narrowed into a uint32 head would put the
+// ratchet somewhere in the middle of the epoch it claims to have finished, which is a restored
+// member sending under generations it has already used -- the defect this whole field exists to
+// close, reached through the arithmetic instead of through the missing field.
+func generationsConsumed(count uint64) (head uint32, exhausted bool, err error) {
+	switch {
+	case count < uint64(1)<<32:
+		return uint32(count), false, nil
+	case count == uint64(1)<<32:
+		return ^uint32(0), true, nil
+	}
+	return 0, false, fmt.Errorf("%w: %d generations consumed, and a ratchet has %d",
+		ErrRatchetExhausted, count, uint64(1)<<32)
+}
+
 // Zeroize clears every secret the tree still holds and refuses every later derivation.
 // Called when the epoch leaves PastEpochWindow.
 //

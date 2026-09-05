@@ -343,11 +343,18 @@ func TestTheWrongLeafKeyStopsOnlyTheCommitsSealedToThatLeaf(t *testing.T) {
 // version field of a blob that is otherwise this build's own layout, so it decodes to the last octet
 // whatever order the checks are in.
 //
-// This one hands LoadGroup the version 1 layout itself -- every field of it, and no path secret vector
-// -- which is the state a previous build of this client actually wrote to its own store. The version
-// field is written FIRST precisely so that such a state is refused as a state to migrate or discard;
-// a check made after the whole decode had succeeded would answer a truncation error instead, which
-// says nothing about why, and that is what this build did until the vector was appended.
+// This one hands LoadGroup the layout IMMEDIATELY BEFORE this build's -- every field of it, and no
+// sender ratchet vector -- which is the state a previous build of this client actually wrote to its
+// own store. The version field is written FIRST precisely so that such a state is refused as a state
+// to migrate or discard; a check made after the whole decode had succeeded would answer a truncation
+// error instead, which says nothing about why, and that is what this build did until the ladder was
+// appended.
+//
+// THE LAYOUT IT WRITES IS DERIVED FROM THE VERSION CONSTANT, and that is a repair. It wrote version 1
+// verbatim while this build wrote 2; version 3 then appended the sender ratchet vector and this case
+// went on passing -- 1 is not 3 either -- while observing a layout two steps back. The one whose
+// refusal is about a real migration is the layout a running client is actually holding, which is the
+// one before this build's.
 func TestLoadGroupRefusesAStateWrittenAtTheLayoutBeforeThisOne(t *testing.T) {
 	crypto := testCrypto(t)
 	fixture := testFourMemberGroup(t, crypto, "restore-version")
