@@ -1624,7 +1624,7 @@ func (self *dohClient) queryWireRawDetailedWithRoute(ctx context.Context, dohUrl
 		}
 		return nil, nil, fmt.Errorf("request %s: %w", dohUrl, err)
 	}
-	defer response.Body.Close()
+	defer releaseHttpResponseBody(ctx, response)
 	if response.StatusCode != http.StatusOK {
 		return nil, nil, fmt.Errorf("request %s: HTTP status %s", dohUrl, response.Status)
 	}

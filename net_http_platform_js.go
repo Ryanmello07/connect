@@ -27,10 +27,7 @@ func (self *ClientStrategy) httpPlatformDirect(request *http.Request) (*httpResu
 	result := newEvalResultFromHttpResponse(response, err, self.settings.MaxHttpResponseBodyBytes)
 	// the one response is the selected response: read its body now, the way
 	// parallelEval does for the winning route
-	if result.materialize != nil {
-		result.err = result.materialize()
-		result.materialize = nil
-	}
+	result.Selected()
 	httpResult, resultErr := materializeHttpResult(result)
 	if resultErr != nil {
 		println("[net]http fetch", request.Method, request.URL.String(), "=", resultErr.Error())

@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -287,6 +288,181 @@ type dohRoundTripperFunc func(*http.Request) (*http.Response, error)
 // Delegates each request to the deterministic test callback.
 func (self dohRoundTripperFunc) RoundTrip(request *http.Request) (*http.Response, error) {
 	return self(request)
+}
+
+type dohCanceledReadBlockingCloseBody struct {
+	ctx          context.Context
+	readEntered  chan struct{}
+	closeEntered chan struct{}
+	releaseClose chan struct{}
+}
+
+func (self *dohCanceledReadBlockingCloseBody) Read([]byte) (int, error) {
+	close(self.readEntered)
+	<-self.ctx.Done()
+	return 0, self.ctx.Err()
+}
+
+func (self *dohCanceledReadBlockingCloseBody) Close() error {
+	close(self.closeEntered)
+	<-self.releaseClose
+	return nil
+}
+
+type dohCloseRecordingBody struct {
+	read       func([]byte) (int, error)
+	closeCount int
+}
+
+func (self *dohCloseRecordingBody) Read(buffer []byte) (int, error) {
+	return self.read(buffer)
+}
+
+func (self *dohCloseRecordingBody) Close() error {
+	self.closeCount += 1
+	return nil
+}
+
+// DoH uses HTTP/2 too, and fan-out cancellation can interrupt a response body
+// read after its headers arrived. That request context owns stream cleanup;
+// synchronously closing the canceled body can otherwise strand the query
+// worker and its concurrency and memory reservations forever.
+func TestDohCanceledResponseReadDoesNotBlockOnClose(t *testing.T) {
+	testCtx, testCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer testCancel()
+
+	readEntered := make(chan struct{})
+	closeEntered := make(chan struct{})
+	releaseClose := make(chan struct{})
+	var releaseCloseOnce sync.Once
+	releaseBlockedClose := func() {
+		releaseCloseOnce.Do(func() { close(releaseClose) })
+	}
+	t.Cleanup(releaseBlockedClose)
+
+	responseCh := make(chan *http.Response, 1)
+	client := &dohClient{httpClient: &http.Client{Transport: dohRoundTripperFunc(func(
+		request *http.Request,
+	) (*http.Response, error) {
+		response := &http.Response{
+			Status:     "200 OK",
+			StatusCode: http.StatusOK,
+			Body: &dohCanceledReadBlockingCloseBody{
+				ctx:          request.Context(),
+				readEntered:  readEntered,
+				closeEntered: closeEntered,
+				releaseClose: releaseClose,
+			},
+			Request: request,
+		}
+		responseCh <- response
+		return response, nil
+	})}}
+	requestCtx, requestCancel := context.WithCancel(context.Background())
+	defer requestCancel()
+	resultCh := make(chan error, 1)
+	go func() {
+		_, _, err := client.queryWireRawDetailedWithRoute(
+			requestCtx,
+			"https://doh.example.test/dns-query",
+			dnsmessage.TypeA,
+			"cancel.example.test",
+		)
+		resultCh <- err
+	}()
+
+	var response *http.Response
+	select {
+	case <-testCtx.Done():
+		t.Fatalf("wait for DoH response body read: %v", testCtx.Err())
+	case <-readEntered:
+		response = <-responseCh
+	}
+	requestCancel()
+
+	select {
+	case err := <-resultCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("DoH canceled read error = %v, expected context cancellation", err)
+		}
+	case <-closeEntered:
+		releaseBlockedClose()
+		select {
+		case <-resultCh:
+		case <-testCtx.Done():
+			t.Fatalf("release blocked DoH response close: %v", testCtx.Err())
+		}
+		t.Fatal("DoH synchronously closed a context-canceled response body")
+	case <-testCtx.Done():
+		t.Fatalf("DoH response cleanup made no completion decision: %v", testCtx.Err())
+	}
+	if response.Request.Context().Err() == nil {
+		t.Fatal("DoH response request context was not canceled")
+	}
+	if response.Body != nil {
+		t.Fatal("canceled DoH response retained a body owned by the transport")
+	}
+	select {
+	case <-closeEntered:
+		t.Fatal("DoH closed the canceled response body")
+	default:
+	}
+}
+
+// Canceled cleanup is the exceptional ownership path. A response read to EOF
+// and a read that fails while its request is live both retain the usual
+// explicit Body.Close obligation.
+func TestDohLiveResponseReadClosesBody(t *testing.T) {
+	readErr := errors.New("invalid dns response framing")
+	for _, test := range []struct {
+		name       string
+		bodyReader func([]byte) (int, error)
+		wantErr    error
+	}{
+		{
+			name:       "complete",
+			bodyReader: bytes.NewReader([]byte{0x01, 0x02}).Read,
+		},
+		{
+			name: "non-context read error",
+			bodyReader: func([]byte) (int, error) {
+				return 0, readErr
+			},
+			wantErr: readErr,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			body := &dohCloseRecordingBody{read: test.bodyReader}
+			var response *http.Response
+			client := &dohClient{httpClient: &http.Client{Transport: dohRoundTripperFunc(func(
+				request *http.Request,
+			) (*http.Response, error) {
+				response = &http.Response{
+					Status:     "200 OK",
+					StatusCode: http.StatusOK,
+					Body:       body,
+					Request:    request,
+				}
+				return response, nil
+			})}}
+
+			_, _, err := client.queryWireRawDetailedWithRoute(
+				context.Background(),
+				"https://doh.example.test/dns-query",
+				dnsmessage.TypeA,
+				"ownership.example.test",
+			)
+			if !errors.Is(err, test.wantErr) {
+				t.Fatalf("DoH read error = %v, expected %v", err, test.wantErr)
+			}
+			if body.closeCount != 1 {
+				t.Fatalf("DoH response body close count = %d, expected 1", body.closeCount)
+			}
+			if response.Body != nil {
+				t.Fatal("closed DoH response retained its body")
+			}
+		})
+	}
 }
 
 // TestDohRouteForConnRejectsMissingEndpoint pins the live proxy panic: an

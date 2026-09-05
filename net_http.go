@@ -673,9 +673,8 @@ type evalResult struct {
 	dialer *clientDialer
 	wsConn *websocket.Conn
 	err    error
-	// materialize is run only for the selected HTTP response, while the
-	// request context is still alive. Losing parallel responses are closed
-	// without allocating their bodies.
+	// materialize is run only for the selected HTTP response. A canceled
+	// parallel HTTP response is released by its attempt context instead.
 	materialize func() error
 
 	httpResult
@@ -707,6 +706,29 @@ func readHttpResponseBody(response *http.Response, maxBytes int64) ([]byte, erro
 	return bodyBytes, nil
 }
 
+func httpResponseContextCanceled(ctx context.Context, response *http.Response) bool {
+	return ctx.Err() != nil ||
+		(response != nil &&
+			response.Request != nil &&
+			response.Request.Context().Err() != nil)
+}
+
+// releaseHttpResponseBody explicitly closes a live response. Once its request
+// context is canceled, net/http owns HTTP/1 connection or HTTP/2 stream cleanup
+// and the body reference is dropped without entering a potentially blocking
+// HTTP/2 Close.
+func releaseHttpResponseBody(ctx context.Context, response *http.Response) {
+	if response == nil || response.Body == nil {
+		return
+	}
+	body := response.Body
+	response.Body = nil
+	if httpResponseContextCanceled(ctx, response) {
+		return
+	}
+	body.Close()
+}
+
 func newEvalResultFromHttpResponse(response *http.Response, err error, maxBodyBytes int64) *evalResult {
 	result := &evalResult{
 		err: err,
@@ -718,10 +740,8 @@ func newEvalResultFromHttpResponse(response *http.Response, err error, maxBodyBy
 		result.err = fmt.Errorf("http response has no body")
 	} else if err == nil {
 		result.materialize = func() error {
-			defer func() {
-				response.Body.Close()
-				response.Body = nil
-			}()
+			// Ownership stays with evalResult until the read outcome is known.
+			// A canceled read must not enter a synchronous HTTP/2 Body.Close.
 			bodyBytes, readErr := readHttpResponseBody(response, maxBodyBytes)
 			if readErr == nil {
 				result.bodyBytes = bodyBytes
@@ -740,21 +760,60 @@ func (self *evalResult) Selected() *evalResult {
 	return self
 }
 
+// Close synchronously releases a live result. Canceled HTTP results must use
+// discardAfterContextCancellation because their transport already owns cleanup.
 func (self *evalResult) Close() {
 	self.materialize = nil
 	if self.wsConn != nil {
-		self.wsConn.Close()
+		wsConn := self.wsConn
+		self.wsConn = nil
+		wsConn.Close()
 		// if wsConn is set, the response does not need to be closed
 		// https://pkg.go.dev/github.com/gorilla/websocket#Dialer.DialContext
 	} else if self.response != nil && self.response.Body != nil {
-		self.response.Body.Close()
+		body := self.response.Body
+		self.response.Body = nil
+		body.Close()
 	}
+}
+
+// discardAfterContextCancellation releases a result after the request context
+// used to create it has already been canceled. net/http owns
+// HTTP stream/connection cancellation through that context. Calling an unread
+// HTTP/2 response Body.Close here is unsafe: it may wait indefinitely for the
+// connection write mutex. A WebSocket has escaped its handshake context once
+// DialContext returns, so it still needs an explicit close.
+func (self *evalResult) discardAfterContextCancellation() {
+	self.materialize = nil
+	if self.wsConn != nil {
+		wsConn := self.wsConn
+		self.wsConn = nil
+		wsConn.Close()
+	}
+	if self.response != nil {
+		self.response.Body = nil
+	}
+}
+
+// closeRejected closes an ordinary failed response, but lets net/http finish
+// cleanup when either the evaluation or response request context was canceled.
+// The response context also catches a timeout derived internally by http.Client.
+func (self *evalResult) closeRejected(ctx context.Context) {
+	if httpResponseContextCanceled(ctx, self.response) {
+		self.discardAfterContextCancellation()
+		return
+	}
+	self.Close()
 }
 
 // materializeHttpResult returns the response body already read when the
 // strategy selected this result.
 func materializeHttpResult(result *evalResult) (*httpResult, error) {
-	defer result.Close()
+	if result.err == nil {
+		defer result.Close()
+	} else {
+		defer result.closeRejected(context.Background())
+	}
 	return &result.httpResult, result.err
 }
 
@@ -835,7 +894,7 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 		case out <- result:
 			success = true
 		case <-handleCtx.Done():
-			result.Close()
+			result.discardAfterContextCancellation()
 		}
 	}
 
@@ -899,7 +958,7 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 					if self.log.V(2).Enabled() {
 						self.log.Infof("[net][p]select: %s = %s\n", dialer.String(), result.err)
 					}
-					result.Close()
+					result.closeRejected(attemptCtx)
 				}
 				attemptErr := attemptCtx.Err()
 				attemptCancel()
@@ -935,7 +994,7 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 						if self.log.V(2).Enabled() {
 							self.log.Infof("[net][p]select: %s = %s\n", result.dialer.String(), result.err)
 						}
-						result.Close()
+						result.closeRejected(handleCtx)
 					}
 					startWorker(func() {
 						run(dialer)
@@ -967,7 +1026,7 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 						if self.log.V(2).Enabled() {
 							self.log.Infof("[net][p]select: %s = %s\n", result.dialer.String(), result.err)
 						}
-						result.Close()
+						result.closeRejected(handleCtx)
 					}
 					startWorker(func() {
 						run(dialer)
@@ -985,7 +1044,7 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 					if result.Selected().err == nil {
 						return result
 					}
-					result.Close()
+					result.closeRejected(handleCtx)
 				}
 			}
 		}
@@ -1072,7 +1131,7 @@ func (self *ClientStrategy) serialEval(ctx context.Context, eval func(ctx contex
 				if self.log.V(2).Enabled() {
 					self.log.Infof("[net][s]select: %s = %s\n", dialer.String(), result.err)
 				}
-				result.Close()
+				result.closeRejected(attemptCtx)
 			}
 			attemptErr := attemptCtx.Err()
 			attemptCancel()
@@ -2115,7 +2174,7 @@ func HttpPostStreamWithStrategyRaw(
 		return nil, err
 	}
 
-	defer res.Body.Close()
+	defer releaseHttpResponseBody(ctx, res)
 	bodyBytes, err := readHttpResponseBody(res, DefaultMaxHttpResponseBodyBytes)
 	if err != nil {
 		return nil, err
