@@ -2536,8 +2536,8 @@ func authVerifiersUnderGate(t testing.TB, scans []authScan) map[string][]string 
 // extending, and a derivation over a package that imports no comparator honestly yields
 // none. But a reader has no way to tell that from a scan that broke, and "it is fine, I
 // checked" is not a thing a log line can say a year later. So the empty case states what
-// kind of empty it is, what will populate it, and which half of guardrail G8 is doing work
-// over that directory today.
+// kind of empty it is, what will populate it, and whether any half of guardrail G8 is a
+// rule in force over that directory today.
 //
 // It prints the imports it read rather than asserting that it read some, because that count
 // is the number the honesty rests on: a class derived from six imports and finding nothing
@@ -2555,7 +2555,7 @@ func authReportAnEmptyComparatorClass(t testing.TB, scan authScan, comparators [
 	}
 	slices.Sort(paths)
 	paths = slices.Compact(paths)
-	t.Logf("%s: that class is empty BY CONSTRUCTION and not because the scan read nothing. Its %d imported packages were read (%v) and none of them exports a function that answers a question about two data shaped arguments, which is the whole of what the class is. That makes this an ARMED TRIPWIRE and not a dead gate: a comparator cannot be called without its package being imported, so the edit that first compares data over there brings that package's entire comparator surface into this class on the same run, with nobody remembering to add it. The half of G8 that is LIVE over that directory today is TestEveryPackageBuiltOnThisOneIsUnderTheConstantTimeGate, which walks this module and requires every production importer of connect/message to be a root here. The residual is recorded as M1-50.",
+	t.Logf("%s: that class is empty BY CONSTRUCTION and not because the scan read nothing. Its %d imported packages were read (%v) and none of them exports a function that answers a question about two data shaped arguments, which is the whole of what the class is. That makes this an ARMED TRIPWIRE and not a dead gate: a comparator cannot be called without its package being imported, so the edit that first compares data over there brings that package's entire comparator surface into this class on the same run, with nobody remembering to add it. Nothing over that directory is a rule in force today, the derived scope check included: TestEveryPackageBuiltOnThisOneIsUnderTheConstantTimeGate walks this module for the production packages that import connect/message, connect/messagegroup is not one of them yet, and a check whose derived class is empty never reaches its assertion either -- it arms at Task 1, the first connect/messagegroup file that calls into connect/message. The residual is recorded as M1-50.",
 		scan.dir, len(paths), paths)
 }
 

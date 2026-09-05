@@ -1,3 +1,31 @@
+# core.autocrlf=true is set at system scope on the Windows boxes that build this
+# repo, so a plain checkout writes CRLF into every file git touches, and a gate that
+# matches on the TEXT of a source file then matches nothing at all. That is not a gate
+# failing; it is a gate reporting the clean run of a complete gate having read nothing,
+# which is the most expensive failure mode this tree has. It has already happened here
+# once, to 84 source anchors that passed vacuously on Windows. Every repair to these
+# packages is made as an exact-string edit over source, and an edit anchored on one
+# ending matches nothing in a file using the other: it edits nothing, the suite then
+# passes, and that reads as "the change was made and was harmless".
+#
+# mls/vectors_runner_test.go holds the same property as a gate, but PER PACKAGE and only
+# over the scope it can derive: it follows "../" path literals out of mls, so it reaches
+# connect/message and connect/messagegroup and cannot reach a CHILD directory at all.
+# connect/mls/syntax sat in exactly that blind spot at 6 CRLF against 17 LF, and
+# connect/message imports it. This pin is the half of the property no derivation reaches:
+# every Go file in the repository, in every package, gated or not.
+#
+# It costs no git object. autocrlf cleans on the way in, so all 474 .go blobs were
+# already LF when this line was added; what it rewrites is the working tree, which is the
+# only place the drift was ever visible and the only place an anchored edit reads.
+#
+# msgrepo pins its Go the same way and names this same failure mode.
+#
+# *.pb.go below is SUBSUMED by this line rather than in conflict with it -- both say
+# eol=lf -- and it stays because the comment under it argues regenerate-and-diff, which is
+# about *.proto as much as about the generated Go.
+*.go text eol=lf
+
 # protoc emits LF and nothing downstream normalizes it back, so a checkout that
 # writes CRLF makes every regeneration rewrite every line ending. `git status`
 # then reports the generated files as modified while `git diff` reports nothing,
