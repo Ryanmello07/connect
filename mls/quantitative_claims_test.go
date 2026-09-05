@@ -48,7 +48,10 @@ package mls
 //     comparison would demand that the prose be wrong. What it buys is that a formula stated over a
 //     constant no test computes with is reported -- which is every one of the live instances.
 //   - a claim whose comment names a test measuring something ELSE. Naming is checked; aim is not. A
-//     reviewer still has to read the sentence.
+//     reviewer still has to read the sentence. Measured, because the first attempt at mutating this
+//     gate hit it: a false formula pasted INTO a comment group that already cites a test is
+//     discharged by that citation and this gate stays green. The same formula in a group of its
+//     own is reported. So this buys the paragraph a test, not the sentence.
 //
 // AND THE OTHER DIRECTION IS CHECKED TOO. Every test this source's prose names, by the shape a test
 // name has, must exist -- so prose left behind by a rename is reported rather than quietly becoming
