@@ -795,10 +795,10 @@ func (self *evalResult) discardAfterContextCancellation() {
 	}
 }
 
-// closeRejected closes an ordinary failed response, but lets net/http finish
+// releaseAfterUse closes an ordinary live response, but lets net/http finish
 // cleanup when either the evaluation or response request context was canceled.
 // The response context also catches a timeout derived internally by http.Client.
-func (self *evalResult) closeRejected(ctx context.Context) {
+func (self *evalResult) releaseAfterUse(ctx context.Context) {
 	if httpResponseContextCanceled(ctx, self.response) {
 		self.discardAfterContextCancellation()
 		return
@@ -809,11 +809,7 @@ func (self *evalResult) closeRejected(ctx context.Context) {
 // materializeHttpResult returns the response body already read when the
 // strategy selected this result.
 func materializeHttpResult(result *evalResult) (*httpResult, error) {
-	if result.err == nil {
-		defer result.Close()
-	} else {
-		defer result.closeRejected(context.Background())
-	}
+	defer result.releaseAfterUse(context.Background())
 	return &result.httpResult, result.err
 }
 
@@ -958,7 +954,7 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 					if self.log.V(2).Enabled() {
 						self.log.Infof("[net][p]select: %s = %s\n", dialer.String(), result.err)
 					}
-					result.closeRejected(attemptCtx)
+					result.releaseAfterUse(attemptCtx)
 				}
 				attemptErr := attemptCtx.Err()
 				attemptCancel()
@@ -994,7 +990,7 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 						if self.log.V(2).Enabled() {
 							self.log.Infof("[net][p]select: %s = %s\n", result.dialer.String(), result.err)
 						}
-						result.closeRejected(handleCtx)
+						result.releaseAfterUse(handleCtx)
 					}
 					startWorker(func() {
 						run(dialer)
@@ -1026,7 +1022,7 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 						if self.log.V(2).Enabled() {
 							self.log.Infof("[net][p]select: %s = %s\n", result.dialer.String(), result.err)
 						}
-						result.closeRejected(handleCtx)
+						result.releaseAfterUse(handleCtx)
 					}
 					startWorker(func() {
 						run(dialer)
@@ -1044,7 +1040,7 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 					if result.Selected().err == nil {
 						return result
 					}
-					result.closeRejected(handleCtx)
+					result.releaseAfterUse(handleCtx)
 				}
 			}
 		}
@@ -1131,7 +1127,7 @@ func (self *ClientStrategy) serialEval(ctx context.Context, eval func(ctx contex
 				if self.log.V(2).Enabled() {
 					self.log.Infof("[net][s]select: %s = %s\n", dialer.String(), result.err)
 				}
-				result.closeRejected(attemptCtx)
+				result.releaseAfterUse(attemptCtx)
 			}
 			attemptErr := attemptCtx.Err()
 			attemptCancel()
@@ -1148,7 +1144,10 @@ func (self *ClientStrategy) serialEval(ctx context.Context, eval func(ctx contex
 			helloStartTime := time.Now()
 			result := self.parallelEval(handleCtx, helloEval)
 			if result != nil {
-				result.Close()
+				// The nested evaluation cancels its selected attempt before
+				// returning. Let net/http own that response cleanup rather
+				// than synchronously closing an HTTP/2 body after cancellation.
+				result.releaseAfterUse(handleCtx)
 			}
 			helloEndTime := time.Now()
 

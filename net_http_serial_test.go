@@ -496,7 +496,7 @@ func TestRejectedHttpResultClosesNonContextReadError(t *testing.T) {
 	if !errors.Is(result.err, readErr) {
 		t.Fatalf("materialize error = %v, expected %v", result.err, readErr)
 	}
-	result.closeRejected(context.Background())
+	result.releaseAfterUse(context.Background())
 
 	if body.closeCount != 1 {
 		t.Fatalf("non-context error response close count = %d, expected 1", body.closeCount)
@@ -544,6 +544,165 @@ func TestParallelEvalReturnsWhenCanceledHttpLoserCloseWouldBlock(t *testing.T) {
 		t.Fatal("parallel evaluation synchronously closed the canceled HTTP loser")
 	case <-testCtx.Done():
 		t.Fatalf("parallel evaluation made no completion decision: %v", testCtx.Err())
+	}
+}
+
+// A cold serial request first discovers a route with a parallel hello. The
+// nested evaluation cancels the hello's request context before returning its
+// selected response, so closing that response synchronously can wedge startup
+// before the real request is ever attempted. Explicit channels distinguish a
+// returned serial result from entry into the forbidden close without timing
+// or scheduler luck.
+func TestSerialEvalColdHelloReturnsWithoutCanceledResponseClose(t *testing.T) {
+	testCtx, testCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer testCancel()
+
+	strategyCtx, strategyCancel := context.WithCancel(context.Background())
+	defer strategyCancel()
+	settings := DefaultClientStrategySettings()
+	settings.RequestTimeout = 30 * time.Minute
+	settings.ParallelBlockSize = 1
+	dialer := &clientDialer{
+		description:   "cold",
+		minimumWeight: 1,
+		settings:      settings,
+	}
+	strategy := &ClientStrategy{
+		ctx:      strategyCtx,
+		log:      loggerOrDefault(nil),
+		settings: settings,
+		dialers: map[*clientDialer]bool{
+			dialer: true,
+		},
+		extenderIpSecrets: map[netip.Addr]string{},
+	}
+
+	releaseClose := make(chan struct{})
+	var releaseCloseOnce sync.Once
+	releaseBlockedClose := func() {
+		releaseCloseOnce.Do(func() {
+			close(releaseClose)
+		})
+	}
+	t.Cleanup(releaseBlockedClose)
+	helloBody := &serialTestBlockingCloseBody{
+		closeEntered: make(chan struct{}),
+		releaseClose: releaseClose,
+	}
+	requestAttempted := make(chan struct{})
+	resultCh := make(chan *evalResult, 1)
+	go func() {
+		resultCh <- strategy.serialEval(
+			context.Background(),
+			func(context.Context, *clientDialer) *evalResult {
+				close(requestAttempted)
+				return &evalResult{}
+			},
+			func(evalCtx context.Context, helloDialer *clientDialer) *evalResult {
+				request, err := http.NewRequestWithContext(
+					evalCtx,
+					http.MethodGet,
+					"https://example.invalid/hello",
+					nil,
+				)
+				if err != nil {
+					return &evalResult{err: err}
+				}
+				helloDialer.Update(evalCtx, nil)
+				return newEvalResultFromHttpResponse(&http.Response{
+					StatusCode: http.StatusOK,
+					Body:       helloBody,
+					Request:    request,
+				}, nil, DefaultMaxHttpResponseBodyBytes)
+			},
+		)
+	}()
+
+	select {
+	case result := <-resultCh:
+		if result == nil || result.dialer != dialer || result.err != nil {
+			t.Fatalf("serial result = %#v, expected discovered route", result)
+		}
+	case <-helloBody.closeEntered:
+		releaseBlockedClose()
+		<-resultCh
+		t.Fatal("serial evaluation synchronously closed the canceled hello response")
+	case <-testCtx.Done():
+		t.Fatalf("serial evaluation made no completion decision: %v", testCtx.Err())
+	}
+	select {
+	case <-requestAttempted:
+	default:
+		t.Fatal("serial evaluation never attempted the request after route discovery")
+	}
+	select {
+	case <-helloBody.closeEntered:
+		t.Fatal("serial evaluation closed the canceled hello response")
+	default:
+	}
+}
+
+// HttpSerial and HttpParallel return only a materialized body, after their
+// evaluation has canceled the selected attempt context. Final result release
+// must honor that transport-ownership boundary just like cold-hello release.
+func TestMaterializedHttpResultReturnsWithoutCanceledResponseClose(t *testing.T) {
+	testCtx, testCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer testCancel()
+
+	requestCtx, requestCancel := context.WithCancel(context.Background())
+	request, err := http.NewRequestWithContext(
+		requestCtx,
+		http.MethodGet,
+		"https://example.invalid",
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseClose := make(chan struct{})
+	var releaseCloseOnce sync.Once
+	releaseBlockedClose := func() {
+		releaseCloseOnce.Do(func() {
+			close(releaseClose)
+		})
+	}
+	t.Cleanup(releaseBlockedClose)
+	body := &serialTestBlockingCloseBody{
+		closeEntered: make(chan struct{}),
+		releaseClose: releaseClose,
+	}
+	result := newEvalResultFromHttpResponse(&http.Response{
+		StatusCode: http.StatusOK,
+		Body:       body,
+		Request:    request,
+	}, nil, DefaultMaxHttpResponseBodyBytes)
+	result.Selected()
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	requestCancel()
+
+	resultCh := make(chan error, 1)
+	go func() {
+		_, resultErr := materializeHttpResult(result)
+		resultCh <- resultErr
+	}()
+	select {
+	case resultErr := <-resultCh:
+		if resultErr != nil {
+			t.Fatal(resultErr)
+		}
+	case <-body.closeEntered:
+		releaseBlockedClose()
+		<-resultCh
+		t.Fatal("materialized result synchronously closed its canceled response")
+	case <-testCtx.Done():
+		t.Fatalf("materialized result made no completion decision: %v", testCtx.Err())
+	}
+	select {
+	case <-body.closeEntered:
+		t.Fatal("materialized result closed its canceled response")
+	default:
 	}
 }
 
