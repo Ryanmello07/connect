@@ -47,8 +47,8 @@ import (
 	"errors"
 	"fmt"
 	"go/ast"
-	"go/parser"
 	"go/token"
+	"io/fs"
 	"maps"
 	"os"
 	"path/filepath"
@@ -1323,147 +1323,184 @@ func moduleRootDir(t *testing.T) string {
 	return ""
 }
 
-// namedSiblingPaths is every "../..." path one go file hands to something as a path.
+// goSourceDirsUnder is every directory at or below one root that DIRECTLY holds a .go file,
+// answered as paths relative to `from`.
 //
-// Read off the syntax tree and not off the text, so a directory that prose merely mentions is
-// not mistaken for one a gate opens. That distinction carries most of the mentions: this
-// package's comments name ../message and ../messagegroup far more often than its code hands
-// either of them to anything, because nearly every mention is a sentence explaining a rule.
-// What puts a directory in the scope below is a path LITERAL, because a literal is what a
-// scan is actually given. No count is written here on purpose -- a number in a comment about
-// how often a comment says something is the most perishable sentence this file could hold.
+// One walk rather than a walk plus a glob per directory: a file with a .go extension IS the
+// evidence that its directory holds source, so a root falls out of a file rather than out of a
+// second question asked about the directory. A directory holding only subdirectories, or only
+// files of other kinds, is not a root, because there is no source in it for an anchored edit to
+// read and packageSourcePathsIn is fatal on a directory that turns out to hold none.
 //
-// A literal that cleans to ".." is not one of them. It names the step up and not a sibling,
-// and the derivation's own prefix -- the "../" three lines below -- is exactly such a
-// literal, so without this the gate reads its own implementation as an instruction to judge
-// connect's root package. That is not a hypothetical: it is what the first run of this
-// closure over its own source did.
-func namedSiblingPaths(t *testing.T, path string) []string {
-	t.Helper()
-	fileSet := token.NewFileSet()
-	parsed, err := parser.ParseFile(fileSet, path, nil, 0)
-	if err != nil {
-		t.Fatalf("parse %s: %v", path, err)
-	}
-	found := []string{}
-	ast.Inspect(parsed, func(node ast.Node) bool {
-		literal, isLiteral := node.(*ast.BasicLit)
-		if !isLiteral || literal.Kind != token.STRING {
-			return true
+// Nothing is skipped. No name a directory carries exempts the Go source inside it from being
+// read by an exact-string edit, which is the only thing this scope is about, and an exception
+// here would be the thing the derivation below exists to have removed.
+//
+// It only ever descends, so the sibling checkout the closure had to decline in prose -- the
+// sdk repository beside connect, which joinScanRoots reaches and which is a different working
+// tree with its own core.autocrlf -- is not declined here. It is unreachable.
+//
+// Split out from its caller so it can be run against a tree built for a test. Its whole
+// substance is that it DESCENDS, and a walk exercised only against the one tree it ships in
+// cannot be told apart from a list that happens to be right about that tree.
+func goSourceDirsUnder(root string, from string) ([]string, error) {
+	seen := map[string]bool{}
+	dirs := []string{}
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
 		}
-		text, err := strconv.Unquote(literal.Value)
+		if entry.IsDir() || filepath.Ext(path) != ".go" {
+			return nil
+		}
+		dir := filepath.Dir(path)
+		if seen[dir] {
+			return nil
+		}
+		seen[dir] = true
+		relative, err := filepath.Rel(from, dir)
 		if err != nil {
-			return true
+			return err
 		}
-		if strings.HasPrefix(text, "../") && filepath.Clean(text) != ".." {
-			found = append(found, text)
-		}
-		return true
+		dirs = append(dirs, filepath.ToSlash(relative))
+		return nil
 	})
-	return found
+	if err != nil {
+		return nil, err
+	}
+	slices.Sort(dirs)
+	return dirs, nil
 }
 
-// lineEndingScanRoots is the set of package directories the gate below judges, DERIVED as a
-// closure rather than listed.
+// lineEndingScanRoots is every directory of this module holding Go source, DERIVED by walking
+// the module root rather than listed.
 //
 // The scope question, answered separately from the class question as R3a requires. The CLASS is
-// derived per package off the files themselves -- which ending each file carries -- and says
-// nothing about WHERE to look. This is where.
+// each file's own pinned ending, read out of .gitattributes per file, and says nothing about
+// where to look. This is where.
 //
-// Start at this package, follow every "../..." path its own source names, and do the same again
-// in whatever that reaches. The closure lands on exactly the packages that read each other's
-// TEXT: mls scans ../message and ../messagegroup for the forbidden primitives, ../message scans
-// ../messagegroup for the constant time rules and ../mls for the join rule, and ../messagegroup
-// names ../mls back. Those are the packages an anchored edit can lie about, so those are the
-// packages that have to be uniform, and a root added to any of those scans is added here with
-// nobody remembering to.
+// It used to be a closure: start at this package, follow every "../" path literal its source
+// hands to something, repeat in whatever that reached. The closure landed on the packages that
+// read each other's TEXT, and that grouping was the whole mechanism while the gate was ending
+// AGNOSTIC -- back then the gate asked whether a package agreed with ITSELF, so it had to know
+// which files to compare against which, and "the packages that scan each other" was the answer.
 //
-// Written as a derivation for guardrail 5's reason and with guardrail 5's usual result. The six
-// gates widened by the split were widened one hand-written list at a time; this gate was not in
-// that set, so it was not widened at all, and it went on judging one directory of three while
-// being the gate that catches this repository's most persistent failure.
+// Since b4e84f4 the gate resolves each file's required ending from the pin independently and
+// compares no file against any other. Grouping carries no information any more, so the closure
+// had nothing left to compute -- and, more to the point, nothing left to justify the
+// directories it left out. It excluded connect/mls/syntax and connect's own package, on a
+// sentence that contradicted itself: the pin holds the child directory, and the pin cannot
+// reach the working tree. Both halves cannot be true, and it is the second that is. Measured
+// against the closure before it was replaced, rather than reasoned about: with all 23 files of
+// mls/syntax flipped uniformly to crlf on disk, ./mls/... ./message/... ./messagegroup/... ran
+// 7496 PASS, 0 FAIL, 0 SKIP.
 //
-// Three things the closure declines, each because the rule declines them rather than because
-// anybody excused them:
+// So the scope is the module, and the closure is deleted rather than given another root. A
+// directory is in scope because it HOLDS Go source, so a package added to this module arrives
+// in scope with nobody remembering to add it -- which is all the closure was ever for, kept,
+// with the list of coupled packages it needed dropped. Nothing is excluded: not the module
+// root's own package, not mls/syntax, and not testdata, whose Go fixtures are read by an
+// anchored string edit exactly like any other file here. If some directory ever genuinely had
+// to be left out, that is a finding about this repository and not an entry to add here.
 //
-//   - a path that resolves to nothing on disk. "../elsewhere", "../nowhere", "../this" and
-//     "../message/a_forge.go" are names handed to control fixtures, not directories. The parent
-//     of a name that does not resolve is never followed either, or every unresolved fixture
-//     name would drag the module root into scope.
-//   - a path outside this module. joinScanRoots reaches the sdk repository beside connect,
-//     which is a different checkout with its own core.autocrlf and is not this working tree.
-//   - ".." on its own, which is a step in a walk up to the module root and not a scan root.
-//     connect's own package and connect/mls/syntax are outside for that reason: no gate of
-//     these three opens either of them by path. That is a real limit and not a clean bill,
-//     but the drift it used to name is gone rather than merely unwatched: mls/syntax was 6
-//     files crlf against 17 lf when this sentence was first written, and the commit that
-//     added `*.go text eol=lf` renormalised it to 0 against 23. What holds the
-//     child directory is that pin, which reaches every Go file in the repository whether a
-//     scope derivation can see it or not; what this scope holds is the working tree, which
-//     the pin cannot reach at all.
-//
-// The coverage claim is checked rather than asserted, against a scope this package already
-// declares: every root of forbiddenScanRoots -- which five further gates alias rather than
-// restate -- has to fall out of the closure. A derivation that stopped following the coupling
-// goes red here instead of quietly judging one directory.
+// The count is the measure of what the closure was missing: 156 files in three directories
+// before, 474 in fifteen after -- and it costs LESS, not more. Measured over four runs each:
+// 0.15-0.18s before, 0.07-0.10s after. The closure had to parse every file of every root
+// through go/parser to find the path literals in it; this reads nothing but the bytes it is
+// judging, and there are three times as many of them for half the time.
 func lineEndingScanRoots(t *testing.T) []string {
 	t.Helper()
 	moduleRoot := moduleRootDir(t)
-	seen := map[string]bool{}
-	roots := []string{}
-	frontier := []string{"."}
-	for len(frontier) > 0 {
-		dir := frontier[0]
-		frontier = frontier[1:]
-		absolute, err := filepath.Abs(dir)
-		if err != nil {
-			t.Fatalf("resolve %s: %v", dir, err)
-		}
-		if seen[absolute] {
-			continue
-		}
-		inside, err := filepath.Rel(moduleRoot, absolute)
-		if err != nil || inside == ".." || strings.HasPrefix(inside, ".."+string(filepath.Separator)) {
-			continue
-		}
-		seen[absolute] = true
-		entry, err := os.Stat(absolute)
-		if err != nil || !entry.IsDir() {
-			continue
-		}
-		sources, err := filepath.Glob(filepath.Join(dir, "*.go"))
-		if err != nil {
-			t.Fatalf("list the source of %s: %v", dir, err)
-		}
-		if len(sources) == 0 {
-			continue
-		}
-		roots = append(roots, filepath.ToSlash(dir))
-		for _, path := range sources {
-			for _, named := range namedSiblingPaths(t, path) {
-				candidate := filepath.Join(dir, named)
-				reached, err := os.Stat(candidate)
-				switch {
-				case err == nil && reached.IsDir():
-					frontier = append(frontier, candidate)
-				case err == nil:
-					frontier = append(frontier, filepath.Dir(candidate))
-				}
-			}
-		}
+	here, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatalf("resolve this package's own directory: %v", err)
+	}
+	roots, err := goSourceDirsUnder(moduleRoot, here)
+	if err != nil {
+		t.Fatalf("walk %s for the go source of this module: %v", moduleRoot, err)
 	}
 	if len(roots) == 0 {
-		t.Fatal("the closure found no package with go source in it, so the gate below judged nothing")
+		t.Fatal("the walk found no directory with go source under the module root, so the gate below judged nothing")
 	}
+	// the coverage claim is checked rather than asserted, against a scope this package already
+	// declares: every root of forbiddenScanRoots -- which five further gates alias rather than
+	// restate -- has to fall out of the walk. It no longer asks whether a closure kept following
+	// the coupling, because there is no closure; it asks the one thing a module walk can still
+	// get wrong, which is whether it started at the MODULE root. A walk rooted at this package
+	// reaches everything under mls and nothing beside it, and that is a green gate over a third
+	// of the files it claims to judge.
 	for _, declared := range forbiddenScanRoots {
 		want := filepath.ToSlash(filepath.Clean(declared))
 		if !slices.Contains(roots, want) {
-			t.Fatalf("the closure returned %v, which does not reach %s; forbiddenScanRoots scans that directory's text, so a scope that cannot reach it is a scope that has stopped following the coupling this gate is about",
+			t.Fatalf("the walk returned %v, which does not reach %s; forbiddenScanRoots scans that directory's text, so a scope that cannot reach it is not rooted at this module",
 				roots, want)
 		}
 	}
-	slices.Sort(roots)
 	return roots
+}
+
+// TestTheLineEndingScopeIsEveryDirectoryHoldingGoSource is the control on that walk, run
+// against a tree built here rather than against this module, because the module's own answer
+// cannot separate a walk that descends from a list that is right about this checkout. The
+// derivation this replaced could not reach a child directory at all and said so in prose;
+// prose is what let that go unnoticed.
+//
+// Four answers are stated, and each is a way this scope has actually been wrong here or is a
+// way it would next go wrong:
+//
+//   - it DESCENDS, at any depth. A walk that stops at its root loses connect/mls/syntax, which
+//     is the directory the closure could not reach and the one measured able to go uniformly
+//     crlf against 7496 passing tests.
+//   - a directory holding no Go source is not a root. packageSourcePathsIn is fatal on one, so
+//     a walk keyed off directories rather than off files turns a folder of prose into a failure
+//     nobody can act on.
+//   - NO NAME is an exception. The four spellings below are the four a reader would reach for
+//     first, because they are the four the Go tool itself skips: a leading dot, a leading
+//     underscore, testdata, vendor. Go skips them when it is deciding what to COMPILE; this
+//     gate is deciding what an exact-string edit can read, and every one of them can be read.
+//     Without this the exclusion the closure carried could be reintroduced under a different
+//     name and the gate would stay green over whatever it stopped judging.
+//   - the ROOTS come back relative to where the caller stands, so one reads as "../message",
+//     the way every scan root in these gates is written, rather than as an absolute path that
+//     matches nothing else anybody writes down here.
+func TestTheLineEndingScopeIsEveryDirectoryHoldingGoSource(t *testing.T) {
+	root := t.TempDir()
+	for _, built := range []string{
+		"top.go",
+		"nested/mid.go",
+		"nested/deeper/leaf.go",
+		"nested/deeper/notes.md",
+		"prose/readme.md",
+		"prose/deeper/readme.md",
+		".dotted/hidden.go",
+		"_underscored/skipped.go",
+		"testdata/fixture.go",
+		"vendor/vendored.go",
+	} {
+		path := filepath.Join(root, filepath.FromSlash(built))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("build the scope fixture: %v", err)
+		}
+		if err := os.WriteFile(path, []byte("package p\n"), 0o644); err != nil {
+			t.Fatalf("build the scope fixture: %v", err)
+		}
+	}
+	dirs, err := goSourceDirsUnder(root, root)
+	if err != nil {
+		t.Fatalf("walk the scope fixture: %v", err)
+	}
+	if want := []string{".", ".dotted", "_underscored", "nested", "nested/deeper", "testdata", "vendor"}; !slices.Equal(dirs, want) {
+		t.Errorf("the walk answered %v, want %v: every directory holding go source at any depth under any name, and no directory holding none", dirs, want)
+	}
+
+	from := filepath.Join(root, "nested")
+	dirs, err = goSourceDirsUnder(root, from)
+	if err != nil {
+		t.Fatalf("walk the scope fixture from inside it: %v", err)
+	}
+	if want := []string{".", "..", "../.dotted", "../_underscored", "../testdata", "../vendor", "deeper"}; !slices.Equal(dirs, want) {
+		t.Errorf("standing in %s the walk answered %v, want %v: a directory beside the caller is named by the step up to it and not by its absolute path", from, dirs, want)
+	}
 }
 
 // pinnedLineEndingFor answers the ending ONE .gitattributes checks one path out with -- "lf",
@@ -1651,8 +1688,11 @@ func TestTheLineEndingPinIsReadTheWayGitResolvesIt(t *testing.T) {
 // start of a line finds no match at all in a crlf file, reads the whole file as one body, and
 // reports clean having found nothing -- which is exactly what a clean file looks like too.
 //
-// Judged PER PACKAGE, and against the ending .gitattributes PINS rather than against whichever
-// ending a package happens to be uniform in.
+// Judged FILE BY FILE, against the ending .gitattributes PINS for that file rather than against
+// whichever ending a package happens to be uniform in. The directory survives as how the report
+// is grouped, and as the one question still asked of a package as a whole -- whether all of its
+// files are pinned to the SAME ending -- but no longer as what any file's class is measured
+// against, which is why the scope below no longer has to know which packages read each other.
 //
 // This sentence used to say the opposite, and it was right when it was written: which ending was
 // correct belonged to the checkout and not to this repository, because a clone with
@@ -1681,13 +1721,21 @@ func TestTheLineEndingPinIsReadTheWayGitResolvesIt(t *testing.T) {
 // construction. A package whose files are pinned to two different endings is reported as that,
 // since no ending it could be in would then be uniform.
 //
-// DERIVED at both ends -- the class off each package's own files, the scope by
-// lineEndingScanRoots. Until 2026-09-05 the scope was this one directory, and the consequence
-// was measurable: mls was 137 files crlf and 0 lf while connect/message had drifted to 6 crlf
+// DERIVED at both ends -- the class off the pin, per file; the scope by lineEndingScanRoots,
+// which walks this module and returns every directory holding Go source. Until 2026-09-05 the
+// scope was this one directory, and the consequence was measurable: mls was 137 files crlf and
+// 0 lf while connect/message had drifted to 6 crlf
 // and 7 lf and connect/messagegroup to 5 and 1. mls stayed uniform BECAUSE of this gate, and
 // the two packages with no gate are what a package with no gate looks like after a fortnight.
 // The review that first raised this named a single file; reading the class off the directory
 // found sixteen, which is guardrail 5's point made by the same defect a second time.
+//
+// The scope then spent part of one day as a closure over "../" path literals, which reached those
+// three packages and excluded connect/mls/syntax and connect's own package on a justification
+// that contradicted itself. Measured before it was removed: all 23 files of mls/syntax went
+// uniformly crlf against 7496 passing tests. Walking the module needs no such argument, and
+// needed no exception either -- an exception is what would have said this was a widening
+// wearing a simplification's clothes.
 //
 // None of that was visible in git. core.autocrlf=true cleans on the way in, so every blob of
 // all three packages was already lf and `git diff` was empty across the whole drift. The

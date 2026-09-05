@@ -8,12 +8,17 @@
 # ending matches nothing in a file using the other: it edits nothing, the suite then
 # passes, and that reads as "the change was made and was harmless".
 #
-# mls/vectors_runner_test.go holds the same property as a gate, but PER PACKAGE and only
-# over the scope it can derive: it follows "../" path literals out of mls, so it reaches
-# connect/message and connect/messagegroup and cannot reach a CHILD directory at all.
-# connect/mls/syntax sat in exactly that blind spot at 6 CRLF against 17 LF, and
-# connect/message imports it. This pin is the half of the property no derivation reaches:
-# every Go file in the repository, in every package, gated or not.
+# mls/vectors_runner_test.go holds the same property as a gate, over every package of the
+# module: it walks the module root, judges every directory holding Go source, and resolves
+# the ending each file is required to carry out of THIS file. It used to derive that scope by
+# following "../" path literals out of mls, which reached connect/message and
+# connect/messagegroup and could not reach a CHILD directory at all; connect/mls/syntax sat in
+# exactly that blind spot at 6 CRLF against 17 LF, and connect/message imports it. That
+# closure is gone as of 2026-09-05 and the scope is the module.
+#
+# The pin still reaches what no scan can: a file this working tree has not got, in a checkout
+# nobody has made yet. The gate reaches what the pin cannot: what the working tree actually
+# carries right now, which is the only place the drift is ever visible.
 #
 # It costs no git object. autocrlf cleans on the way in, so all 474 .go blobs were
 # already LF when this line was added; what it rewrites is the working tree, which is the
@@ -35,7 +40,7 @@
 # So a pin is never on its own evidence that a tree is clean, and that is why it is not left
 # on its own. mls/vectors_runner_test.go's TestThePackageSourceIsOneLineEndingThroughout READS
 # this file, derives lf from the line below rather than hard-coding it, and holds the working
-# tree of connect/mls, connect/message and connect/messagegroup to it. Delete that line and
+# tree of every package in this module to it. Delete that line and
 # every file it judges reports as pinned to nothing and the gate goes red -- which is the point
 # of deriving it: the pin and the gate are one mechanism and neither half was worth anything
 # alone. Until 2026-09-05 they were two, and deleting this line was invisible to all 7,495
