@@ -835,8 +835,18 @@ const (
 	// generation past the bound is refused and the head catches up by exactly this much before
 	// the refusal returns -- see (*ratchet).peekFor -- so the work one generation number can buy
 	// is this constant whether the number is inside the bound or outside it, and a receiver that
-	// fell behind a busy peer reaches it again in ceil(distance/MaxGenerationSkip) messages
-	// instead of being deaf to that peer for the rest of the epoch.
+	// fell behind a busy peer reaches it again after losing
+	// ceil((distance-MaxGenerationSkip)/(MaxGenerationSkip-1)) messages instead of being deaf to
+	// that peer for the rest of the epoch.
+	//
+	// THE DENOMINATOR IS ONE SHORT OF THE CONSTANT because the peer moves as well. A refused
+	// message costs that peer one further send before the next attempt, so the gap closes by
+	// MaxGenerationSkip-1 per message refused and not by MaxGenerationSkip. This sentence read
+	// ceil(distance/MaxGenerationSkip) until it was measured, and so did the disclosure in
+	// (*Group).LoadGroup: the two formulas disagree at seven of the ten distances
+	// TestTheCatchUpLosesTheNumberOfMessagesThisDisclosureStates derives from this constant, and
+	// the case that disclosure names -- a peer 1026 ahead -- is one of the seven, losing ONE
+	// message where the old formula says two.
 	MaxGenerationSkip uint32 = 1024
 
 	// RatchetWindowSize bounds the skipped keys retained for out of order receipt BY ONE
@@ -896,6 +906,22 @@ func (self *SecretTree) nextSenderKeyLocked(leaf LeafIndex, kind RatchetType) (g
 // ErrRatchetGenerationConsumed and ErrRatchetGenerationTooFarAhead both say the key never
 // existed or no longer does, which is a different statement from ValSem006 -- that one is
 // the AEAD refusing a message whose key was found.
+//
+// IT BYPASSES SENDER DATA AUTHENTICATION, and this paragraph is here because there is no caller to
+// have learned it from. Verified in this package's non test source: this method has ZERO production
+// callers. The framing path reaches a generation number only after openSenderData has opened an
+// AEAD under the epoch's sender_data_secret, and every argument written elsewhere in this file
+// about what a peer can buy with one header -- peekFor's "the party choosing it is a member of this
+// group", pruneRetained's bound over forged headers -- rests on that AEAD. It is an argument about
+// the FRAMING PATH and not about this type's API, and this door is where the two come apart: a
+// caller that hands this method a leaf index, a kind and a generation taken off the wire has
+// skipped the AEAD, and what it buys per unauthenticated header is ratchetFor -- which takes the
+// leaf node secret out of the tree and materialises both of that leaf's ratchets, destructively and
+// for any leaf the tree has -- plus up to MaxGenerationSkip steps and the retention that goes with
+// them. The leaf index itself is bounded, by takeLeafSecret's pathToLeaf; it is the only thing
+// here that is. pruneRetained bounds the memory. Nothing here bounds who is
+// asking. So the first caller of this method owes its own answer to that question before it writes
+// the call; the framing layer's answer is not inherited by coming through this door.
 func (self *SecretTree) ReceiverKey(leaf LeafIndex, kind RatchetType, generation uint32) (key []byte, nonce []byte, err error) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -962,7 +988,10 @@ func (self *SecretTree) SenderGeneration(leaf LeafIndex, kind RatchetType) (uint
 // SORTED, and pathSecretsOf's two reasons hold unchanged: a map has no order and these octets go
 // to a disk, so two persists of one unchanged epoch must not answer different octets; and the sort
 // is written out rather than imported, because this package's constant-time gate derives its
-// banned comparator class out of the imports each production file makes.
+// banned comparator class out of the imports each production file makes. It is
+// sortSenderRatchetEntries and not two nested loops written here, so the ordering can be held to a
+// descending input on every run rather than only on the rounds the map's randomisation supplies
+// one -- see that function for what the difference was measured to be.
 //
 // NO SECRET IS COPIED, which is marshalState's rule for every field of the blob this fills. Each
 // Secret here is the live ratchet's own storage, and that is safe for exactly as long as the
@@ -989,12 +1018,35 @@ func (self *SecretTree) SenderRatchets(leaf LeafIndex) ([]senderRatchetEntry, er
 		out = append(out, senderRatchetEntry{
 			Kind: key.kind, Consumed: r.consumed(), Secret: r.secret})
 	}
-	for i := 1; i < len(out); i += 1 {
-		for j := i; 0 < j && out[j].Kind < out[j-1].Kind; j -= 1 {
-			out[j], out[j-1] = out[j-1], out[j]
+	sortSenderRatchetEntries(out)
+	return out, nil
+}
+
+// sortSenderRatchetEntries puts a vector into the strictly increasing RatchetType order that
+// RestoreSenderRatchets is the only reader of.
+//
+// IT IS A NAMED FUNCTION SO THE ORDER CAN BE HELD WITHOUT WAITING FOR THE RUNTIME TO COOPERATE.
+// Its caller ranges a map, so a case that can reach the sort only through SenderRatchets is handed
+// a DESCENDING input on the rounds go's iteration randomisation happens to produce one and on no
+// others -- measured over the two entries a leaf of this build holds, 600 rounds in 5000. A case
+// written over that door has to ask hundreds of times, guard its own vacuity, and still assert a
+// probability rather than a property. TestSenderRatchetsAnswersOneOrderWhateverTheMapHandsBack is
+// still that case, because the door is what ships; this function is how the ordering itself is
+// held to a descending input on every run.
+//
+// It sorts IN PLACE rather than answering a vector, so there is no second allocation of a slice
+// whose elements alias live ratchet secrets, and no way for a caller to sort a copy and persist
+// the original.
+//
+// The sort is written out rather than imported, for SenderRatchets' stated reason: this package's
+// constant-time gate derives its banned comparator class out of the imports each production file
+// makes, and slices.SortFunc arrives beside slices.Equal and slices.Compare.
+func sortSenderRatchetEntries(entries []senderRatchetEntry) {
+	for i := 1; i < len(entries); i += 1 {
+		for j := i; 0 < j && entries[j].Kind < entries[j-1].Kind; j -= 1 {
+			entries[j], entries[j-1] = entries[j-1], entries[j]
 		}
 	}
-	return out, nil
 }
 
 // RestoreSenderRatchets puts this leaf's own ratchets back where the persisted state left them.

@@ -2783,9 +2783,20 @@ func LoadGroup(cfg *GroupConfig, epoch uint64, signer SignaturePrivateKey) (*Gro
 	//     restored, alice Protects once more, and bob answers "generation too far ahead:
 	//     generation 1026, head 0, bound 1024" -- and answers it again for every later message
 	//     alice sends in that epoch, because a refusal left the head where it was. It is now
-	//     bounded: the refusal advances that peer's head by MaxGenerationSkip, so a member behind
-	//     by n generations loses ceil(n/MaxGenerationSkip) messages from that peer and then reads
-	//     it again. In the measured case that is one.
+	//     bounded -- and the bound is NOT ceil(n/MaxGenerationSkip), which is what this paragraph
+	//     stated until somebody ran it. The refusal advances that peer's head by
+	//     MaxGenerationSkip while the peer advances by ONE, the next message it sends, so the gap
+	//     closes by MaxGenerationSkip-1 per message refused: a member behind by n generations
+	//     loses ceil((n-MaxGenerationSkip)/(MaxGenerationSkip-1)) messages from that peer and then
+	//     reads it again, and loses none at all at or below the bound.
+	//     TestTheCatchUpLosesTheNumberOfMessagesThisDisclosureStates measures both formulas at ten
+	//     values of n derived from the constant; they disagree at seven, and the case named above
+	//     is one of the seven -- n=1026 loses ONE message, where ceil(n/MaxGenerationSkip) says
+	//     two. And "loses" is first delivery rather than the epoch: the catch-up leaves that
+	//     peer's head MaxGenerationSkip further on, which is inside the bound of the generation it
+	//     has just refused, so a RETRANSMISSION of that message opens rather than being refused
+	//     again. Measured in the same case: asking a second time for generation 1026 answers the
+	//     key.
 	//
 	// WHY NOT PERSIST THE PEERS TOO, since the blob could hold them and they are no more secret
 	// than what it already carries -- the encryption secret it rebuilds derives every leaf's every

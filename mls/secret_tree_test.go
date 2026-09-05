@@ -5899,3 +5899,375 @@ func TestSenderRatchetsAnswersOneOrderWhateverTheMapHandsBack(t *testing.T) {
 	t.Logf("%d of %d rounds saw the map hand back the descending order, and every SenderRatchets answer was ascending",
 		sawDescending, stOrderingRounds)
 }
+
+// ---------------------------------------------------------------------------
+// what the catch-up keeps, and the two numbers the disclosures state about it
+// ---------------------------------------------------------------------------
+
+// stCatchUpRetainedRun is the generations a catch-up from head 0 leaves openable, as an inclusive
+// range, DERIVED from the three constants that decide it rather than written down.
+//
+// The catch-up walks MaxGenerationSkip generations and keeps the newest of them the retention
+// bounds admit: RatchetWindowSize bounds one ratchet and MaxRetainedWindowKeys bounds the tree. A
+// fixture that named 0 and 1023 would go on asserting those two numbers after a change to any of
+// the three -- passing over a build that retains nothing near them, or failing over one that is
+// correct.
+func stCatchUpRetainedRun(t *testing.T) (oldest uint32, newest uint32) {
+	t.Helper()
+	kept := RatchetWindowSize
+	if MaxRetainedWindowKeys < kept {
+		kept = MaxRetainedWindowKeys
+	}
+	if uint64(kept) > uint64(MaxGenerationSkip) {
+		kept = int(MaxGenerationSkip)
+	}
+	if kept < 1 {
+		t.Fatalf("the retention bounds admit %d generation(s), so a catch-up keeps nothing and there is nothing here to observe",
+			kept)
+	}
+	return MaxGenerationSkip - uint32(kept), MaxGenerationSkip - 1
+}
+
+// TestTheCatchUpRetainsTheGenerationsItWalkedPast holds the half of the catch-up that is the entire
+// reason it exists.
+//
+// WHAT WAS UNOBSERVED, measured: deleting BOTH statements of the retention from
+// (*ratchet).catchUpLocked -- the store into the window and the prune beside it -- left 7478 tests
+// green. A member that steps past a gap and keeps nothing has done the KDF work and thrown the
+// result away, which is what catchUpLocked's own comment forbids: "the keys it passes are RETAINED
+// rather than discarded ... discarding them would make a catch-up strictly worse for the honest
+// case than the in-bound skip an attacker can force".
+//
+// WHY THE CASE NEXT DOOR DOES NOT COVER IT, which is the whole reason this one is written.
+// TestAReceiverPastTheSkipBoundCatchesUpInsteadOfGoingDeafForTheEpoch ends by opening ahead-1, and
+// ahead-1 is 1025 while the head the catch-up left is 1024. That generation is at or ABOVE the
+// head, so it was stored by the ACCEPTED skip that opened ahead+1 a moment earlier -- by peekFor's
+// own loop -- and not by the catch-up at all. Its retention assertion is real and it is about the
+// other path.
+//
+// SO THIS ONE OPENS FROM INSIDE THE GAP: a generation strictly BELOW the head the catch-up left,
+// asked before anything else has stepped that ratchet, so the only thing in this build that could
+// have kept it is the catch-up. And the key is compared against the sender's own, because a
+// catch-up that stored the wrong keys answers the right length with a nil error.
+func TestTheCatchUpRetainsTheGenerationsItWalkedPast(t *testing.T) {
+	ahead := MaxGenerationSkip + 2
+	if ahead <= MaxGenerationSkip {
+		t.Fatalf("a peer %d generations ahead is inside the bound of %d, so no catch-up runs and this case observes an ordinary skip",
+			ahead, MaxGenerationSkip)
+	}
+	oldest, newest := stCatchUpRetainedRun(t)
+	inside := []uint32{oldest, newest}
+	for _, generation := range inside {
+		if generation >= MaxGenerationSkip {
+			t.Fatalf("generation %d is not below the head a catch-up of %d leaves, so opening it would observe the accepted path",
+				generation, MaxGenerationSkip)
+		}
+	}
+
+	// the sender's own keys for the generations this case will ask the receiver for, drawn from a
+	// second tree so what is compared is a key and not just the absence of an error.
+	sender, receiver := stNewTree(t, 8), stNewTree(t, 8)
+	senderKeys, senderNonces := map[uint32][]byte{}, map[uint32][]byte{}
+	for draws := uint32(0); draws <= ahead; draws += 1 {
+		generation, key, nonce, err := sender.NextSenderKey(1, RatchetApplication)
+		if err != nil {
+			t.Fatalf("NextSenderKey at draw %d: %v", draws, err)
+		}
+		for _, wanted := range inside {
+			if generation == wanted {
+				senderKeys[generation] = bytes.Clone(key)
+				senderNonces[generation] = bytes.Clone(nonce)
+			}
+		}
+		if generation == ahead {
+			break
+		}
+	}
+	for _, generation := range inside {
+		if senderKeys[generation] == nil {
+			t.Fatalf("the sender never drew generation %d in %d draws, so there is nothing to compare the receiver's answer against",
+				generation, ahead+1)
+		}
+	}
+
+	// the refusal that runs the catch-up, and the vacuity guard for everything below: an in-bound
+	// distance would retain through peekFor's accepted loop and this case would report that as
+	// this.
+	if _, _, err := receiver.ReceiverKey(1, RatchetApplication, ahead); !errors.Is(err, ErrRatchetGenerationTooFarAhead) {
+		t.Fatalf("a receiver at head 0 asked for generation %d answered %v, want ErrRatchetGenerationTooFarAhead",
+			ahead, err)
+	}
+	head, err := receiver.SenderGeneration(1, RatchetApplication)
+	if err != nil {
+		t.Fatalf("SenderGeneration after the catch-up: %v", err)
+	}
+	if head != MaxGenerationSkip {
+		t.Fatalf("the catch-up left the head at %d, want %d: the refusal did not advance it by the bound, so the generations opened below are not the ones this case is about",
+			head, MaxGenerationSkip)
+	}
+
+	for _, generation := range inside {
+		key, nonce, err := receiver.ReceiverKey(1, RatchetApplication, generation)
+		if err != nil {
+			t.Fatalf("generation %d -- inside the run of %d the catch-up walked, below the head %d it left, and asked before anything else stepped this ratchet -- answered %v: the catch-up expanded that generation's key and kept nothing, so a member that fell behind pays for the whole walk and can still open none of the messages it walked past",
+				generation, MaxGenerationSkip, head, err)
+		}
+		if !bytes.Equal(key, senderKeys[generation]) || !bytes.Equal(nonce, senderNonces[generation]) {
+			t.Fatalf("the catch-up retained key %x and nonce %x for generation %d, and the sender drew %x and %x: the head moved without the secret moving with it",
+				key, nonce, generation, senderKeys[generation], senderNonces[generation])
+		}
+	}
+}
+
+// TestTheCatchUpHoldsThisRatchetsWindowToItsOwnBound is the other half of the retention: the prune
+// the catch-up runs beside each store it makes.
+//
+// IT IS WHITE BOX AND THAT IS THE FINDING, not a shortcut. At the exported door the prune inside
+// the catch-up is INVISIBLE: ReceiverKey applies the tree wide bound the moment the catch-up
+// returns, MaxRetainedWindowKeys is RatchetWindowSize itself, and with one ratchet holding
+// everything the two bounds evict the same oldest entries down to the same total. So the end states
+// agree and only the PEAK differs -- the window this ratchet holds while the walk is running, which
+// reaches what was already retained plus MaxGenerationSkip before anything trims it. That peak is
+// what this case reads, at the only place it exists.
+//
+// THE VACUITY GUARD IS ARITHMETIC RATHER THAN A NUMBER: the seeded window plus the walk must exceed
+// the bound, or a build with no prune at all would end inside it and this case would pass over the
+// deletion it exists to catch.
+func TestTheCatchUpHoldsThisRatchetsWindowToItsOwnBound(t *testing.T) {
+	seed := uint32(RatchetWindowSize / 2)
+	if seed > MaxGenerationSkip {
+		seed = MaxGenerationSkip
+	}
+	if seed == 0 {
+		t.Fatalf("the bound of %d admits no seeding skip, so the catch-up below would start on an empty window and its prune would have nothing to do",
+			RatchetWindowSize)
+	}
+	tree := stNewTree(t, 8)
+	subject, err := tree.ratchetFor(1, RatchetApplication)
+	if err != nil {
+		t.Fatalf("ratchetFor: %v", err)
+	}
+	// an ordinary in-bound skip first, so the window is not empty when the catch-up starts.
+	if _, err := subject.keyFor(seed); err != nil {
+		t.Fatalf("keyFor(%d): %v", seed, err)
+	}
+	seeded := len(subject.window)
+	if uint64(seeded)+uint64(MaxGenerationSkip) <= uint64(RatchetWindowSize) {
+		t.Fatalf("a walk of %d over a window of %d entries reaches %d, which is inside the bound of %d: a build whose catch-up never pruned would end inside it too and this case would observe nothing",
+			MaxGenerationSkip, seeded, uint64(seeded)+uint64(MaxGenerationSkip), RatchetWindowSize)
+	}
+	if err := subject.catchUpLocked(); err != nil {
+		t.Fatalf("catchUpLocked: %v", err)
+	}
+	if len(subject.window) > RatchetWindowSize {
+		t.Fatalf("the catch-up walked %d generations onto a window already holding %d and left %d entries retained, want at most %d: a window that never prunes is memory this epoch does not release, and the party who decides how much of it there is is whoever chose the generation number",
+			MaxGenerationSkip, seeded, len(subject.window), RatchetWindowSize)
+	}
+	t.Logf("a catch-up of %d over a seeded window of %d left %d entries, bound %d",
+		MaxGenerationSkip, seeded, len(subject.window), RatchetWindowSize)
+}
+
+// TestTheGenerationTheCatchUpRefusedOpensOnARetransmit holds the sentence (*Group).LoadGroup's
+// disclosure states about what a catch-up costs: the refused message is refused ONCE, not for the
+// epoch.
+//
+// The catch-up leaves that peer's head MaxGenerationSkip further on, which is inside the bound of
+// the generation it has just refused -- so the same generation asked a second time is an ordinary
+// in-bound skip. A disclosure that says "loses" without saying which delivery it means describes a
+// worse product than this one is.
+func TestTheGenerationTheCatchUpRefusedOpensOnARetransmit(t *testing.T) {
+	ahead := MaxGenerationSkip + 2
+	sender, receiver := stNewTree(t, 8), stNewTree(t, 8)
+	var senderKey, senderNonce []byte
+	for draws := uint32(0); draws <= ahead; draws += 1 {
+		generation, key, nonce, err := sender.NextSenderKey(1, RatchetApplication)
+		if err != nil {
+			t.Fatalf("NextSenderKey at draw %d: %v", draws, err)
+		}
+		if generation == ahead {
+			senderKey, senderNonce = bytes.Clone(key), bytes.Clone(nonce)
+			break
+		}
+	}
+	if senderKey == nil {
+		t.Fatalf("the sender did not reach generation %d, so its ratchet is not handing out consecutive generations",
+			ahead)
+	}
+	if _, _, err := receiver.ReceiverKey(1, RatchetApplication, ahead); !errors.Is(err, ErrRatchetGenerationTooFarAhead) {
+		t.Fatalf("the first delivery of generation %d answered %v, want ErrRatchetGenerationTooFarAhead",
+			ahead, err)
+	}
+	key, nonce, err := receiver.ReceiverKey(1, RatchetApplication, ahead)
+	if err != nil {
+		t.Fatalf("the RETRANSMISSION of generation %d answered %v; the disclosure in (*Group).LoadGroup says the catch-up leaves the head inside the bound of the generation it refused, so this message opens on a second delivery",
+			ahead, err)
+	}
+	if !bytes.Equal(key, senderKey) || !bytes.Equal(nonce, senderNonce) {
+		t.Fatalf("the retransmission opened under key %x nonce %x and the sender drew %x and %x",
+			key, nonce, senderKey, senderNonce)
+	}
+}
+
+// stCatchUpLossDistances is the distances the case below measures, DERIVED from MaxGenerationSkip
+// rather than typed, so a change to the bound moves the cases with it instead of leaving ten
+// numbers that were about a different constant. The values straddle each multiple of the bound,
+// because that is where the two formulas part company.
+func stCatchUpLossDistances() []uint32 {
+	skip := MaxGenerationSkip
+	return []uint32{
+		skip, skip + 1, skip + 2,
+		2*skip - 2, 2*skip - 1, 2 * skip, 2*skip + 1,
+		3*skip - 2, 3*skip - 1, 3 * skip,
+	}
+}
+
+// stMessagesLostCatchingUp is the formula (*Group).LoadGroup's disclosure and MaxGenerationSkip's
+// own comment both state, written once so the case below measures the sentence rather than a
+// paraphrase of it.
+func stMessagesLostCatchingUp(distance uint32) int {
+	if distance <= MaxGenerationSkip {
+		return 0
+	}
+	behind := uint64(distance) - uint64(MaxGenerationSkip)
+	perRefusal := uint64(MaxGenerationSkip) - 1
+	return int((behind + perRefusal - 1) / perRefusal)
+}
+
+// TestTheCatchUpLosesTheNumberOfMessagesThisDisclosureStates measures the number two disclosures in
+// this package state, because they had stated a different one.
+//
+// WHAT WAS WRONG. Both said ceil(n/MaxGenerationSkip). The refusal advances the receiver's head by
+// MaxGenerationSkip, but the peer advances too -- it sends one further message before the next
+// attempt -- so the gap closes by MaxGenerationSkip-1 per message refused, not by
+// MaxGenerationSkip. Measured: at n=1026, the case (*Group).LoadGroup names, ONE message is lost
+// and the old formula says two.
+//
+// THE CASE GUARDS AGAINST AGREEING WITH BOTH. The two formulas coincide at some distances, so a
+// fixture that happened to sample only those would certify the corrected sentence and the
+// superseded one equally well; the run therefore requires the superseded formula to have DISAGREED
+// with the measurement at least once, and says so rather than passing if it never does.
+func TestTheCatchUpLosesTheNumberOfMessagesThisDisclosureStates(t *testing.T) {
+	distances := stCatchUpLossDistances()
+	disagreements := 0
+	for _, distance := range distances {
+		receiver := stNewTree(t, 8)
+		lost, opened, found := 0, uint32(0), false
+		// the peer keeps sending: each refused delivery costs it one further message, which is
+		// the whole of why the denominator is one short of the bound.
+		for generation := distance; generation <= distance+MaxGenerationSkip; generation += 1 {
+			if _, _, err := receiver.ReceiverKey(1, RatchetApplication, generation); err == nil {
+				opened, found = generation, true
+				break
+			}
+			lost += 1
+		}
+		if !found {
+			t.Fatalf("a receiver at head 0 whose peer is %d generations ahead never opened anything over %d further messages, so the catch-up is not converging",
+				distance, MaxGenerationSkip)
+		}
+		if want := stMessagesLostCatchingUp(distance); lost != want {
+			t.Fatalf("a peer %d generations ahead cost %d message(s) before generation %d opened, and the disclosure in (*Group).LoadGroup states %d",
+				distance, lost, opened, want)
+		}
+		// the formula that stood in both disclosures until this case was written.
+		superseded := int((uint64(distance) + uint64(MaxGenerationSkip) - 1) / uint64(MaxGenerationSkip))
+		if superseded != lost {
+			disagreements += 1
+		}
+	}
+	if disagreements == 0 {
+		t.Fatalf("ceil(n/MaxGenerationSkip) agreed with the measured loss at all %d distances, so this case cannot tell the corrected disclosure from the one it replaced and the correction is unobserved",
+			len(distances))
+	}
+	t.Logf("%d of %d distances distinguish the stated formula from the superseded ceil(n/MaxGenerationSkip)",
+		disagreements, len(distances))
+}
+
+// TestTheSenderRatchetVectorIsSortedIntoTheOrderTheRestoreDemands holds the ordering that decides
+// whether a persisted state can be loaded back, on a DESCENDING input, on every run.
+//
+// WHY IT IS BESIDE TestSenderRatchetsAnswersOneOrderWhateverTheMapHandsBack rather than instead of
+// it. That case drives the door that ships, and it can be handed a descending input only on the
+// rounds go's map randomisation supplies one -- measured at 600 rounds in 5000, so it asks hundreds
+// of times, guards its own vacuity, and what it finally reports is a probability. This case hands
+// the sort the descending vector directly, so the property is observed on run one and on every run
+// after it. Neither replaces the other: that one says the door sorts, this one says the sort sorts.
+//
+// AND IT IS TIED TO THE READ AT BOTH ENDS, which is what makes the ordering load-bearing rather
+// than cosmetic: the same vector is refused by RestoreSenderRatchets before the sort and accepted
+// after it.
+func TestTheSenderRatchetVectorIsSortedIntoTheOrderTheRestoreDemands(t *testing.T) {
+	live := stNewTree(t, 8)
+	if _, _, _, err := live.NextSenderKey(1, RatchetApplication); err != nil {
+		t.Fatalf("NextSenderKey: %v", err)
+	}
+	entries, err := live.SenderRatchets(1)
+	if err != nil {
+		t.Fatalf("SenderRatchets: %v", err)
+	}
+	if len(entries) < 2 {
+		t.Fatalf("this leaf holds %d ratchet(s), so no two entries can be out of order and this case observes nothing",
+			len(entries))
+	}
+
+	// the descending vector, DERIVED by reversing the one this build actually writes rather than
+	// assembled out of kinds typed here: what has to be sorted is whatever SenderRatchets can
+	// produce, and a hand-built vector is a second opinion about that.
+	descending := make([]senderRatchetEntry, 0, len(entries))
+	for i := len(entries) - 1; 0 <= i; i -= 1 {
+		descending = append(descending, entries[i])
+	}
+	if !stHoldsAKindOutOfOrder(descending) {
+		t.Fatal("reversing the live vector did not put it out of order, so the sort below is handed the order it would have produced anyway")
+	}
+
+	// the read refuses it as it stands. This is the state that cannot be loaded back, and it is
+	// what a build with no sort would persist every time the map iterated this way.
+	if err := stNewTree(t, 8).RestoreSenderRatchets(1, descending); !errors.Is(err, errGroupStateSenderRatchetOrder) {
+		t.Fatalf("the descending vector restored with %v, want errGroupStateSenderRatchetOrder: without that refusal the ordering is not a property and this case measures nothing",
+			err)
+	}
+	sortSenderRatchetEntries(descending)
+	if stHoldsAKindOutOfOrder(descending) {
+		t.Fatalf("the sort left the vector out of order: %v", stKindsOf(descending))
+	}
+	if err := stNewTree(t, 8).RestoreSenderRatchets(1, descending); err != nil {
+		t.Fatalf("the sorted vector was refused: %v", err)
+	}
+
+	// AND IT IS A SORT RATHER THAN A SWAP OF THE ENDS, which the vector above cannot tell apart: a
+	// leaf of this build holds two ratchets, so reversing its vector exercises exactly one
+	// comparison. The Kind values below are sort INPUTS and not ratchet types this build has --
+	// nothing installs this vector, it is only ordered -- and the run is longer than anything
+	// SenderRatchets can write precisely so that swapping the ends fails it.
+	longer := []senderRatchetEntry{}
+	for kind := 5; 0 < kind; kind -= 1 {
+		longer = append(longer, senderRatchetEntry{Kind: RatchetType(kind)})
+	}
+	sortSenderRatchetEntries(longer)
+	if stHoldsAKindOutOfOrder(longer) {
+		t.Fatalf("a descending run of %d came back as %v: the ordering is a swap of the ends and not a sort",
+			len(longer), stKindsOf(longer))
+	}
+}
+
+// stHoldsAKindOutOfOrder reports whether any entry names a kind at or below the one before it,
+// which is the shape RestoreSenderRatchets refuses.
+func stHoldsAKindOutOfOrder(entries []senderRatchetEntry) bool {
+	for i := 1; i < len(entries); i += 1 {
+		if entries[i].Kind <= entries[i-1].Kind {
+			return true
+		}
+	}
+	return false
+}
+
+// stKindsOf is the kinds of a vector, for a failure message that shows the order it is complaining
+// about rather than one position out of it.
+func stKindsOf(entries []senderRatchetEntry) []RatchetType {
+	kinds := []RatchetType{}
+	for _, entry := range entries {
+		kinds = append(kinds, entry.Kind)
+	}
+	return kinds
+}

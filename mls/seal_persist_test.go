@@ -83,11 +83,27 @@ const sealAndRecordName = "sealAndRecordLocked"
 
 // sealSiteDoor is one derived seal site and the exported call a fixture reaches it with.
 //
-// The `handedBack` half of drive is the assertion this whole file is about. "The call returned an
-// error" is satisfied by a build that persisted afterwards and by one that never persisted at all;
-// what tells them apart is whether a message came back BESIDE the refusal, because a message that
-// came back is a message whose generation the store has not recorded and which a peer may already
-// have opened.
+// THE HEADER THAT STOOD HERE NAMED THE OTHER ASSERTION'S PROPERTY, and it is corrected rather than
+// deleted because a reader would have trusted it. It said that "the call returned an error" is
+// satisfied by a build that persisted afterwards and by one that never persisted at all, and that
+// the `handedBack` half is what tells those apart. It is not: over a REFUSING store a build that
+// never persisted at all has nothing to refuse it, so it answers a message and a NIL error, and the
+// errors.Is check below is precisely what separates the two -- which is what this file's own
+// measurement at the top records, four failures out of 7478 with the persist rewritten as
+// `_ = self.persist()`, every one of them on that check.
+//
+// WHAT `handedBack` OBSERVES is the other half of sealAndRecordLocked's sentence: "the ciphertext is
+// dropped inside this function, so nothing under that generation ever reaches a peer". The build it
+// separates from this one is the alternative that comment names and rejects -- "answer the
+// ciphertext and report the store's refusal some other way" -- and that build satisfies the
+// errors.Is check perfectly, because it returns the store's refusal too. Only this half sees it. The
+// drop is spelled at each of the three doors rather than once, so it is three places the property
+// can be lost and one assertion standing over all three.
+//
+// AND IT IS THE CONTROL'S VACUITY GUARD AS WELL, in the other direction: a door that answered
+// nothing over a store that is not refusing would satisfy the refusal assertions below without ever
+// having sealed anything, so the control requires the message to come back before the refusing run
+// requires it not to.
 type sealSiteDoor struct {
 	site  string
 	door  string
