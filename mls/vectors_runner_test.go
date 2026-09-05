@@ -1394,8 +1394,13 @@ func namedSiblingPaths(t *testing.T, path string) []string {
 //     which is a different checkout with its own core.autocrlf and is not this working tree.
 //   - ".." on its own, which is a step in a walk up to the module root and not a scan root.
 //     connect's own package and connect/mls/syntax are outside for that reason: no gate of
-//     these three opens either of them by path. That is a real limit and not a clean bill --
-//     measured 2026-09-05, mls/syntax is 6 files crlf and 17 lf.
+//     these three opens either of them by path. That is a real limit and not a clean bill,
+//     but the drift it used to name is gone rather than merely unwatched: mls/syntax was 6
+//     files crlf against 17 lf when this sentence was first written, and the commit that
+//     added `*.go text eol=lf` renormalised it to 0 against 23. What holds the
+//     child directory is that pin, which reaches every Go file in the repository whether a
+//     scope derivation can see it or not; what this scope holds is the working tree, which
+//     the pin cannot reach at all.
 //
 // The coverage claim is checked rather than asserted, against a scope this package already
 // declares: every root of forbiddenScanRoots -- which five further gates alias rather than
@@ -1461,6 +1466,178 @@ func lineEndingScanRoots(t *testing.T) []string {
 	return roots
 }
 
+// pinnedLineEndingFor answers the ending ONE .gitattributes checks one path out with -- "lf",
+// "crlf", or "" -- and names the line that decided. The second value is what says whether this
+// rule set had an OPINION at all, which is not the same question: a rule set that marks the path
+// binary answers "" and has decided, and one that never mentions the path answers "" and has not.
+//
+// The rule set is read rather than restated for the reason the gate below gives: this repository
+// states which ending is right in exactly one place, and a gate that hard-coded the answer would
+// leave that place unguarded again.
+//
+// Resolution is git's own. Rules in FILE ORDER, LAST match wins, so a narrower line further down
+// answers for the paths it covers and a scan stopping at the first match would report a pin that
+// had already been undone. `-text` and the `binary` macro turn conversion off entirely, so they
+// CLEAR an eol an earlier line asked for rather than sitting beside it. `text` with no eol says
+// the file is text and leaves the ending to core.eol, which is a checkout's answer and not this
+// repository's, so it pins nothing here and decides nothing either.
+//
+// The pattern half is gitAttributesPatternMatches, which has its own control, rather than a
+// comparison over the pattern string. `*.go`, `/*.go` and `**/*.go` are one rule to git, and a
+// gate that recognised only the spelling its author happened to use is a gate that gets silenced
+// by respelling the line instead of by fixing the tree. That false positive has already happened
+// here once, to the corpus rule.
+func pinnedLineEndingFor(body string, filePath string) (string, string) {
+	ending, decidedBy := "", ""
+	for _, line := range strings.Split(body, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || strings.HasPrefix(fields[0], "#") {
+			continue
+		}
+		if !gitAttributesPatternMatches(fields[0], filePath) {
+			continue
+		}
+		for _, attribute := range fields[1:] {
+			switch {
+			case attribute == "-text" || attribute == "binary":
+				// an opinion, and the opinion is "no ending at all". The line is reported for that
+				// reason: pinnedLineEndingOf walks outward until a rule set has decided, and a -text
+				// reporting no decision would let a further away eol= answer for a file git has been
+				// told to leave alone.
+				ending, decidedBy = "", strings.TrimSpace(line)
+			case strings.HasPrefix(attribute, "eol="):
+				ending, decidedBy = strings.TrimPrefix(attribute, "eol="), strings.TrimSpace(line)
+			}
+		}
+	}
+	return ending, decidedBy
+}
+
+// pinnedLineEndingOf resolves one SCANNED file's pin across every rule set that has a say in it,
+// nearest first, which is how git resolves an attribute: a .gitattributes in the file's own
+// directory overrides one in the module root, and the further one answers only for what the
+// nearer one says nothing about.
+//
+// The walk is done rather than assumed, and that is not hypothetical tidiness. The first version
+// of this read connect/.gitattributes and treated it as the whole answer. That is true today and
+// stops being true the moment a package grows a rule set of its own -- and the failure it buys is
+// this file's oldest one: a gate demanding lf while git checks the file out crlf, reading
+// something other than what it claims to read, and reporting a correct tree as broken or a broken
+// one as correct depending on which way the nearer rule went.
+func pinnedLineEndingOf(t *testing.T, moduleRoot string, scanned string) (string, string) {
+	t.Helper()
+	segments := strings.Split(repositoryPathOf(t, moduleRoot, scanned), "/")
+	for depth := len(segments) - 1; depth >= 0; depth-- {
+		dir := filepath.Join(append([]string{moduleRoot}, segments[:depth]...)...)
+		body, err := os.ReadFile(filepath.Join(dir, ".gitattributes"))
+		if err != nil {
+			continue
+		}
+		// a rule set's patterns are written against paths INSIDE it, so mls/.gitattributes says
+		// "*.go" about "group.go" and never about "mls/group.go".
+		if ending, decidedBy := pinnedLineEndingFor(string(body), strings.Join(segments[depth:], "/")); decidedBy != "" {
+			return ending, decidedBy
+		}
+	}
+	return "", ""
+}
+
+// repositoryPathOf is one scanned file as .gitattributes addresses it: relative to the module
+// root, forward slashes. A rule's pattern is matched against a repository path and never against
+// the "../message/framing.go" a scan happens to open the file by.
+func repositoryPathOf(t *testing.T, moduleRoot string, scanned string) string {
+	t.Helper()
+	absolute, err := filepath.Abs(scanned)
+	if err != nil {
+		t.Fatalf("resolve %s: %v", scanned, err)
+	}
+	relative, err := filepath.Rel(moduleRoot, absolute)
+	if err != nil {
+		t.Fatalf("place %s under %s: %v", scanned, moduleRoot, err)
+	}
+	return filepath.ToSlash(relative)
+}
+
+// TestTheLineEndingPinIsReadTheWayGitResolvesIt is the control on the derivation the gate below
+// now rests on, and it is not optional in either direction: a reader answering "lf" for
+// everything would report the tree correct whatever .gitattributes said, and one answering ""
+// for everything would fail the gate on a correctly pinned repository. Both are stated, and so
+// is the third answer the walk depends on -- whether a rule set decided anything at all.
+//
+// The table is written against rule sets spelled out here rather than against the live file, so
+// it goes on meaning what it says when the live file changes; the nesting is exercised against a
+// tree built for it, because this repository has no nested rule set covering Go source and a
+// control that can only be run where the property already holds proves nothing. The live file is
+// then asked one question of its own, because everything above would pass unchanged against a
+// repository that had stopped pinning anything at all.
+func TestTheLineEndingPinIsReadTheWayGitResolvesIt(t *testing.T) {
+	const pin = "*.go text eol=lf"
+	for _, probe := range []struct {
+		body    string
+		path    string
+		want    string
+		decides bool
+		why     string
+	}{
+		{pin, "mls/group.go", "lf", true, "the rule this repository carries, on a path it covers"},
+		{pin, "protocol/message.proto", "", false, "and one it does not"},
+		{"", "mls/group.go", "", false, "no rule at all is no pin, which is what deleting the line looks like"},
+		{"# " + pin, "mls/group.go", "", false, "a commented out rule is not a rule"},
+		{"/*.go text eol=lf", "group.go", "lf", true, "the same rule anchored at the root"},
+		{"**/*.go text eol=lf", "mls/group.go", "lf", true, "and spelled with a leading globstar"},
+		{pin + "\n*.go text eol=crlf", "mls/group.go", "crlf", true, "the last matching line wins, which is git's resolution and not a preference"},
+		{pin + "\nmls/** -text", "mls/group.go", "", true, "-text turns conversion off and clears the eol an earlier line asked for -- and DECIDES, so no outer rule set answers for it"},
+		{pin + "\nmls/** binary", "mls/group.go", "", true, "and binary is git's macro for the same thing"},
+		{"*.go text", "mls/group.go", "", false, "text with no eol says the file is text, not which ending a checkout writes, so an outer rule set still answers"},
+	} {
+		ending, decidedBy := pinnedLineEndingFor(probe.body, probe.path)
+		if ending != probe.want || (decidedBy != "") != probe.decides {
+			t.Errorf("%q against %q answered %q decided-by %q, want %q decided %v: %s",
+				probe.body, probe.path, ending, decidedBy, probe.want, probe.decides, probe.why)
+		}
+	}
+
+	// the nesting, against a tree built for it. Nearest rule set with an opinion wins; a nearer one
+	// with no opinion about this path defers outward.
+	root := t.TempDir()
+	nested := filepath.Join(root, "pkg")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatalf("build the nesting fixture: %v", err)
+	}
+	source := filepath.Join(nested, "x.go")
+	if err := os.WriteFile(source, []byte("package pkg\n"), 0o644); err != nil {
+		t.Fatalf("build the nesting fixture: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".gitattributes"), []byte(pin+"\n"), 0o644); err != nil {
+		t.Fatalf("build the nesting fixture: %v", err)
+	}
+	if ending, _ := pinnedLineEndingOf(t, root, source); ending != "lf" {
+		t.Errorf("with only a module root rule set the walk answered %q, want lf", ending)
+	}
+	for _, nearer := range []struct {
+		body string
+		want string
+		why  string
+	}{
+		{"*.go text eol=crlf\n", "crlf", "a nearer rule set with an opinion overrides the module root's"},
+		{"*.json -text\n", "lf", "a nearer rule set saying nothing about this path defers outward"},
+		{"*.go -text\n", "", "a nearer rule set marking it binary decides, and the root's eol does not answer for it"},
+	} {
+		if err := os.WriteFile(filepath.Join(nested, ".gitattributes"), []byte(nearer.body), 0o644); err != nil {
+			t.Fatalf("build the nesting fixture: %v", err)
+		}
+		if ending, _ := pinnedLineEndingOf(t, root, source); ending != nearer.want {
+			t.Errorf("with %q nearer the file the walk answered %q, want %q: %s", nearer.body, ending, nearer.want, nearer.why)
+		}
+	}
+
+	ending, decidedBy := pinnedLineEndingOf(t, moduleRootDir(t), "vectors_runner_test.go")
+	if ending == "" {
+		t.Fatal("no .gitattributes from this package up to the module root pins a line ending for this file, so the gate below has nothing to hold the working tree to")
+	}
+	t.Logf("the live rule set checks this file out %s, by %q", ending, decidedBy)
+}
+
 // TestThePackageSourceIsOneLineEndingThroughout refuses a working tree in which some file of a
 // package disagrees with the rest of that package about how a line ends.
 //
@@ -1474,11 +1651,35 @@ func lineEndingScanRoots(t *testing.T) []string {
 // start of a line finds no match at all in a crlf file, reads the whole file as one body, and
 // reports clean having found nothing -- which is exactly what a clean file looks like too.
 //
-// Judged PER PACKAGE and never globally, and pinned to NEITHER ending, because which one is
-// right belongs to the checkout and not to this repository: a clone with core.autocrlf off is
-// lf throughout, one with it on is crlf throughout, and both are fine to work in. mls being
-// crlf while message is lf costs nobody anything, because no edit is anchored across a package
-// boundary. message being half of each is the defect.
+// Judged PER PACKAGE, and against the ending .gitattributes PINS rather than against whichever
+// ending a package happens to be uniform in.
+//
+// This sentence used to say the opposite, and it was right when it was written: which ending was
+// correct belonged to the checkout and not to this repository, because a clone with
+// core.autocrlf off was lf throughout and one with it on was crlf throughout and both were fine
+// to work in. `*.go text eol=lf` ended that. Measured on a fresh clone of the commit that added
+// it, with core.autocrlf confirmed live at system scope: all 474 tracked .go files arrived lf,
+// while 116 tracked non-.go text files arrived crlf -- which is the control saying autocrlf was
+// on for that clone rather than quietly off. So no checkout produces a crlf .go file any more,
+// and a package that is uniformly crlf is not a checkout at all: it is a tool having rewritten
+// the working tree, which is the one thing this gate exists to catch.
+//
+// Accepting uniform-crlf cost the gate that whole class. Flipping all 13 files of ../message to
+// crlf left this gate PASSING, on the sentence "all 13 source files of ../message end their
+// lines crlf", and no other gate in the suite noticed.
+//
+// The requirement is READ OUT OF .gitattributes rather than written down here, which is
+// guardrail 5 pointed at a constant instead of at a list. It also closes the other half of the
+// property: deleting `*.go text eol=lf` was invisible to the entire suite, because the pin said
+// which ending was right and nothing observed the tree, while this gate observed the tree and
+// asked for no particular ending. Neither half was worth anything alone. Now the pin is this
+// gate's input, so deleting it leaves every file here pinned to nothing and the gate goes red --
+// one mechanism instead of two unguarded halves.
+//
+// Uniformity is no longer asserted separately because it FALLS OUT: every file of a package is
+// held to the ending its own path is pinned to, so a package that passes is uniform by
+// construction. A package whose files are pinned to two different endings is reported as that,
+// since no ending it could be in would then be uniform.
 //
 // DERIVED at both ends -- the class off each package's own files, the scope by
 // lineEndingScanRoots. Until 2026-09-05 the scope was this one directory, and the consequence
@@ -1491,16 +1692,23 @@ func lineEndingScanRoots(t *testing.T) []string {
 // None of that was visible in git. core.autocrlf=true cleans on the way in, so every blob of
 // all three packages was already lf and `git diff` was empty across the whole drift. The
 // working tree is the only place it shows, and the working tree is what an anchored edit reads.
+// It is also why `git diff --numstat` is not a landed-check for a line ending edit any more: the
+// clean filter converts a crlf back to lf before the diff is computed, so a mutation that really
+// is on disk reports an empty numstat. Check the bytes.
 //
 // A file carrying no line ending at all belongs to neither class and is counted apart, so an
 // empty file cannot make a mixed package look uniform, and a file mixed WITHIN itself is its
 // own report: that one is never a checkout and is always a tool that wrote part of a file.
 func TestThePackageSourceIsOneLineEndingThroughout(t *testing.T) {
+	moduleRoot := moduleRootDir(t)
 	roots := lineEndingScanRoots(t)
 	t.Logf("the derived scope is %v", roots)
 	for _, root := range roots {
 		paths := packageSourcePathsIn(t, root)
-		byEnding := map[string][]string{}
+		heldTo := map[string]int{}
+		decidedBy := map[string]bool{}
+		unpinned := []string{}
+		wrong := []string{}
 		empty := 0
 		for _, path := range paths {
 			source, err := os.ReadFile(path)
@@ -1509,37 +1717,57 @@ func TestThePackageSourceIsOneLineEndingThroughout(t *testing.T) {
 			}
 			lines := bytes.Count(source, []byte("\n"))
 			carried := bytes.Count(source, []byte("\r\n"))
+			carries := ""
 			switch {
 			case lines == 0:
 				empty += 1
+				continue
 			case carried == lines:
-				byEnding["crlf"] = append(byEnding["crlf"], path)
+				carries = "crlf"
 			case carried == 0:
-				byEnding["lf"] = append(byEnding["lf"], path)
+				carries = "lf"
 			default:
 				t.Errorf("%s holds %d lines of which %d end crlf, so the file is mixed within itself and no anchored edit over it can be trusted either way",
 					path, lines, carried)
+				continue
+			}
+			pinned, decided := pinnedLineEndingOf(t, moduleRoot, path)
+			if pinned == "" {
+				unpinned = append(unpinned, path)
+				continue
+			}
+			// counted against what the REPOSITORY says rather than against what the tree does, so
+			// heldTo below is the pin and never a majority vote of the files.
+			heldTo[pinned] += 1
+			decidedBy[decided] = true
+			if carries != pinned {
+				wrong = append(wrong, fmt.Sprintf("%s is %s", path, carries))
 			}
 		}
-		if len(byEnding) == 0 {
+		if len(unpinned) > 0 {
+			t.Errorf("%d of %s's %d source files are pinned to no line ending by any .gitattributes between them and the module root (%s is one), so this gate is holding them to nothing; the pin and this gate are one mechanism and neither half is worth anything alone",
+				len(unpinned), root, len(paths), unpinned[0])
+			continue
+		}
+		if len(heldTo) == 0 {
 			t.Errorf("none of %s's source files carries a line ending at all (%d were empty), so this gate read nothing of that package", root, empty)
 			continue
 		}
-		if len(byEnding) > 1 {
-			// the smaller class is named rather than the larger, because bringing those files
-			// over is the repair.
-			smaller := ""
-			for ending := range byEnding {
-				if smaller == "" || len(byEnding[ending]) < len(byEnding[smaller]) {
-					smaller = ending
-				}
-			}
-			t.Errorf("%s's source is not one line ending throughout: %v end their lines %s and the other %d files do not; an exact-string edit anchored on one ending matches nothing in a file using the other and reports the change as made",
-				root, byEnding[smaller], smaller, len(paths)-len(byEnding[smaller])-empty)
+		if len(heldTo) > 1 {
+			t.Errorf("%s's source is pinned to more than one line ending (%v by %v), so no ending the package could be in is uniform and an edit anchored on either matches nothing in the files pinned to the other",
+				root, slices.Sorted(maps.Keys(heldTo)), slices.Sorted(maps.Keys(decidedBy)))
 			continue
 		}
-		for ending, paths := range byEnding {
-			t.Logf("all %d source files of %s end their lines %s, and %d carry no line ending", len(paths), root, ending, empty)
+		if len(wrong) > 0 {
+			// the pin is named rather than the majority ending, because the pin is the answer and a
+			// majority is only a vote.
+			t.Errorf("%s: %v, and %v checks every one of them out %v; a file the working tree carries in an ending no checkout of this repository produces was written by a tool, and an exact-string edit anchored on the other ending matches nothing in it and reports the change as made",
+				root, wrong, slices.Sorted(maps.Keys(decidedBy)), slices.Sorted(maps.Keys(heldTo)))
+			continue
+		}
+		for ending, count := range heldTo {
+			t.Logf("all %d source files of %s end their lines %s, which is what %v checks them out as, and %d carry no line ending",
+				count, root, ending, slices.Sorted(maps.Keys(decidedBy)), empty)
 		}
 	}
 }

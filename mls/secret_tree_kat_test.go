@@ -1306,9 +1306,9 @@ func TestSecretTreeComparisonCannotReportAComparisonItDidNotMake(t *testing.T) {
 	}
 
 	for _, row := range []struct {
-		name     string
-		weaken   func(evidence *secretTreeComparison)
-		want     error
+		name   string
+		weaken func(evidence *secretTreeComparison)
+		want   error
 	}{
 		{"a run that never entered scope", func(e *secretTreeComparison) { e.inScope = false }, errSecretTreeIncomplete},
 		{"a provider whose widths were never read", func(e *secretTreeComparison) { e.keySize = 0 }, errSecretTreeIncomplete},
@@ -1821,9 +1821,9 @@ func mustRemarshal(t *testing.T, vector secretTreeVector) json.RawMessage {
 // Reporting that as a refusal that did not happen would be reporting a defect in the generator.
 func TestTheConsumeDirectionRefusesAGeneratedSecretTreeUnderTheWrongLabel(t *testing.T) {
 	for _, wrong := range []struct {
-		name          string
-		labels        secretTreeGenerateLabels
-		want          error
+		name           string
+		labels         secretTreeGenerateLabels
+		want           error
 		onlyWithLeaves bool
 	}{
 		{

@@ -131,9 +131,13 @@ func TestZeroizeSecretAcceptsNilAndEmpty(t *testing.T) {
 const noInlineDirective = "//go:noinline"
 
 // carriesTheNoInlineDirective reports whether a doc group holds the directive as one of
-// its own lines. The text is trimmed because this repository is checked out with
-// core.autocrlf on, and a carriage return on the end of the line is what makes an exact
-// comparison silently answer no on windows and yes everywhere else.
+// its own lines. The text is trimmed because a carriage return on the end of the line is
+// what makes an exact comparison silently answer no on windows and yes everywhere else.
+//
+// core.autocrlf being on is no longer how one gets there. It is set at system scope on the
+// windows boxes that build this repository and `*.go text eol=lf` exempts every Go file from
+// it, so the trim stays for the route that pin does not close: a tool writing crlf into the
+// working tree.
 func carriesTheNoInlineDirective(doc *ast.CommentGroup) bool {
 	if doc == nil {
 		return false

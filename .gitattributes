@@ -24,6 +24,22 @@
 # *.pb.go below is SUBSUMED by this line rather than in conflict with it -- both say
 # eol=lf -- and it stays because the comment under it argues regenerate-and-diff, which is
 # about *.proto as much as about the generated Go.
+#
+# EOL=LF ACTS ONLY AT CHECKOUT, and that single fact explains the whole episode. All seven
+# *.pb.go files were already pinned by the rule below, and on 2026-09-05, before the
+# renormalisation that landed with this line, five of them were still CRLF on disk anyway: a
+# pin added after a file has been checked out does not go back and rewrite it. This file
+# governs what the NEXT checkout writes. The working tree is governed by whatever last wrote
+# it, which on this project is as often a tool as it is git.
+#
+# So a pin is never on its own evidence that a tree is clean, and that is why it is not left
+# on its own. mls/vectors_runner_test.go's TestThePackageSourceIsOneLineEndingThroughout READS
+# this file, derives lf from the line below rather than hard-coding it, and holds the working
+# tree of connect/mls, connect/message and connect/messagegroup to it. Delete that line and
+# every file it judges reports as pinned to nothing and the gate goes red -- which is the point
+# of deriving it: the pin and the gate are one mechanism and neither half was worth anything
+# alone. Until 2026-09-05 they were two, and deleting this line was invisible to all 7,495
+# tests in the suite.
 *.go text eol=lf
 
 # protoc emits LF and nothing downstream normalizes it back, so a checkout that

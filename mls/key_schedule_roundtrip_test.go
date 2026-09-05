@@ -283,7 +283,7 @@ type seedCodec struct {
 	// structure is a fresh zero value of the structure this codec encodes. It is what the
 	// coverage gates derive their class from: the registries reachable on the wire and the
 	// fields the corpus has to vary both come off this type rather than off a list.
-	structure      func() any
+	structure func() any
 	// project, when non-nil, answers the exported values the derived walks read in place of the
 	// decoded structure itself.
 	//

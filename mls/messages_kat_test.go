@@ -140,9 +140,9 @@ func init() {
 // that is wrong on purpose and require the matching refusal, which is
 // TestCompareMessagesVectorRefusesACaseItShouldNotAccept.
 var (
-	errMessagesIncomplete   = errors.New("the comparison reports values it cannot have computed")
-	errMessagesFieldMissing = errors.New("the case publishes no value for a column this family reads")
-	errMessagesFieldEmpty   = errors.New("the case publishes an empty value for a column this family reads")
+	errMessagesIncomplete    = errors.New("the comparison reports values it cannot have computed")
+	errMessagesFieldMissing  = errors.New("the case publishes no value for a column this family reads")
+	errMessagesFieldEmpty    = errors.New("the case publishes an empty value for a column this family reads")
 	errMessagesDoesNotDecode = errors.New("a published encoding does not decode as the structure its column names")
 	errMessagesWrongShape    = errors.New("a published encoding is not the message its column name states")
 	errMessagesNotByteExact  = errors.New("a published encoding did not survive a decode and re-encode unchanged")

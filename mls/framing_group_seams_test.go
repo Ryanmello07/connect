@@ -462,7 +462,6 @@ type seamCandidate struct {
 	framesUnknown bool
 }
 
-
 // seamAuthenticatorCarriersIn answers the type names a caller can put its own authenticators
 // inside: the seed itself, every type declared in the scan holding one in a field, every type
 // holding one of THOSE, and so on to a fixed point.

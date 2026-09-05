@@ -219,9 +219,15 @@ func productionSources(sourceTexts map[string]string) map[string]string {
 //
 // The line endings are normalised first, because every matcher downstream of this
 // anchors on what a line holds, and a carriage return sits on the end of every one of
-// them in a checkout git smudged. This repository has already paid for that once, with
+// them in a file something smudged. This repository has already paid for that once, with
 // eighty four source anchors passing on windows because they matched nothing at all --
 // and a matcher that stops matching is a gate that stops demanding.
+//
+// A CHECKOUT is no longer that something: `*.go text eol=lf` means git writes lf into
+// every Go file here whatever core.autocrlf says. A TOOL writing crlf into the working
+// tree still is, which is why this normalisation stays --
+// TestThePackageSourceIsOneLineEndingThroughout catches that one, but only after a
+// matcher has already read the file.
 func codeOf(text string) string {
 	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
 	code := make([]string, 0, len(lines))

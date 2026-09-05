@@ -434,7 +434,7 @@ type Group struct {
 	// WHAT KEEPS THE TWO FROM PARTING COMPANY is that one statement list writes both: NewGroup
 	// builds them from the same GroupInfo and MergePendingCommit installs both off the same
 	// staged commit, which is what the epoch mover gate reads.
-	verified *VerifiedGroupContext
+	verified   *VerifiedGroupContext
 	schedule   *KeySchedule
 	secretTree *SecretTree
 	transcript *TranscriptHashes
@@ -2898,7 +2898,6 @@ func LoadGroup(cfg *GroupConfig, epoch uint64, signer SignaturePrivateKey) (*Gro
 	handedOn = true
 	return group, nil
 }
-
 
 // ---------------------------------------------------------------------------
 // p7 task 16: joining a group from a Welcome and a ratchet tree the CALLER anchored

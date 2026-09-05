@@ -266,7 +266,10 @@ func TestTreeAdaptCitesNoTestThatDoesNotExist(t *testing.T) {
 }
 
 // readSourceFile reads one file of this package as text, with its line endings normalised so a
-// prose scan reads the same thing on a checkout that stores CRLF as on one that does not.
+// prose scan reads the same thing whatever last wrote the file. This used to say "on a checkout
+// that stores CRLF as on one that does not"; `*.go text eol=lf` means no checkout of this
+// repository stores CRLF in a Go file, and what is left to normalise against is a tool that
+// rewrote the working tree.
 func readSourceFile(name string) (string, error) {
 	body, err := os.ReadFile(name)
 	if err != nil {

@@ -494,7 +494,6 @@ func keyScheduleFieldsNamedIn(body *ast.BlockStmt, fields []string) int {
 	return len(named)
 }
 
-
 // syntaxCodecEntryPoints is the third sanctioned exemption to convention C1, and like the
 // first two it is DERIVED: the top level functions mls/syntax declares that are handed a
 // Marshaler or an Unmarshaler.

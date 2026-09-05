@@ -8030,7 +8030,9 @@ func TestNoCryptoSourceCarriesABuildConstraint(t *testing.T) {
 
 // The build constraint lines of one file's text. Carriage returns are normalised first for
 // the reason codeOf normalises them: a matcher anchored on what a line holds matches
-// nothing at all in a checkout git smudged, and a gate that matches nothing demands nothing.
+// nothing at all in a file something smudged, and a gate that matches nothing demands
+// nothing. Not a checkout any more -- `*.go text eol=lf` closed that route -- but a tool
+// that rewrites the working tree still smudges, which is the route codeOf now names.
 func buildConstraintsIn(text string) []string {
 	found := []string{}
 	for _, line := range strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n") {

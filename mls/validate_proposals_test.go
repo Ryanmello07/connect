@@ -131,7 +131,6 @@ func testRemoveOf(leaf LeafIndex) CachedProposal {
 	}
 }
 
-
 func testUpdateOf(sender LeafIndex, leaf *LeafNode) CachedProposal {
 	return CachedProposal{
 		Proposal: Proposal{ProposalType: ProposalTypeUpdate, Update: &Update{LeafNode: *leaf}},
@@ -178,7 +177,6 @@ func testGceOf(exts ...Extension) CachedProposal {
 		ByValue: true,
 	}
 }
-
 
 // testRequiredCapabilitiesExtension is a required_capabilities naming one extension type no
 // fixture leaf of this package lists, so a capability rule that fires is firing on the
@@ -259,7 +257,6 @@ func TestTheLeafTheseFixturesUpdateIsNotTheCommitters(t *testing.T) {
 
 // testValidationGroupId is the group id every input below is judged under.
 
-//
 // ONE SPELLING, because an update leaf's LeafNodeTBS carries the group id and a fixture that
 // signed under one id while the input announced another would be a leaf refused for the wrong
 // reason -- and every test asserting a refusal would pass over it.
@@ -1505,7 +1502,7 @@ func TestTheUpdateDoorDoesNotJudgeALifetimeAnUpdateLeafDoesNotCarry(t *testing.T
 	// clock every sending path passes
 	expired := &LeafValidationContext{
 		Crypto: crypto, Suite: crypto.Suite(), GroupId: testValidationGroupId(),
-		LeafIndex: testUpdatedLeaf,
+		LeafIndex:      testUpdatedLeaf,
 		ExpectedSource: LeafNodeSourceUpdate,
 		NowMs:          uint64(max(time.Now().UnixMilli(), 1)),
 		ClockSkewMs:    leafLifetimeSkewSeconds * 1000,
@@ -1690,7 +1687,6 @@ func testRequiredCapabilitiesNaming(t *testing.T, types ...ExtensionType) Extens
 	}
 	return Extension{ExtensionType: ExtensionTypeRequiredCapabilities, ExtensionData: body}
 }
-
 
 // updateSweepRules is one edit per rule of the derived class. It is not what decides the class:
 // the gate below reads that off validate_proposals.go and holds this table to it in both

@@ -461,6 +461,7 @@ func theTypesThisSourceSerializes(files []parsedSource,
 	}
 	return wire
 }
+
 // eraseWireWriter is the encoder every writer in this source is handed.
 //
 // A DECLARATION TAKING ONE IS PART OF THE ENCODING, and that is the property the reading below is
@@ -1259,7 +1260,7 @@ var theFieldsOfTheEraseClassThatAreNotKeyMaterial = map[string]string{
 		"received, and every member of the group computes both",
 	"Group.proposals": "the cache holds proposals this member received and their references, which travelled " +
 		"to every member of the group as messages the delivery service also saw",
-	"StagedCommit.context":    "the group context of the epoch this commit opens; see Group.context",
+	"StagedCommit.context": "the group context of the epoch this commit opens; see Group.context",
 	"StagedCommit.groupId": "the id of the group that staged this commit, which is the same octets " +
 		"StagedCommit.context carries one row down and Group.context carries one type over: a group id " +
 		"is in every GroupContext, in every FramedContent this group frames, and in the GroupInfo of " +

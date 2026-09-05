@@ -2078,7 +2078,6 @@ func TestPendingAnswersEveryEntryOnceInReceptionOrder(t *testing.T) {
 	}
 }
 
-
 // ---------------------------------------------------------------------------
 // the epoch a RESOLUTION runs in
 // ---------------------------------------------------------------------------

@@ -78,7 +78,7 @@ func TestOwnerSuccessorBodyIsTheOctetsAnIndependentEncoderProduces(t *testing.T)
 			nominatedAtMs:     1770000000000, floorMs: SuccessionFloorMinMs,
 		},
 		{
-			name: "a 64 octet successor id, which is where the varint grows a second octet",
+			name:    "a 64 octet successor id, which is where the varint grows a second octet",
 			enabled: false, enabledByte: 0x00,
 			successorMemberId: bytes.Repeat([]byte{0x5c}, 64),
 			nominatedAtMs:     0xfedcba9876543210, floorMs: SuccessionFloorMinMs + 1,

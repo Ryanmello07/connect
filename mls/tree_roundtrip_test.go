@@ -602,7 +602,7 @@ func treeSeedCodecs() []seedCodec {
 			decode: func(bs []byte) (any, error) {
 				return UnmarshalRatchetTree(bs)
 			},
-			encode: func(value any) ([]byte, error) { return marshalRatchetTree(value.(*RatchetTree)) },
+			encode:         func(value any) ([]byte, error) { return marshalRatchetTree(value.(*RatchetTree)) },
 			checkRoundTrip: checkRatchetTreeRoundTrip,
 			describe:       func(value any) string { return describeRatchetTree(value.(*RatchetTree)) },
 		},
@@ -1016,6 +1016,7 @@ func checkAnother(bs []byte) error {
 
 var checkAsAValue = syntax.CheckRoundTrip[RatchetTree, *RatchetTree]
 `
+
 // ---------------------------------------------------------------------------
 // the controls on the two things this plan added to the shared harness
 // ---------------------------------------------------------------------------
