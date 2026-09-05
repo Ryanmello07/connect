@@ -25,6 +25,18 @@ if [[ $nginx_build_status != 0 ]]; then
 fi
 export NGINX_UDP_PROXY_V2_BINARY="$warp_lb_dir/build/nginx-local/sbin/nginx"
 
+# A failed output filter is the causal pipeline status. Reporting only an
+# upstream SIGPIPE would incorrectly attribute the failure to the test process.
+test_pipeline_status() {
+    local test_status="$1"
+    local filter_status="$2"
+    if [[ "$filter_status" != 0 ]]; then
+        echo "test output filter failed with status $filter_status (upstream test status $test_status)" >&2
+        return "$filter_status"
+    fi
+    return "$test_status"
+}
+
 # Some tests are timing-sensitive: they pass in a fresh process but stall or
 # fail late in the full -race suite, once accumulated GC/race overhead slows
 # delivery. Run each such group first, in its own process, so it executes under
@@ -38,28 +50,25 @@ skip_filter="$pt_filter|$webrtc_filter"
 
 # run the WebRTC tests first, in their own process
 match="/$(basename $(pwd))/\\S*\.go\|^\\S*_test.go"
-GORACE="log_path=profile/race.out halt_on_error=1" go test -timeout 0 -v -race -run "$webrtc_filter" "$@" | grep --line-buffered --color=always -e "^" -e "$match"
-if [[ ${pipestatus[1]} != 0 ]]; then
-    exit ${pipestatus[1]}
-fi
+GORACE="log_path=profile/race.out halt_on_error=1" go test -timeout 0 -v -race -run "$webrtc_filter" "$@" | grep --binary-files=text --line-buffered --color=always -e "^" -e "$match"
+pipeline_status=("${pipestatus[@]}")
+test_pipeline_status "${pipeline_status[1]}" "${pipeline_status[2]}" || exit $?
 
 # run the packet-translation tests next, in their own process
 match="/$(basename $(pwd))/\\S*\.go\|^\\S*_test.go"
-GORACE="log_path=profile/race.out halt_on_error=1" go test -timeout 0 -v -race -run "$pt_filter" "$@" | grep --line-buffered --color=always -e "^" -e "$match"
-if [[ ${pipestatus[1]} != 0 ]]; then
-    exit ${pipestatus[1]}
-fi
+GORACE="log_path=profile/race.out halt_on_error=1" go test -timeout 0 -v -race -run "$pt_filter" "$@" | grep --binary-files=text --line-buffered --color=always -e "^" -e "$match"
+pipeline_status=("${pipestatus[@]}")
+test_pipeline_status "${pipeline_status[1]}" "${pipeline_status[2]}" || exit $?
 
 for d in `find . -iname '*_test.go' | xargs -n 1 dirname | sort | uniq | paste -sd ' ' -`; do
     # if [[ $1 == "" || $1 == `basename $d` ]]; then
         pushd $d
         # highlight source files in this dir
         match="/$(basename $(pwd))/\\S*\.go\|^\\S*_test.go"
-        GORACE="log_path=profile/race.out halt_on_error=1" go test -timeout 0 -v -race -skip "$skip_filter" -cpuprofile profile/cpu -memprofile profile/memory "$@" | grep --line-buffered --color=always -e "^" -e "$match"
+        GORACE="log_path=profile/race.out halt_on_error=1" go test -timeout 0 -v -race -skip "$skip_filter" -cpuprofile profile/cpu -memprofile profile/memory "$@" | grep --binary-files=text --line-buffered --color=always -e "^" -e "$match"
         # -trace profile/trace -coverprofile profile/cover
-        if [[ ${pipestatus[1]} != 0 ]]; then
-            exit ${pipestatus[1]}
-        fi
+        pipeline_status=("${pipestatus[@]}")
+        test_pipeline_status "${pipeline_status[1]}" "${pipeline_status[2]}" || exit $?
         popd
     # fi
 done
