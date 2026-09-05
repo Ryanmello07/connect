@@ -2792,11 +2792,19 @@ func LoadGroup(cfg *GroupConfig, epoch uint64, signer SignaturePrivateKey) (*Gro
 	//     TestTheCatchUpLosesTheNumberOfMessagesThisDisclosureStates measures both formulas at ten
 	//     values of n derived from the constant; they disagree at seven, and the case named above
 	//     is one of the seven -- n=1026 loses ONE message, where ceil(n/MaxGenerationSkip) says
-	//     two. And "loses" is first delivery rather than the epoch: the catch-up leaves that
-	//     peer's head MaxGenerationSkip further on, which is inside the bound of the generation it
-	//     has just refused, so a RETRANSMISSION of that message opens rather than being refused
-	//     again. Measured in the same case: asking a second time for generation 1026 answers the
-	//     key.
+	//     two.
+	//   - and "loses" is FIRST DELIVERY rather than the epoch, on a condition the sentence that
+	//     stood here did not carry. A refusal moves that peer's head on by MaxGenerationSkip and
+	//     nothing else moves it, so a RETRANSMISSION of the refused message opens on delivery
+	//     ceil(g/MaxGenerationSkip) -- the second one while g is inside 2*MaxGenerationSkip, and
+	//     one further delivery per MaxGenerationSkip past that. The old sentence said it opens on
+	//     the retransmission full stop, and its case drove g=1026, which is inside the window
+	//     where that is true. Measured across it by
+	//     TestTheGenerationTheCatchUpRefusedOpensOnTheDeliveryThisDisclosureStates, at distances
+	//     derived from the constant: g=1026 opens on the second delivery, g=2049 on the third and
+	//     g=10240 on the tenth. Note the denominator: retransmitting one generation closes the gap
+	//     by the whole bound because the peer is not advancing, which is the same reason the LOSS
+	//     above closes it by one less.
 	//
 	// WHY NOT PERSIST THE PEERS TOO, since the blob could hold them and they are no more secret
 	// than what it already carries -- the encryption secret it rebuilds derives every leaf's every

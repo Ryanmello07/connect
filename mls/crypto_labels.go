@@ -61,9 +61,12 @@ func mlsLabelPreimage(w *syntax.Writer) ([]byte, error) {
 // Every FIELD does obey that limit. A COMPOSITION of fields does not. RefHash wraps a
 // whole serialized AuthenticatedContent in ONE opaque<V>, and that structure's group_id,
 // authenticated_data, proposal arms and signature are each bounded by a mebibyte with an
-// UNBOUNDED SUM. Measured: an Add whose key package carries a BasicCredential of
-// MaxVectorLength-64 octets marshals to 1050045 octets, decodes back through
-// syntax.Unmarshal, and signs and verifies as an authentic member message — and it took
+// UNBOUNDED SUM. Measured, and measured HERE rather than only in this paragraph --
+// TestTheEnormousAddIsTheOctetCountsTheseDisclosuresState holds every number in this
+// sentence, because two files stated it and they stated two different numbers: an Add whose
+// key package carries a BasicCredential of MaxVectorLength-64 octets marshals to 1050045
+// octets, decodes back through syntax.Unmarshal, and signed and verified as an authentic
+// member message on the build that had no bound — and it took
 // the process down in five separate places, ProposalCache.Store, KeyPackage.Ref,
 // DeriveJoinerSecret, EncryptWithLabel and VerifyWithLabel, the last of which runs BEFORE
 // any application level check a caller could have made. One member, one valid proposal,

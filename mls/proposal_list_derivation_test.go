@@ -1062,11 +1062,57 @@ func testCommitOrderOfWidth(t *testing.T, width int) []CachedProposal {
 // bound is the other half of the same worry: a ratio near zero is an accessor whose call the
 // compiler deleted, and a ceiling passed by measuring nothing is the false pass this file has
 // already had once.
+// measuredClockStep is the smallest positive interval this machine's clock reports.
+//
+// IT IS MEASURED AND NOT WRITTEN DOWN, and that is a correctness fix rather than a tidy-up. The
+// vacuity floor beneath the ratio below was `const floor = 4 * time.Millisecond`, chosen because
+// this machine's timer advances in steps of about 505 microseconds -- and a machine whose timer is
+// finer, or which simply runs the block faster, FAILED it. Measured during review: one run in
+// eleven fired it on an unmodified tree, so every count this project compares was a sample. A
+// floor is a statement about the CLOCK, so it is read off the clock.
+//
+// The smallest of several samples is taken rather than one, because a single spin can begin part
+// way through a tick and report a fraction of the real step; the minimum over repeats converges on
+// the step from above and never reports one larger than the clock actually has.
+func measuredClockStep(t *testing.T) time.Duration {
+	t.Helper()
+	step := time.Duration(0)
+	for round := 0; round < 32; round += 1 {
+		started := time.Now()
+		for {
+			spent := time.Since(started)
+			if spent <= 0 {
+				continue
+			}
+			if step == 0 || spent < step {
+				step = spent
+			}
+			break
+		}
+	}
+	if step <= 0 {
+		t.Fatal("this machine's clock never advanced over 32 spins, so no floor derived from it means anything")
+	}
+	return step
+}
+
+// timingVacuityFloorOver is how long a timed block has to run for the ratio taken over it to be a
+// measurement rather than a reading of the timer.
+//
+// EIGHT STEPS, and the eight is arithmetic rather than taste. A duration quantised to `step` is
+// known to within one step, so a block of k steps carries a relative error of 1/k and a RATIO of
+// two such blocks carries about 2/k. The bound below separates 1.3x from 12x, so an error of a
+// quarter is comfortably inside the gap and an eighth per side is where that lands.
+func timingVacuityFloorOver(step time.Duration) time.Duration {
+	return 8 * step
+}
+
 func TestAPerTypeViewIsLinearInTheCommitOrder(t *testing.T) {
 	const cycles = 128
 	const blocks = 6
-	const roundsPerBlock = 120
-	const floor = 4 * time.Millisecond
+
+	step := measuredClockStep(t)
+	floor := timingVacuityFloorOver(step)
 
 	cycle := len(testInterleavedCommitOrder(t))
 	list := NewProposalList(testCommitOrderOfWidth(t, cycles*cycle))
@@ -1122,6 +1168,44 @@ func TestAPerTypeViewIsLinearInTheCommitOrder(t *testing.T) {
 			named, proposalListBucketNames(t))
 	}
 
+	// THE BLOCK LENGTH IS CALIBRATED AGAINST THE FLOOR rather than assumed to clear it, which is
+	// the other half of the fix. A fixed round count on a machine faster than the one it was
+	// chosen on produces blocks under the floor, and the old code called that a FAILURE -- a
+	// correct accessor reported as a defect because the machine was quick. The work grows until a
+	// block is long enough to measure, so on a fast machine this case measures MORE rather than
+	// failing, and the skip below is reached only when even the grown block cannot clear the
+	// clock.
+	//
+	// IT CALIBRATES TO TWICE THE FLOOR, and the headroom is not decoration. A block timed at
+	// exactly the floor sits one scheduling hiccup away from falling under it, and the twelve
+	// blocks below are timed separately. Measured with no headroom at all: one of the three full
+	// runs of this package taken while this was written reached the skip. Twice puts ordinary
+	// jitter inside the margin and leaves the skip for a machine that genuinely cannot be
+	// measured, which is the case it is there for.
+	rounds := 120
+	calibrationSink := 0
+	calibrated := false
+	for attempt := 0; attempt < 8; attempt += 1 {
+		started := time.Now()
+		for round := 0; round < rounds; round += 1 {
+			for _, one := range answering {
+				calibrationSink += len(filterOf(one.carries))
+			}
+		}
+		if time.Since(started) >= 2*floor {
+			calibrated = true
+			break
+		}
+		rounds *= 2
+	}
+	if calibrationSink == 0 {
+		t.Fatal("the calibration filtered nothing at all, so the block length below was grown against a loop the compiler deleted")
+	}
+	if !calibrated {
+		t.Skipf("a block of %d rounds over %d proposals still runs inside this machine's vacuity floor of %v; the ratio below would be a measurement of the timer rather than of the accessor",
+			rounds, len(held), floor)
+	}
+
 	// both accumulators are LIVE and both totals are compared below, because a replay whose result
 	// nothing reads is one the compiler is entitled to delete -- an earlier attempt at exactly this
 	// measurement was eliminated and reported a confident false pass.
@@ -1140,14 +1224,14 @@ func TestAPerTypeViewIsLinearInTheCommitOrder(t *testing.T) {
 	}
 	for block := 0; block < blocks; block += 1 {
 		timed("views", func() {
-			for round := 0; round < roundsPerBlock; round += 1 {
+			for round := 0; round < rounds; round += 1 {
 				for _, one := range answering {
 					answered += len(one.answer())
 				}
 			}
 		})
 		timed("witness", func() {
-			for round := 0; round < roundsPerBlock; round += 1 {
+			for round := 0; round < rounds; round += 1 {
 				for _, one := range answering {
 					witnessed += len(filterOf(one.carries))
 				}
@@ -1159,17 +1243,21 @@ func TestAPerTypeViewIsLinearInTheCommitOrder(t *testing.T) {
 		t.Fatalf("the accessors answered %d entries and the witness matched %d over the same order; the two halves are not doing the same work and the ratio below is not a comparison",
 			answered, witnessed)
 	}
+	// A BLOCK THAT CAME IN UNDER THE FLOOR IS A SKIP AND NOT A FAILURE. The calibration above
+	// cleared it once, so reaching here means the machine got faster part way through -- another
+	// process finished, the governor stepped up -- which says nothing at all about the accessor.
+	// Reporting that as a defect is what made every count in this package a sample.
 	for _, name := range slices.Sorted(maps.Keys(shortest)) {
 		if shortest[name] < floor {
-			t.Fatalf("the shortest %s block ran for %v, which is inside what this machine's clock can resolve; the ratio below would be a measurement of the timer",
-				name, shortest[name])
+			t.Skipf("the shortest %s block ran for %v against a vacuity floor of %v derived from this machine's clock; the ratio would be a measurement of the timer rather than of the accessor",
+				name, shortest[name], floor)
 		}
 	}
-	viewsEach := took["views"] / (blocks * roundsPerBlock)
-	witnessEach := took["witness"] / (blocks * roundsPerBlock)
+	viewsEach := took["views"] / time.Duration(blocks*rounds)
+	witnessEach := took["witness"] / time.Duration(blocks*rounds)
 	over := float64(viewsEach) / float64(witnessEach)
-	t.Logf("over %d proposals the %d view reads took %v per round and the same filters written out took %v, %.2fx",
-		len(held), len(answering), viewsEach, witnessEach, over)
+	t.Logf("over %d proposals the %d view reads took %v per round and the same filters written out took %v, %.2fx; %d rounds per block against a clock step of %v and a floor of %v",
+		len(held), len(answering), viewsEach, witnessEach, over, rounds, step, floor)
 	if over < 0.25 {
 		t.Fatalf("a view read costs %.2fx what filtering the commit order costs, which is less than the filter it IS; the accessor's call was optimised away and this gate measured nothing",
 			over)

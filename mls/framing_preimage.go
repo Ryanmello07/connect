@@ -157,9 +157,14 @@ func (self *AuthenticatedContent) ConfirmedTranscriptHashInput() ([]byte, error)
 // the process instead. An AuthenticatedContent is a COMPOSITION: its group_id, its
 // authenticated_data, the arms of the proposal it carries and its signature are each bounded by
 // syntax.MaxVectorLength and their SUM is not, and a decoder produces such a value rather than
-// refusing it. Measured: an Add whose key package carries a BasicCredential of
-// MaxVectorLength-64 octets marshals to 1050064 octets, decodes back, and signs and verifies as
-// an authentic member message.
+// refusing it. Measured, by TestTheEnormousAddIsTheOctetCountsTheseDisclosuresState: an Add whose
+// key package carries a BasicCredential of MaxVectorLength-64 octets marshals to 1050045 octets and
+// decodes back, and on the build that had no bound it signed and verified as an authentic member
+// message. THIS PARAGRAPH SAID 1050064 UNTIL SOMEBODY MEASURED IT. That number is also real and is
+// the length of something else -- the FramedContentTBS a signature over the same value covers --
+// and what this method wraps is the serialized AuthenticatedContent, which is the 1050045. The
+// sentence had been copied from crypto_labels.go with the wrong one of the two numbers in it, and
+// nothing measured either.
 //
 // So the refusal is HERE, at the outermost declaration that can carry one, and not at
 // (*ProposalCache).Store or at any other caller. Store computes this reference before its

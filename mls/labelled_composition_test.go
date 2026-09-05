@@ -237,6 +237,92 @@ func enormousProposalContent(t *testing.T, payload int) *AuthenticatedContent {
 	})
 }
 
+// enormousAddContent is an AuthenticatedContent carrying one ADD whose key package holds a
+// credential of the requested size, which is the composition three disclosures of this package
+// state an octet count for.
+//
+// It is the Add and not the group_context_extensions proposal beside it because that is what those
+// three sentences describe -- "an Add whose key package carries a BasicCredential of
+// MaxVectorLength-64 octets" -- and a fixture that measured a different structure would answer a
+// different number and certify the sentence anyway.
+func enormousAddContent(t *testing.T, payload int) *AuthenticatedContent {
+	t.Helper()
+	return testProposalContentAt(t, LeafIndex(0), []byte("group"), 1, &Proposal{
+		ProposalType: ProposalTypeAdd,
+		Add:          &Add{KeyPackage: *enormousKeyPackage(t, payload)},
+	})
+}
+
+// TestTheEnormousAddIsTheOctetCountsTheseDisclosuresState measures the numbers crypto_labels.go,
+// framing_preimage.go and key_package.go each state about one composition.
+//
+// THE THREE SENTENCES DID NOT AGREE, which is what this case was written for. crypto_labels.go said
+// the Add "marshals to 1050045 octets" and framing_preimage.go said 1050064 of the same value in
+// the same words. Both numbers are real and they are lengths of DIFFERENT things: 1050045 is the
+// serialized AuthenticatedContent, which is what ProposalRef and RefHash wrap, and 1050064 is the
+// FramedContentTBS, which is what a signature covers. One of the two paragraphs was carrying the
+// other quantity's number. Nothing measured either, so nothing said so.
+//
+// WHY THE COUNTS ARE PINNED EXACTLY rather than bounded below. A floor of "over
+// syntax.MaxVectorLength" is satisfied by any composition at all and would leave the two disclosures
+// free to go on disagreeing; what a reader takes from those paragraphs is the SIZE, so the size is
+// what is held. A wire format change moves these numbers, this case fails, and the prose is
+// corrected in the same commit rather than a round later.
+//
+// AND THE REFUSALS ARE HERE TOO, because an octet count on its own says nothing about the defect
+// the paragraphs are about. The historical build signed and verified this value as an authentic
+// member message and took the process down in the labelled constructions; today both doors that
+// hash a whole composition refuse it, one frame above the panic.
+func TestTheEnormousAddIsTheOctetCountsTheseDisclosuresState(t *testing.T) {
+	crypto := testCrypto(t)
+	const credential = syntax.MaxVectorLength - 64
+
+	keyPackage := enormousKeyPackage(t, credential)
+	encodedKeyPackage := mustMarshalForSize(t, keyPackage)
+	if len(encodedKeyPackage) != 1050016 {
+		t.Errorf("a key package whose credential carries MaxVectorLength-64 octets marshals to %d octets and key_package.go's disclosure describes one of 1050016",
+			len(encodedKeyPackage))
+	}
+
+	content := enormousAddContent(t, credential)
+	encodedContent := mustMarshalForSize(t, content)
+	if len(encodedContent) != 1050045 {
+		t.Errorf("the Add carrying it marshals to %d octets and crypto_labels.go states 1050045",
+			len(encodedContent))
+	}
+	if len(encodedContent) <= syntax.MaxVectorLength {
+		t.Fatalf("the composition is %d octets and one labelled field holds %d, so it fits and the refusals below would be about something else",
+			len(encodedContent), syntax.MaxVectorLength)
+	}
+
+	// it DECODES, which is the half of the disclosure that says a peer can send this: a decoder
+	// bounds each field and never their sum.
+	var back AuthenticatedContent
+	if err := syntax.Unmarshal(encodedContent, &back); err != nil {
+		t.Fatalf("the composition did not decode back: %v; the disclosures say a decoder accepts it, which is what makes it a peer's value rather than a hand built one",
+			err)
+	}
+
+	groupContext := mustMarshalForSize(t, testResolveContext())
+	tbs, err := FramedContentTBSBytes(WireFormatPrivateMessage, &content.Content, groupContext)
+	if err != nil {
+		t.Fatalf("FramedContentTBSBytes over the composition: %v", err)
+	}
+	if len(tbs) != 1050064 {
+		t.Errorf("the FramedContentTBS over it is %d octets and framing_preimage.go states 1050064",
+			len(tbs))
+	}
+
+	if _, err := keyPackage.Ref(crypto); !errors.Is(err, syntax.ErrLengthExceedsMax) {
+		t.Errorf("(*KeyPackage).Ref over the composition answered %v, want syntax.ErrLengthExceedsMax; key_package.go says this method used to take the process down over one",
+			err)
+	}
+	if _, err := content.ProposalRef(crypto); !errors.Is(err, syntax.ErrLengthExceedsMax) {
+		t.Errorf("(*AuthenticatedContent).ProposalRef over the composition answered %v, want syntax.ErrLengthExceedsMax",
+			err)
+	}
+}
+
 // A key package whose credential carries the requested size. The credential is where a
 // peer's bytes sit in a structure this package hashes whole, and a decoder accepts it: it
 // is one opaque<V> under the limit inside a composition over it.

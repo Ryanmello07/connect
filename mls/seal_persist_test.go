@@ -31,6 +31,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/urnetwork/connect/mls/syntax"
 )
 
 // sealSiteCallers is every declaration of this package's non test source that calls
@@ -92,13 +94,24 @@ const sealAndRecordName = "sealAndRecordLocked"
 // measurement at the top records, four failures out of 7478 with the persist rewritten as
 // `_ = self.persist()`, every one of them on that check.
 //
-// WHAT `handedBack` OBSERVES is the other half of sealAndRecordLocked's sentence: "the ciphertext is
-// dropped inside this function, so nothing under that generation ever reaches a peer". The build it
-// separates from this one is the alternative that comment names and rejects -- "answer the
-// ciphertext and report the store's refusal some other way" -- and that build satisfies the
-// errors.Is check perfectly, because it returns the store's refusal too. Only this half sees it. The
-// drop is spelled at each of the three doors rather than once, so it is three places the property
-// can be lost and one assertion standing over all three.
+// WHAT `handedBack` OBSERVES IS THE DOORS' DROP AND NOT sealAndRecordLocked'S OWN, and this is the
+// third header written over this field. Both of the first two named a property that is not asserted
+// here, so this one says what the field reads rather than what a reader would like it to mean:
+// `drive` returns whether (*Group).ProposeUpdate, (*Group).CreateCommit or (*Group).Protect handed
+// its caller a value, and each of those three is `return nil, err` written out at the call. That is
+// a real property and it is three places it can be lost -- a door that returned its half-built
+// proposal beside the refusal would put octets on the wire under a generation the persisted state
+// does not carry -- and it is what this field measures.
+//
+// sealAndRecordLocked'S OWN DROP IS A DIFFERENT PROPERTY AND IT IS ASSERTED SOMEWHERE ELSE. The
+// build its comment names and rejects -- "answer the ciphertext and report the store's refusal some
+// other way" -- is invisible to every assertion in this file, because the three doors go on
+// dropping what it hands them. Measured over the whole of ./mls/... and ./message/... with that
+// function's `return nil, err` rewritten as `return private, err`: 7,488 pass and ONE fails, and
+// the one is TestSealAndRecordDropsTheCiphertextWhoseGenerationItCouldNotRecord -- so before that
+// case was written, nothing in either package saw it. It sees it by calling the function rather
+// than a door, and it exists because this header claimed the property twice while nothing held
+// it.
 //
 // AND IT IS THE CONTROL'S VACUITY GUARD AS WELL, in the other direction: a door that answered
 // nothing over a store that is not refusing would satisfy the refusal assertions below without ever
@@ -161,6 +174,86 @@ func sealSiteConsumedTotal(t *testing.T, group *Group) uint64 {
 		total += entry.Consumed
 	}
 	return total
+}
+
+// TestSealAndRecordDropsTheCiphertextWhoseGenerationItCouldNotRecord is sealAndRecordLocked's own
+// half of the sentence, asserted at the frame that makes it.
+//
+// WHY IT IS NOT THE GATE BELOW. That case drives the three exported doors, and every one of them
+// writes `return nil, err` over whatever the seal answered -- so a sealAndRecordLocked that handed
+// back the ciphertext ALONGSIDE the store's refusal is dropped by its callers and observed by
+// nothing. Measured: with its refusal arm rewritten as `return private, err`, ./mls/... and
+// ./message/... come back 7,488 passing and one failing, and the one is this case. The gate below
+// passes under that rewrite, at all three of its doors. The function's own comment states the drop
+// as the reason the
+// order is safe -- "a refusal here costs the generation and nothing else: the ciphertext is dropped
+// inside this function, so nothing under that generation ever reaches a peer" -- so the frame that
+// makes the claim is the frame it is asserted at.
+//
+// THE CONTROL IS THE SAME CALL OVER A STORE THAT IS NOT REFUSING, for the reason the gate below
+// gives at each door: a call that answered nothing for a reason of its own would satisfy the
+// refusal assertion perfectly and observe nothing.
+func TestSealAndRecordDropsTheCiphertextWhoseGenerationItCouldNotRecord(t *testing.T) {
+	crypto := testCrypto(t)
+	owner := testIdentity(t, crypto, "owner")
+	cfg := testGroupConfig(t, crypto, owner, "seal-and-record-drop")
+	store := &refusingPutStore{testStore: newTestStore()}
+	cfg.Store = store
+	group, err := NewGroup(cfg, owner.SigPriv, BasicCredential(owner.IdentityPub))
+	if err != nil {
+		t.Fatalf("NewGroup: %v", err)
+	}
+	defer group.Close()
+
+	private, err := sealOneMessageThroughTheRecordingDoor(t, group)
+	if err != nil || private == nil {
+		t.Fatalf("sealAndRecordLocked over a store that is not refusing answered (%v, %v); this call is not reachable in this fixture, so the refusal below would observe nothing",
+			private, err)
+	}
+
+	// armed after the group exists and after the control, for the gate's reason: NewGroup
+	// persists, so a store refusing from the start refuses the constructor.
+	store.refusing = true
+	before := sealSiteConsumedTotal(t, group)
+	private, err = sealOneMessageThroughTheRecordingDoor(t, group)
+	if !errors.Is(err, errTheStoreRefusedThisWrite) {
+		t.Fatalf("sealAndRecordLocked over a refusing store = %v, want the store's own refusal", err)
+	}
+	if private != nil {
+		t.Fatalf("sealAndRecordLocked answered a *PrivateMessage ALONGSIDE the store's refusal; those octets are sealed under generation %d and the persisted state does not carry it, so a restore of this member draws that generation again and two plaintexts go out under one key and nonce",
+			before)
+	}
+	if after := sealSiteConsumedTotal(t, group); after != before+1 {
+		t.Fatalf("the refused seal moved this leaf from %d consumed generation(s) to %d, want %d: the drop above is being read over a call that never sealed",
+			before, after, before+1)
+	}
+}
+
+// sealOneMessageThroughTheRecordingDoor calls sealAndRecordLocked the way the three doors do.
+//
+// It builds the authenticated content the way (*Group).Protect does and takes stateLock the way
+// every door does, because that function's contract is "the caller holds stateLock" and a fixture
+// that ignored it would be measuring a call this package never makes.
+func sealOneMessageThroughTheRecordingDoor(t *testing.T, group *Group) (*PrivateMessage, error) {
+	t.Helper()
+	group.stateLock.Lock()
+	defer group.stateLock.Unlock()
+	groupContext, err := syntax.Marshal(group.context)
+	if err != nil {
+		t.Fatalf("marshal group context: %v", err)
+	}
+	authenticated, err := SignAuthenticatedContent(group.crypto, group.signer,
+		WireFormatPrivateMessage, &FramedContent{
+			GroupId:         cloneBytes(group.context.GroupId),
+			Epoch:           group.context.Epoch,
+			Sender:          Sender{SenderType: SenderTypeMember, LeafIndex: group.ownLeaf},
+			ContentType:     ContentTypeApplication,
+			ApplicationData: []byte("a message whose generation nothing recorded"),
+		}, groupContext)
+	if err != nil {
+		t.Fatalf("SignAuthenticatedContent: %v", err)
+	}
+	return group.sealAndRecordLocked(authenticated)
 }
 
 // TestEverySealSiteRefusesWhenTheStoreRefusesToRecordWhatItSpent is the gate.

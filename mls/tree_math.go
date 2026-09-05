@@ -156,7 +156,10 @@ func ExtendedLeafCount(n LeafCount) (LeafCount, error) {
 	// order alone decides which sentinel the caller sees. Testing fullness
 	// first reported MaxLeafCount+1 as ErrLeafCountNotFull here while the shared
 	// check called the same value ErrLeafCountRange, so a caller switching on the
-	// sentinel would have had to know which function produced it.
+	// sentinel would have had to know which function produced it. The two halves
+	// of that are asserted rather than stated: TestExtendAndTruncate drives
+	// MaxLeafCount+1 through this function and TestCheckLeafCount drives the same
+	// value through the shared check, and both want ErrLeafCountRange.
 	if n > MaxLeafCount {
 		return 0, ErrLeafCountRange
 	}

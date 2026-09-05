@@ -442,7 +442,8 @@ func (self *ratchet) step() (uint32, *generationKeys, error) {
 // formed Nk zero bytes with a nil error: a key every party in the world can compute, handed
 // to the framing layer as this sender's. The cost is that one ratchet's window can hold
 // RatchetWindowSize+1 entries between a peek and its erase, which is one entry and not a
-// multiple of anything a peer chooses.
+// multiple of anything a peer chooses. That peak is measured at the only place it exists,
+// by TestOneRatchetsWindowHoldsOneOverItsBoundBetweenAPeekAndTheEraseAfterIt.
 //
 // The noinline directive is the erase-helper class's: prune erases through storage that
 // outlives this call, and the directive is what keeps those stores across a boundary the
@@ -918,10 +919,16 @@ func (self *SecretTree) nextSenderKeyLocked(leaf LeafIndex, kind RatchetType) (g
 // skipped the AEAD, and what it buys per unauthenticated header is ratchetFor -- which takes the
 // leaf node secret out of the tree and materialises both of that leaf's ratchets, destructively and
 // for any leaf the tree has -- plus up to MaxGenerationSkip steps and the retention that goes with
-// them. The leaf index itself is bounded, by takeLeafSecret's pathToLeaf; it is the only thing
-// here that is. pruneRetained bounds the memory. Nothing here bounds who is
-// asking. So the first caller of this method owes its own answer to that question before it writes
-// the call; the framing layer's answer is not inherited by coming through this door.
+// them.
+//
+// TWO OF THOSE ARE BOUNDED AND THE THIRD IS NOT, and the sentence that stood here said "the leaf
+// index is the only thing here that is" bounded and then named a second bound in the next breath.
+// Both bounds are real: the leaf index by takeLeafSecret's pathToLeaf, and the retained key memory
+// by pruneRetained, tree wide. What has NO bound here is who is asking -- this door takes a leaf, a
+// kind and a generation and asks nothing about where they came from -- so the work and the
+// retention above are bounded PER CALL and unbounded in calls. So the first caller of this method
+// owes its own answer to that question before it writes the call; the framing layer's answer is not
+// inherited by coming through this door.
 func (self *SecretTree) ReceiverKey(leaf LeafIndex, kind RatchetType, generation uint32) (key []byte, nonce []byte, err error) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()

@@ -19,7 +19,9 @@
 // PastEpochWindow is NOT declared here. It is the key schedule's, declared once in
 // key_schedule.go, and this plan only references it: spec A section 4.3 runs
 // DeleteGroupStateBefore(epoch - PastEpochWindow) on every merged commit, which is what makes
-// MASTER section 8.1's ephemeral guarantee real. XwingPublicKeyLen and AlgIdXwing are TreeKEM's
+// MASTER section 8.1's ephemeral guarantee real. TestPastEpochWindowDropsOlderState is what says
+// this build runs it, reading that cutoff in both directions -- the epoch at it survives and the
+// one below it is gone -- rather than leaving the arithmetic to this sentence. XwingPublicKeyLen and AlgIdXwing are TreeKEM's
 // for the same reason. A second declaration of any of them in package mls is a compile error,
 // not a merge inconvenience.
 package mls

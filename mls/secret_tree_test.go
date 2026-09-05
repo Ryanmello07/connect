@@ -6067,44 +6067,181 @@ func TestTheCatchUpHoldsThisRatchetsWindowToItsOwnBound(t *testing.T) {
 		MaxGenerationSkip, seeded, len(subject.window), RatchetWindowSize)
 }
 
-// TestTheGenerationTheCatchUpRefusedOpensOnARetransmit holds the sentence (*Group).LoadGroup's
-// disclosure states about what a catch-up costs: the refused message is refused ONCE, not for the
-// epoch.
+// TestOneRatchetsWindowHoldsOneOverItsBoundBetweenAPeekAndTheEraseAfterIt is peekFor's own
+// disclosure about what it costs to store the target without pruning against it.
 //
-// The catch-up leaves that peer's head MaxGenerationSkip further on, which is inside the bound of
-// the generation it has just refused -- so the same generation asked a second time is an ordinary
-// in-bound skip. A disclosure that says "loses" without saying which delivery it means describes a
-// worse product than this one is.
-func TestTheGenerationTheCatchUpRefusedOpensOnARetransmit(t *testing.T) {
-	ahead := MaxGenerationSkip + 2
-	sender, receiver := stNewTree(t, 8), stNewTree(t, 8)
-	var senderKey, senderNonce []byte
-	for draws := uint32(0); draws <= ahead; draws += 1 {
-		generation, key, nonce, err := sender.NextSenderKey(1, RatchetApplication)
-		if err != nil {
-			t.Fatalf("NextSenderKey at draw %d: %v", draws, err)
-		}
-		if generation == ahead {
-			senderKey, senderNonce = bytes.Clone(key), bytes.Clone(nonce)
-			break
-		}
+// THAT ONE ENTRY IS THE PRICE OF NOT ZEROIZING THE ANSWER, which is the reason peekFor's comment
+// gives: a prune run after the store could evict the target it just retained, and eviction erases,
+// so a key would come back as Nk zero octets with a nil error. So the window peaks at
+// RatchetWindowSize+1 for as long as it takes keyFor to delete the generation it is returning.
+//
+// IT IS WHITE BOX FOR TestTheCatchUpHoldsThisRatchetsWindowToItsOwnBound's reason: at the exported
+// door the peak does not exist. ReceiverKey reaches keyFor, which is peekFor plus the delete, so
+// every value an exported caller can observe is already back at the bound. The one entry is real,
+// it is what the disclosure states, and this is the only frame it is visible from.
+func TestOneRatchetsWindowHoldsOneOverItsBoundBetweenAPeekAndTheEraseAfterIt(t *testing.T) {
+	tree := stNewTree(t, 8)
+	const leaf = LeafIndex(1)
+	const kind = RatchetApplication
+	// a maximal in-bound skip fills the window to its bound, which is what makes the next store
+	// the one that overflows it. Without it the peek below lands inside the bound and this case
+	// would pass over a build that pruned the target away.
+	if _, _, err := tree.ReceiverKey(leaf, kind, MaxGenerationSkip); err != nil {
+		t.Fatalf("ReceiverKey(%d): %v", MaxGenerationSkip, err)
 	}
-	if senderKey == nil {
-		t.Fatalf("the sender did not reach generation %d, so its ratchet is not handing out consecutive generations",
-			ahead)
-	}
-	if _, _, err := receiver.ReceiverKey(1, RatchetApplication, ahead); !errors.Is(err, ErrRatchetGenerationTooFarAhead) {
-		t.Fatalf("the first delivery of generation %d answered %v, want ErrRatchetGenerationTooFarAhead",
-			ahead, err)
-	}
-	key, nonce, err := receiver.ReceiverKey(1, RatchetApplication, ahead)
+	r, err := tree.ratchetFor(leaf, kind)
 	if err != nil {
-		t.Fatalf("the RETRANSMISSION of generation %d answered %v; the disclosure in (*Group).LoadGroup says the catch-up leaves the head inside the bound of the generation it refused, so this message opens on a second delivery",
-			ahead, err)
+		t.Fatalf("ratchetFor: %v", err)
 	}
-	if !bytes.Equal(key, senderKey) || !bytes.Equal(nonce, senderNonce) {
-		t.Fatalf("the retransmission opened under key %x nonce %x and the sender drew %x and %x",
-			key, nonce, senderKey, senderNonce)
+	if len(r.window) != RatchetWindowSize {
+		t.Fatalf("the window holds %d entries and this case needs it exactly full at %d, or the store below cannot take it over",
+			len(r.window), RatchetWindowSize)
+	}
+	head, err := tree.SenderGeneration(leaf, kind)
+	if err != nil {
+		t.Fatalf("SenderGeneration: %v", err)
+	}
+
+	target := head + 1
+	keys, err := r.peekFor(target)
+	if err != nil {
+		t.Fatalf("peekFor(%d): %v", target, err)
+	}
+	if len(r.window) != RatchetWindowSize+1 {
+		t.Fatalf("the window holds %d entries after a peek onto a full window, and peekFor's disclosure states %d: a build that pruned against its own target would sit at %d and would answer the caller a key it had just zeroized",
+			len(r.window), RatchetWindowSize+1, RatchetWindowSize)
+	}
+	if held, retained := r.window[target]; !retained || held != keys {
+		t.Fatalf("generation %d is not the entry the window is holding over its bound, so the extra entry is something else and this bound is not the one the disclosure states",
+			target)
+	}
+	if stAllZero(keys.key) || stAllZero(keys.nonce) {
+		t.Fatal("the key the peek answered is already zero, which is what an eviction of the target would leave and is the failure the extra entry exists to prevent")
+	}
+
+	// and the erase that follows takes it back out again: keyFor is this peek plus the delete,
+	// so the entry is one entry and not a leak.
+	if _, err := r.keyFor(target); err != nil {
+		t.Fatalf("keyFor(%d): %v", target, err)
+	}
+	if len(r.window) != RatchetWindowSize {
+		t.Fatalf("the window holds %d entries after the erase, want its bound of %d: the extra entry outlives the call that needed it",
+			len(r.window), RatchetWindowSize)
+	}
+}
+
+// stDeliveriesToOpenARefusedGeneration is how many times a peer has to DELIVER one generation
+// before a receiver whose head is at nought opens it, written once so the disclosure in
+// (*Group).LoadGroup is measured rather than paraphrased.
+//
+// IT IS NOT stMessagesLostCatchingUp AND THE DIFFERENCE IS WHAT THE PEER IS DOING. That formula
+// counts the messages lost while a peer KEEPS SENDING: each refusal advances the receiver by
+// MaxGenerationSkip while the peer advances by one, so the gap closes by MaxGenerationSkip-1 per
+// refusal. This one counts deliveries of ONE generation, retransmitted -- the peer is not moving,
+// so the gap closes by the whole of MaxGenerationSkip per refusal and the denominator is the
+// constant itself. The superseded formula ceil(n/MaxGenerationSkip), which was wrong for the loss,
+// is right here for exactly that reason, and writing both down is what keeps the two questions
+// from being answered with one number again.
+func stDeliveriesToOpenARefusedGeneration(generation uint32) int {
+	if generation <= MaxGenerationSkip {
+		return 1
+	}
+	return int((uint64(generation) + uint64(MaxGenerationSkip) - 1) / uint64(MaxGenerationSkip))
+}
+
+// TestTheGenerationTheCatchUpRefusedOpensOnTheDeliveryThisDisclosureStates holds what
+// (*Group).LoadGroup's disclosure says a catch-up costs a RETRANSMISSION.
+//
+// IT USED TO BE ONE POINT AND THE POINT WAS INSIDE THE CLAIM. The case this replaces drove
+// ahead=MaxGenerationSkip+2 and asserted that the second delivery opened, under a sentence that
+// said a retransmission "opens rather than being refused again" full stop. That sentence is false
+// past 2*MaxGenerationSkip -- one refusal moves the head by MaxGenerationSkip and nothing else
+// moves it, so a generation further ahead than two bounds is refused again -- and the fixture sat
+// at 1026, comfortably inside the window where it holds. Measured now at distances DERIVED from the
+// constant on both sides of that threshold: 2*MaxGenerationSkip+1 takes three deliveries and
+// 10*MaxGenerationSkip takes ten.
+//
+// THE RUN GUARDS ITS OWN SPAN. A set of distances that never crossed 2*MaxGenerationSkip would
+// certify the sentence this case exists to correct, so the distances are required to produce more
+// than one answer and to include one on each side of the threshold.
+func TestTheGenerationTheCatchUpRefusedOpensOnTheDeliveryThisDisclosureStates(t *testing.T) {
+	distances := stRetransmitDistances()
+	below, above := 0, 0
+	answers := map[int]bool{}
+	for _, distance := range distances {
+		if distance <= 2*MaxGenerationSkip {
+			below += 1
+		} else {
+			above += 1
+		}
+		answers[stDeliveriesToOpenARefusedGeneration(distance)] = true
+	}
+	if below == 0 || above == 0 || len(answers) < 2 {
+		t.Fatalf("these %d distance(s) put %d at or under 2*MaxGenerationSkip and %d past it, and the formula answers %d distinct value(s); a run that does not cross the threshold certifies the sentence this case replaced",
+			len(distances), below, above, len(answers))
+	}
+
+	for _, distance := range distances {
+		sender, receiver := stNewTree(t, 8), stNewTree(t, 8)
+		var senderKey, senderNonce []byte
+		for draws := uint32(0); draws <= distance; draws += 1 {
+			generation, key, nonce, err := sender.NextSenderKey(1, RatchetApplication)
+			if err != nil {
+				t.Fatalf("NextSenderKey at draw %d: %v", draws, err)
+			}
+			if generation == distance {
+				senderKey, senderNonce = bytes.Clone(key), bytes.Clone(nonce)
+				break
+			}
+		}
+		if senderKey == nil {
+			t.Fatalf("the sender did not reach generation %d, so its ratchet is not handing out consecutive generations",
+				distance)
+		}
+
+		// the peer RETRANSMITS: the same generation over and over, which is what makes the
+		// denominator the whole bound rather than one short of it.
+		want := stDeliveriesToOpenARefusedGeneration(distance)
+		deliveries, key, nonce := 0, []byte(nil), []byte(nil)
+		for deliveries < want+1 {
+			deliveries += 1
+			opened, openedNonce, err := receiver.ReceiverKey(1, RatchetApplication, distance)
+			if err == nil {
+				key, nonce = opened, openedNonce
+				break
+			}
+			if !errors.Is(err, ErrRatchetGenerationTooFarAhead) {
+				t.Fatalf("delivery %d of generation %d answered %v, want ErrRatchetGenerationTooFarAhead",
+					deliveries, distance, err)
+			}
+		}
+		if key == nil {
+			t.Fatalf("generation %d was still refused after %d deliveries, and this disclosure says it opens on delivery %d",
+				distance, deliveries, want)
+		}
+		if deliveries != want {
+			t.Fatalf("generation %d opened on delivery %d and the disclosure in (*Group).LoadGroup states %d: a retransmission opens on delivery ceil(g/MaxGenerationSkip), which is the second one only while g is inside 2*MaxGenerationSkip",
+				distance, deliveries, want)
+		}
+		if !bytes.Equal(key, senderKey) || !bytes.Equal(nonce, senderNonce) {
+			t.Fatalf("the retransmission of generation %d opened under key %x nonce %x and the sender drew %x and %x",
+				distance, key, nonce, senderKey, senderNonce)
+		}
+	}
+	t.Logf("%d distance(s) measured, %d distinct delivery counts", len(distances), len(answers))
+}
+
+// stRetransmitDistances straddles 2*MaxGenerationSkip, DERIVED from the constant for
+// stCatchUpLossDistances' reason: the threshold this case is about is a multiple of the bound, so
+// the cases have to be written as multiples of it rather than as the numbers one bound happens to
+// produce.
+func stRetransmitDistances() []uint32 {
+	skip := MaxGenerationSkip
+	return []uint32{
+		skip - 1, skip, skip + 2,
+		2*skip - 1, 2 * skip, 2*skip + 1,
+		3 * skip, 3*skip + 1,
+		10 * skip,
 	}
 }
 

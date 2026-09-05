@@ -1647,13 +1647,44 @@ func eraseSubFieldOn(expr ast.Expr, receiver string, alias map[string]string, fi
 // function in this package handed a *Group -- or a declaration in connect/message handed an
 // *UpdatePathPlan, whose secret fields are exported -- drops exactly what a method drops.
 //
-// LOCALS ARE NOT POSITIONS, and that boundary is the seam gate's own: a value a body CONSTRUCTED
-// is not a value anybody handed it, so an assignment to a field of one drops storage that never
-// left this frame. CreateUpdatePathSecrets writes private.EncryptionPriv over the nil a
-// constructor two statements up put there, and a reading that swept in locals would report that
-// as a leaked leaf key.
+// A LOCAL A BODY CONSTRUCTED IS NOT A POSITION, AND A LOCAL IT TOOK OUT OF THE RECEIVER IS. The
+// boundary used to sit at "locals are not positions" full stop, justified as "a value a body
+// CONSTRUCTED is not a value anybody handed it" -- and that justification does not cover the case
+// the boundary dropped. (*SecretTree).RestoreSenderRatchets writes a fresh ratchet secret over
+// r.secret, where r came out of self.ratchetFor: the body did not construct it, it is the
+// RECEIVER'S own storage reached one call away, and dropping it drops a live ratchet secret.
+// Measured both ways. With this widening, deleting the zeroizeSecret in front of that assignment
+// fails the gate below naming the site. With the widening taken out again, the reading finds
+// thirteen drop sites, that assignment is not one of them, and the gate reports the source clean
+// with the erase gone -- which is the state this package shipped in.
+//
+// What is still excluded is what the old sentence was actually protecting.
+// CreateUpdatePathSecrets writes private.EncryptionPriv over the nil a constructor two statements
+// up put there, and that local IS constructed here, so it is sourced from no receiver and stays
+// out. The widening is stated as PROVENANCE rather than as a ban on locals -- a value this
+// declaration took out of the receiver, by calling one of its methods, by reading one of its
+// fields, or by walking one of them -- which is the same question the receiver and parameter
+// positions ask, asked one hop further in.
 func declarationsHolding(files []parsedSource, typeName string) []eraseMethod {
 	held := []eraseMethod{}
+	structs := map[string]*ast.StructType{}
+	answers := map[string][][]ast.Expr{}
+	for _, parsed := range files {
+		structTypesIn(parsed, structs)
+		for _, declaration := range parsed.file.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || function.Type.Results == nil {
+				continue
+			}
+			results := []ast.Expr{}
+			for _, result := range function.Type.Results.List {
+				for repeat := 0; repeat < max(len(result.Names), 1); repeat += 1 {
+					results = append(results, result.Type)
+				}
+			}
+			answers[function.Name.Name] = append(answers[function.Name.Name], results)
+		}
+	}
 	for _, parsed := range files {
 		for _, declaration := range parsed.file.Decls {
 			function, isFunction := declaration.(*ast.FuncDecl)
@@ -1661,10 +1692,15 @@ func declarationsHolding(files []parsedSource, typeName string) []eraseMethod {
 				continue
 			}
 			positions := []*ast.Field{}
-			if function.Recv != nil && len(function.Recv.List) == 1 &&
-				receiverTypeName(function.Recv.List[0].Type) == typeName {
-
-				positions = append(positions, function.Recv.List[0])
+			receiver, receiverType := "", ""
+			if function.Recv != nil && len(function.Recv.List) == 1 {
+				receiverType = receiverTypeName(function.Recv.List[0].Type)
+				if len(function.Recv.List[0].Names) == 1 {
+					receiver = function.Recv.List[0].Names[0].Name
+				}
+				if receiverType == typeName {
+					positions = append(positions, function.Recv.List[0])
+				}
 			}
 			if function.Type.Params != nil {
 				for _, parameter := range function.Type.Params.List {
@@ -1684,9 +1720,151 @@ func declarationsHolding(files []parsedSource, typeName string) []eraseMethod {
 					})
 				}
 			}
+			for _, name := range localsTakenOutOfTheReceiver(function, receiver, receiverType,
+				typeName, structs, answers) {
+
+				held = append(held, eraseMethod{
+					receiver: typeName, name: function.Name.Name, self: name,
+					parsed: parsed, decl: function,
+				})
+			}
 		}
 	}
 	return held
+}
+
+// localsTakenOutOfTheReceiver is every local of one body bound from the receiver's own storage
+// whose type is the one being asked about.
+//
+// THREE SHAPES, AND THEY ARE THE THREE WAYS STORAGE LEAVES A RECEIVER: a method of it answering
+// the value, a field of it read directly, and a walk over one of those. Each is read off the
+// syntax, and the TYPE is read off the declaration the value came from -- a method's result at the
+// position the local binds, a field's declared type, or the element type of what is walked --
+// rather than guessed from the name, because a reading that guessed would sweep unrelated locals
+// into the class and the class would then demand erases nothing owes.
+func localsTakenOutOfTheReceiver(function *ast.FuncDecl, receiver string, receiverType string,
+	typeName string, structs map[string]*ast.StructType, answers map[string][][]ast.Expr) []string {
+
+	if receiver == "" || receiver == "_" {
+		return nil
+	}
+	names := []string{}
+	seen := map[string]bool{}
+	take := func(target ast.Expr) {
+		bare, isBare := target.(*ast.Ident)
+		if !isBare || bare.Name == "_" || bare.Name == receiver || seen[bare.Name] {
+			return
+		}
+		seen[bare.Name] = true
+		names = append(names, bare.Name)
+	}
+	holds := func(typed ast.Expr) bool {
+		return typed != nil && slices.Contains(identifiersNamedIn(typed), typeName)
+	}
+	ast.Inspect(function.Body, func(node ast.Node) bool {
+		switch typed := node.(type) {
+		case *ast.AssignStmt:
+			if len(typed.Rhs) == 1 {
+				for at, produced := range eraseReceiverSourcedTypes(typed.Rhs[0], receiver,
+					receiverType, structs, answers, len(typed.Lhs)) {
+
+					if at < len(typed.Lhs) && holds(produced) {
+						take(typed.Lhs[at])
+					}
+				}
+				return true
+			}
+			if len(typed.Lhs) != len(typed.Rhs) {
+				return true
+			}
+			for i, right := range typed.Rhs {
+				produced := eraseReceiverSourcedTypes(right, receiver, receiverType, structs,
+					answers, 1)
+				if len(produced) == 1 && holds(produced[0]) {
+					take(typed.Lhs[i])
+				}
+			}
+		case *ast.RangeStmt:
+			// the VALUE of a range is the element; the key is an index or a map key, which is
+			// eraseAliasesIn's own reading of the same statement.
+			if typed.Value == nil {
+				return true
+			}
+			for _, over := range eraseReceiverSourcedTypes(typed.X, receiver, receiverType,
+				structs, answers, 1) {
+
+				if holds(eraseElementTypeOf(over)) {
+					take(typed.Value)
+				}
+			}
+		}
+		return true
+	})
+	return names
+}
+
+// eraseReceiverSourcedTypes is the declared type of what an expression rooted in the receiver
+// produces, one entry per result position. An expression rooted anywhere else answers nothing,
+// which is what keeps a local this body constructed out of the class.
+func eraseReceiverSourcedTypes(expr ast.Expr, receiver string, receiverType string,
+	structs map[string]*ast.StructType, answers map[string][][]ast.Expr, want int) []ast.Expr {
+
+	switch typed := expr.(type) {
+	case *ast.ParenExpr:
+		return eraseReceiverSourcedTypes(typed.X, receiver, receiverType, structs, answers, want)
+	case *ast.StarExpr:
+		return eraseReceiverSourcedTypes(typed.X, receiver, receiverType, structs, answers, want)
+	case *ast.CallExpr:
+		selector, isSelector := typed.Fun.(*ast.SelectorExpr)
+		if !isSelector || selector.Sel == nil || rootIdentifierOf(selector.X) != receiver {
+			return nil
+		}
+		// every declaration of that name is tried, because a name can be a method of two types
+		// and a reading that took the first would be answering for the wrong one.
+		for _, results := range answers[selector.Sel.Name] {
+			if len(results) == want {
+				return results
+			}
+		}
+		return nil
+	case *ast.IndexExpr:
+		for _, over := range eraseReceiverSourcedTypes(typed.X, receiver, receiverType, structs,
+			answers, 1) {
+
+			if element := eraseElementTypeOf(over); element != nil {
+				return []ast.Expr{element}
+			}
+		}
+		return nil
+	case *ast.SelectorExpr:
+		base, isBare := typed.X.(*ast.Ident)
+		if !isBare || base.Name != receiver {
+			return nil
+		}
+		structure, isDeclared := structs[receiverType]
+		if !isDeclared {
+			return nil
+		}
+		for _, field := range structure.Fields.List {
+			for _, name := range field.Names {
+				if name.Name == typed.Sel.Name {
+					return []ast.Expr{field.Type}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// eraseElementTypeOf is what one entry of a map or a slice holds.
+func eraseElementTypeOf(expr ast.Expr) ast.Expr {
+	switch typed := expr.(type) {
+	case *ast.MapType:
+		return typed.Value
+	case *ast.ArrayType:
+		return typed.Elt
+	}
+	return nil
 }
 
 // TestEveryPathThatDropsHeldKeyMaterialErasesItFirst is the half a completeness reading cannot
@@ -1729,8 +1907,8 @@ func TestEveryPathThatDropsHeldKeyMaterialErasesItFirst(t *testing.T) {
 			if len(held) != 0 && len(moved) == 0 {
 				continue
 			}
-			t.Errorf("(*%s).%s writes to %s and neither erases what it drops, refuses to overwrite a live one, nor moves it: %v is dropped with the value. A staged epoch dropped this way is a complete second epoch left in the heap for the collector to move around",
-				member, site.method.name, site.field.name, moved)
+			t.Errorf("%s writes to %s.%s, which is storage of a %s it was handed or took out of its own receiver, and neither erases what it drops, refuses to overwrite a live one, nor moves it: %v is dropped with the value. A staged epoch dropped this way is a complete second epoch left in the heap for the collector to move around",
+				site.method.name, site.method.self, site.field.name, member, moved)
 		}
 	}
 	if sites < 4 {
@@ -1793,6 +1971,32 @@ func (self *Dropper) drop() {
 // the same drop through a position a receiver-rooted reading has no name for.
 func abandon(dropper *Dropper) {
 	dropper.pending = nil
+}
+
+// the value a body took OUT OF THE RECEIVER and dropped through the local it came back in,
+// which is the shape a reading of receiver and parameter positions alone has no name for. Keeper
+// hands nothing to restore; restore asks Keeper for one of the values Keeper is holding and
+// writes over its storage, which is (*SecretTree).RestoreSenderRatchets exactly.
+type Keeper struct {
+	entries map[int]*Held
+}
+
+func (self *Keeper) entryFor(at int) *Held {
+	return self.entries[at]
+}
+
+func (self *Keeper) restore(at int, secret []byte) {
+	entry := self.entryFor(at)
+	entry.secret = secret
+}
+
+// and the local this body CONSTRUCTED, which is not a position however much storage it holds:
+// the value never left this frame, so the assignment below drops a nil and not a live secret.
+// This is the case the old boundary was written for and it stays outside the class.
+func mint(secret []byte) *Held {
+	fresh := &Held{}
+	fresh.secret = secret
+	return fresh
 }
 
 type Refuser struct {
@@ -1965,13 +2169,25 @@ func eraseControlReading(t *testing.T) {
 	// and the drop sites: Dropper is reported, Mover and Refuser are not.
 	verdicts := map[string]eraseDropSite{}
 	for _, member := range []string{"Mover", "Dropper", "Refuser", "Presumer", "SubFielder",
-		"Trailer"} {
+		"Trailer", "Held"} {
 		for _, site := range theDropSitesIn(reading, member) {
 			verdicts[member+"."+site.method.name] = site
 		}
 	}
 	if _, found := verdicts["Dropper.abandon"]; !found {
 		t.Errorf("the drop reading found no assignment in abandon, which is handed a Dropper in a parameter and drops its held value; a reading rooted in the receiver asks this obligation of methods and of nothing else")
+	}
+	// the widened position: a local the body took out of its own receiver.
+	keeper, found := verdicts["Held.restore"]
+	if !found {
+		t.Error("the drop reading found no assignment in (*Keeper).restore, which writes over the storage of a value it asked its own receiver for; a reading that sees only receivers and parameters reports this source clean while a live secret is dropped through a local")
+	} else if keeper.erased || keeper.refused || len(keeper.installed) != 0 || len(keeper.movedOut) != 0 {
+		t.Errorf("(*Keeper).restore is read as erasing, refusing or moving what it drops: erased=%v refused=%v",
+			keeper.erased, keeper.refused)
+	}
+	// and the local this body CONSTRUCTED, which the widening must not sweep in.
+	if _, found := verdicts["Held.mint"]; found {
+		t.Error("the drop reading reports mint, which writes over storage of a value it built two statements earlier; a reading that cannot tell a constructed local from one taken out of a receiver reports every constructor in this package as a leak")
 	}
 	drop, found := verdicts["Dropper.drop"]
 	if !found {

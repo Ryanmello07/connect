@@ -341,8 +341,10 @@ func NewKeyPackage(crypto CryptoProvider, suite CipherSuite, cred Credential,
 // MakeKeyPackageRef wraps whatever this answers in ONE opaque<V>, and a KeyPackage is a
 // COMPOSITION -- its credential, its extensions, its key material
 // and its signature are each bounded by syntax.MaxVectorLength and their sum is not. A credential
-// of MaxVectorLength-64 octets is a key package a decoder ACCEPTS, and this method used to take
-// the process down over one. RefHash refuses the same octets now, one frame further down; the
+// of MaxVectorLength-64 octets is a key package of 1050016 octets, which a decoder ACCEPTS, and
+// this method used to take the process down over one --
+// TestTheEnormousAddIsTheOctetCountsTheseDisclosuresState builds exactly that key package, holds
+// the count, and drives this method over it. RefHash refuses the same octets now, one frame further down; the
 // bound stays here because this is the frame that can say a KEY PACKAGE was what did not fit.
 func (self *KeyPackage) Ref(crypto CryptoProvider) ([]byte, error) {
 	if crypto == nil {
