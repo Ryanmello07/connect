@@ -114,8 +114,16 @@ var (
 	// processed.Commit.Zeroize() and then receiver.ApplyCommit(processed) -- the group advanced to
 	// the next epoch and answered a 32-zero epoch authenticator, because the group id and the
 	// prior epoch SURVIVE Zeroize and were the only two fields this door read. Two members that
-	// both took that path compare equal, which is a fork detector answering "no fork" out of
-	// erased storage.
+	// both took that path compare equal -- measured, byte for byte -- which is a fork detector
+	// answering "no fork" out of erased storage about two groups with nothing in common.
+	//
+	// AND THE CALL DOES NOT ANSWER nil, which is worth writing down because it is WORSE than nil
+	// rather than better. With both refusals removed the merge runs to completion, installs the
+	// erased epoch, and then fails at the persist -- marshalState refuses an epoch whose schedule
+	// cannot answer the secret it was built from -- so the caller is handed
+	// errGroupStateRestoreSecret, which names the store. The group has already moved by then, and a
+	// caller reading that value learns that its state could not be written rather than that the
+	// value it passed was erased.
 	errStagedCommitErased = errors.New("mls: the staged commit's key material has been erased")
 
 	errCreationConfirmationTag = errors.New("mls: the epoch 0 confirmation tag is not a tag of this suite's width")
