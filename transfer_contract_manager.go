@@ -35,6 +35,14 @@ var oobErrThrottle = newLogThrottle(time.Minute)
 // shouldLogOobErr reports whether an out-of-band error should be logged and the number of errors suppressed since the previous allowed log.
 func shouldLogOobErr() (bool, int64) { return oobErrThrottle.Allow(time.Now()) }
 
+// contractErrThrottle rate-limits `[contract]error = NoPermission` and similar
+// per-contract error logs. NoPermission is expected transiently while a target's
+// provide registration is still committing (transfer.go:682), so every sequence
+// retry and every exit attempt emits this line. Without throttling a single
+// NoPermission (or any persistent per-exit rejection) generates hundreds of
+// thousands of log lines per session.
+var contractErrThrottle = newLogThrottle(time.Minute)
+
 type ContractKey struct {
 	Destination       TransferPath
 	IntermediaryIds   MultiHopId
@@ -971,7 +979,13 @@ func (self *ContractManager) handleControlFrameForQueue(
 		}
 		for _, contractError := range contractErrors {
 			if self.client.log.V(1).Enabled() {
-				self.client.log.Infof("[contract]error = %s\n", contractError)
+				if ok, suppressed := contractErrThrottle.Allow(time.Now()); ok {
+					if suppressed > 0 {
+						self.client.log.Infof("[contract]error = %s (%d suppressed)\n", contractError, suppressed)
+					} else {
+						self.client.log.Infof("[contract]error = %s\n", contractError)
+					}
+				}
 			}
 			c := func() {
 				contractStatus := &ContractStatus{
