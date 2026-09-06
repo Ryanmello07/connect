@@ -1280,10 +1280,27 @@ func TestPublishedCorpusSegmentStepsIntoTheShapeThePublishedValueHas(t *testing.
 
 // packageSourcePathsIn is every go file at the top level of one package directory, sorted.
 //
-// It does not recurse. What sits under testdata is either fixture source that only ever
-// reaches a go/parser -- which has no opinion at all about how a line ends -- or bytes that
-// .gitattributes marks -text so no checkout rewrites them. Neither is read by an anchored
-// string edit, which is the thing the gate below exists to protect.
+// It does not recurse because its CALLER has already descended: lineEndingScanRoots hands back
+// every directory of this module holding Go source at any depth, so a nested directory arrives
+// as a root of its own and recursing here would judge its files twice.
+//
+// This used to give a different reason, and both halves of that reason are false. It said what
+// sits under testdata is either fixture source that only ever reaches a go/parser -- "which has
+// no opinion at all about how a line ends" -- or bytes .gitattributes marks -text, and that
+// "neither is read by an anchored string edit". Both were measured, not argued with:
+//
+//   - go/parser is not the only reader. crypto_forbidden_test.go opens every .go file under
+//     testdata/forbidden with os.ReadFile and keeps string(body) in sourceTexts, and its
+//     matchers run over that text. It survives a crlf flip only because codeOf normalises
+//     the carriage returns away itself -- a defence that reader wrote for itself, and the
+//     comment above it says so, naming this gate as what catches the flip "only after a
+//     matcher has already read the file".
+//   - nothing under testdata/forbidden is marked -text. It is covered by `*.go text eol=lf`
+//     like every other Go file in this module, which is what this gate logs for that root.
+//     Flipping mls/testdata/forbidden/nested/*.go to crlf on disk turns this gate RED.
+//
+// Testdata Go is source, it is judged, and the judged-file assertion below now states that as
+// an assertion rather than as a sentence.
 //
 // A directory holding no go source is a fatal and not an empty result, because a scope that
 // resolved to nothing is what "every file agreed" looks like when nothing was read.
@@ -1372,6 +1389,68 @@ func goSourceDirsUnder(root string, from string) ([]string, error) {
 	return dirs, nil
 }
 
+// everyGoSourceFileUnder is every .go FILE at or below one directory, answered as paths relative
+// to `from`, sorted.
+//
+// It is the second half of the judged-file assertion the gate below makes, and its whole value
+// is that it shares NOTHING with the walk it is compared against. goSourceDirsUnder asks a
+// question about DIRECTORIES through filepath.WalkDir and the gate then globs each answer; this
+// asks a question about FILES through an explicit os.ReadDir recursion. A narrowing written into
+// either one shows up as a set the other no longer matches. A helper called by both would be
+// narrowed once for both, which is why this is not the walk above with a different predicate.
+//
+// There is no name test in it and no depth test in it. An entry is a directory, in which case it
+// is descended into, or it ends .go, in which case it is named. That is deliberate, and it is
+// the shape the scope control below gets wrong: that control says "NO NAME is an exception" and
+// then observes it through a fixture holding four names, so a fifth name -- `security` is the
+// one measured -- walks past a control written to forbid exactly that. A predicate with no names
+// in it has no fixture of names to fall outside of.
+//
+// Nothing is pruned, .git included, for the same reason: the two enumerations have to agree
+// about the same tree, and a prune here that the walk above does not make would report a
+// difference that is this function's and not the tree's. .git holds no .go file, so the two
+// agree either way; the symmetry is what is being kept, not the cost.
+func everyGoSourceFileUnder(t *testing.T, root string, from string) []string {
+	t.Helper()
+	files := []string{}
+	pending := []string{root}
+	for len(pending) > 0 {
+		dir := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatalf("read %s while enumerating this module's go source: %v", dir, err)
+		}
+		for _, entry := range entries {
+			path := filepath.Join(dir, entry.Name())
+			if entry.IsDir() {
+				pending = append(pending, path)
+				continue
+			}
+			if filepath.Ext(entry.Name()) != ".go" {
+				continue
+			}
+			relative, err := filepath.Rel(from, path)
+			if err != nil {
+				t.Fatalf("place %s under %s: %v", path, from, err)
+			}
+			files = append(files, filepath.ToSlash(relative))
+		}
+	}
+	slices.Sort(files)
+	return files
+}
+
+// namesOf prints a difference at a length a failure can be read at, and says how much it left
+// out. A one file difference is named in full, which is the case that matters: the whole reason
+// the assertion is over sets and not over counts is that a set can say WHICH file went missing.
+func namesOf(paths []string, most int) string {
+	if len(paths) <= most {
+		return fmt.Sprintf("%v", paths)
+	}
+	return fmt.Sprintf("%v and %d more", paths[:most], len(paths)-most)
+}
+
 // lineEndingScanRoots is every directory of this module holding Go source, DERIVED by walking
 // the module root rather than listed.
 //
@@ -1458,8 +1537,11 @@ func lineEndingScanRoots(t *testing.T) []string {
 //     first, because they are the four the Go tool itself skips: a leading dot, a leading
 //     underscore, testdata, vendor. Go skips them when it is deciding what to COMPILE; this
 //     gate is deciding what an exact-string edit can read, and every one of them can be read.
-//     Without this the exclusion the closure carried could be reintroduced under a different
-//     name and the gate would stay green over whatever it stopped judging.
+//     Four names are four names, though, and this bullet used to be the whole guarantee: a
+//     FIFTH name walked past it, and `security` was the one measured doing it. What holds the
+//     claim now is the judged-file assertion at the end of the gate, which compares the files
+//     read against everyGoSourceFileUnder and needs no name in it at all. This fixture stays as
+//     the demonstration that the walk descends and skips nothing; it is not the proof.
 //   - the ROOTS come back relative to where the caller stands, so one reads as "../message",
 //     the way every scan root in these gates is written, rather than as an absolute path that
 //     matches nothing else anybody writes down here.
@@ -1500,6 +1582,78 @@ func TestTheLineEndingScopeIsEveryDirectoryHoldingGoSource(t *testing.T) {
 	}
 	if want := []string{".", "..", "../.dotted", "../_underscored", "../testdata", "../vendor", "deeper"}; !slices.Equal(dirs, want) {
 		t.Errorf("standing in %s the walk answered %v, want %v: a directory beside the caller is named by the step up to it and not by its absolute path", from, dirs, want)
+	}
+}
+
+// TestTheIndependentGoSourceEnumerationNamesEveryGoFileAtAnyDepth is the control on the OTHER
+// half of the judged-file assertion, run against a tree built here for the same reason the scope
+// control is: an enumeration exercised only against the tree it ships in cannot be told apart
+// from a list that happens to be right about that tree.
+//
+// The fixture is deliberately DEEPER than the scope control's, which is exactly two levels and
+// therefore cannot see a depth limit of two. Thirteen files of this module sit three and four
+// levels below the module root -- mls/testdata/forbidden/nested holds three of them -- so a
+// limit that reads as harmless against a two deep fixture drops them, and that was one of the
+// four narrowings this assertion was built to close.
+//
+// It states four answers, and the third is the point of the function existing at all:
+//
+//   - it names FILES, not directories, so what the gate judged can be compared against it member
+//     by member rather than as a count that matches by accident.
+//   - it DESCENDS to any depth, four levels here.
+//   - no directory name is an exception -- and, unlike the scope control, the code it is
+//     observing contains no directory name at all, so this fixture is a demonstration and not
+//     the enumeration the property rests on.
+//   - a file that is not .go is not a member, so a folder of prose does not inflate the set the
+//     gate is held to.
+func TestTheIndependentGoSourceEnumerationNamesEveryGoFileAtAnyDepth(t *testing.T) {
+	root := t.TempDir()
+	for _, built := range []string{
+		"top.go",
+		"notes.md",
+		"nested/mid.go",
+		"nested/deeper/leaf.go",
+		"nested/deeper/further/deepest.go",
+		"nested/deeper/further/readme.md",
+		"prose/readme.md",
+		".dotted/hidden.go",
+		"_underscored/skipped.go",
+		"testdata/fixture.go",
+		"testdata/corpus/seed",
+		"vendor/vendored.go",
+		"oddly.named/inside.go",
+	} {
+		path := filepath.Join(root, filepath.FromSlash(built))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("build the enumeration fixture: %v", err)
+		}
+		if err := os.WriteFile(path, []byte("package p\n"), 0o644); err != nil {
+			t.Fatalf("build the enumeration fixture: %v", err)
+		}
+	}
+
+	files := everyGoSourceFileUnder(t, root, root)
+	want := []string{
+		".dotted/hidden.go",
+		"_underscored/skipped.go",
+		"nested/deeper/further/deepest.go",
+		"nested/deeper/leaf.go",
+		"nested/mid.go",
+		"oddly.named/inside.go",
+		"testdata/fixture.go",
+		"top.go",
+		"vendor/vendored.go",
+	}
+	if !slices.Equal(files, want) {
+		t.Errorf("the enumeration answered %v, want %v: every go file at any depth under any directory name, and nothing that is not go source",
+			files, want)
+	}
+
+	// and it answers relative to where the caller stands, because the gate compares it against
+	// paths it resolved against the module root and a set of absolute paths matches none of them.
+	fromNested := everyGoSourceFileUnder(t, root, filepath.Join(root, "nested"))
+	if !slices.Contains(fromNested, "../top.go") || !slices.Contains(fromNested, "deeper/leaf.go") {
+		t.Errorf("standing in nested the enumeration answered %v, want a file above the caller named by the step up to it and one below it named without one", fromNested)
 	}
 }
 
@@ -1744,6 +1898,31 @@ func TestTheLineEndingPinIsReadTheWayGitResolvesIt(t *testing.T) {
 // clean filter converts a crlf back to lf before the diff is computed, so a mutation that really
 // is on disk reports an empty numstat. Check the bytes.
 //
+// The scope is then CHECKED rather than trusted: every file this gate reads is collected as it is
+// read, and the set of them is asserted equal to the .go files of this module, enumerated a
+// second time by everyGoSourceFileUnder. Until 2026-09-05 the derivation was never checked at
+// all -- the gate logged a per root count summing to exactly 474 and asserted on neither half of
+// it, so any narrowing that left forbiddenScanRoots reachable passed in silence. Measured:
+// inserting `if entry.IsDir() && entry.Name() == "security" { return fs.SkipDir }` into the walk
+// AND flipping security/main.go uniformly to crlf on disk ran 7,497 PASS, 0 FAIL, 0 SKIP,
+// identical to clean, while the same file flipped without the skip is correctly red. Sets and
+// not counts, because a count matches by accident and a set names the file that went missing.
+//
+// That closes four narrowings at once, which is why it is one assertion and not four rules: a
+// directory skipped under a name outside the scope control's four name fixture; a depth limit,
+// which that fixture is exactly two deep and cannot see; the two line survivor that roots the
+// walk at this package AND drops the forbiddenScanRoots coverage loop, taking the gate from 474
+// files to 168 with each half alone caught and the pair not; and the next one, which is the
+// actual point.
+//
+// What it does NOT hold, said here rather than left to be found: a narrowing written into BOTH
+// enumerations at once. Every A-equals-B assertion has that residual. It is pushed as far out as
+// it goes by giving the two halves nothing in common -- different traversal primitive, different
+// question, no shared helper, no shared predicate, and a second half whose comment says it
+// exists to have no name test and no depth test in it -- so the second edit has to be written
+// deliberately into a function that says why it is empty. It is smaller than it was. It is not
+// zero, and this gate is best effort to exactly that extent.
+//
 // A file carrying no line ending at all belongs to neither class and is counted apart, so an
 // empty file cannot make a mixed package look uniform, and a file mixed WITHIN itself is its
 // own report: that one is never a checkout and is always a tool that wrote part of a file.
@@ -1751,11 +1930,13 @@ func TestThePackageSourceIsOneLineEndingThroughout(t *testing.T) {
 	moduleRoot := moduleRootDir(t)
 	roots := lineEndingScanRoots(t)
 	t.Logf("the derived scope is %v", roots)
+	judged := []string{}
 	for _, root := range roots {
 		paths := packageSourcePathsIn(t, root)
 		heldTo := map[string]int{}
 		decidedBy := map[string]bool{}
 		unpinned := []string{}
+		exempted := []string{}
 		wrong := []string{}
 		empty := 0
 		for _, path := range paths {
@@ -1763,6 +1944,10 @@ func TestThePackageSourceIsOneLineEndingThroughout(t *testing.T) {
 			if err != nil {
 				t.Fatalf("read %s: %v", path, err)
 			}
+			// recorded where the file is actually READ, and not where the scope was derived, so a
+			// narrowing anywhere between the two -- in the walk, in the glob, or in a filter added to
+			// this loop later -- is a member the assertion at the end no longer finds.
+			judged = append(judged, repositoryPathOf(t, moduleRoot, path))
 			lines := bytes.Count(source, []byte("\n"))
 			carried := bytes.Count(source, []byte("\r\n"))
 			carries := ""
@@ -1780,8 +1965,18 @@ func TestThePackageSourceIsOneLineEndingThroughout(t *testing.T) {
 				continue
 			}
 			pinned, decided := pinnedLineEndingOf(t, moduleRoot, path)
-			if pinned == "" {
+			switch {
+			case decided == "":
 				unpinned = append(unpinned, path)
+				continue
+			case pinned == "":
+				// DECIDED, and what it decided is "no ending at all": a -text or binary rule covering a
+				// .go file. That is a different answer from "no rule set mentions this file", and
+				// reporting it as that one did two wrong things at once -- it named a rule set that HAD
+				// spoken as silent, and then suppressed every remaining file of the root behind the
+				// diagnosis. pinnedLineEndingOf has always distinguished the two through its second
+				// return; only this caller collapsed them.
+				exempted = append(exempted, fmt.Sprintf("%s, by %q", path, decided))
 				continue
 			}
 			// counted against what the REPOSITORY says rather than against what the tree does, so
@@ -1792,30 +1987,51 @@ func TestThePackageSourceIsOneLineEndingThroughout(t *testing.T) {
 				wrong = append(wrong, fmt.Sprintf("%s is %s", path, carries))
 			}
 		}
+		// no report short circuits another. Each of these is a different defect about a different
+		// set of the root's files, and the `continue` that used to stand under the first is how one
+		// -text rule over one .go file would leave every OTHER file of its root unjudged.
 		if len(unpinned) > 0 {
 			t.Errorf("%d of %s's %d source files are pinned to no line ending by any .gitattributes between them and the module root (%s is one), so this gate is holding them to nothing; the pin and this gate are one mechanism and neither half is worth anything alone",
 				len(unpinned), root, len(paths), unpinned[0])
-			continue
 		}
-		if len(heldTo) == 0 {
-			t.Errorf("none of %s's source files carries a line ending at all (%d were empty), so this gate read nothing of that package", root, empty)
-			continue
+		if len(exempted) > 0 {
+			t.Errorf("%d of %s's %d source files are marked as carrying no line ending AT ALL (%s), so this gate can hold them to nothing; a .go file git has been told not to convert is a hole in the pin rather than an exemption from it, and it is reported as the decision it is instead of as an absent rule",
+				len(exempted), root, len(paths), exempted[0])
 		}
 		if len(heldTo) > 1 {
 			t.Errorf("%s's source is pinned to more than one line ending (%v by %v), so no ending the package could be in is uniform and an edit anchored on either matches nothing in the files pinned to the other",
 				root, slices.Sorted(maps.Keys(heldTo)), slices.Sorted(maps.Keys(decidedBy)))
-			continue
 		}
 		if len(wrong) > 0 {
 			// the pin is named rather than the majority ending, because the pin is the answer and a
 			// majority is only a vote.
 			t.Errorf("%s: %v, and %v checks every one of them out %v; a file the working tree carries in an ending no checkout of this repository produces was written by a tool, and an exact-string edit anchored on the other ending matches nothing in it and reports the change as made",
 				root, wrong, slices.Sorted(maps.Keys(decidedBy)), slices.Sorted(maps.Keys(heldTo)))
-			continue
 		}
-		for ending, count := range heldTo {
-			t.Logf("all %d source files of %s end their lines %s, which is what %v checks them out as, and %d carry no line ending",
-				count, root, ending, slices.Sorted(maps.Keys(decidedBy)), empty)
+		if len(heldTo) == 0 && len(unpinned) == 0 && len(exempted) == 0 {
+			t.Errorf("none of %s's source files carries a line ending at all (%d were empty), so this gate read nothing of that package", root, empty)
+		}
+		if len(heldTo) == 1 && len(wrong) == 0 {
+			for ending, count := range heldTo {
+				t.Logf("all %d source files of %s end their lines %s, which is what %v checks them out as, and %d carry no line ending",
+					count, root, ending, slices.Sorted(maps.Keys(decidedBy)), empty)
+			}
 		}
 	}
+
+	// the scope, checked against the class it claims to cover: every .go file of this module,
+	// enumerated a second time and by other means, has to be a file this gate just read.
+	slices.Sort(judged)
+	inModule := everyGoSourceFileUnder(t, moduleRoot, moduleRoot)
+	if !slices.Equal(judged, inModule) {
+		if unjudged := missingFrom(inModule, judged); len(unjudged) > 0 {
+			t.Errorf("this gate judged %d of the %d go files under %s, and %s went unread; whatever those files carry, nothing in this suite has looked at it, and a scope that has narrowed away from the module it claims is green over everything it stopped reaching",
+				len(judged), len(inModule), moduleRoot, namesOf(unjudged, 12))
+		}
+		if outside := missingFrom(judged, inModule); len(outside) > 0 {
+			t.Errorf("this gate judged %s, which the independent enumeration of %s does not hold; a file judged twice, or judged from outside the module, means the two halves disagree about what the module IS and neither number below can be read",
+				namesOf(outside, 12), moduleRoot)
+		}
+	}
+	t.Logf("the gate judged %d files, against %d go files under %s", len(judged), len(inModule), moduleRoot)
 }
