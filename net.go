@@ -3,6 +3,7 @@ package connect
 import (
 	"context"
 	"crypto/tls"
+	"io"
 	"net"
 	"time"
 
@@ -11,6 +12,58 @@ import (
 
 type DialContextFunction = func(ctx context.Context, network string, addr string) (net.Conn, error)
 type DialTlsContextFunction = func(ctx context.Context, network string, addr string) (net.Conn, error)
+
+// withWriteProgressDeadline bounds a synchronous connection write phase by the
+// earlier of the caller deadline and its no-progress budget. Context
+// cancellation alone cannot interrupt a net.Conn.Write already in progress.
+func withWriteProgressDeadline(
+	ctx context.Context,
+	conn net.Conn,
+	noProgressTimeout time.Duration,
+	write func() error,
+) error {
+	deadline, hasDeadline := ctx.Deadline()
+	if 0 < noProgressTimeout {
+		progressDeadline := time.Now().Add(noProgressTimeout)
+		if !hasDeadline || progressDeadline.Before(deadline) {
+			deadline = progressDeadline
+			hasDeadline = true
+		}
+	}
+	if !hasDeadline {
+		return write()
+	}
+	if err := conn.SetWriteDeadline(deadline); err != nil {
+		return err
+	}
+	defer conn.SetWriteDeadline(time.Time{})
+	return write()
+}
+
+// writeAllWithProgressDeadline writes the entire buffer within one bounded
+// no-progress phase, handling legal short writes without dropping bytes.
+func writeAllWithProgressDeadline(
+	ctx context.Context,
+	conn net.Conn,
+	buffer []byte,
+	noProgressTimeout time.Duration,
+) error {
+	return withWriteProgressDeadline(ctx, conn, noProgressTimeout, func() error {
+		for 0 < len(buffer) {
+			n, err := conn.Write(buffer)
+			if 0 < n {
+				buffer = buffer[n:]
+			}
+			if err != nil {
+				return err
+			}
+			if n == 0 {
+				return io.ErrShortWrite
+			}
+		}
+		return nil
+	})
+}
 
 func DefaultConnectSettings() *ConnectSettings {
 	tlsConfig, err := DefaultTlsConfig()

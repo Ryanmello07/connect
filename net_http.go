@@ -1624,6 +1624,15 @@ type clientDialer struct {
 	settings *ClientStrategySettings
 }
 
+// nativeHttp2Config applies the socket-progress invariant shared by every
+// native net/http HTTP/2 client. WriteByteTimeout renews whenever bytes move,
+// so ConnectTimeout bounds a stalled write without limiting a healthy request.
+func nativeHttp2Config(settings *ConnectSettings) *http.HTTP2Config {
+	return &http.HTTP2Config{
+		WriteByteTimeout: settings.ConnectTimeout,
+	}
+}
+
 func (self *clientDialer) HttpClient() *http.Client {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
@@ -1669,10 +1678,9 @@ func (self *clientDialer) HttpClient() *http.Client {
 		// when an embedder asked for them -- that guard is about the mobile
 		// heap -- but it used to gate the whole config, so a desktop build had
 		// no HTTP2Config at all and therefore no health check either.
-		transport.HTTP2 = &http.HTTP2Config{
-			SendPingTimeout: self.settings.Http2SendPingTimeout,
-			PingTimeout:     self.settings.Http2PingTimeout,
-		}
+		transport.HTTP2 = nativeHttp2Config(&self.settings.ConnectSettings)
+		transport.HTTP2.SendPingTimeout = self.settings.Http2SendPingTimeout
+		transport.HTTP2.PingTimeout = self.settings.Http2PingTimeout
 		if 0 < self.settings.Http2MaxDecoderHeaderTableSize ||
 			0 < self.settings.Http2MaxEncoderHeaderTableSize ||
 			0 < self.settings.Http2MaxReceiveBufferPerConnection ||
@@ -2133,6 +2141,18 @@ func HttpGetWithRawFunction[R any](
 /**
  * Streaming POST
  */
+// newHttpPostStreamTransport constructs the native streaming transport with
+// the same dial and HTTP/2 progress bounds as other API clients.
+func newHttpPostStreamTransport(settings *ConnectSettings) *http.Transport {
+	return &http.Transport{
+		DialContext:         wrapControlDial("api", settings.Log, true, settings.DialContext),
+		TLSClientConfig:     settings.TlsConfig,
+		TLSHandshakeTimeout: settings.TlsTimeout,
+		ForceAttemptHTTP2:   true,
+		HTTP2:               nativeHttp2Config(settings),
+	}
+}
+
 func HttpPostStreamWithStrategyRaw(
 	ctx context.Context,
 	requestUrl string,
@@ -2156,12 +2176,7 @@ func HttpPostStreamWithStrategyRaw(
 	// resolves in-process. See egress.go / egress_dial.go; identical behavior
 	// everywhere else.
 	settings := DefaultConnectSettings()
-	var transport http.RoundTripper = &http.Transport{
-		DialContext:         wrapControlDial("api", settings.Log, true, settings.DialContext),
-		TLSClientConfig:     settings.TlsConfig,
-		TLSHandshakeTimeout: settings.TlsTimeout,
-		ForceAttemptHTTP2:   true,
-	}
+	var transport http.RoundTripper = newHttpPostStreamTransport(settings)
 	if direct := platformDirectHttpTransport(); direct != nil {
 		// js/wasm: the browser's fetch, which no custom dialer can reach
 		transport = direct
