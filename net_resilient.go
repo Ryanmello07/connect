@@ -114,7 +114,7 @@ func newResilientDialTlsContext(
 				return nil, err
 			}
 			// once the stream is established, no longer need the resilient features
-			if err := rconn.Off(); err != nil {
+			if err := offResilientTlsConn(ctx, rconn, connectSettings.ConnectTimeout); err != nil {
 				tlsConn.Close()
 				return nil, err
 			}
@@ -137,6 +137,16 @@ func newResilientDialTlsContext(
 		return dialControlTlsWithFamilyFallback(
 			ctx, connectSettings, "tcp", addr, connectSettings.DialContext, handshake)
 	}
+}
+
+// offResilientTlsConn bounds the partial-record drain that Off may perform.
+// The completed TLS handshake's context cannot interrupt that raw Write.
+func offResilientTlsConn(
+	ctx context.Context,
+	rconn *ResilientTlsConn,
+	phaseTimeout time.Duration,
+) error {
+	return withConnWritePhaseDeadline(ctx, rconn, phaseTimeout, rconn.Off)
 }
 
 // adapts techniques to overcome adversarial networks

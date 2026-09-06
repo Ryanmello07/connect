@@ -87,6 +87,7 @@ func NewExtenderHttpClient(
 	transport := &http.Transport{
 		DialTLSContext:    newExtenderDialTlsContext(connectSettings, extenderConfig, clientHttpNextProtos),
 		ForceAttemptHTTP2: true,
+		HTTP2:             nativeHttp2Config(connectSettings),
 	}
 	return &http.Client{
 		Transport: transport,
@@ -197,7 +198,7 @@ func newExtenderDialTlsContext(
 					return nil, err
 				}
 				// once the stream is established, no longer need the resilient features
-				if err := rconn.Off(); err != nil {
+				if err := offResilientTlsConn(ctx, rconn, connectSettings.ConnectTimeout); err != nil {
 					return nil, err
 				}
 
@@ -291,8 +292,7 @@ func newExtenderDialTlsContext(
 		headerBytes := make([]byte, 4+len(headerMessageBytes))
 		binary.BigEndian.PutUint32(headerBytes[0:4], uint32(len(headerMessageBytes)))
 		copy(headerBytes[4:4+len(headerMessageBytes)], headerMessageBytes)
-		_, err = serverConn.Write(headerBytes)
-		if err != nil {
+		if err = writeConnPhaseWithDeadline(ctx, serverConn, headerBytes, connectSettings.ConnectTimeout); err != nil {
 			return nil, err
 		}
 

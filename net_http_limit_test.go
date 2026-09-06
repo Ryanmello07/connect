@@ -61,6 +61,7 @@ func TestEvalResultReadsOnlySelectedResponseBody(t *testing.T) {
 		Body:          io.NopCloser(selectedReader),
 		ContentLength: 8,
 	}, nil, 32)
+	defer selected.Close()
 
 	losingReader := &countingReader{Reader: bytes.NewReader([]byte("losing"))}
 	losing := newEvalResultFromHttpResponse(&http.Response{
