@@ -337,20 +337,40 @@ func TestAdjacentHttp2ConstructorsBoundWriteProgress(t *testing.T) {
 	}
 }
 
+// writeDeadlineClearErrorConn injects a failure when a write deadline is
+// cleared, after forwarding nonzero deadlines to its wrapped connection.
+type writeDeadlineClearErrorConn struct {
+	net.Conn
+	clearErr error
+	setCalls atomic.Int32
+}
+
+// SetWriteDeadline records each attempt and injects the configured clear
+// failure only for a zero deadline.
+func (self *writeDeadlineClearErrorConn) SetWriteDeadline(deadline time.Time) error {
+	self.setCalls.Add(1)
+	if deadline.IsZero() {
+		return self.clearErr
+	}
+	return self.Conn.SetWriteDeadline(deadline)
+}
+
 // The extender header is a raw post-TLS write, outside net/http. Its helper
-// must install the same no-progress deadline before entering the socket write.
-func TestWriteAllWithProgressDeadlineBoundsExtenderHeader(t *testing.T) {
+// must install the same phase deadline before entering the socket write.
+func TestWriteConnPhaseDeadlineBoundsExtenderHeader(t *testing.T) {
 	clientConn, serverConn := net.Pipe()
 	defer serverConn.Close()
 	gate := newHttp2WriteGateConn(clientConn)
 	defer gate.Close()
 	gate.arm()
+	clearErr := errors.New("clear write deadline")
+	deadlineConn := &writeDeadlineClearErrorConn{Conn: gate, clearErr: clearErr}
 
 	writeDone := make(chan error, 1)
 	go func() {
-		writeDone <- writeAllWithProgressDeadline(
+		writeDone <- writeConnPhaseWithDeadline(
 			context.Background(),
-			gate,
+			deadlineConn,
 			[]byte("extender header"),
 			time.Minute,
 		)
@@ -360,6 +380,64 @@ func TestWriteAllWithProgressDeadlineBoundsExtenderHeader(t *testing.T) {
 	gate.expire()
 	if err := waitForHttp2BodyRead(t, writeDone); !errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatalf("extender header write error is %v, want deadline exceeded", err)
+	}
+}
+
+// A successful write still fails when its deadline cannot be cleared, so a
+// pooled connection is never returned with stale write state.
+func TestWriteConnPhaseDeadlineReportsClearFailure(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+	clearErr := errors.New("clear write deadline")
+	deadlineConn := &writeDeadlineClearErrorConn{Conn: clientConn, clearErr: clearErr}
+	buffer := []byte("extender header")
+	readDone := make(chan error, 1)
+	go func() {
+		readBuffer := make([]byte, len(buffer))
+		_, err := io.ReadFull(serverConn, readBuffer)
+		readDone <- err
+	}()
+
+	err := writeConnPhaseWithDeadline(context.Background(), deadlineConn, buffer, time.Minute)
+	if !errors.Is(err, clearErr) {
+		t.Fatalf("write result is %v, want clear deadline failure", err)
+	}
+	select {
+	case err := <-readDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the raw write reader")
+	}
+}
+
+// A context canceled before the phase begins prevents both the deadline
+// mutation and the write callback.
+func TestConnWritePhaseDeadlineRejectsCanceledContextBeforeWrite(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+	deadlineConn := &writeDeadlineClearErrorConn{
+		Conn:     clientConn,
+		clearErr: errors.New("clear write deadline"),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	writeCalled := false
+	err := withConnWritePhaseDeadline(ctx, deadlineConn, time.Minute, func() error {
+		writeCalled = true
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("write phase result is %v, want context canceled", err)
+	}
+	if writeCalled {
+		t.Fatal("write callback ran for an already canceled context")
+	}
+	if deadlineConn.setCalls.Load() != 0 {
+		t.Fatalf("write deadline changed %d times for an already canceled context", deadlineConn.setCalls.Load())
 	}
 }
 

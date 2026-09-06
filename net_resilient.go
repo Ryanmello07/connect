@@ -144,9 +144,9 @@ func newResilientDialTlsContext(
 func offResilientTlsConn(
 	ctx context.Context,
 	rconn *ResilientTlsConn,
-	noProgressTimeout time.Duration,
+	phaseTimeout time.Duration,
 ) error {
-	return withWriteProgressDeadline(ctx, rconn, noProgressTimeout, rconn.Off)
+	return withConnWritePhaseDeadline(ctx, rconn, phaseTimeout, rconn.Off)
 }
 
 // adapts techniques to overcome adversarial networks

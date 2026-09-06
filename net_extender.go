@@ -292,7 +292,7 @@ func newExtenderDialTlsContext(
 		headerBytes := make([]byte, 4+len(headerMessageBytes))
 		binary.BigEndian.PutUint32(headerBytes[0:4], uint32(len(headerMessageBytes)))
 		copy(headerBytes[4:4+len(headerMessageBytes)], headerMessageBytes)
-		if err = writeAllWithProgressDeadline(ctx, serverConn, headerBytes, connectSettings.ConnectTimeout); err != nil {
+		if err = writeConnPhaseWithDeadline(ctx, serverConn, headerBytes, connectSettings.ConnectTimeout); err != nil {
 			return nil, err
 		}
 

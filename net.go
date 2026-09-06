@@ -13,20 +13,23 @@ import (
 type DialContextFunction = func(ctx context.Context, network string, addr string) (net.Conn, error)
 type DialTlsContextFunction = func(ctx context.Context, network string, addr string) (net.Conn, error)
 
-// withWriteProgressDeadline bounds a synchronous connection write phase by the
-// earlier of the caller deadline and its no-progress budget. Context
-// cancellation alone cannot interrupt a net.Conn.Write already in progress.
-func withWriteProgressDeadline(
+// withConnWritePhaseDeadline bounds a synchronous connection write phase by
+// the earlier of the caller deadline and its phase budget. Context cancellation
+// alone cannot interrupt a net.Conn.Write already in progress.
+func withConnWritePhaseDeadline(
 	ctx context.Context,
 	conn net.Conn,
-	noProgressTimeout time.Duration,
+	phaseTimeout time.Duration,
 	write func() error,
-) error {
+) (resultErr error) {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	deadline, hasDeadline := ctx.Deadline()
-	if 0 < noProgressTimeout {
-		progressDeadline := time.Now().Add(noProgressTimeout)
-		if !hasDeadline || progressDeadline.Before(deadline) {
-			deadline = progressDeadline
+	if 0 < phaseTimeout {
+		phaseDeadline := time.Now().Add(phaseTimeout)
+		if !hasDeadline || phaseDeadline.Before(deadline) {
+			deadline = phaseDeadline
 			hasDeadline = true
 		}
 	}
@@ -36,19 +39,24 @@ func withWriteProgressDeadline(
 	if err := conn.SetWriteDeadline(deadline); err != nil {
 		return err
 	}
-	defer conn.SetWriteDeadline(time.Time{})
+	defer func() {
+		clearErr := conn.SetWriteDeadline(time.Time{})
+		if resultErr == nil {
+			resultErr = clearErr
+		}
+	}()
 	return write()
 }
 
-// writeAllWithProgressDeadline writes the entire buffer within one bounded
-// no-progress phase, handling legal short writes without dropping bytes.
-func writeAllWithProgressDeadline(
+// writeConnPhaseWithDeadline writes the entire buffer within one bounded phase,
+// handling legal short writes without dropping bytes.
+func writeConnPhaseWithDeadline(
 	ctx context.Context,
 	conn net.Conn,
 	buffer []byte,
-	noProgressTimeout time.Duration,
+	phaseTimeout time.Duration,
 ) error {
-	return withWriteProgressDeadline(ctx, conn, noProgressTimeout, func() error {
+	return withConnWritePhaseDeadline(ctx, conn, phaseTimeout, func() error {
 		for 0 < len(buffer) {
 			n, err := conn.Write(buffer)
 			if 0 < n {
