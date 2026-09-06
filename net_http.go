@@ -139,6 +139,14 @@ type ClientStrategySettings struct {
 	ExtenderConfigs []*ExtenderConfig
 
 	DohSettings *DohSettings
+	// InternalDohDomains are network-space domains whose exact host and
+	// subdomains resolve through the strategy's direct DoH cache before a
+	// control connection is dialed by raw IP. The request hostname remains
+	// unchanged for HTTP Host, TLS SNI, and certificate verification.
+	//
+	// An explicit ConnectSettings.Resolver takes precedence and disables this
+	// rule. This lets embedders and tests retain a resolver they installed.
+	InternalDohDomains []string
 
 	HelloRetryTimeout time.Duration
 
@@ -206,6 +214,9 @@ type ClientStrategy struct {
 	log                Logger
 
 	settings *ClientStrategySettings
+	// internalDohResolver exists only when InternalDohDomains are configured
+	// and the caller did not install ConnectSettings.Resolver.
+	internalDohResolver *internalDohResolver
 
 	mutex sync.Mutex
 	// dialers are only updated inside the mutex
@@ -291,6 +302,8 @@ func newNormalDialTlsContext(
 
 // extender udp 53 to platform extender
 func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *ClientStrategy {
+	settings, internalDohResolver := clientStrategySettingsWithInternalDoh(settings)
+
 	// propagate so a strategy-level logger covers dial logging. Copy instead
 	// of writing through the caller's settings: the caller may share them
 	// with concurrent constructions or other readers (see the platform
@@ -413,6 +426,7 @@ func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *C
 		cancel:              strategyCancel,
 		log:                 loggerOrDefault(settings.Log),
 		settings:            settings,
+		internalDohResolver: internalDohResolver,
 		dialers:             dialers,
 		resolvedExtenderIps: resolvedExtenderIps,
 		extenderIpSecrets:   map[netip.Addr]string{},
@@ -439,6 +453,9 @@ func (self *ClientStrategy) CloseIdleConnections() {
 	for dialer := range self.dialers {
 		dialer.Close()
 	}
+	if self.internalDohResolver != nil {
+		self.internalDohResolver.CloseIdleConnections()
+	}
 }
 
 // Ends discovery and releases pooled HTTP connections. APIs and transports
@@ -452,6 +469,9 @@ func (self *ClientStrategy) Close() {
 			self.unsubNetworkChange()
 		}
 		self.CloseIdleConnections()
+		if self.internalDohResolver != nil {
+			self.internalDohResolver.Close()
+		}
 	})
 }
 
@@ -1156,6 +1176,14 @@ func (self *ClientStrategy) HttpParallel(request *http.Request) (*httpResult, er
 	}
 	self.applyExtraHeaders(request.Header)
 
+	// js/wasm: one fetch, no dialer strategies (net_http_platform_js.go)
+	if result, ok := self.httpPlatformDirect(request); ok {
+		if result == nil {
+			return nil, fmt.Errorf("http request failed")
+		}
+		return result, nil
+	}
+
 	eval := func(handleCtx context.Context, dialer *clientDialer) *evalResult {
 		attemptRequest, err := cloneHttpRequestForAttempt(handleCtx, request)
 		if err != nil {
@@ -1204,6 +1232,14 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 
 	self.applyExtraHeaders(request.Header)
 	self.applyExtraHeaders(helloRequest.Header)
+
+	// js/wasm: one fetch, no dialer strategies (net_http_platform_js.go)
+	if result, ok := self.httpPlatformDirect(request); ok {
+		if result == nil {
+			return nil, fmt.Errorf("http request failed")
+		}
+		return result, nil
+	}
 
 	eval := func(handleCtx context.Context, dialer *clientDialer) *evalResult {
 		attemptRequest, err := cloneHttpRequestForAttempt(handleCtx, request)
@@ -2062,14 +2098,17 @@ func HttpPostStreamWithStrategyRaw(
 	// resolves in-process. See egress.go / egress_dial.go; identical behavior
 	// everywhere else.
 	settings := DefaultConnectSettings()
-	client := &http.Client{
-		Transport: &http.Transport{
-			DialContext:         wrapControlDial("api", settings.Log, true, settings.DialContext),
-			TLSClientConfig:     settings.TlsConfig,
-			TLSHandshakeTimeout: settings.TlsTimeout,
-			ForceAttemptHTTP2:   true,
-		},
+	var transport http.RoundTripper = &http.Transport{
+		DialContext:         wrapControlDial("api", settings.Log, true, settings.DialContext),
+		TLSClientConfig:     settings.TlsConfig,
+		TLSHandshakeTimeout: settings.TlsTimeout,
+		ForceAttemptHTTP2:   true,
 	}
+	if direct := platformDirectHttpTransport(); direct != nil {
+		// js/wasm: the browser's fetch, which no custom dialer can reach
+		transport = direct
+	}
+	client := &http.Client{Transport: transport}
 	defer client.CloseIdleConnections()
 	res, err := client.Do(req)
 	if err != nil {

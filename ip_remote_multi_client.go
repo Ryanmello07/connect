@@ -9877,6 +9877,40 @@ func (self *multiClientWindow) contractStatus(contractStatus *ContractStatus) {
 	}
 }
 
+var errContractReliability = errors.New("Contract reliability failure.")
+
+// contractStatusMatchesClient keeps a reliability result scoped to the exact
+// window client whose destination requested the contract. A ContractManager is
+// owned by one channel, but the explicit key check makes that ownership
+// invariant fail closed if the manager ever starts carrying other routes.
+func contractStatusMatchesClient(client *multiClientChannel, status *ContractStatus) bool {
+	if client == nil || client.args == nil || status == nil || client.args.Destination.Len() == 0 {
+		return false
+	}
+	return status.Key.Destination.DestinationId == client.args.Destination.Tail()
+}
+
+// contractStatusFromClient receives the status together with the channel that
+// emitted it. Reliability is the platform's authoritative statement that the
+// selected destination is no longer a usable route: exclude that channel from
+// new-flow selection immediately, make its WindowStats terminal, and wake the
+// ordinary resize path to remove it, migrate eligible flows, and backfill the
+// window. Other contract errors are account, policy, setup, or trust results;
+// they remain observable but cannot poison provider selection.
+func (self *multiClientWindow) contractStatusFromClient(client *multiClientChannel, status *ContractStatus) {
+	if contractStatusMatchesClient(client, status) &&
+		status.Error != nil &&
+		*status.Error == protocol.ContractError_Reliability {
+		client.setWarning(true, warnUnhealthy)
+		client.addError(errContractReliability)
+		if self.resizeMonitor != nil {
+			self.resizeMonitor.NotifyAll()
+		}
+	}
+
+	self.contractStatus(status)
+}
+
 func (self *multiClientWindow) AddContractStatsCallback(contractStatsCallback ContractStatsFunction) func() {
 	callbackId := self.contractStatsCallbacks.Add(contractStatsCallback)
 	return func() {
@@ -10675,6 +10709,16 @@ func (self *multiClientWindow) resize() {
 		if 0 < targetWindowSize {
 			self.armOutcome()
 		}
+		minSatisfied := func(clientCount int) bool {
+			return windowMinSatisfied(
+				windowSizeMin,
+				clientCount,
+				len(warnedClients),
+				fixedDestination,
+				self.settings.StrictWindowSizeHardMax,
+				windowSize.WindowSizeHardMax,
+			)
+		}
 
 		addedCount := 0
 		if len(clients) < targetWindowSize {
@@ -10686,7 +10730,7 @@ func (self *multiClientWindow) resize() {
 				fixedDestination,
 			)
 			self.monitor.AddWindowExpandEvent(
-				windowMinSatisfied(windowSizeMin, len(clients), len(warnedClients), fixedDestination),
+				minSatisfied(len(clients)),
 				targetWindowSize+len(warnedClients),
 			)
 			addedCount = self.expand(
@@ -10710,7 +10754,7 @@ func (self *multiClientWindow) resize() {
 		}
 		if 0 < windowSize.WindowSizeHardMax && windowSize.WindowSizeHardMax < len(clients)+len(warnedClients)+addedCount {
 			self.monitor.AddWindowExpandEvent(
-				windowMinSatisfied(windowSizeMin, len(clients)+addedCount, len(warnedClients), fixedDestination),
+				minSatisfied(len(clients)+addedCount),
 				windowSize.WindowSizeHardMax,
 			)
 			collapseLowestWeighted(max(0, windowSize.WindowSizeHardMax-addedCount))
@@ -10719,7 +10763,7 @@ func (self *multiClientWindow) resize() {
 			}
 		} else {
 			self.monitor.AddWindowExpandEvent(
-				windowMinSatisfied(windowSizeMin, len(clients)+addedCount, len(warnedClients), fixedDestination),
+				minSatisfied(len(clients)+addedCount),
 				len(clients)+len(warnedClients)+addedCount,
 			)
 		}
@@ -11049,6 +11093,7 @@ func (self *multiClientWindow) expand(
 			// constructor signature stays put (nil falls back per-packet)
 			args.ReceivePackets = self.clientReceivePacketsCallback
 			args.NetworkPeerDestination = self.networkPeerDestination
+			args.contractStatus = self.contractStatusFromClient
 			// the evaluation epoch, not the window ctx: identical between
 			// rebuilds, and what lets the outcome rebuild fail every
 			// in-flight candidate fast (see evalEpochContext)
@@ -11502,19 +11547,36 @@ func (self *multiClientWindow) lastResortClients() []*multiClientChannel {
 // traffic does not cross rank until necessary.
 // windowMinSatisfied is the monitor's "connected" gate. A fixed destination
 // counts warned clients toward the minimum: its only replacement is another
-// client to the same endpoint, so a warned sole selected peer must not
-// report "connecting" for its whole session while it is still routing (the
-// same judgment as the OrderedClients fixed-destination fallback).
+// client to the same endpoint, so a warned sole selected peer must not report
+// "connecting" for its whole session while it is still routing (the same
+// judgment as the OrderedClients fixed-destination fallback).
+//
+// An expanding window normally excludes warned clients because it can replace
+// them. A strict window at its ownership ceiling cannot: the admission gate
+// counts retained warned clients and rejects a new identity. Count those
+// clients toward the presentation minimum only when the ceiling is saturated
+// and at least one unwarned client remains selectable. This keeps the monitor
+// consistent with the admission policy without declaring an all-warned window
+// connected or concealing a replacement slot that can still be filled.
 func windowMinSatisfied(
 	windowSizeMin int,
 	clientCount int,
 	warnedCount int,
 	fixedDestination bool,
+	strictWindowSizeHardMax bool,
+	windowSizeHardMax int,
 ) bool {
 	if fixedDestination {
 		return windowSizeMin <= clientCount+warnedCount
 	}
-	return windowSizeMin <= clientCount
+	if windowSizeMin <= clientCount {
+		return true
+	}
+	return strictWindowSizeHardMax &&
+		0 < clientCount &&
+		0 < windowSizeHardMax &&
+		windowSizeHardMax <= clientCount+warnedCount &&
+		windowSizeMin <= clientCount+warnedCount
 }
 
 func (self *multiClientWindow) OrderedClients() []*multiClientChannel {
@@ -11759,6 +11821,12 @@ type multiClientChannelArgs struct {
 	// selected a trusted same-network peer and the entire multi-client uses
 	// the Network relationship.
 	NetworkPeerDestination bool
+
+	// contractStatus preserves the identity of the channel whose contract
+	// manager emitted a result. The public constructor callback does not carry
+	// that identity; the owning window needs it to retire only the failed route.
+	// nil keeps directly constructed test channels on the legacy relay path.
+	contractStatus func(client *multiClientChannel, status *ContractStatus)
 }
 
 // clientReceivePacketsFunction is the batch form of
@@ -11987,6 +12055,12 @@ type multiClientChannel struct {
 	// Nil outside focused tests. The callback assumes the same conditional
 	// ownership as Transfer: success consumes every group packet.
 	sendGroupForTest func(*parsedPacketGroup, time.Duration, bool) (bool, error)
+	// Nil outside focused tests. Replaces only concrete Client admission after
+	// the real packet/group callback is built, since Client is not an interface.
+	sendTransferForTest func(AckFunction) (bool, error)
+	// Nil outside focused tests. Makes the send-to-completion interval exact
+	// without replacing either side of the production callback path.
+	packetTransferNowForTest func() time.Time
 	// Nil outside focused tests. Overrides only the idle cping send so its
 	// timeout lifecycle can be tested without constructing a full Transfer
 	// route. Production uses SendDetailedMessage with the same signature.
@@ -12182,9 +12256,9 @@ type multiClientChannel struct {
 	// SendDetailedMessage just relays an opaque ackCallback, and the busy
 	// probe's own wait (busyLivenessProbe) only measures elapsed time to
 	// detect a suspended scheduler and throws the duration away. So this
-	// channel times it itself -- SendDetailedWithAck's ackCallback captures
-	// the send instant in its closure and folds time.Since(that) in here on a
-	// successful ack, via addSendRttSample.
+	// channel times it itself -- SendDetailedWithAck's Ack-required callback
+	// captures the send instant in its closure and folds the elapsed duration
+	// in here only after a successful peer Ack, via addSendRttSample.
 	//
 	// rttEwmaMillis smooths with the classic 1/8 TCP SRTT weight (RFC 6298);
 	// rttJitterMillis is the matching RTTVAR-style mean absolute deviation,
@@ -12305,44 +12379,6 @@ func newMultiClientChannel(
 		client.webRtcManager.PrioritizePeer(args.Destination.Tail())
 	}
 
-	// contractStatusCallback is multiClientWindow.contractStatus, which performs
-	// only bounded Dispatch into the window-owned coalescer. Register that exact
-	// internal shape directly so every exit does not allocate its own goroutine
-	// and packet-sequence-sized status ring.
-	contractStatusSub := client.ContractManager().addContractStatusDispatchCallback(contractStatusCallback)
-	contractStatsSub := client.ContractManager().AddContractStatsCallback(contractStatsCallback)
-	peerIdentitySub := client.EncryptionSessionManager().AddPeerIdentityChangeCallback(peerIdentityChangeCallback)
-	go HandleError(func() {
-		select {
-		case <-cancelCtx.Done():
-		case <-client.Done():
-		}
-		// Essential cleanup first, observer-facing events after. A stats
-		// observer can remain parked (an app suspended mid-callback), and
-		// CloseContractStats dispatches to it SYNCHRONOUSLY — ordering it
-		// first let a parked observer block RemoveClientWithArgs, retaining
-		// the platform identity and another client/transport record on every
-		// peer churn. See TestMultiClientCleanupPrecedesBlockedObservers.
-		contractStatusSub()
-		peerIdentitySub()
-		// Detach the platform transport before the synchronous local teardown.
-		// The API generator retires the derived identity asynchronously after
-		// Client and OOB cleanup have joined, so a slow Pion close never blocks
-		// this path and the final contract-close controls retain valid auth.
-		generator.RemoveClientWithArgs(client, &args.MultiClientGeneratorClientArgs)
-		client.Cancel()
-		// Fire the contract-close events for this client's still-open
-		// contracts while the stats listener is still attached, or a removed
-		// peer's contracts linger open forever in the contract-details UI.
-		// The client is already cancelled — that is what woke this cleanup —
-		// and CloseAllContractStats is the deterministic synchronous backstop
-		// that emits regardless of the stopped epoch worker.
-		client.CloseContractStats()
-		contractStatsSub()
-		// the removed client's established peers leave the aggregate set
-		peerIdentityChangeCallback()
-	}, cancel)
-
 	// sourceFilter := map[TransferPath]bool{
 	//     Path{ClientId:args.DestinationId}: true,
 	// }
@@ -12383,6 +12419,54 @@ func newMultiClientChannel(
 		// affinityCount:             0,
 		// affinityTime:              time.Time{},
 	}
+
+	// The window-owned callback includes this channel's identity so a typed
+	// reliability failure can retire only its source. Direct constructor users
+	// leave it nil and retain the original public status relay.
+	effectiveContractStatusCallback := contractStatusCallback
+	if args.contractStatus != nil {
+		effectiveContractStatusCallback = func(status *ContractStatus) {
+			args.contractStatus(clientChannel, status)
+		}
+	}
+	// The callback performs only bounded Dispatch into the window-owned
+	// coalescer plus constant-time reliability classification. Register it
+	// directly so every exit does not allocate its own goroutine and
+	// packet-sequence-sized status ring.
+	contractStatusSub := client.ContractManager().addContractStatusDispatchCallback(effectiveContractStatusCallback)
+	contractStatsSub := client.ContractManager().AddContractStatsCallback(contractStatsCallback)
+	peerIdentitySub := client.EncryptionSessionManager().AddPeerIdentityChangeCallback(peerIdentityChangeCallback)
+	go HandleError(func() {
+		select {
+		case <-cancelCtx.Done():
+		case <-client.Done():
+		}
+		// Essential cleanup first, observer-facing events after. A stats
+		// observer can remain parked (an app suspended mid-callback), and
+		// CloseContractStats dispatches to it SYNCHRONOUSLY — ordering it
+		// first let a parked observer block RemoveClientWithArgs, retaining
+		// the platform identity and another client/transport record on every
+		// peer churn. See TestMultiClientCleanupPrecedesBlockedObservers.
+		contractStatusSub()
+		peerIdentitySub()
+		// Detach the platform transport before the synchronous local teardown.
+		// The API generator retires the derived identity asynchronously after
+		// Client and OOB cleanup have joined, so a slow Pion close never blocks
+		// this path and the final contract-close controls retain valid auth.
+		generator.RemoveClientWithArgs(client, &args.MultiClientGeneratorClientArgs)
+		client.Cancel()
+		// Fire the contract-close events for this client's still-open
+		// contracts while the stats listener is still attached, or a removed
+		// peer's contracts linger open forever in the contract-details UI.
+		// The client is already cancelled — that is what woke this cleanup —
+		// and CloseAllContractStats is the deterministic synchronous backstop
+		// that emits regardless of the stopped epoch worker.
+		client.CloseContractStats()
+		contractStatsSub()
+		// the removed client's established peers leave the aggregate set
+		peerIdentityChangeCallback()
+	}, cancel)
+
 	go HandleError(clientChannel.detectBlackhole, cancel)
 	go HandleError(clientChannel.ping, cancel)
 
@@ -14006,12 +14090,11 @@ func (self *multiClientChannel) SendGroupDetailedWithAck(
 		return true, nil
 	}
 
+	var completionOnce sync.Once
 	ackCallback := func(err error) {
-		if err == nil {
-			self.addSendAckGroup(sendPacketGroup)
-		} else {
-			self.addError(err)
-		}
+		completionOnce.Do(func() {
+			self.observePacketGroupTransferCompletion(sendPacketGroup, ack, err)
+		})
 	}
 	opts := []any{scheduleIpFlow(sendPacketGroup.ipPath)}
 	if self.performanceProfile != nil && self.performanceProfile.AllowDirect {
@@ -14026,13 +14109,19 @@ func (self *multiClientChannel) SendGroupDetailedWithAck(
 			observeTransportWrite(sendPacketGroup.transportAttribution.observe),
 		)
 	}
-	success, err := self.client.sendMultiHopGroupWithTimeoutDetailed(
-		frames,
-		self.args.Destination,
-		ackCallback,
-		timeout,
-		opts...,
-	)
+	var success bool
+	var err error
+	if self.sendTransferForTest != nil {
+		success, err = self.sendTransferForTest(ackCallback)
+	} else {
+		success, err = self.client.sendMultiHopGroupWithTimeoutDetailed(
+			frames,
+			self.args.Destination,
+			ackCallback,
+			timeout,
+			opts...,
+		)
+	}
 	if err != nil || !success {
 		self.addSendAbandonedGroup(sendPacketGroup)
 		for _, frame := range frames {
@@ -14060,11 +14149,12 @@ func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, 
 	} else {
 		packetByteCount := ByteCount(len(parsedPacket.packet))
 		self.addSend(packetByteCount, parsedPacket.ipPath)
-		// sendTime anchors THIS packet's own round trip -- captured here rather
-		// than read back from pendingSendTime, which tracks the OLDEST
-		// outstanding send and would misattribute the RTT under concurrent
-		// in-flight packets. See addSendRttSample.
-		sendTime := time.Now()
+		// The packet-local clock is needed only when a peer Ack will complete a
+		// real round trip. A NoAck callback observes the initial route write.
+		var sendTime time.Time
+		if ack {
+			sendTime = self.packetTransferNow()
+		}
 
 		// a stalled exit swallows the packet: reported sent, never acknowledged,
 		// and crucially no error -- an error would reset the flow immediately,
@@ -14087,13 +14177,11 @@ func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, 
 			return true, nil
 		}
 
+		var completionOnce sync.Once
 		ackCallback := func(err error) {
-			if err == nil {
-				self.addSendAck(packetByteCount)
-				self.addSendRttSample(time.Since(sendTime))
-			} else {
-				self.addError(err)
-			}
+			completionOnce.Do(func() {
+				self.observePacketTransferCompletion(packetByteCount, sendTime, ack, err)
+			})
 		}
 
 		opts := []any{scheduleIpFlow(parsedPacket.ipPath)}
@@ -14103,13 +14191,18 @@ func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, 
 		if !ack {
 			opts = append(opts, NoAck())
 		}
-		success, err := self.client.SendMultiHopWithTimeoutDetailed(
-			frame,
-			self.args.Destination,
-			ackCallback,
-			timeout,
-			opts...,
-		)
+		var success bool
+		if self.sendTransferForTest != nil {
+			success, err = self.sendTransferForTest(ackCallback)
+		} else {
+			success, err = self.client.SendMultiHopWithTimeoutDetailed(
+				frame,
+				self.args.Destination,
+				ackCallback,
+				timeout,
+				opts...,
+			)
+		}
 		// ownership: `parsedPacket.packet` is consumed on success and stays with the
 		// caller on any failure. The wrapped (!raw) marshal buffer is internal and
 		// must be freed on any failure; for raw frames the frame bytes ARE the
@@ -14145,6 +14238,64 @@ func (self *multiClientChannel) SendDetailedWithAck(parsedPacket *parsedPacket, 
 		}
 		return success, err
 	}
+}
+
+// Records the terminal disposition of one packet admitted to Transfer.
+//
+// For an Ack-required packet, a terminal error means the reliable Transfer
+// sequence failed and remains hard evidence against the provider. For a NoAck
+// packet, the callback is only the initial route-write disposition: a timeout
+// means this datagram was dropped under transient carrier backpressure, not
+// that the provider failed. Poisoning endErr in that case removes the whole
+// provider channel and resets unrelated TCP flows that share it. A successful
+// NoAck write retires its outstanding accounting but cannot contribute RTT:
+// no peer acknowledgement completed a round trip.
+func (self *multiClientChannel) observePacketTransferCompletion(
+	packetByteCount ByteCount,
+	sendTime time.Time,
+	ack bool,
+	err error,
+) {
+	if err == nil {
+		self.addSendAck(packetByteCount)
+		if ack {
+			self.addSendRttSample(self.packetTransferNow().Sub(sendTime))
+		}
+		return
+	}
+	if ack || !errors.Is(err, errTransferRouteWriteTimeout) {
+		self.addError(err)
+		return
+	}
+	self.addSendAbandoned(packetByteCount)
+}
+
+// Returns the packet completion clock. Production uses the monotonic wall
+// clock; focused tests can provide exact send and completion instants.
+func (self *multiClientChannel) packetTransferNow() time.Time {
+	if self.packetTransferNowForTest != nil {
+		return self.packetTransferNowForTest()
+	}
+	return time.Now()
+}
+
+// Applies the same reliable-vs-datagram failure boundary to a logical packet
+// group. One failed NoAck group is retired packet-accurately without giving a
+// transient route-write timeout provider-wide shared fate.
+func (self *multiClientChannel) observePacketGroupTransferCompletion(
+	sendPacketGroup *parsedPacketGroup,
+	ack bool,
+	err error,
+) {
+	if err == nil {
+		self.addSendAckGroup(sendPacketGroup)
+		return
+	}
+	if ack || !errors.Is(err, errTransferRouteWriteTimeout) {
+		self.addError(err)
+		return
+	}
+	self.addSendAbandonedGroup(sendPacketGroup)
 }
 
 func (self *multiClientChannel) SendDetailedMessage(message proto.Message, timeout time.Duration, ackCallback func(error)) (bool, error) {
@@ -15253,15 +15404,14 @@ func (self *multiClientChannel) addSendGroup(sendPacketGroup *parsedPacketGroup)
 	self.addSourceToEventBucketWithLock(eventBucket, sendPacketGroup.ipPath)
 }
 
-// addSendAbandoned is the symmetric undo of addSend for a send the transport
-// refused: a hard error from the send call, or a false success (backpressure
-// -- the pack never entered a send sequence before the timeout). Both returns
-// happen strictly before the pack is accepted into a sequence, so the ack
-// callback that would normally retire this accounting can never fire. Without
-// the undo, the refused send stays booked as outstanding forever: the nack
-// count stays up and pendingSendTime keeps aging, so a burst of backpressure
-// is enough for sendStalled to convict an exit that then goes innocently
-// idle.
+// addSendAbandoned is the symmetric undo of addSend for a send that cannot
+// earn acknowledgement credit. This includes a hard error/false result before
+// Transfer admission, and an admitted NoAck datagram whose initial route write
+// failed. The first case has no callback; the second callback describes only
+// that disposable write and must not poison the provider. Without the undo,
+// either send stays booked as outstanding forever: the nack count stays up and
+// pendingSendTime keeps aging, so a burst of backpressure is enough for
+// sendStalled to convict an exit that then goes innocently idle.
 //
 // The aggregate undo is exact. The refused send is by construction still
 // counted in packetStats -- only its own ack could have removed it, and no

@@ -31,8 +31,11 @@ import (
 // the day the SDK gains an in-process resolver the permit is already correct".
 // This is that day.
 //
-// Everything here is inert unless an egress interface is set: mobile and
-// desktop app builds keep the platform resolver they always had.
+// Everything here is inert unless a platform supplies an egress resolver.
+// Mobile and macOS builds keep the platform resolver they always had. Windows
+// supplies a resolver whose Dial hook is inert until an egress interface is
+// set. Linux supplies one whose unmarked path preserves the live system
+// resolver and refreshes only a server made stale by a resolv.conf transition.
 
 // egressSelfExcluded is the platform's answer to "are this process's own
 // sockets steered around the tunnel it provides by something other than a
@@ -60,8 +63,9 @@ func egressBound() bool {
 
 // egressAwareResolver returns the resolver control dials should use: the
 // caller's own resolver when one is configured, else the platform's
-// egress-bound in-process resolver (Windows always, Linux while this process
-// is the tunnel daemon), else nil (the OS resolver).
+// in-process resolver (Windows and Linux), else nil (the OS resolver). Each
+// platform resolver decides at wire-dial time whether an egress escape is in
+// force.
 func egressAwareResolver(custom *net.Resolver) *net.Resolver {
 	if custom != nil {
 		return custom
@@ -88,9 +92,44 @@ func egressAwareResolver(custom *net.Resolver) *net.Resolver {
 // the second half of the Linux fix: pinning the resolver into NetDialer alone
 // would leave these three call sites resolving through the captured stub.
 func resolveEgressUDPAddr(ctx context.Context, addr string) (*net.UDPAddr, error) {
-	resolver := egressResolver()
-	bound := resolver != nil && egressBound()
+	platformResolver := egressResolver()
+	bound := platformResolver != nil && egressBound()
+	return resolveEgressUDPAddrWithResolvers(
+		ctx,
+		addr,
+		platformResolver,
+		net.DefaultResolver,
+		bound,
+	)
+}
+
+// resolveEgressUDPAddrWithResolvers keeps resolver selection independently
+// exercisable without replacing net.DefaultResolver process-wide. Production
+// supplies the platform and default resolvers above; tests supply a controlled
+// default resolver so host files and machine DNS cannot decide the result.
+func resolveEgressUDPAddrWithResolvers(
+	ctx context.Context,
+	addr string,
+	platformResolver *net.Resolver,
+	defaultResolver *net.Resolver,
+	bound bool,
+) (*net.UDPAddr, error) {
+	resolver := platformResolver
 	if !bound {
+		// Keep the platform resolver but not net.ResolveUDPAddr: the caller
+		// supplied a lifecycle context specifically so a transport shutdown can
+		// interrupt a name lookup.
+		resolver = defaultResolver
+	}
+	return resolveUDPAddrWithResolver(ctx, addr, resolver, bound)
+}
+
+// resolveUDPAddrWithResolver is the context-aware UDP name path shared by the
+// platform resolver and an explicitly configured client-strategy resolver.
+// nil means the platform default resolver. bound applies an egress interface's
+// hard single-family constraint after the process-wide family preference.
+func resolveUDPAddrWithResolver(ctx context.Context, addr string, resolver *net.Resolver, bound bool) (*net.UDPAddr, error) {
+	if resolver == nil {
 		// Keep the platform resolver but not net.ResolveUDPAddr: the caller
 		// supplied a lifecycle context specifically so a transport shutdown can
 		// interrupt a name lookup.
@@ -101,9 +140,12 @@ func resolveEgressUDPAddr(ctx context.Context, addr string) (*net.UDPAddr, error
 	if err != nil {
 		return nil, err
 	}
-	port, err := strconv.Atoi(portStr)
+	if host == "" {
+		return nil, fmt.Errorf("resolve %s: empty host", addr)
+	}
+	port, err := parseControlUDPPort(addr, portStr)
 	if err != nil {
-		return nil, fmt.Errorf("resolve %s: non-numeric port: %w", addr, err)
+		return nil, err
 	}
 	// an ip literal needs no resolution and has no family choice to make
 	if ip, ipErr := netip.ParseAddr(host); ipErr == nil {
@@ -122,6 +164,20 @@ func resolveEgressUDPAddr(ctx context.Context, addr string) (*net.UDPAddr, error
 		pick = egressBoundIPAddr(addrs, index4, index6, pick)
 	}
 	return &net.UDPAddr{IP: pick.IP, Port: port, Zone: pick.Zone}, nil
+}
+
+// parseControlUDPPort keeps the raw UDP resolver paths from producing an
+// address net cannot dial. These paths accept numeric ports only and reject
+// the same out-of-range values as net.Resolver.LookupPort.
+func parseControlUDPPort(addr string, portStr string) (int, error) {
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return 0, fmt.Errorf("resolve %s: non-numeric port: %w", addr, err)
+	}
+	if port < 0 || 65535 < port {
+		return 0, fmt.Errorf("resolve %s: invalid port %q", addr, portStr)
+	}
+	return port, nil
 }
 
 // egressBoundIPAddr applies an interface-index bind's family constraint on

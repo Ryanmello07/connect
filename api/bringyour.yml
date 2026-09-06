@@ -176,6 +176,43 @@ paths:
               schema:
                 $ref: "#/components/schemas/LeaderboardResult"
 
+  /stats/points-leaderboard:
+    post:
+      description: |
+        Page the all-time points leaderboard. Every network with points is
+        ranked on three dimensions (total points, finalized epochs with points
+        = "blocks", current streak of consecutive finalized epochs with points)
+        with competition ranks (1, 2, 2, 4), and every ranked network is
+        listed: the pages form one continuous list. A row carries the network
+        name only when that network turned on
+        /network/points-ranking-visibility (its "show my network name"
+        switch); otherwise the row is anonymous. The emoji tag (/network/emoji)
+        shows on every row that set one.
+        Each sort has its own tie-break order, every key descending, then the
+        network id ascending so the order is total: `points` = (points,
+        streak, blocks), `blocks` = (blocks, streak, points), `streak` =
+        (streak, blocks, points). The pages come in exactly that order, and a
+        rank is shared only by networks whose three values all tie.
+        Pages use a keyset cursor pinned to a ranking snapshot (rebuilt when an
+        epoch finalizes, when a payout plan commits, and hourly); a cursor
+        whose snapshot was pruned returns `restart: true` and the client
+        reloads from the top. No authentication is required; with a bearer
+        token the response also carries `me`, the caller's own row whether or
+        not it opted in.
+      operationId: Stats Points Leaderboard
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PointsLeaderboardArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PointsLeaderboardResult"
+
   /auth/login:
     post:
       description: |
@@ -394,6 +431,159 @@ paths:
               schema:
                 $ref: "#/components/schemas/AuthCodeCreateResult"
 
+  /auth/apple/callback:
+    post:
+      tags: [auth]
+      summary: Sign in with Apple return for android, windows and linux
+      description: |
+        Apple has no SDK for android, windows or linux, so those apps open
+        Apple's authorize page in the system browser (a Custom Tab on android)
+        with `client_id` = the Apple Services ID, `redirect_uri` = this
+        endpoint, `response_type=code id_token`, `response_mode=form_post`,
+        `scope=name email`, and a fresh `state` and `nonce` per attempt. Apple
+        posts the result here as a form, and this endpoint answers `302` to the
+        app's own scheme so the browser hands control back to the app:
+
+            <scheme>://oauth/apple?state=…&id_token=…&code=…&user=…
+            <scheme>://oauth/apple?state=…&error=…
+
+        `user` is the JSON name/email Apple sends with the first authorization
+        only. Nothing is stored or verified here: the app checks that `state`
+        is the attempt it started and that the identity token's `nonce` claim
+        is the one it minted, then signs in with the token through
+        `POST /auth/login` (`auth_jwt_type: apple`), which verifies the
+        signature and the audience.
+
+        `state` is opaque except for one optional claim: when it is the
+        base64url encoding of a JSON object with a `platform` key, that key
+        picks the scheme (`android` → `ur://`, `windows` and `linux` →
+        `urnetwork://`); without it the android scheme is used. `GET` with the
+        same parameters as a query behaves the same way (manual testing).
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [state]
+              properties:
+                state:
+                  type: string
+                  description: The attempt's state, echoed by Apple untouched.
+                code:
+                  type: string
+                  description: Apple's authorization code (unused by the apps, passed through).
+                id_token:
+                  type: string
+                  description: Apple's identity token (a JWT carrying the attempt's nonce).
+                user:
+                  type: string
+                  description: JSON with the user's name and email, first authorization only.
+                error:
+                  type: string
+                  description: Apple's error, e.g. `user_cancelled_authorize`.
+      responses:
+        '302':
+          description: Redirect to the app's `<scheme>://oauth/apple?…` return url.
+          headers:
+            Location:
+              schema:
+                type: string
+              example: 'ur://oauth/apple?state=eyJwbGF0Zm9ybSI6ImFuZHJvaWQiLCJ0b2tlbiI6IjEyMyJ9&id_token=eyJ...'
+        '400':
+          description: No `state` in the form, or a body over 64 KiB.
+    get:
+      tags: [auth]
+      summary: Sign in with Apple return (query form, for manual testing)
+      parameters:
+        - in: query
+          name: state
+          required: true
+          schema:
+            type: string
+        - in: query
+          name: id_token
+          schema:
+            type: string
+        - in: query
+          name: code
+          schema:
+            type: string
+        - in: query
+          name: user
+          schema:
+            type: string
+        - in: query
+          name: error
+          schema:
+            type: string
+      responses:
+        '302':
+          description: Redirect to the app's `<scheme>://oauth/apple?…` return url.
+        '400':
+          description: No `state`.
+  /auth/google/callback:
+    get:
+      tags: [auth]
+      summary: Sign in with Google return for windows and linux
+      description: |
+        Windows and Linux have no native Google sign-in, so those apps open
+        Google's authorize page in the system browser with `client_id` = the
+        ur.io web sign-in client, `redirect_uri` = this endpoint,
+        `response_type=code`, `scope=openid email profile`,
+        `prompt=select_account`, and a fresh `state` and `nonce` per attempt
+        (android signs in with play services and ur.io in the page; neither
+        uses this). Google redirects the browser here with the authorization
+        code; this endpoint exchanges it at Google's token endpoint with the
+        web client's secret (vault `google.yml` `sign_in_oauth`) and answers
+        `302` to the app's own scheme so the browser hands control back to
+        the app:
+
+            <scheme>://oauth/google?state=…&id_token=…
+            <scheme>://oauth/google?state=…&error=…
+
+        Nothing is stored. The app checks that `state` is the attempt it
+        started and that the identity token's `nonce` claim is the one it
+        minted, then signs in with the token through `POST /auth/login`
+        (`auth_jwt_type: google`), which verifies the signature and the
+        audience.
+
+        `state` is opaque except for the optional `platform` claim shared
+        with the Apple callback: base64url JSON with a `platform` key picks
+        the scheme (`android` → `ur://`, `windows` and `linux` →
+        `urnetwork://`); without it the android scheme is used. Google's own
+        `error` (e.g. `access_denied`) is passed through; a failed exchange
+        or a missing client configuration comes back as `error` too
+        (`not_configured` when the vault has no `sign_in_oauth`).
+      parameters:
+        - in: query
+          name: state
+          required: true
+          schema:
+            type: string
+          description: The attempt's state, echoed by Google untouched.
+        - in: query
+          name: code
+          schema:
+            type: string
+          description: Google's authorization code, exchanged here for the identity token.
+        - in: query
+          name: error
+          schema:
+            type: string
+          description: Google's error, e.g. `access_denied`.
+      responses:
+        '302':
+          description: Redirect to the app's `<scheme>://oauth/google?…` return url.
+          headers:
+            Location:
+              schema:
+                type: string
+              example: 'urnetwork://oauth/google?state=eyJwbGF0Zm9ybSI6IndpbmRvd3MiLCJ0b2tlbiI6IjEyMyJ9&id_token=eyJ...'
+        '400':
+          description: No `state`.
+        '405':
+          description: Not a `GET`.
   /auth/code-login:
     post:
       description: |
@@ -535,7 +725,11 @@ paths:
   /network/clients:
     get:
       description: |
-        Get the latest status of all clients on this network.
+        Get the latest status of the network's devices: every top-level
+        client (no source_client_id) that is not a hosted proxy device, with
+        no provide-mode qualification. Child clients are never listed, and
+        neither are the network's cloud proxy devices (the "resident proxy"
+        clients the proxy host runs), which `/network/proxies` lists instead.
 
         Includes:
 
@@ -544,7 +738,27 @@ paths:
         - Connections, which are transports from the client to the platform.
         Note there can be multiple active connections for a single client.
         - Provide status
+
+        `proxy_client` is never present on this list.
       operationId: Network Clients
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkClientsResult"
+
+  /network/proxies:
+    get:
+      description: |
+        The network's cloud proxy devices: the clients that carry a hosted
+        proxy device (created with `proxy_config` on `/network/auth-client`),
+        each with its `proxy_client` credentials (proxy URLs, auth token,
+        WireGuard details). Same row shape as `/network/clients` otherwise:
+        resident status, connections, provide status.
+      operationId: Network Proxies
       security:
         - BearerAuth: []
       responses:
@@ -726,7 +940,11 @@ paths:
   /network/ranking:
     get:
       description: |
-        Get leaderboard ranking of current network
+        Get leaderboard ranking of current network. Besides the data
+        leaderboard rank, the result carries the network's points leaderboard
+        settings (`points_leaderboard_public`, `emoji_tag`) and its points
+        ranks (`rank_points`, `rank_blocks`, `rank_streak`; 0 until the
+        network has points and a ranking snapshot exists).
       operationId: Network Get Ranking
       security:
         - BearerAuth: []
@@ -757,6 +975,53 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SetNetworkRankingVisibilityResult"
+
+  /network/points-ranking-visibility:
+    post:
+      description: |
+        Turn the network's name on or off on the points leaderboard. Every
+        network with points is ranked and listed either way; this switch only
+        decides whether its row shows the network name or "Anonymous". The
+        emoji tag (/network/emoji) shows on the row regardless.
+      operationId: Network Points Ranking Visibility
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetNetworkPointsRankingVisibilityArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SetNetworkPointsRankingVisibilityResult"
+
+  /network/emoji:
+    post:
+      description: |
+        Set the network's emoji tag: 1 to 6 emoji (each grapheme cluster must
+        be a single emoji: pictographs with skin tones, ZWJ sequences, keycaps,
+        flags). Letters, digits and punctuation are rejected with the message
+        "Use 1 to 6 emoji.". An empty string clears the tag. The tag is shown
+        on the points leaderboard row and in the network's own header.
+      operationId: Network Set Emoji Tag
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetNetworkEmojiTagArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SetNetworkEmojiTagResult"
 
   /network/block-location:
     post:
@@ -947,6 +1212,81 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SubscriptionBalanceResult"
+
+  /subscription/details:
+    get:
+      description: |
+        The "Manage subscription" screen: every store currently billing the
+        caller's network, one entry per store, with the window it bought
+        (`end_time` is the expiry, or the next renewal date when the store
+        renews), the store's auto-renew state and the control that stops it.
+
+        `auto_renew` is true/false when the store answered and null when the
+        store lookup failed (best-effort, ~5 s per store; the entry still
+        carries the window from our own records). `can_cancel` is true only
+        for Stripe, which /subscription/cancel acts on; Apple and Google
+        entries carry the store's own subscriptions page in `manage_url` (a
+        subscription is cancelled where it is billed); a Solana entry is a
+        one-time USDC payment that never renews. `has_stripe_customer` gates
+        the Stripe billing portal (/stripe/customer-portal errors without one).
+
+        The result is cached per network for 60 seconds; cancel and resume
+        invalidate it.
+      operationId: Subscription Details
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubscriptionDetailsResult"
+
+  /subscription/cancel:
+    post:
+      description: |
+        Stop the Stripe subscription billing the caller's network at the end of
+        the paid period (`cancel_at_period_end`); the customer keeps Pro until
+        `end_time`. Only `store` "stripe" (the default) is acted on: the other
+        stores answer with `error.message` and, for Apple/Google, the store's
+        subscriptions page in `manage_url`. Idempotent: an already-cancelling
+        subscription is not written again.
+      operationId: Subscription Cancel
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SubscriptionCancelArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubscriptionCancelResult"
+
+  /subscription/resume:
+    post:
+      description: |
+        Undo /subscription/cancel while the paid period is still running: the
+        Stripe subscription renews again. Same request and result shapes.
+      operationId: Subscription Resume
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SubscriptionCancelArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubscriptionCancelResult"
 
   /subscription/check-balance-code:
     post:
@@ -1659,6 +1999,29 @@ paths:
               schema:
                 $ref: "#/components/schemas/NetworkBalanceCodesResult"
 
+  /account/epochs:
+    get:
+      description: |
+        The caller network's finalized epochs, newest first: the points earned
+        inside each epoch's wall-clock window and the network's share of the
+        operator pool in basis points (0 when no coldkey was attached, i.e.
+        points only). `limit` defaults to 26 and is capped at 104.
+      operationId: Account Epochs
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: query
+          name: limit
+          required: false
+          schema:
+            type: integer
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccountEpochsResult"
+
   /account/referral-code:
     get:
       description: |
@@ -1816,6 +2179,125 @@ paths:
               schema:
                 $ref: "#/components/schemas/StripeCreateCustomerPortalResult"
 
+  /pay/data/checkout:
+    post:
+      description: |
+        Buy a data pack with a card without signing in (the ur.io buy-data
+        page). Starts a hosted Stripe checkout and returns the url to send the
+        customer to. To pay with USDC on Solana use /pay/data/solana-intent.
+
+        With `network_name`, the data is applied to that network by the payment
+        webhook as soon as the payment confirms, and the customer is emailed a
+        note that the data is on the network (the code is included, already
+        applied). The name is matched case-insensitively and exactly; an unknown
+        name returns `error.message` "No network named <name>".
+
+        Without `network_name`, the customer receives a data code by email, as
+        before. Stripe collects the email on its checkout page when `email` is
+        not given.
+
+        The success url is the configured checkout success url plus
+        `item=<item_id>` and, when applying to a network, `network=<name>`.
+        Unauthenticated, per-ip rate limited. Errors are returned as
+        `error.message` with a 200.
+      operationId: Pay Data Checkout
+      security: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PayDataCheckoutArgs"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PayDataCheckoutResult"
+
+  /pay/data/network-lookup:
+    post:
+      description: |
+        Whether a network with exactly this name exists, for the buy-data page.
+        Matched the same way /pay/data/checkout resolves `network_name`
+        (case-insensitive, exact). Unlike /auth/network-check, which is a sign-up
+        similarity check, a name within a few characters of an existing one is
+        NOT reported as existing. Returns only the canonical name, no id.
+        Unauthenticated, per-ip rate limited.
+      operationId: Pay Data Network Lookup
+      security: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PayDataNetworkLookupArgs"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PayDataNetworkLookupResult"
+
+  /pay/data/solana-intent:
+    post:
+      description: |
+        Buy a data pack with USDC on Solana, without signing in or giving an
+        email: the data goes straight to the network named by `network_name`
+        (matched like /pay/data/network-lookup). Records the payment intent and
+        returns the exact `amount_usd` to send in USDC. The client generates
+        `reference` (a Solana Pay reference: a fresh base58 public key) and
+        either opens a Solana Pay url carrying it, or shows the buyer the
+        receiving address, the amount and `memo` (which is the reference) to
+        send by hand from any wallet or exchange. The Helius webhook
+        (/pay/solana) matches the transfer by the reference among the
+        transaction's account keys OR by the memo text, then lands the data on
+        the network (data only, valid for one year, no Pro) and emails the
+        network's admin when their login is an email.
+
+        The intent expires after 24 hours (`expires_at`); a payment that arrives
+        late still credits as long as the intent has not been swept. A reused
+        reference, an unknown item or an unknown network return `error.message`
+        with a 200. Unauthenticated, per-ip rate limited.
+      operationId: Pay Data Solana Intent
+      security: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PayDataSolanaIntentArgs"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PayDataSolanaIntentResult"
+
+  /pay/data/solana-status:
+    post:
+      description: |
+        The state of a data pack payment started with /pay/data/solana-intent,
+        for the buy-data page to poll while it waits: `pending` until the USDC
+        transfer is credited, `paid` once the data is on the network, `expired`
+        when the intent passed `expires_at` unpaid, `unknown` for a reference
+        that is not a data pack intent (plan intents made by a signed-in wallet
+        are not reported here). Unauthenticated, per-ip rate limited.
+      operationId: Pay Data Solana Status
+      security: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PayDataSolanaStatusArgs"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PayDataSolanaStatusResult"
+
   /stripe/create-checkout-session:
     post:
       description: |
@@ -1898,9 +2380,15 @@ paths:
   /sn/wallet:
     post:
       description: |
-        Set the caller network's subnet coldkey - the ss58 address that pool
-        payouts for this network are claimable by. This wallet is deliberately
-        separate from the account payout wallet.
+        Attach the caller's subnet coldkey - the ss58 address that pool payouts
+        are claimable by. Proof of key possession is required: `message` is the
+        single-use challenge issued by POST /auth/wallet-challenge for
+        blockchain TAO and `signature` is the coldkey's sr25519 signature over
+        it. `client_id` scopes the wallet to one provider client (a
+        client-scoped JWT selects its own client). Banned addresses are
+        rejected. Not retroactive: the wallet applies from the next committed
+        epoch's leaf set. This wallet is deliberately separate from the
+        account payout wallet.
       operationId: Sn Set Wallet
       security:
         - BearerAuth: []
@@ -1916,6 +2404,92 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SnSetWalletResult"
+    get:
+      description: |
+        The coldkeys attached inside the caller's network: the network-level
+        wallet (no `client_id`) and every provider client's wallet. `wallet` is
+        the session's effective wallet (the client-scoped wallet for a client
+        session when set, else the network wallet); absent when none is
+        attached. An empty `wallets` list is not an error.
+      operationId: Sn Get Wallet
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnGetWalletResult"
+
+  /sn/wallet/validate:
+    post:
+      description: |
+        Checks an address before it is attached: ss58 syntax with the Bittensor
+        prefix, the operator ban list, and whether the account exists on the
+        subtensor chain. When the chain cannot be reached the result reports
+        `exists_on_chain: true` with a message, so an outage never blocks a
+        user. No authentication; chain lookups are rate limited per source
+        address.
+      operationId: Sn Validate Wallet
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SnValidateWalletArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnValidateWalletResult"
+
+  /sn/head:
+    get:
+      description: |
+        The caller network's standing for a head mining spot (Top 200,
+        WHITEPAPER 8.4). `score` is the server's estimate of split-adjusted
+        distinct routable egress-IP breadth from the live trail egress index,
+        `floor` the score of the last network inside `cutoff` (0 while fewer
+        networks score), `rank_estimate` 1-based (0 without a score).
+        `bound`/`hotkey`/`uid` reflect an active head binding. `source` is
+        "server" until validators publish consensus scores on chain; a chain
+        outage degrades to the estimate, never an error.
+      operationId: Sn Head
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnHeadResult"
+
+  /sn/head/binding:
+    post:
+      description: |
+        Store a device's consent for a fleet binding (WHITEPAPER 11.4): the
+        canonical binding payload and the client's Ed25519 signature over its
+        keccak256 digest, optionally with the head hotkey's sr25519 signature.
+        When both signatures verify the response carries the
+        `bindFleetMember` calldata for the operator to submit from their own
+        key. The server never submits on chain.
+      operationId: Sn Head Binding
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SnHeadBindingArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnHeadBindingResult"
 
   /sn/pool/claim:
     get:
@@ -3884,6 +4458,20 @@ components:
           type: string
         total_referrals:
           type: integer
+        max_referrals:
+          description: |
+            Referrals a network is paid for (pro.yml referral.max_referrals).
+            0 when the server has no pro.yml (uncapped); clients treat 0 as unknown.
+          type: integer
+        bonus_per_referral_bytes:
+          description: Bytes granted to the referrer per referral, per bonus period. 0 when unknown.
+          type: integer
+        referred_bonus_bytes:
+          description: Bytes granted to the referred network, per bonus period. 0 when unknown.
+          type: integer
+        bonus_period_seconds:
+          description: The bonus grant period in seconds (24h = 86400). 0 when unknown.
+          type: integer
 
     TransferStatsResult:
       type: object
@@ -4053,6 +4641,12 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/LeaderboardEarner"
+        rank:
+          description: The caller network's leaderboard position (1 = top earner); 0 when the network has no ranked payouts.
+          type: integer
+        total:
+          description: The number of ranked networks.
+          type: integer
         error:
           type: object
           properties:
@@ -4070,6 +4664,24 @@ components:
         leaderboard_public:
           description: Whether your network is publicly visibile on the leaderboard
           type: boolean
+        points_leaderboard_public:
+          description: Whether the network is listed on the points leaderboard
+          type: boolean
+        emoji_tag:
+          description: The network's emoji tag (1 to 6 emoji), absent when unset
+          type: string
+        rank_points:
+          description: Competition rank by total points, 0 when unranked
+          type: integer
+          format: int64
+        rank_blocks:
+          description: Competition rank by finalized epochs with points, 0 when unranked
+          type: integer
+          format: int64
+        rank_streak:
+          description: Competition rank by current streak, 0 when unranked
+          type: integer
+          format: int64
 
     NetworkRankingResult:
       type: object
@@ -4092,6 +4704,147 @@ components:
     SetNetworkRankingVisibilityResult:
       type: object
       properties:
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    SetNetworkPointsRankingVisibilityArgs:
+      type: object
+      required:
+        - public
+      properties:
+        public:
+          description: true to list the network on the points leaderboard
+          type: boolean
+
+    SetNetworkPointsRankingVisibilityResult:
+      type: object
+      properties:
+        points_leaderboard_public:
+          type: boolean
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    SetNetworkEmojiTagArgs:
+      type: object
+      required:
+        - emoji_tag
+      properties:
+        emoji_tag:
+          description: 1 to 6 emoji; an empty string clears the tag
+          type: string
+          example: "🐬🔥"
+
+    SetNetworkEmojiTagResult:
+      type: object
+      properties:
+        emoji_tag:
+          description: The stored (NFC-normalized) tag, empty when cleared
+          type: string
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+              example: Use 1 to 6 emoji.
+
+    PointsLeaderboardArgs:
+      type: object
+      properties:
+        sort:
+          description: The dimension to page by
+          type: string
+          enum: [points, blocks, streak]
+          default: points
+        cursor:
+          description: The next_cursor of the previous page; omit for the first page
+          type: string
+        limit:
+          description: Page size, default 50, max 200
+          type: integer
+
+    PointsLeaderboardRow:
+      type: object
+      properties:
+        network_id:
+          type: string
+        network_name:
+          description: Present only when the network turned on points_leaderboard_public (/network/points-ranking-visibility)
+          type: string
+        emoji_tag:
+          description: The network's emoji tag, absent when unset; shown whether or not the name is
+          type: string
+        anonymous:
+          description: true when the network name is hidden; the row is listed either way
+          type: boolean
+        contains_profanity:
+          description: The public name contains profanity (apps may mask it)
+          type: boolean
+        total_points:
+          description: All-time points
+          type: number
+          format: double
+        blocks_with_points:
+          description: Finalized epochs in which the network earned points
+          type: integer
+        streak:
+          description: Consecutive finalized epochs with points ending at the latest finalized epoch
+          type: integer
+        longest_streak:
+          description: The best streak ever (informational, never ranked)
+          type: integer
+        rank_points:
+          type: integer
+          format: int64
+        rank_blocks:
+          type: integer
+          format: int64
+        rank_streak:
+          type: integer
+          format: int64
+
+    PointsLeaderboardMe:
+      allOf:
+        - $ref: "#/components/schemas/PointsLeaderboardRow"
+        - type: object
+          properties:
+            points_leaderboard_public:
+              type: boolean
+            ranked:
+              description: false when the network has no points yet
+              type: boolean
+
+    PointsLeaderboardResult:
+      type: object
+      properties:
+        rows:
+          type: array
+          items:
+            $ref: "#/components/schemas/PointsLeaderboardRow"
+        next_cursor:
+          description: Absent on the last page
+          type: string
+        restart:
+          description: The cursor's snapshot is gone; reload from the top
+          type: boolean
+        total_ranked:
+          description: Networks ranked in the snapshot; every one of them is listed across the pages
+          type: integer
+          format: int64
+        snapshot_time:
+          type: string
+          format: date-time
+        latest_epoch:
+          description: The latest finalized epoch the snapshot counts
+          type: integer
+          format: int64
+        me:
+          $ref: "#/components/schemas/PointsLeaderboardMe"
         error:
           type: object
           properties:
@@ -4657,12 +5410,235 @@ components:
         - coldkey_ss58
       properties:
         coldkey_ss58:
-          description: The subnet coldkey as an ss58 address.
+          description: The subnet coldkey as an ss58 address (Bittensor prefix 42).
+          type: string
+        client_id:
+          description: uuid of the provider client the wallet is attached to. Defaults to the session client for a client-scoped JWT; must belong to the caller's network.
+          type: string
+        signature:
+          description: The coldkey's sr25519 signature (hex) over `message`. Required for app callers.
+          type: string
+        message:
+          description: The exact single-use challenge text issued by POST /auth/wallet-challenge for blockchain TAO and this address.
           type: string
 
     SnSetWalletResult:
       type: object
       properties:
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    SnWallet:
+      type: object
+      properties:
+        coldkey_ss58:
+          type: string
+        client_id:
+          description: uuid of the provider client; absent for the network-level wallet.
+          type: string
+        set_at_millis:
+          description: Unix time in milliseconds the wallet was set.
+          type: integer
+
+    SnGetWalletResult:
+      type: object
+      properties:
+        wallet:
+          $ref: "#/components/schemas/SnWallet"
+        wallets:
+          type: array
+          items:
+            $ref: "#/components/schemas/SnWallet"
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    SnValidateWalletArgs:
+      type: object
+      required:
+        - address
+      properties:
+        address:
+          description: The ss58 address to check.
+          type: string
+
+    SnValidateWalletResult:
+      type: object
+      properties:
+        valid_syntax:
+          description: The address decodes as ss58 with the Bittensor prefix.
+          type: boolean
+        exists_on_chain:
+          description: The account exists on the subtensor chain (true when the chain could not be reached; see message).
+          type: boolean
+        banned:
+          description: The address is on the operator ban list and must not be attached.
+          type: boolean
+        message:
+          type: string
+
+    AccountEpoch:
+      type: object
+      properties:
+        epoch:
+          type: integer
+        start_millis:
+          description: Epoch window start, unix milliseconds.
+          type: integer
+        end_millis:
+          description: Epoch window end, unix milliseconds.
+          type: integer
+        points:
+          description: Points earned inside the window.
+          type: number
+          format: double
+        share_bps:
+          description: The network's share of the operator pool in basis points; 0 when no coldkey was attached.
+          type: integer
+
+    AccountEpochsResult:
+      type: object
+      properties:
+        epochs:
+          type: array
+          items:
+            $ref: "#/components/schemas/AccountEpoch"
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    SnHeadResult:
+      type: object
+      properties:
+        eligible:
+          description: The estimate places the network inside the cutoff.
+          type: boolean
+        score:
+          description: Split-adjusted distinct routable egress-IP breadth (server estimate).
+          type: number
+          format: double
+        floor:
+          description: Score of the last network inside the cutoff; 0 while fewer networks score.
+          type: number
+          format: double
+        rank_estimate:
+          description: 1-based estimated rank; 0 without a score.
+          type: integer
+        cutoff:
+          description: Head-tier size (200).
+          type: integer
+        bound:
+          description: An active head binding exists for one of the network's clients.
+          type: boolean
+        hotkey:
+          description: The bound head hotkey as ss58; absent when not bound.
+          type: string
+        uid:
+          description: The bound uid; 0 when not bound.
+          type: integer
+        rank:
+          description: The bound network's estimated rank; 0 when not bound.
+          type: integer
+        epoch:
+          description: The current contract epoch.
+          type: integer
+        netuid:
+          type: integer
+        source:
+          description: '"server" (estimate) or "chain" (validator consensus).'
+          type: string
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    SnFleetBinding:
+      type: object
+      description: |
+        protocol.FleetBinding on the wire: 32-byte values as 0x-hex, the
+        hotkey as ss58 or 0x-hex, the client id as its uuid. The digest is
+        keccak256(domain "urnetwork/fleet-binding/v1" + fields).
+      properties:
+        chain_id:
+          type: integer
+        netuid:
+          type: integer
+        coordinator:
+          description: 0x-hex coordinator contract address.
+          type: string
+        fleet_id:
+          type: string
+        hotkey:
+          type: string
+        client_id:
+          description: uuid
+          type: string
+        client_key:
+          description: 0x-hex 32-byte client Ed25519 public key.
+          type: string
+        generation:
+          type: integer
+        valid_from_epoch:
+          type: integer
+        valid_to_epoch:
+          type: integer
+        commitment_hash:
+          type: string
+
+    SnHeadBindingArgs:
+      type: object
+      required:
+        - binding
+        - client_signature
+      properties:
+        binding:
+          $ref: "#/components/schemas/SnFleetBinding"
+        client_signature:
+          description: The device's Ed25519 signature (hex) over the binding digest; `signature` is accepted as an alias.
+          type: string
+        signature:
+          type: string
+        hotkey_signature:
+          description: The head hotkey's sr25519 signature (hex) over the same digest; optional, required for calldata.
+          type: string
+        hotkey:
+          description: Optional override of the binding's hotkey (ss58 or 0x-hex).
+          type: string
+
+    SnHeadBindingResult:
+      type: object
+      properties:
+        digest:
+          description: 0x-hex keccak256 binding digest.
+          type: string
+        client_signature_valid:
+          type: boolean
+        hotkey_signature_valid:
+          type: boolean
+        ready:
+          description: Both signatures verified and calldata is present.
+          type: boolean
+        calldata:
+          description: 0x-hex `bindFleetMember` calldata for the operator to submit.
+          type: string
+        to:
+          description: The coordinator contract address to send the calldata to.
+          type: string
+        data:
+          description: Same as calldata.
+          type: string
+        contract_address:
+          type: string
+        chain_id:
+          type: integer
         error:
           type: object
           properties:
@@ -4730,6 +5706,17 @@ components:
           type: integer
         contract_address:
           description: 0x-hex EVM address of the subnet contract.
+          type: string
+        settlement_vault_address:
+          description: 0x-hex EVM address of the settlement vault claims are sent to; absent when unset.
+          type: string
+        no_id:
+          description: The operator id (decimal string); absent when unset.
+          type: string
+        netuid:
+          type: integer
+        rpc_url:
+          description: Public subtensor EVM JSON-RPC url for clients; absent when unset.
           type: string
 
     RefreshTokenResult:
@@ -4965,6 +5952,128 @@ components:
             message:
               type: string
 
+    PayDataCheckoutArgs:
+      type: object
+      required:
+        - item_id
+        - provider
+      properties:
+        item_id:
+          type: string
+          enum: [data_1tib, data_10tib]
+        provider:
+          type: string
+          enum: [stripe]
+          description: the hosted checkout; empty means stripe
+        network_name:
+          type: string
+          description: the network that receives the data; omit to receive a code by email
+        email:
+          type: string
+          description: where the code (or the applied note) is sent; Stripe collects it at checkout when omitted
+    PayDataCheckoutResult:
+      type: object
+      properties:
+        url:
+          type: string
+          description: the hosted checkout url to send the customer to
+        provider:
+          type: string
+          enum: [stripe]
+        network_id:
+          type: string
+          format: uuid
+          description: the resolved network when network_name was given
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+    PayDataNetworkLookupArgs:
+      type: object
+      required:
+        - network_name
+      properties:
+        network_name:
+          type: string
+    PayDataNetworkLookupResult:
+      type: object
+      required:
+        - exists
+      properties:
+        exists:
+          type: boolean
+        network_name:
+          type: string
+          description: the name as stored, when it exists
+    PayDataSolanaIntentArgs:
+      type: object
+      required:
+        - item_id
+        - network_name
+        - reference
+      properties:
+        item_id:
+          type: string
+          enum: [data_1tib, data_10tib]
+        network_name:
+          type: string
+          description: the network that receives the data
+        reference:
+          type: string
+          description: |
+            the Solana Pay reference the client generated (a fresh base58 public
+            key); it doubles as the transfer memo for a payment sent by hand
+    PayDataSolanaIntentResult:
+      type: object
+      properties:
+        amount_usd:
+          type: number
+          description: the exact amount to send, in USDC
+        reference:
+          type: string
+        memo:
+          type: string
+          description: the transfer memo for a payment sent by hand (the reference)
+        expires_at:
+          type: string
+          format: date-time
+        network_name:
+          type: string
+          description: the resolved network name, as stored
+        network_id:
+          type: string
+          format: uuid
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+    PayDataSolanaStatusArgs:
+      type: object
+      required:
+        - reference
+      properties:
+        reference:
+          type: string
+    PayDataSolanaStatusResult:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          enum: [pending, paid, expired, unknown]
+        item_id:
+          type: string
+          enum: [data_1tib, data_10tib]
+        network_name:
+          type: string
+        amount_usd:
+          type: number
+        expires_at:
+          type: string
+          format: date-time
     StripeCreateCheckoutSessionArgs:
       type: object
       properties:
@@ -4996,6 +6105,79 @@ components:
         session_id:
           type: string
           description: both modes; the caller can reconcile the purchase with this
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    SubscriptionDetailsResult:
+      type: object
+      properties:
+        subscriptions:
+          type: array
+          description: One entry per store billing the network, ordered by store.
+          items:
+            type: object
+            properties:
+              store:
+                type: string
+                description: stripe | apple | google | solana | manual | x402 | "" (unknown)
+              plan:
+                type: string
+                description: The wire plan value ("supporter"); shown as Pro.
+              cadence:
+                type: string
+                description: yearly | monthly | "" when unknown.
+              start_time:
+                type: string
+                description: datetime, the start of the active window
+              end_time:
+                type: string
+                description: datetime, the expiry or the next renewal date
+              auto_renew:
+                type: boolean
+                nullable: true
+                description: The store will bill again at end_time; null when the store lookup failed.
+              cancel_at_period_end:
+                type: boolean
+                description: The store lets the paid period run out and will not bill again.
+              can_cancel:
+                type: boolean
+                description: POST /subscription/cancel acts on this entry (Stripe only).
+              manage_url:
+                type: string
+                description: The store's own subscriptions page (Apple, Google), else empty.
+              transaction_id:
+                type: string
+                description: The store handle for support; invoice id, original transaction id, purchase token or payment reference.
+        has_stripe_customer:
+          type: boolean
+          description: A Stripe customer exists for the network; gate for /stripe/customer-portal.
+        update_time:
+          type: string
+          description: datetime
+
+    SubscriptionCancelArgs:
+      type: object
+      properties:
+        store:
+          type: string
+          description: The store to act on. "stripe" (default) is the only store the server can cancel.
+
+    SubscriptionCancelResult:
+      type: object
+      properties:
+        store:
+          type: string
+        end_time:
+          type: string
+          description: datetime, the end of the paid period (Pro is kept until then)
+        auto_renew:
+          type: boolean
+        manage_url:
+          type: string
+          description: For a store the server cannot act on, where the customer cancels.
         error:
           type: object
           properties:
