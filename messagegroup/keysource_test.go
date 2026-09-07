@@ -23,14 +23,22 @@
 // reproduction that succeeds from these three is the statement that every key of the record
 // layer is the MLS key schedule expanded, and nothing else.
 //
-// NOTHING HERE CALLS THIS PACKAGE'S OWN DERIVATIONS, ITS SEALER OR ITS MAC, and that is the
-// whole of what makes this evidence rather than a tautology. StorageRoot, GroupHandleKey,
-// SenderHandle, DeriveClassKeys, RecordKeyZero, RecordKeyNext, RecordAeadHead, RecordAeadBody,
-// sealRecordAead, padBody, message.AADHead, message.AADBody, message.WriteKey and
-// message.ComputeWriteAuth are absent from this file by construction. What stands in for them
-// is RFC 5869 written out from the RFC, chacha20poly1305.NewX, crypto/hmac and crypto/sha256.
-// A reproduction that reached for the package's own sealer would seal under whatever key the
-// package chose -- a key it drew from a second source included -- and would pass.
+// NOTHING ON THE REPRODUCTION'S SIDE OF THE COMPARISON COMES FROM THE MODULE UNDER TEST, and
+// that is the whole of what makes this evidence rather than a tautology. A reproduction that
+// reached for the record layer's own sealer would seal under whatever key the record layer
+// chose -- a key it drew from a second source included -- and would agree with it forever. What
+// stands in for it is RFC 5869 written out from the RFC, chacha20poly1305.NewX, crypto/hmac and
+// crypto/sha256.
+//
+// StorageRoot, GroupHandleKey, SenderHandle, DeriveClassKeys, RecordKeyZero, RecordKeyNext,
+// RecordAeadHead, RecordAeadBody, sealRecordAead, padBody, message.AADHead, message.AADBody,
+// message.WriteKey and message.ComputeWriteAuth are the fourteen names this paragraph used to
+// list. THEY ARE AN ILLUSTRATION AND NOT THE CLASS. Four of them are in connect/message and
+// were outside the gate that once held this claim, which is how a reviewer pointed the
+// reproduction at message.WriteKey and left all three tests green. The class is now every name
+// the MODULE declares, read off go.mod and the import graph, and the gate at the bottom of this
+// file is where it is derived, what its scope is, and -- stated rather than implied -- what it
+// still cannot see.
 //
 // THE REPRODUCTION CANNOT SEE THE TWO VALUES IT REPRODUCES, and that is a type rather than a
 // promise. keySourceShape carries every PUBLIC field of the record: the group id, the leaf,
@@ -163,11 +171,18 @@ const (
 	keySourceAeadTagBytes   = 16
 	// MASTER section 7.1's registration for XChaCha20-Poly1305, carried inside both aads.
 	keySourceAeadAlgId uint16 = 0x0021
-	// MASTER section 8's retention table, the durable row. Held against the join below rather
-	// than trusted, so a table change fails here instead of agreeing with itself.
-	keySourceDurableWire byte = 0x01
-	// The 256 octet rung of MASTER's size ladder, which is the rung every record here lands on.
-	keySourceRungBytes = 256
+	// MASTER section 8's retention table, the durable row: the CLASS tag and the wire byte it
+	// joins to. BOTH are transcribed, and neither is read off the package into the shape any
+	// more. Asking message.RetentionClassWire for the wire byte -- which keySourceShapeOf used
+	// to do -- put one of the record layer's own derivations on the reproduction's side of the
+	// comparison, and retention_wire is carried by both aads and by the write_auth preimage, so
+	// it is a keyed octet by the definition this file opens with.
+	keySourceDurableClassCode byte = 0x01
+	keySourceDurableWire      byte = 0x01
+	// MASTER's size ladder, the 256 octet rung: the bucket TAG and the octet count it names. The
+	// count fixes octet_length(ct_body), so it is on the same side of the same line.
+	keySourceSizeBucketCode byte = 0x00
+	keySourceRungBytes           = 256
 )
 
 // keySourceShape is every PUBLIC field of one record: what a server, or anybody holding the
@@ -401,21 +416,23 @@ func keySourceShapeOf(t *testing.T, record *message.Record, leaf uint32,
 
 	t.Helper()
 	header := record.Header
-	// the wire byte is transcribed above and held against the join every preimage in the tree
-	// goes through, so a change to MASTER's table is a failure here rather than an agreement
-	// between this file and itself.
-	wire, err := message.RetentionClassWire(header.RetentionClass, header.EphBucket)
-	if err != nil {
-		t.Fatalf("join class %d and bucket %d: %v", header.RetentionClass, header.EphBucket, err)
+	// the record is held against the TRANSCRIPTIONS, and the transcriptions are what the shape
+	// then carries. This function used to call message.RetentionClassWire and
+	// message.SizeBucketBytes and put their answers in the shape, which is two of the record
+	// layer's own derivations producing octets the reproduction compares. What the package thinks
+	// those two values are is asked on the other side of the gate, by
+	// TestTheTranscribedRetentionAndSizeAgreeWithThePackage, and its answer never arrives here.
+	if byte(header.RetentionClass) != keySourceDurableClassCode {
+		t.Fatalf("this reproduction is written for MASTER section 8's durable class %#02x and the record carries %#02x",
+			keySourceDurableClassCode, byte(header.RetentionClass))
 	}
-	if wire != keySourceDurableWire {
-		t.Fatalf("the durable class joins to wire byte %#02x and MASTER section 8's table is transcribed here as %#02x",
-			wire, keySourceDurableWire)
+	if header.EphBucket != 0 {
+		t.Fatalf("the durable row of MASTER section 8's table carries eph bucket 0 and the record carries %d",
+			header.EphBucket)
 	}
-	// the rung is transcribed and held against the ladder for the same reason.
-	if rung := message.SizeBucketBytes(header.SizeBucket); rung != keySourceRungBytes {
-		t.Fatalf("size bucket %d is %d octets on the ladder and this file transcribes it as %d",
-			header.SizeBucket, rung, keySourceRungBytes)
+	if byte(header.SizeBucket) != keySourceSizeBucketCode {
+		t.Fatalf("this reproduction is written for the %#02x rung of MASTER's ladder and the record carries %#02x",
+			keySourceSizeBucketCode, byte(header.SizeBucket))
 	}
 	return keySourceShape{
 		groupId:       header.GroupId,
@@ -423,8 +440,8 @@ func keySourceShapeOf(t *testing.T, record *message.Record, leaf uint32,
 		epoch:         header.Epoch,
 		streamIndex:   header.StreamIndex,
 		isCommit:      header.IsCommit,
-		retentionWire: wire,
-		sizeBucket:    byte(header.SizeBucket),
+		retentionWire: keySourceDurableWire,
+		sizeBucket:    keySourceSizeBucketCode,
 		rungBytes:     keySourceRungBytes,
 		expireAt:      header.ExpireAt,
 		blobId:        header.BlobId,
@@ -434,14 +451,31 @@ func keySourceShapeOf(t *testing.T, record *message.Record, leaf uint32,
 	}
 }
 
-// keySourceSealed is one fixture's worth of evidence: a session over a real group, the three
-// values the reproduction is allowed, and the records that came out of it.
+// keySourceSealed is one fixture's worth of evidence: the three values the reproduction is
+// allowed, the records that came out of a real session over a real group, and what those records
+// opened back to.
+//
+// IT CARRIES NO SESSION AND NO GROUP HANDLE, and that is the boundary the gate at the bottom of
+// this file rests on. keySourceSealRecords is the one function that gate excludes -- it has to
+// call the record layer, because CP3b's bar is that the fixture is REAL -- and this type is what
+// stops the exclusion leaking: nothing that crosses it can seal, open, export or derive. Only
+// octets cross, and one subject. TestTheFixtureCanHandTheReproductionNothingItCouldSealWith
+// holds that field by field, through this package's test types, so a *testSession put back here
+// fails on the commit that puts it back.
 type keySourceSealed struct {
-	fixture   *testSession
-	mlsSecret []byte
-	records   []*message.Record
-	heads     [][]byte
-	bodies    [][]byte
+	// the three values of the file header, taken here so that the reproduction's own caller
+	// never has to reach the fixture for one.
+	mlsSecret   []byte
+	pqSecret    []byte
+	serverNonce []byte
+	// the sender's leaf index, which is public and is a SHAPE input rather than a key: the
+	// record header carries sender_handle, which is the key schedule's function of it.
+	leaf         uint32
+	records      []*message.Record
+	heads        [][]byte
+	bodies       [][]byte
+	openedHeads  [][]byte
+	openedBodies [][]byte
 }
 
 // The head plaintext is EIGHTEEN octets on every record, so ct_head is thirty four, and every
@@ -464,7 +498,13 @@ func keySourceSealRecords(t *testing.T, name string) *keySourceSealed {
 	t.Helper()
 	fixture := newTestSession(t, name)
 	fixture.trackOwn(t)
-	sealed := &keySourceSealed{fixture: fixture}
+	sealed := &keySourceSealed{
+		pqSecret:    testPqSecret(),
+		serverNonce: testServerNonce(),
+		// the leaf is read HERE rather than in the reproduction's caller, because
+		// GroupHandle.OwnLeafIndex is the record layer's and the caller is inside the gate.
+		leaf: fixture.handle.OwnLeafIndex(),
+	}
 	for i := 0; i < keySourceRecordCount; i += 1 {
 		head := []byte(fmt.Sprintf("record head %06d", i))
 		if len(head) != keySourceHeadPlainBytes {
@@ -479,9 +519,21 @@ func keySourceSealRecords(t *testing.T, name string) *keySourceSealed {
 		if err != nil {
 			t.Fatalf("SealRecord %d: %v", i, err)
 		}
+		// the OPEN half of the class, run HERE for the same reason. See (6) in the file header
+		// for what it binds: a second key source on the open side alone is a record that does
+		// not open, and a second key source on both sides is a record this reproduction does not
+		// match. The assertion body compares what came back; it does not run the open itself,
+		// because the assertion bodies are inside the gate and the record layer's own open is
+		// the subject rather than the reproduction.
+		openedHead, openedBody, err := fixture.session.OpenRecord(record)
+		if err != nil {
+			t.Fatalf("record %d: OpenRecord: %v", i, err)
+		}
 		sealed.records = append(sealed.records, record)
 		sealed.heads = append(sealed.heads, head)
 		sealed.bodies = append(sealed.bodies, body)
+		sealed.openedHeads = append(sealed.openedHeads, openedHead)
+		sealed.openedBodies = append(sealed.openedBodies, openedBody)
 	}
 	// the group's OWN exporter, under the label MASTER section 7 names, at the width it names.
 	// This is the one secret the reproduction is handed, and it comes off the real mls.Group the
@@ -510,9 +562,8 @@ func keySourceSealRecords(t *testing.T, name string) *keySourceSealed {
 // reproduce rebuilds record i from the three values and the record's public half.
 func (self *keySourceSealed) reproduce(t *testing.T, i int, mlsSecret []byte) keySourceReproduction {
 	t.Helper()
-	shape := keySourceShapeOf(t, self.records[i], self.fixture.handle.OwnLeafIndex(),
-		self.heads[i], self.bodies[i])
-	return reproduceRecordFromTheExporterOutput(t, mlsSecret, testPqSecret(), testServerNonce(), shape)
+	shape := keySourceShapeOf(t, self.records[i], self.leaf, self.heads[i], self.bodies[i])
+	return reproduceRecordFromTheExporterOutput(t, mlsSecret, self.pqSecret, self.serverNonce, shape)
 }
 
 // CP3b's bar, standing: no test-only key source anywhere on the path.
@@ -557,14 +608,14 @@ func TestEveryKeyedOctetOfARecordIsReproducibleFromTheExporterAndTheTwoInjectedV
 				i, got.writeAuth, record.WriteAuth)
 		}
 		// and the OPEN half of the class, bound to the same reproduction. See (6) in the file
-		// header: a second key source on the open side alone is a record that does not open.
-		gotHead, gotBody, err := sealed.fixture.session.OpenRecord(record)
-		if err != nil {
-			t.Fatalf("record %d: OpenRecord: %v", i, err)
-		}
-		if string(gotHead) != string(sealed.heads[i]) || string(gotBody) != string(sealed.bodies[i]) {
+		// header: a second key source on the open side alone is a record that does not open. The
+		// open ran in the fixture, which is the one function outside the gate below; what is
+		// compared here is what it answered.
+		if string(sealed.openedHeads[i]) != string(sealed.heads[i]) ||
+			string(sealed.openedBodies[i]) != string(sealed.bodies[i]) {
 			t.Errorf("record %d: opened to %d and %d octets, want %d and %d",
-				i, len(gotHead), len(gotBody), len(sealed.heads[i]), len(sealed.bodies[i]))
+				i, len(sealed.openedHeads[i]), len(sealed.openedBodies[i]),
+				len(sealed.heads[i]), len(sealed.bodies[i]))
 		}
 	}
 	t.Logf("%d records rebuilt byte for byte from Export(%q, nil, %d), pq_secret and server_nonce",
@@ -619,84 +670,364 @@ func TestFlippingAnyBitOfTheExporterOutputChangesEveryKeyedOctetOfARecord(t *tes
 	}
 }
 
+// The two table values keySourceShapeOf transcribes, held against the package that ships them.
+//
+// IT IS ON THE OTHER SIDE OF THE GATE ON PURPOSE. This is the one place the record layer is
+// asked what it thinks the durable wire byte and the 256 octet rung are, and its answer is
+// compared against a transcription and thrown away -- it reaches no shape and no preimage. Until
+// this test existed the comparison happened inside keySourceShapeOf and the package's answer WAS
+// the shape's, which put two derivations of the record layer on the reproduction's side.
+//
+// The retention class tag and the size bucket tag are pinned too, because they are what
+// keySourceShapeOf holds the record against: a tag that moved without this test would make every
+// record fail the shape check with no statement about which of the two was wrong.
+func TestTheTranscribedRetentionAndSizeAgreeWithThePackage(t *testing.T) {
+	if byte(message.RetentionDurable) != keySourceDurableClassCode {
+		t.Errorf("message.RetentionDurable is %#02x and MASTER section 8's durable row is transcribed here as %#02x",
+			byte(message.RetentionDurable), keySourceDurableClassCode)
+	}
+	wire, err := message.RetentionClassWire(message.RetentionDurable, 0)
+	if err != nil {
+		t.Fatalf("join the durable class and bucket 0: %v", err)
+	}
+	if wire != keySourceDurableWire {
+		t.Errorf("the durable class joins to wire byte %#02x and MASTER section 8's table is transcribed here as %#02x",
+			wire, keySourceDurableWire)
+	}
+	if byte(message.SizeBucket256) != keySourceSizeBucketCode {
+		t.Errorf("message.SizeBucket256 is %#02x and this file transcribes the rung's tag as %#02x",
+			byte(message.SizeBucket256), keySourceSizeBucketCode)
+	}
+	if rung := message.SizeBucketBytes(message.SizeBucket(keySourceSizeBucketCode)); rung != keySourceRungBytes {
+		t.Errorf("size bucket %#02x is %d octets on the ladder and this file transcribes it as %d",
+			keySourceSizeBucketCode, rung, keySourceRungBytes)
+	}
+}
+
 // ---------------------------------------------------------------------------
-// the gate that holds the reproduction's independence, which was a sentence until it was this
+// the gate that holds the reproduction's independence, DERIVED FROM THE PROPERTY IT NAMES
 // ---------------------------------------------------------------------------
 
-// The whole of what makes the reproduction above evidence rather than a tautology is that it
-// calls NONE of this package's own derivations. That was a paragraph in the file header and
-// nothing could fail on it -- which is the exact defect this file exists to close one level up:
-// a verification stated in prose is a verification nobody is holding. So it is a gate, and the
-// paragraph is a summary of what the gate reads rather than the only place the claim lives.
+// The whole of what makes the reproduction above evidence rather than a tautology is that no
+// code of the module under test produces any octet it compares. That claim was a paragraph; then
+// it was a gate over the wrong class; this is the third version, and the difference between the
+// second and the third is the whole subject of this comment.
 //
-// THE CLASS IS DERIVED. It is every function and method this package's PRODUCTION source
-// declares, read off the syntax tree. It is deliberately not a list of the ones that look
-// dangerous -- StorageRoot, RecordAeadBody, sealRecordAead -- because a list understates its
-// class on the commit that adds the next declaration, and this project has been walked past by
-// a hand written list fourteen times. Everything this package ships is banned from the
-// reproduction, including whatever it ships next.
+// WHAT THE SECOND VERSION GOT WRONG, because it is the defect this project keeps repeating: its
+// class was "identifiers declared in connect/messagegroup" -- the DIRECTORY the file happens to
+// sit in -- and the property is "code that produces the record's keyed octets". Those are not
+// the same set, and a reviewer walked through the gap three times:
 //
-// THE SCOPE IS A CLOSURE AND NOT A FILE, which is what gives it reach past this file. It is
-// every function reachable from reproduceRecordFromTheExporterOutput through this package's TEST
-// source, so keyschedule_test.go's RFC 5869 reference -- which the reproduction expands through,
-// and whose own header makes the same independence claim, also as a sentence -- is INSIDE this
-// gate: a call to keyScheduleExpand added there fails here. That the closure leaves this file is
-// ASSERTED rather than trusted, because a closure that stopped at its seed would report the same
-// clean run a complete one reports.
+//	(1) message.WriteKey, message.ComputeWriteAuth, message.AADHead and message.AADBody are four
+//	    of the fourteen names the file header bans by name, all on SealRecord's path, all in the
+//	    OTHER package of the record layer -- and all outside a class derived from this directory.
+//	    A second key source planted in message.WriteKey went red on the reproduction; pointing
+//	    the reproduction at message.WriteKey turned all three tests green with the gate still
+//	    green.
+//	(2) The matcher read *ast.CallExpr nodes and nothing else, so a production package level
+//	    const or var was invisible to it. A hard coded second key source planted as a package
+//	    constant, read by the reproduction, passed everything.
+//	(3) The scope was the closure seeded at reproduceRecordFromTheExporterOutput, which EXCLUDES
+//	    the two test bodies that carry the comparisons -- so a production derivation called from
+//	    the assertion side could make a comparison tautological and stay invisible.
 //
-// THE MATCHING IS BY NAME rather than through go/types, and it OVER reports rather than under. A
-// stdlib method that one day shares a name with a production method of this package is a failure
-// here, naming the call and both files. That is the safe direction for a ban list and it is the
-// direction mls/crypto_forbidden_test.go argues for its own line based matcher. There is no
-// collision today, and the gate logs the sizes of what it read, so the day there is one the
-// failure says which name it was.
+// All three are one error at three altitudes: the artefact was derived from the INSTANCE the
+// property was first seen in rather than from the property. So all three are re-derived.
+//
+// THE CLASS IS EVERY NAME THE MODULE DECLARES. The module path is read out of go.mod, the
+// package set is walked from this package and from its test source's imports through every
+// module internal import transitively, and the class is every function, every method, every
+// package level constant, every package level variable and every type their production source
+// declares. connect/message, connect/mls and connect/mls/syntax are in it today because this
+// package's production source imports them, and a package the next import adds is in it with no
+// edit here. message.WriteKey is a member. So is a constant nobody has written yet.
+//
+// THE REACH IS CALLS AND REFERENCES. A name is reached whether it is called, read as a constant,
+// taken as a value or named as a type. That is (2), and it is why the matcher walks identifiers
+// rather than call expressions.
+//
+// THE SCOPE IS THE WHOLE COMPARISON. It is walked in BOTH directions from
+// reproduceRecordFromTheExporterOutput: backwards to every test function that transitively
+// reaches it -- which is what the two assertion bodies are -- and forwards from each of those
+// through everything they reach. That is (3), and the gate asserts the backward walk found
+// something, because a backward walk that found nothing reports the clean run a complete one
+// reports.
+//
+// ONE FUNCTION IS OUTSIDE THE SCOPE, AND IT IS DERIVED RATHER THAN NAMED. CP3b's bar is that the
+// fixture is REAL: a real mls.Group, the real sealer, the real open. So the function that founds
+// the group, seals the records, opens them and takes the exporter's answer must call the record
+// layer, and a gate that banned that would ban the evidence. It is found by its RESULT TYPE, as
+// the one test function that answers a *keySourceSealed, and the gate fails if there is not
+// exactly one -- a second one would be a second door, and writing this one's name in a list
+// would be the same enumeration this section exists to undo. The gate also fails if anything
+// else in the scope reaches into that function's closure other than through the function itself,
+// because an exclusion that had grown to swallow an assertion body would clear it in silence.
+//
+// AND WHAT IT HANDS ACROSS IS A TYPE. keySourceSealed carries the three values, the leaf, the
+// records and what they opened to, and no live session and no group handle -- so the excluded
+// function cannot pass its reach along. TestTheFixtureCanHandTheReproductionNothingItCouldSealWith
+// holds that field by field and THROUGH this package's test structs, so a *testSession put back
+// on the boundary fails even though *testSession is a test type.
+//
+// ---------------------------------------------------------------------------
+// WHAT THIS GATE STILL CANNOT SEE, stated rather than implied
+// ---------------------------------------------------------------------------
+//
+// (a) THE SUBJECT PRODUCER ITSELF, which is the price of the exclusion above. A second key
+// source MIRRORED in it -- a fixture that perturbs the exporter's answer the same way a
+// perturbed production side does -- reproduces and passes. Two things stand against that and
+// neither is this gate: the boundary type, which is why nothing but octets crosses, and that
+// such an edit is a deliberate change to the fixture rather than to a derivation.
+//
+// (b) RESOLUTION IS SYNTACTIC. Names are resolved by their qualifier and not by go/types, which
+// this module cannot reach: golang.org/x/tools is not a dependency and this gate is not worth
+// adding one for. A selector rooted at an imported non module package, or at a local whose value
+// came from one, is read as that package's -- which is what keeps aead.Seal from being read as
+// connect/mls's Seal, since connect/mls really does declare a Seal. A selector the walk cannot
+// root falls back to matching the selected name against the module's declarations, which OVER
+// reports rather than under: a standard library method that one day shares a name with a module
+// function fails here, naming the call and the file. That is the safe direction for a ban, and
+// it is the direction mls/crypto_forbidden_test.go argues for its own matcher. A FIELD read off
+// an unrooted value is not matched, because the record's public half is read exactly that way
+// and is one of the reproduction's declared inputs rather than a derivation.
+//
+// (c) DYNAMIC REACH. A module function reached through a value this walk cannot follow -- a func
+// typed struct field, a method value in a map -- is outside the name matching above. Nothing in
+// the scope does that today and nothing here would say so if it started.
+//
+// (d) A SECOND DERIVATION OF THE SAME MATERIAL, unchanged from (1) in the file header. This gate
+// holds that no module code produced these octets. It does not hold that the octets could not
+// have been produced twice.
 
-// The positive control, which nothing calls.
+// The four controls, one per shape the matcher has to recognise, and nothing calls any of them.
 //
-// It exists so that a matcher which stopped matching fails HERE rather than reporting the
+// They exist so that a matcher which stopped matching fails HERE rather than reporting the
 // reproduction clean having recognised nothing -- the same shape mls/crypto_forbidden_test.go's
-// testdata/forbidden fixture has, and the reason nothing below rests on a scan having run. The
-// gate asserts it is OUTSIDE the closure before it believes what the matcher said about it: a
-// control that had drifted into the scope would be a control reporting on itself.
-func keySourceControlThatCallsAProductionDerivation(recordKey []byte) ([]byte, []byte) {
+// testdata/forbidden fixture has. Two of them are the reviewer's escapes written down as code:
+// the constant read is (2), and the connect/message pair is (1). The gate asserts each is
+// OUTSIDE the scope before it believes what the matcher said about it, because a control that
+// had drifted into the scope would be a control reporting on itself.
+func keySourceControlThatCallsThisPackagesDerivation(recordKey []byte) ([]byte, []byte) {
 	return RecordAeadBody(recordKey)
 }
 
-// keySourceProductionCallables is the class: every function and method name this package's
-// production source declares, with the file it came from.
-func keySourceProductionCallables(t *testing.T) map[string]string {
-	t.Helper()
-	_, sources := messagegroupProductionSources(t)
-	declared := map[string]string{}
-	for _, source := range sources {
-		for _, declaration := range source.parsed.Decls {
-			function, isFunction := declaration.(*ast.FuncDecl)
-			if !isFunction {
-				continue
-			}
-			declared[function.Name.Name] = source.path
-		}
-	}
-	if len(declared) == 0 {
-		t.Fatal("no production function was read out of this package, so this gate banned an empty class")
-	}
-	return declared
+func keySourceControlThatReadsThisPackagesConstant() uint16 {
+	return RecordAeadAlgId
 }
 
-// keySourceTestFunctions indexes every function this package's TEST source declares, by name,
-// with the file each came from.
+func keySourceControlThatCallsAnotherModulePackage(storageRoot []byte) []byte {
+	return message.WriteKey(storageRoot)
+}
+
+func keySourceControlThatReadsAnotherModulePackage() message.RetentionClass {
+	return message.RetentionDurable
+}
+
+// keySourceModulePackage is one package of the module under test, with every name its production
+// source declares.
+type keySourceModulePackage struct {
+	importPath string
+	funcs      map[string]bool
+	values     map[string]bool
+	types      map[string]bool
+}
+
+// keySourceTestFile is one of this package's test files, with the imports a name written in it
+// resolves through. Resolution is per FILE because import names are.
+type keySourceTestFile struct {
+	path          string
+	moduleImports map[string]string
+	otherImports  map[string]bool
+	dotImports    []string
+}
+
+// keySourceTestFunction is one function of this package's test source, with the file it was
+// written in.
+type keySourceTestFunction struct {
+	name string
+	decl *ast.FuncDecl
+	file *keySourceTestFile
+}
+
+// keySourceTestStruct is one struct type of this package's test source, with the file it was
+// written in -- which is the file its field types resolve through, and which is read off the
+// declaration rather than guessed at by name.
+type keySourceTestStruct struct {
+	decl *ast.StructType
+	file *keySourceTestFile
+}
+
+// keySourceReach is one name of the class that a scanned body reaches, with how it reached it.
+type keySourceReach struct {
+	from  string
+	file  string
+	name  string
+	owner string
+	kind  string
+}
+
+func (self keySourceReach) String() string {
+	return fmt.Sprintf("%s (%s) %s %s, which %s declares", self.from, self.file, self.kind, self.name, self.owner)
+}
+
+// keySourceModuleRoot walks up from this package to the go.mod that declares the module, and
+// answers the directory holding it and the module path it declares.
 //
-// A method and a function of one name collapse to one entry, and that is the safe direction: it
-// pulls MORE functions into the closure below, so the gate reads more source rather than less.
-func keySourceTestFunctions(t *testing.T) (map[string]*ast.FuncDecl, map[string]string) {
+// Both are READ rather than written down, which is what makes "the module under test" a fact of
+// the tree: a module rename carries this gate's class with it instead of emptying it.
+func keySourceModuleRoot(t *testing.T) (string, string) {
+	t.Helper()
+	dir, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatalf("resolve this package's directory: %v", err)
+	}
+	for {
+		source, err := os.ReadFile(filepath.Join(dir, "go.mod"))
+		if err == nil {
+			for _, line := range strings.Split(string(source), "\n") {
+				if path, isModule := strings.CutPrefix(strings.TrimSpace(line), "module "); isModule {
+					return dir, strings.TrimSpace(path)
+				}
+			}
+			t.Fatalf("%s declares no module path, so this gate has no module to derive a class from",
+				filepath.Join(dir, "go.mod"))
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			t.Fatal("no go.mod above this package, so this gate cannot derive the module under test")
+		}
+		dir = parent
+	}
+}
+
+// keySourceReadModulePackage reads one package's production declarations, and answers the module
+// internal imports it holds, which is how the package set below grows.
+func keySourceReadModulePackage(t *testing.T, importPath string, dir string,
+	modulePath string) (*keySourceModulePackage, []string) {
+
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read %s, which %s names: %v", dir, importPath, err)
+	}
+	read := &keySourceModulePackage{
+		importPath: importPath,
+		funcs:      map[string]bool{},
+		values:     map[string]bool{},
+		types:      map[string]bool{},
+	}
+	imports := []string{}
+	fileSet := token.NewFileSet()
+	files := 0
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		path := filepath.ToSlash(filepath.Join(dir, name))
+		parsed, err := parser.ParseFile(fileSet, path, nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse %s: %v", path, err)
+		}
+		files += 1
+		for _, imported := range parsed.Imports {
+			held := strings.Trim(imported.Path.Value, `"`)
+			if held == modulePath || strings.HasPrefix(held, modulePath+"/") {
+				imports = append(imports, held)
+			}
+		}
+		for _, declaration := range parsed.Decls {
+			switch declaration := declaration.(type) {
+			case *ast.FuncDecl:
+				read.funcs[declaration.Name.Name] = true
+			case *ast.GenDecl:
+				for _, spec := range declaration.Specs {
+					switch spec := spec.(type) {
+					case *ast.ValueSpec:
+						for _, name := range spec.Names {
+							// the blank identifier names nothing. `var _ GroupHandle = ...` is an
+							// interface satisfaction assertion, and reading it into the class
+							// makes every `for _, x := range` in the scope a reach.
+							if name.Name != "_" {
+								read.values[name.Name] = true
+							}
+						}
+					case *ast.TypeSpec:
+						read.types[spec.Name.Name] = true
+					}
+				}
+			}
+		}
+	}
+	if files == 0 {
+		t.Fatalf("%s holds no production go file, so this gate read an empty class out of %s", dir, importPath)
+	}
+	return read, imports
+}
+
+// keySourceModuleClass is THE CLASS: every name the production source of every module package
+// this package or its test source can reach declares.
+//
+// The seeds are this package itself and every module package its TEST source imports, so a test
+// file reaching for a package the production source does not import still hands the gate the
+// class it would need to see it. Growth from there is transitive and needs no edit here.
+func keySourceModuleClass(t *testing.T, root string, modulePath string,
+	files []*keySourceTestFile) (map[string]*keySourceModulePackage, string) {
+
+	t.Helper()
+	here, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatalf("resolve this package's directory: %v", err)
+	}
+	relative, err := filepath.Rel(root, here)
+	if err != nil {
+		t.Fatalf("place this package inside %s: %v", root, err)
+	}
+	selfImport := modulePath
+	if relative != "." {
+		selfImport = modulePath + "/" + filepath.ToSlash(relative)
+	}
+	frontier := []string{selfImport}
+	for _, file := range files {
+		for _, path := range file.moduleImports {
+			frontier = append(frontier, path)
+		}
+	}
+	class := map[string]*keySourceModulePackage{}
+	for 0 < len(frontier) {
+		importPath := frontier[len(frontier)-1]
+		frontier = frontier[:len(frontier)-1]
+		if _, isRead := class[importPath]; isRead {
+			continue
+		}
+		dir := root
+		if importPath != modulePath {
+			dir = filepath.Join(root, filepath.FromSlash(strings.TrimPrefix(importPath, modulePath+"/")))
+		}
+		read, imports := keySourceReadModulePackage(t, importPath, dir, modulePath)
+		class[importPath] = read
+		frontier = append(frontier, imports...)
+	}
+	if _, isRead := class[selfImport]; !isRead {
+		t.Fatalf("%s was not read into the class, so the gate banned nothing this package declares", selfImport)
+	}
+	return class, selfImport
+}
+
+// keySourceTestSource reads this package's test source: every function by name, every file's
+// import resolution, and every struct type, which the boundary check below walks.
+func keySourceTestSource(t *testing.T, modulePath string) (map[string]*keySourceTestFunction,
+	[]*keySourceTestFile, map[string]*keySourceTestStruct) {
+
 	t.Helper()
 	entries, err := os.ReadDir(".")
 	if err != nil {
 		t.Fatalf("read this package's directory: %v", err)
 	}
 	fileSet := token.NewFileSet()
-	functions := map[string]*ast.FuncDecl{}
-	declaredIn := map[string]string{}
+	functions := map[string]*keySourceTestFunction{}
+	files := []*keySourceTestFile{}
+	structs := map[string]*keySourceTestStruct{}
 	for _, entry := range entries {
 		name := entry.Name()
 		if entry.IsDir() || !strings.HasSuffix(name, "_test.go") {
@@ -707,46 +1038,296 @@ func keySourceTestFunctions(t *testing.T) (map[string]*ast.FuncDecl, map[string]
 		if err != nil {
 			t.Fatalf("parse %s: %v", path, err)
 		}
-		for _, declaration := range parsed.Decls {
-			function, isFunction := declaration.(*ast.FuncDecl)
-			if !isFunction || function.Body == nil {
+		file := &keySourceTestFile{
+			path:          path,
+			moduleImports: map[string]string{},
+			otherImports:  map[string]bool{},
+		}
+		for _, imported := range parsed.Imports {
+			held := strings.Trim(imported.Path.Value, `"`)
+			local := held[strings.LastIndex(held, "/")+1:]
+			if imported.Name != nil {
+				local = imported.Name.Name
+			}
+			if local == "." {
+				file.dotImports = append(file.dotImports, held)
 				continue
 			}
-			functions[function.Name.Name] = function
-			declaredIn[function.Name.Name] = path
+			if held == modulePath || strings.HasPrefix(held, modulePath+"/") {
+				file.moduleImports[local] = held
+				continue
+			}
+			file.otherImports[local] = true
+		}
+		files = append(files, file)
+		for _, declaration := range parsed.Decls {
+			switch declaration := declaration.(type) {
+			case *ast.FuncDecl:
+				if declaration.Body == nil {
+					continue
+				}
+				// a method and a function of one name collapse to one entry, which is the safe
+				// direction: it pulls MORE source into the walk rather than less.
+				functions[declaration.Name.Name] = &keySourceTestFunction{
+					name: declaration.Name.Name, decl: declaration, file: file,
+				}
+			case *ast.GenDecl:
+				for _, spec := range declaration.Specs {
+					typed, isType := spec.(*ast.TypeSpec)
+					if !isType {
+						continue
+					}
+					if structure, isStruct := typed.Type.(*ast.StructType); isStruct {
+						structs[typed.Name.Name] = &keySourceTestStruct{decl: structure, file: file}
+					}
+				}
+			}
 		}
 	}
 	if len(functions) == 0 {
 		t.Fatal("no test function was read out of this package, so this gate scoped itself to nothing")
 	}
-	return functions, declaredIn
+	return functions, files, structs
 }
 
-// keySourceCalleeNames is every name called inside one body: a bare identifier by its own name,
-// a selector by the name it selects.
-func keySourceCalleeNames(body ast.Node) []string {
-	names := []string{}
-	ast.Inspect(body, func(node ast.Node) bool {
-		call, isCall := node.(*ast.CallExpr)
-		if !isCall {
-			return true
-		}
-		switch callee := call.Fun.(type) {
+// keySourceExprRoot is the leftmost identifier of an expression: the thing a selector chain, a
+// call or a type is written on.
+func keySourceExprRoot(node ast.Expr) string {
+	for {
+		switch typed := node.(type) {
+		case nil:
+			return ""
 		case *ast.Ident:
-			names = append(names, callee.Name)
+			return typed.Name
 		case *ast.SelectorExpr:
-			names = append(names, callee.Sel.Name)
+			node = typed.X
+		case *ast.CallExpr:
+			node = typed.Fun
+		case *ast.IndexExpr:
+			node = typed.X
+		case *ast.StarExpr:
+			node = typed.X
+		case *ast.ParenExpr:
+			node = typed.X
+		case *ast.UnaryExpr:
+			node = typed.X
+		case *ast.SliceExpr:
+			node = typed.X
+		case *ast.TypeAssertExpr:
+			node = typed.X
+		case *ast.CompositeLit:
+			node = typed.Type
+		case *ast.ArrayType:
+			node = typed.Elt
+		case *ast.Ellipsis:
+			node = typed.Elt
+		default:
+			return ""
+		}
+	}
+}
+
+// keySourceNonModuleRoots is every name inside one function that resolves to a package OUTSIDE
+// this module, so a selector written on it is that package's rather than a name to match.
+//
+// It is what stops aead.Seal from being read as connect/mls's Seal: aead came out of
+// chacha20poly1305.NewX, and t came in as a *testing.T. Without it the widened class goes red on
+// the standard library, which is a gate that has to be turned off rather than one that holds.
+func keySourceNonModuleRoots(function *keySourceTestFunction) map[string]bool {
+	rooted := map[string]bool{}
+	for _, list := range []*ast.FieldList{function.decl.Recv, function.decl.Type.Params, function.decl.Type.Results} {
+		if list == nil {
+			continue
+		}
+		for _, field := range list.List {
+			if !function.file.otherImports[keySourceExprRoot(field.Type)] {
+				continue
+			}
+			for _, name := range field.Names {
+				rooted[name.Name] = true
+			}
+		}
+	}
+	note := func(targets []ast.Expr, values []ast.Expr) bool {
+		grew := false
+		for at, value := range values {
+			root := keySourceExprRoot(value)
+			if !function.file.otherImports[root] && !rooted[root] {
+				continue
+			}
+			taking := targets
+			if len(values) == len(targets) {
+				taking = targets[at : at+1]
+			}
+			for _, target := range taking {
+				name, isIdent := target.(*ast.Ident)
+				if isIdent && !rooted[name.Name] {
+					rooted[name.Name] = true
+					grew = true
+				}
+			}
+		}
+		return grew
+	}
+	// to a fixpoint, because one local's package can arrive through another's.
+	for pass := 0; pass < 8; pass += 1 {
+		grew := false
+		ast.Inspect(function.decl.Body, func(node ast.Node) bool {
+			switch typed := node.(type) {
+			case *ast.AssignStmt:
+				grew = note(typed.Lhs, typed.Rhs) || grew
+			case *ast.ValueSpec:
+				targets := []ast.Expr{}
+				for _, name := range typed.Names {
+					targets = append(targets, name)
+				}
+				if function.file.otherImports[keySourceExprRoot(typed.Type)] {
+					grew = note(targets, []ast.Expr{typed.Type}) || grew
+				}
+				grew = note(targets, typed.Values) || grew
+			}
+			return true
+		})
+		if !grew {
+			break
+		}
+	}
+	return rooted
+}
+
+// keySourceOwnerOf is the module package that declares a name, or the empty string. Packages are
+// consulted in a fixed order, so a name two of them declare reports the same one every run.
+func keySourceOwnerOf(name string, class map[string]*keySourceModulePackage, functionsOnly bool) string {
+	for _, importPath := range keySourceSortedKeys(class) {
+		read := class[importPath]
+		if read.funcs[name] {
+			return importPath
+		}
+		if !functionsOnly && (read.values[name] || read.types[name]) {
+			return importPath
+		}
+	}
+	return ""
+}
+
+// keySourceModuleReaches is THE MATCHER: every name of the class one function's body reaches,
+// through a call, a constant read, a value or a type.
+func keySourceModuleReaches(function *keySourceTestFunction, class map[string]*keySourceModulePackage,
+	selfImport string) []keySourceReach {
+
+	body := function.decl.Body
+	rooted := keySourceNonModuleRoots(function)
+	selected := map[*ast.Ident]bool{}
+	keyed := map[*ast.Ident]bool{}
+	called := map[ast.Expr]bool{}
+	ast.Inspect(body, func(node ast.Node) bool {
+		switch typed := node.(type) {
+		case *ast.SelectorExpr:
+			selected[typed.Sel] = true
+		case *ast.KeyValueExpr:
+			if name, isIdent := typed.Key.(*ast.Ident); isIdent {
+				keyed[name] = true
+			}
+		case *ast.CallExpr:
+			called[typed.Fun] = true
+		}
+		return true
+	})
+	found := []keySourceReach{}
+	report := func(name string, owner string, kind string) {
+		found = append(found, keySourceReach{
+			from: function.name, file: function.file.path, name: name, owner: owner, kind: kind,
+		})
+	}
+	kindOf := func(node ast.Expr) string {
+		if called[node] {
+			return "calls"
+		}
+		return "reads"
+	}
+	ast.Inspect(body, func(node ast.Node) bool {
+		switch typed := node.(type) {
+		case *ast.SelectorExpr:
+			root := keySourceExprRoot(typed.X)
+			if path, isModulePackage := function.file.moduleImports[root]; isModulePackage {
+				report(root+"."+typed.Sel.Name, path, kindOf(typed))
+				return true
+			}
+			if function.file.otherImports[root] || rooted[root] {
+				return true
+			}
+			// a selector on a value this walk cannot root. Only a CALL is matched: a field read
+			// off an unrooted value is how the record's public half is read, and that is one of
+			// the reproduction's declared inputs rather than a derivation.
+			if called[typed] {
+				if owner := keySourceOwnerOf(typed.Sel.Name, class, true); owner != "" {
+					report(typed.Sel.Name, owner, "calls")
+				}
+			}
+		case *ast.Ident:
+			if selected[typed] || keyed[typed] || typed.Name == "_" {
+				return true
+			}
+			// unqualified, so it can only be this package's own production source: every other
+			// package of the module has to be reached through an import name, and the gate
+			// refuses a dot import for exactly that reason.
+			own := class[selfImport]
+			if own.funcs[typed.Name] || own.values[typed.Name] || own.types[typed.Name] {
+				report(typed.Name, selfImport, kindOf(typed))
+			}
+		}
+		return true
+	})
+	lines := []string{}
+	seen := map[string]bool{}
+	compacted := []keySourceReach{}
+	for _, reach := range found {
+		line := reach.String()
+		if seen[line] {
+			continue
+		}
+		seen[line] = true
+		lines = append(lines, line)
+	}
+	slices.Sort(lines)
+	for _, line := range lines {
+		for _, reach := range found {
+			if reach.String() == line {
+				compacted = append(compacted, reach)
+				break
+			}
+		}
+	}
+	return compacted
+}
+
+// keySourceMentionedNames is every name a body mentions: a bare identifier by its own name, a
+// selector by the name it selects.
+//
+// The call graph below is built out of this rather than out of call expressions, because a
+// function reached as a VALUE is still reached.
+func keySourceMentionedNames(function *ast.FuncDecl) []string {
+	names := []string{}
+	ast.Inspect(function.Body, func(node ast.Node) bool {
+		switch typed := node.(type) {
+		case *ast.Ident:
+			names = append(names, typed.Name)
+		case *ast.SelectorExpr:
+			names = append(names, typed.Sel.Name)
 		}
 		return true
 	})
 	return names
 }
 
-// keySourceClosureFrom is every test function reachable from one seed through this package's
-// test source, the seed included.
-func keySourceClosureFrom(seed string, functions map[string]*ast.FuncDecl) map[string]bool {
-	closure := map[string]bool{seed: true}
-	frontier := []string{seed}
+// keySourceForwardClosure is every test function reachable from the seeds, the seeds included.
+func keySourceForwardClosure(seeds []string, functions map[string]*keySourceTestFunction) map[string]bool {
+	closure := map[string]bool{}
+	frontier := []string{}
+	for _, seed := range seeds {
+		closure[seed] = true
+		frontier = append(frontier, seed)
+	}
 	for 0 < len(frontier) {
 		name := frontier[len(frontier)-1]
 		frontier = frontier[:len(frontier)-1]
@@ -754,93 +1335,306 @@ func keySourceClosureFrom(seed string, functions map[string]*ast.FuncDecl) map[s
 		if !isDeclared {
 			continue
 		}
-		for _, called := range keySourceCalleeNames(function) {
-			if closure[called] {
+		for _, mentioned := range keySourceMentionedNames(function.decl) {
+			if closure[mentioned] {
 				continue
 			}
-			if _, isTestFunction := functions[called]; !isTestFunction {
+			if _, isTestFunction := functions[mentioned]; !isTestFunction {
 				continue
 			}
-			closure[called] = true
-			frontier = append(frontier, called)
+			closure[mentioned] = true
+			frontier = append(frontier, mentioned)
 		}
 	}
 	return closure
 }
 
-// keySourceCallsIntoProduction is the matcher: every call, from a function in the scope, to a
-// name in the class.
-//
-// The gate and its positive control both go through this one body, so a matcher that stopped
-// matching fails at the control rather than clearing the scope.
-func keySourceCallsIntoProduction(functions map[string]*ast.FuncDecl, declaredIn map[string]string,
-	scope map[string]bool, class map[string]string) []string {
-
-	found := []string{}
-	for name := range scope {
-		function, isDeclared := functions[name]
-		if !isDeclared {
-			continue
-		}
-		for _, called := range keySourceCalleeNames(function) {
-			if path, isProduction := class[called]; isProduction {
-				found = append(found, fmt.Sprintf("%s (%s) calls %s, which %s declares",
-					name, declaredIn[name], called, path))
+// keySourceBackwardClosure is every test function that transitively REACHES the seed, the seed
+// included. It is what puts the assertion bodies inside this gate.
+func keySourceBackwardClosure(seed string, functions map[string]*keySourceTestFunction) map[string]bool {
+	callers := map[string][]string{}
+	for name, function := range functions {
+		for _, mentioned := range keySourceMentionedNames(function.decl) {
+			if _, isTestFunction := functions[mentioned]; isTestFunction {
+				callers[mentioned] = append(callers[mentioned], name)
 			}
 		}
 	}
-	slices.Sort(found)
-	return slices.Compact(found)
+	closure := map[string]bool{seed: true}
+	frontier := []string{seed}
+	for 0 < len(frontier) {
+		name := frontier[len(frontier)-1]
+		frontier = frontier[:len(frontier)-1]
+		for _, caller := range callers[name] {
+			if closure[caller] {
+				continue
+			}
+			closure[caller] = true
+			frontier = append(frontier, caller)
+		}
+	}
+	return closure
 }
 
-// The reproduction reaches nothing this package ships, held off the syntax tree.
+// keySourceSortedKeys is the keys of a map in one order, so every list this gate prints and every
+// package order it resolves through is the same on every run.
+func keySourceSortedKeys[V any](held map[string]V) []string {
+	keys := []string{}
+	for key := range held {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+	return keys
+}
+
+// keySourceNamesTheFixture answers whether a result list names keySourceSealed, which is how the
+// subject producer is found without writing its name down.
+func keySourceNamesTheFixture(results *ast.FieldList) bool {
+	if results == nil {
+		return false
+	}
+	named := false
+	for _, field := range results.List {
+		ast.Inspect(field.Type, func(node ast.Node) bool {
+			if name, isIdent := node.(*ast.Ident); isIdent && name.Name == "keySourceSealed" {
+				named = true
+			}
+			return true
+		})
+	}
+	return named
+}
+
+// The reproduction's whole side of the comparison reaches nothing the module under test ships.
 //
-// A reproduction that called the package's own derivations would rebuild the record under
-// whatever key the package chose -- one drawn from a second source included -- and would agree
-// with it forever. That is the failure the two tests above exist to be immune to, and this is
-// what keeps them immune to it as the package grows.
-func TestTheReproductionCallsNothingThisPackageShips(t *testing.T) {
-	class := keySourceProductionCallables(t)
-	functions, declaredIn := keySourceTestFunctions(t)
+// A reproduction that reached for the record layer's own derivations would rebuild the record
+// under whatever key the record layer chose -- one drawn from a second source included -- and
+// would agree with it forever. So would an assertion body that recomputed an expected octet the
+// same way. That is the failure the two tests above exist to be immune to, and this is what
+// keeps them immune to it as the module grows.
+func TestNothingOnTheReproductionsSideOfTheComparisonComesFromTheModule(t *testing.T) {
 	const seed = "reproduceRecordFromTheExporterOutput"
-	const control = "keySourceControlThatCallsAProductionDerivation"
+	root, modulePath := keySourceModuleRoot(t)
+	functions, files, _ := keySourceTestSource(t, modulePath)
+	class, selfImport := keySourceModuleClass(t, root, modulePath, files)
 	if _, isDeclared := functions[seed]; !isDeclared {
 		t.Fatalf("%s was not read out of this package's test source, so this gate walked nothing", seed)
 	}
-	closure := keySourceClosureFrom(seed, functions)
-	// a closure of one is a closure that found no calls at all, which reports the clean run a
-	// complete one reports.
-	if len(closure) < 2 {
-		t.Fatalf("the closure from %s holds %d function(s), so the walk read no calls", seed, len(closure))
+	// the class has to leave this DIRECTORY, which is the whole of escape (1): message.WriteKey
+	// is on SealRecord's path and is not declared here.
+	beyondThisPackage := []string{}
+	names := 0
+	for _, importPath := range keySourceSortedKeys(class) {
+		read := class[importPath]
+		names += len(read.funcs) + len(read.values) + len(read.types)
+		if importPath != selfImport {
+			beyondThisPackage = append(beyondThisPackage, importPath)
+		}
 	}
-	// and it must LEAVE this file, which is the whole of the reach claim above: keyschedule_test.go's
-	// RFC 5869 reference is what the reproduction expands through.
+	if len(beyondThisPackage) == 0 {
+		t.Fatalf("the class is %s and nothing else, so it is this directory again and message.WriteKey is outside it",
+			selfImport)
+	}
+	// a dot import would put a module name in reach unqualified, which is the one thing this
+	// matcher's per file resolution cannot see.
+	for _, file := range files {
+		if 0 < len(file.dotImports) {
+			t.Errorf("%s dot imports %v, so a name of the module can be written in it unqualified and this gate resolves by qualifier",
+				file.path, file.dotImports)
+		}
+	}
+	// THE SCOPE, walked in both directions.
+	backward := keySourceBackwardClosure(seed, functions)
+	if len(backward) < 2 {
+		t.Fatalf("nothing in this package's test source reaches %s, so the bodies that carry the comparisons are outside this gate",
+			seed)
+	}
+	comparison := keySourceForwardClosure(keySourceSortedKeys(backward), functions)
+	// the ONE exclusion, derived by result type: the function that produces the subject.
+	producers := []string{}
+	for _, name := range keySourceSortedKeys(functions) {
+		if keySourceNamesTheFixture(functions[name].decl.Type.Results) {
+			producers = append(producers, name)
+		}
+	}
+	if len(producers) != 1 {
+		t.Fatalf("%d test function(s) answer a *keySourceSealed and this gate excludes exactly one of them: %v",
+			len(producers), producers)
+	}
+	producer := producers[0]
+	if !comparison[producer] {
+		t.Fatalf("%s produces the fixture and nothing in the comparison reaches it, so the scope this gate excluded is not the one it walked",
+			producer)
+	}
+	excluded := keySourceForwardClosure([]string{producer}, functions)
+	scope := map[string]bool{}
+	for name := range comparison {
+		if !excluded[name] {
+			scope[name] = true
+		}
+	}
+	// the exclusion may be entered ONLY through the producer. An exclusion that had grown to
+	// swallow an assertion body would clear it in silence, which is this tree's most expensive
+	// failure mode.
+	for _, name := range keySourceSortedKeys(scope) {
+		for _, mentioned := range keySourceMentionedNames(functions[name].decl) {
+			if mentioned == producer || !excluded[mentioned] {
+				continue
+			}
+			t.Errorf("%s is inside this gate and reaches %s, which %s's closure excluded: the exclusion is swallowing scope rather than bounding the subject",
+				name, mentioned, producer)
+		}
+	}
+	// the scope holds the ASSERTION BODIES, which is escape (3).
+	inScope := []string{}
 	spanned := []string{}
-	for name := range closure {
-		if !slices.Contains(spanned, declaredIn[name]) {
-			spanned = append(spanned, declaredIn[name])
+	for _, name := range keySourceSortedKeys(scope) {
+		if strings.HasPrefix(name, "Test") {
+			inScope = append(inScope, name)
+		}
+		if path := functions[name].file.path; !slices.Contains(spanned, path) {
+			spanned = append(spanned, path)
 		}
 	}
 	slices.Sort(spanned)
+	if len(inScope) < 2 {
+		t.Errorf("the scope holds %v, so the bodies that carry the four comparisons are outside this gate", inScope)
+	}
+	// and it holds something the forward walk alone cannot reach, which is what says the backward
+	// walk ran at all rather than reporting the forward one's answer over again.
+	forward := keySourceForwardClosure([]string{seed}, functions)
+	backwardOnly := []string{}
+	for _, name := range keySourceSortedKeys(scope) {
+		if !forward[name] {
+			backwardOnly = append(backwardOnly, name)
+		}
+	}
+	if len(backwardOnly) == 0 {
+		t.Errorf("every function in the scope is reachable forwards from %s, so the backward walk added nothing and this is the gate that missed the assertion bodies",
+			seed)
+	}
+	// and it leaves this file, which is the reach claim: keyschedule_test.go's RFC 5869 reference
+	// is what the reproduction expands through.
 	if len(spanned) < 2 {
-		t.Errorf("the closure from %s stays inside %v, so nothing outside this file is gated by it",
-			seed, spanned)
+		t.Errorf("the scope stays inside %v, so nothing outside this file is gated by it", spanned)
 	}
-	// the control is outside the scope, so what the matcher says about it is not a statement
-	// about the reproduction.
-	if closure[control] {
-		t.Fatalf("%s is inside the reproduction's closure, so it is no longer a control", control)
+	// the four controls, one per shape, each outside the scope and each recognised.
+	controls := map[string]string{
+		"keySourceControlThatCallsThisPackagesDerivation": "a call to a function this package's production source declares",
+		"keySourceControlThatReadsThisPackagesConstant":   "a READ of a package level constant, which a matcher walking call expressions cannot see",
+		"keySourceControlThatCallsAnotherModulePackage":   "a call into connect/message, which a class derived from this DIRECTORY does not hold",
+		"keySourceControlThatReadsAnotherModulePackage":   "a read of a connect/message constant, which is both escapes at once",
 	}
-	if found := keySourceCallsIntoProduction(functions, declaredIn, closure, class); 0 < len(found) {
-		t.Errorf("the reproduction reaches this package's own declarations, so it rebuilds a record under whatever key this package chose: %v", found)
+	for _, name := range keySourceSortedKeys(controls) {
+		control, isDeclared := functions[name]
+		if !isDeclared {
+			t.Fatalf("the control %s was not read out of this package's test source", name)
+		}
+		if comparison[name] {
+			t.Fatalf("%s is inside the comparison's closure, so it is no longer a control", name)
+		}
+		if reaches := keySourceModuleReaches(control, class, selfImport); len(reaches) == 0 {
+			t.Errorf("the matcher recognised nothing in %s, which is %s, so its clean reading of the reproduction means nothing",
+				name, controls[name])
+		}
 	}
-	// the positive control: the same matcher over the control function must report it. Without
-	// this, a matcher that recognised nothing would clear the closure in silence.
-	controlFound := keySourceCallsIntoProduction(functions, declaredIn, map[string]bool{control: true}, class)
-	if len(controlFound) == 0 {
-		t.Errorf("the matcher recognised nothing in %s, which calls a production derivation outright, so its clean reading of the reproduction means nothing",
-			control)
+	// and the finding.
+	found := []string{}
+	for _, name := range keySourceSortedKeys(scope) {
+		for _, reach := range keySourceModuleReaches(functions[name], class, selfImport) {
+			found = append(found, reach.String())
+		}
 	}
-	t.Logf("%d production callables banned; the closure from %s is %d function(s) across %v; the control reports %v",
-		len(class), seed, len(closure), spanned, controlFound)
+	if 0 < len(found) {
+		t.Errorf("the reproduction's side of the comparison reaches the module under test, so an octet it compares was produced by the code it is evidence about: %v",
+			found)
+	}
+	t.Logf("%d names across %d module package(s) %v banned; the scope is %d function(s) across %v, %d of them reached only backwards from %s; %s and its %d function closure are the subject",
+		names, len(class), keySourceSortedKeys(class), len(scope), spanned, len(backwardOnly), seed,
+		producer, len(excluded))
+}
+
+// keySourceTypeReachesTheModule answers the first module name a type expression can reach,
+// following this package's own TEST structs transitively.
+//
+// The transitivity is the point: *testSession is a test type and looks harmless, and it holds a
+// *GroupSession, which is the record layer itself. A check that stopped at the first hop would
+// certify exactly the field this boundary exists to keep out.
+func keySourceTypeReachesTheModule(node ast.Expr, file *keySourceTestFile,
+	class map[string]*keySourceModulePackage, selfImport string,
+	structs map[string]*keySourceTestStruct, seen map[string]bool) string {
+
+	reached := ""
+	ast.Inspect(node, func(inner ast.Node) bool {
+		if reached != "" {
+			return false
+		}
+		switch typed := inner.(type) {
+		case *ast.SelectorExpr:
+			if path, isModulePackage := file.moduleImports[keySourceExprRoot(typed.X)]; isModulePackage {
+				reached = keySourceExprRoot(typed.X) + "." + typed.Sel.Name + " (" + path + ")"
+				return false
+			}
+		case *ast.Ident:
+			own := class[selfImport]
+			if own.types[typed.Name] {
+				reached = typed.Name + " (" + selfImport + ")"
+				return false
+			}
+			structure, isTestStruct := structs[typed.Name]
+			if !isTestStruct || seen[typed.Name] {
+				return true
+			}
+			seen[typed.Name] = true
+			// and it resolves through the file the deeper struct was written in, not this one.
+			for _, field := range structure.decl.Fields.List {
+				if deeper := keySourceTypeReachesTheModule(field.Type, structure.file, class,
+					selfImport, structs, seen); deeper != "" {
+					reached = typed.Name + " -> " + deeper
+					return false
+				}
+			}
+		}
+		return true
+	})
+	return reached
+}
+
+// The boundary the excluded function hands across carries no door back into the record layer.
+//
+// keySourceSealRecords is the one function the gate above excludes from its scope, and the whole
+// reason that exclusion is safe is that what it returns is octets and one subject. A *testSession
+// field here -- which is what this type carried until the gate was widened -- would put a live
+// GroupSession on the reproduction's side of the boundary, and everything the gate refuses to let
+// the assertion bodies call would be two selectors away.
+func TestTheFixtureCanHandTheReproductionNothingItCouldSealWith(t *testing.T) {
+	root, modulePath := keySourceModuleRoot(t)
+	_, files, structs := keySourceTestSource(t, modulePath)
+	class, selfImport := keySourceModuleClass(t, root, modulePath, files)
+	boundary, isDeclared := structs["keySourceSealed"]
+	if !isDeclared {
+		t.Fatal("keySourceSealed is not a struct of this package's test source, so this check read nothing")
+	}
+	carrying := []string{}
+	fields := 0
+	for _, field := range boundary.decl.Fields.List {
+		for _, name := range field.Names {
+			fields += 1
+			if reached := keySourceTypeReachesTheModule(field.Type, boundary.file, class, selfImport,
+				structs, map[string]bool{"keySourceSealed": true}); reached != "" {
+				carrying = append(carrying, name.Name+" reaches "+reached)
+			}
+		}
+	}
+	if fields == 0 {
+		t.Fatal("keySourceSealed has no fields, so this check certified an empty boundary")
+	}
+	slices.Sort(carrying)
+	// exactly one field may reach the module, and it is the SUBJECT: the records themselves.
+	// Anything else is a value the reproduction's side of the boundary could derive with.
+	if len(carrying) != 1 || !strings.HasPrefix(carrying[0], "records reaches ") {
+		t.Errorf("the fields of keySourceSealed that reach the module under test are %v, and the only one that may is the records themselves; everything else the fixture hands across must be octets",
+			carrying)
+	}
+	t.Logf("%d fields on the boundary, %d of them reaching the module: %v", fields, len(carrying), carrying)
 }

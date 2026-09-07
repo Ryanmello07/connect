@@ -1,7 +1,11 @@
 // The group of FOUR, and the copath it is the smallest size to make real.
 //
-// WHY THIS FILE EXISTS. Thirty-two call sites of this package's corpus ran on testTwoMemberGroup and
-// nothing larger existed. In a group of two the only node of a sender's filtered direct path that
+// WHY THIS FILE EXISTS. TWENTY-SEVEN call sites of this package's corpus ran on testTwoMemberGroup
+// and nothing larger existed -- the query is `git grep -n testTwoMemberGroup dd140bd -- mls/`, at the
+// commit before this file, and it answers 32 LINES of which two are func declarations and three are
+// comments. This line read "thirty-two" until 2026-09-07, which is a count of grep lines published as
+// a count of call sites in a file whose own subject is a measurement.
+// In a group of two the only node of a sender's filtered direct path that
 // covers the receiver is the ROOT, and the receiver's own leaf is the whole of that node's copath
 // resolution -- so every path secret any commit ever seals to this member is sealed to the member's
 // own leaf key, and (*TreeKEMPrivate).NodePrivateKey's own-leaf arm answers every question the
