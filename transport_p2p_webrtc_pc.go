@@ -84,18 +84,20 @@ func newWebRtcPeerConnectionFactory(
 			s.SetNetworkTypes(networkTypes)
 		}
 	}
-	if selectedNet != nil {
-		// An injected network owns candidate enumeration and socket routing.
+	if settings.Network != nil {
+		log.Infof("[ice-factory]using caller-owned network\n")
 	} else if settings.UseLoopbackOnlyIceInterfaces {
 		// hermetic same-host mode (tests): gather only loopback candidates so
 		// the local connect cost is a couple of pairs, independent of the
 		// host's interface population (see WebRtcSettings)
+		log.Infof("[ice-factory]using loopback-only ice interfaces\n")
 		s.SetIncludeLoopbackCandidate(true)
 		s.SetInterfaceFilter(func(interfaceName string) bool {
 			ifc, err := net.InterfaceByName(interfaceName)
 			return err == nil && ifc.Flags&net.FlagLoopback != 0
 		})
 	} else if index4, index6 := EgressInterfaceIndex(); index4 != 0 || index6 != 0 {
+		log.Infof("[ice-factory]using egress-bound net (index4=%d index6=%d)\n", index4, index6)
 		// bind ICE sockets to the physical egress interface so p2p does not
 		// loop into the tunnel this process provides (R1); a no-op off
 		// Windows and when no egress index is set.
@@ -113,6 +115,7 @@ func newWebRtcPeerConnectionFactory(
 		log,
 		settings.UseEgressOnlyIceInterfaces,
 	); ok {
+		log.Infof("[ice-factory]using iceInterfaceNet (synthetic interfaces)\n")
 		// Android (API 30+) denies netlink, so pion's default net.Interfaces()
 		// gathering yields zero host candidates and p2p never leaves the WAN
 		// relay. Device clients also opt into the same egress-only view on
@@ -122,6 +125,8 @@ func newWebRtcPeerConnectionFactory(
 		// is both the usable path and a bounded setup cost.
 		// See OPTIMIZENETWORKPEER1.md §5.1.
 		selectedNet = iceNet
+	} else {
+		log.Infof("[ice-factory]no network selected, using pion default\n")
 	}
 	if settings.EnableDatagramFastPath &&
 		0 < settings.DatagramFastPathWriteQueueSize &&

@@ -3167,6 +3167,16 @@ func (self *peerConn) Run() {
 			}
 			return
 		}
+		if self.log.V(1).Enabled() {
+			// Count candidates in the local SDP offer
+			candidateCount := 0
+			for _, line := range strings.Split(offer.SDP, "\n") {
+				if strings.HasPrefix(line, "a=candidate:") {
+					candidateCount++
+				}
+			}
+			self.log.Infof("[peerconn]local SDP offer: type=%s candidates=%d sdp_len=%d\n", offer.Type, candidateCount, len(offer.SDP))
+		}
 		offerBytes, err := json.Marshal(&offer)
 		if err != nil {
 			self.cancelBecause(fmt.Errorf("encode local offer: %w", err))
@@ -3858,7 +3868,13 @@ func (self *peerConn) flushIceCandidatesWithOpts(nonBlocking bool) {
 // negotiation lane. Pion may invoke this callback after later signals arrive.
 func (self *peerConn) handleLocalIceCandidate(candidate *webrtc.ICECandidate) {
 	if candidate == nil {
+		if self.log.V(1).Enabled() {
+			self.log.Infof("[peerconn]ice gather complete (nil candidate)\n")
+		}
 		return
+	}
+	if self.log.V(1).Enabled() {
+	 self.log.Infof("[peerconn]local ice candidate: %s %s %s:%d\n", candidate.Typ, candidate.Protocol, candidate.Address, candidate.Port)
 	}
 	if self.beforeIceCandidateStateLockForTest != nil {
 		self.beforeIceCandidateStateLockForTest()
