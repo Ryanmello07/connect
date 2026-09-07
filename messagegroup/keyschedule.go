@@ -154,6 +154,17 @@ type ClassKeys struct {
 // epoch it is in and drops it at the next commit, and the octets it drops are what forward
 // secrecy is about. Every field is erased by name rather than by a loop over a slice of them,
 // so a fourth field added without an erase beside it leaves this method visibly short.
+//
+// The noinline directive is this package's erase helper class, and this method is a member of
+// it through the HAND-OFF rather than through a write it spells: the three arrays outlive the
+// call, and zeroize is where the stores are. connect/mls settled that class boundary first and
+// argued it at length -- "a body that hands the caller's array to an eraser has erased it just
+// as surely as one that spells the loop, and in this package that is how erasure is nearly
+// always written" -- and this method was outside the copy of that rule this package shipped
+// until zeroize_test.go's gate was re-derived from the property rather than from the one loop
+// this package happens to spell.
+//
+//go:noinline
 func (self *ClassKeys) Zeroize() {
 	if self == nil {
 		return
@@ -168,9 +179,143 @@ func (self *ClassKeys) Zeroize() {
 // Each is HKDF-Expand(storage_root, label, 32) under its own label, and the three labels are
 // three separate constants for the reason the file comment gives.
 func DeriveClassKeys(storageRoot []byte) *ClassKeys {
+	refuseWrongWidthStorageRoot(storageRoot)
 	return &ClassKeys{
 		Perm:    keyScheduleExpand(storageRoot, []byte(permClassInfo), classKeyBytes),
 		Durable: keyScheduleExpand(storageRoot, []byte(durableClassInfo), classKeyBytes),
 		Media:   keyScheduleExpand(storageRoot, []byte(mediaClassInfo), classKeyBytes),
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the record key ladder, spec A section 5.3 and MASTER section 8.1
+// ---------------------------------------------------------------------------
+
+// The four labels of the ladder, raw ascii, four constants and not one stem with a word
+// substituted into it.
+//
+// The last two are the pair this rule exists for. "rec/v1/head" and "rec/v1/body" share an
+// eleven character prefix and differ in their final four octets, which makes them the most
+// concatenation prone pair in the whole schedule: a single construction with the tail
+// substituted is one edit away from handing the head and the body one key, and a record whose
+// two ciphertexts are sealed under one key and one nonce is a record whose Poly1305 one time
+// key an attacker recovers. The first two are separated by their first octet, which is inside
+// the shorter of them, so nothing following one can turn it into the other.
+const (
+	recordKeyZeroInfo  = "sender/v1"
+	recordKeyNextInfo  = "ratchet/v1"
+	recordAeadHeadInfo = "rec/v1/head"
+	recordAeadBodyInfo = "rec/v1/body"
+)
+
+// The width of one rung of the ladder, and the width of the material one rung expands into.
+//
+// The fifty six is DERIVED and never written. MASTER section 8.1's block gives 56 for
+// key_head | nonce_head, and 56 is 32 + 24 -- the aead's key size and the extended nonce
+// XChaCha20-Poly1305 takes. Writing the number down would put this file's opinion of the
+// primitive beside the primitive: a suite change would silently truncate the nonce by twelve
+// octets and every record would still round trip against itself. Written as the sum, the same
+// change is a compile error at recordaead.go, which is where the primitive is.
+const (
+	recordKeyBytes          = 32
+	recordAeadMaterialBytes = recordAeadKeyBytes + recordAeadNonceBytes
+)
+
+// RecordKeyZero derives record_key[0], the head of one sender's ladder for one retention class.
+//
+//	record_key[0] = HKDF-Expand(class_key, "sender/v1" | LP(leaf_index), 32)
+//
+// The leaf goes through leafLabelledInfo and so through leafIndexLP, which is the one reading
+// of LP(leaf_index) this package has: sender_handle is derived from the same shape one file
+// over and the two must not be able to drift apart. Open item M1-8 is the ruling on what LP of
+// an integer means, and when it lands it is a single edit inside that helper.
+//
+// The class key is what separates one sender's ladders from each other -- section 5.5 sizes the
+// skipped key window per (sender_handle, retention class) for exactly this reason -- so a wrong
+// width one is refused rather than expanded. There is no error to return in the signature spec A
+// section 5.3 publishes, so the refusal is a panic carrying the sentinel, which is the shape
+// SenderHandle and writeauth.go's computing half already use: nothing here is reachable from the
+// network, the class key is this member's own derivation, and a ladder built on a truncated key
+// is a ladder no peer reproduces.
+func RecordKeyZero(classKey []byte, leaf uint32) []byte {
+	refuseWrongWidthClassKey(classKey)
+	return keyScheduleExpand(classKey, leafLabelledInfo(recordKeyZeroInfo, leaf), recordKeyBytes)
+}
+
+// RecordKeyNext derives record_key[i+1] from record_key[i].
+//
+//	record_key[i+1] = HKDF-Expand(record_key[i], "ratchet/v1", 32)
+//
+// It does not erase its input. The forward secrecy of the ladder is the CALLER's erasure of the
+// rung it has finished with -- SenderRatchet.Next is where that happens and where section 5.5
+// puts it -- because this function is also how a receiver walks forward over rungs it must
+// RETAIN, and an erasure here would blank the skipped key window as it filled it.
+func RecordKeyNext(recordKey []byte) []byte {
+	refuseWrongWidthRecordKey(recordKey)
+	return keyScheduleExpand(recordKey, []byte(recordKeyNextInfo), recordKeyBytes)
+}
+
+// RecordAeadHead derives the key and nonce ct_head is sealed under.
+//
+//	key_head | nonce_head = HKDF-Expand(record_key[i], "rec/v1/head", 56)
+//
+// The contradiction this function does not resolve, stated where a reader meets it. MASTER
+// section 8.1 says one line after the ladder that "ct_head is always under the durable class,
+// since it is always retained", while spec A section 5.3 gives this function and RecordAeadBody
+// the SAME record_key[i] argument. For a DURABLE record the two coincide and nothing at this
+// layer can tell them apart; for a PERMANENT, MEDIA or EPH record they are two rungs of two
+// different class ladders, and no document says how one record then has one stream_index. That
+// is open item M1-6. This derivation is exactly what section 5.3 declares -- one record key in,
+// the head's material out -- and task 11 is where the ruling binds, because SealRecord is what
+// states which key it passes to each.
+func RecordAeadHead(recordKey []byte) (key []byte, nonce []byte) {
+	return recordAeadMaterial(recordKey, recordAeadHeadInfo)
+}
+
+// RecordAeadBody derives the key and nonce ct_body is sealed under.
+//
+//	key_body | nonce_body = HKDF-Expand(record_key[i], "rec/v1/body", 56)
+//
+// It is a call to the same helper under the OTHER label and not a call to RecordAeadHead: the
+// whole separation between a record's two ciphertexts is that the two labels are two constants,
+// and a body that reached the head's derivation would be a body one edit away from sealing both
+// halves of a record under one key and one nonce.
+func RecordAeadBody(recordKey []byte) (key []byte, nonce []byte) {
+	return recordAeadMaterial(recordKey, recordAeadBodyInfo)
+}
+
+// The one expansion the two aead derivations share, so the split of the fifty six octets is
+// stated once.
+//
+// The key is the FIRST thirty two octets and the nonce is the last twenty four, which is the
+// order MASTER section 8.1 writes them in -- key_head | nonce_head -- and a transposition
+// produces two values of the right widths that seal and open against themselves and against
+// nothing else.
+//
+// Both halves are cut with their capacity pinned to their own length. Without that an append to
+// the key would write into the nonce's octets, which is a defect that shows up as a record that
+// does not open on the OTHER side of a wire and never here.
+func recordAeadMaterial(recordKey []byte, info string) (key []byte, nonce []byte) {
+	refuseWrongWidthRecordKey(recordKey)
+	material := keyScheduleExpand(recordKey, []byte(info), recordAeadMaterialBytes)
+	return material[:recordAeadKeyBytes:recordAeadKeyBytes], material[recordAeadKeyBytes:recordAeadMaterialBytes:recordAeadMaterialBytes]
+}
+
+// The class key width refusal, in one place so the ladder's head cannot disagree with a later
+// caller about what a class key is.
+func refuseWrongWidthClassKey(classKey []byte) {
+	if len(classKey) != classKeyBytes {
+		panic(fmt.Errorf("%w: %d octets, want %d", ErrClassKeyLength, len(classKey), classKeyBytes))
+	}
+}
+
+// The record key width refusal, made by every function that takes a rung of the ladder.
+//
+// It is checked and not assumed even though every rung this package produces is thirty two
+// octets by construction: the exported signatures take a []byte from a caller, and a short one
+// expands to a well formed key and a well formed nonce that no peer computes.
+func refuseWrongWidthRecordKey(recordKey []byte) {
+	if len(recordKey) != recordKeyBytes {
+		panic(fmt.Errorf("%w: %d octets, want %d", ErrRecordKeyLength, len(recordKey), recordKeyBytes))
 	}
 }

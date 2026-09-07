@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"go/ast"
+	"go/parser"
 	"go/token"
 	"slices"
 	"strings"
@@ -330,7 +331,7 @@ func TestTheKeySchedulesOnlyExtractionIsStorageRoots(t *testing.T) {
 			if !isFunction || function.Body == nil {
 				continue
 			}
-			if keyScheduleCallsAnExtractionEntryPoint(function.Body) {
+			if keyScheduleCallsAnExtractionEntryPoint(source.parsed, function.Body) {
 				extracting = append(extracting, function.Name.Name)
 			}
 		}
@@ -516,19 +517,164 @@ func keyScheduleHasConcatenation(expr ast.Expr) bool {
 	return found
 }
 
-// Whether a body calls an hkdf entry point that takes a salt, through any receiver.
+// Whether a body computes A KEYED HASH OVER A SALT AND AN IKM, which is what an extraction is
+// whatever it is spelled as.
 //
-// Extract and Key are the two, and Key is the worse of them: it is Extract and Expand in one
-// call, so a transposition there produces a whole key schedule that is internally consistent and
-// wrong. Expand is deliberately not here -- it has no salt argument and so carries no
-// transposition -- which is what keeps this class the EXTRACTION class rather than the kdf class.
-func keyScheduleCallsAnExtractionEntryPoint(body ast.Node) bool {
-	for _, callee := range keyScheduleCalleeNames(body) {
-		if callee == "Extract" || callee == "Key" {
+// THE CLASS IS DERIVED FROM THE PROPERTY AND NOT FROM TWO CALLEE NAMES, and that is this gate's
+// history rather than a preference. The version this replaces returned true only for a callee
+// literally named Extract or Key. Measured on this package's own source: a second storage root
+// spelled as the HMAC it is --
+//
+//	mac := hmac.New(sha256.New, pqSecret)   // salt and ikm TRANSPOSED
+//	mac.Write(mlsSecret)
+//	return mac.Sum(nil)
+//
+// -- landed in production with the whole three tree suite green. It is guardrail G1's exact
+// defect, both of its imports were already on connect/mls's pinned crypto list so the import gate
+// did not fire, and the escaping spelling is one a reader of this very file has in front of them:
+// keyScheduleReferenceExtract at the top is that same three line body, because RFC 5869 section
+// 2.2 DEFINES HKDF-Extract(salt, IKM) as HMAC-Hash(salt, IKM).
+//
+// So two shapes are read, and both are decided from the property:
+//
+//   - a KDF entry point that takes a salt: a callee named Extract or Key, through any receiver.
+//     Key is the worse of the two because it is Extract and Expand in one call, so a
+//     transposition there produces a whole key schedule that is internally consistent and wrong.
+//     Expand is deliberately absent: it has no salt argument and so carries no transposition,
+//     which is what keeps this the EXTRACTION class rather than the kdf class.
+//   - any call at all on a package this FILE imports whose job is a keyed hash or a salted kdf,
+//     resolved through the file's own import spec so an alias is followed. hmac.New IS an
+//     extraction under another name and so is every entry point of crypto/hkdf.
+//
+// The residual, stated rather than hidden: a keyed hash built by hand out of a plain hash --
+// sha3 with a key written into the message, say -- is outside both shapes. What closes that is
+// imports_test.go, which pins this package's production import set AS A WHOLE, so a second hash
+// package cannot arrive without a row; the two gates are the pair, and neither is complete alone.
+func keyScheduleCallsAnExtractionEntryPoint(parsed *ast.File, body ast.Node) bool {
+	keyed := keyScheduleKeyedHashImportsOf(parsed)
+	found := false
+	ast.Inspect(body, func(node ast.Node) bool {
+		call, isCall := node.(*ast.CallExpr)
+		if !isCall {
 			return true
 		}
+		switch callee := call.Fun.(type) {
+		case *ast.Ident:
+			if callee.Name == "Extract" || callee.Name == "Key" {
+				found = true
+			}
+		case *ast.SelectorExpr:
+			if callee.Sel.Name == "Extract" || callee.Sel.Name == "Key" {
+				found = true
+			}
+			if qualifier, isName := callee.X.(*ast.Ident); isName && keyed[qualifier.Name] {
+				found = true
+			}
+		}
+		return true
+	})
+	return found
+}
+
+// The local names one file binds to a package whose job is a keyed hash or a salted kdf.
+//
+// Resolved through the import spec, so an alias -- import mac "crypto/hmac" -- is followed, and
+// the local name is the spec's own when it names one and the path's last segment otherwise. The
+// paths are recognised by that last segment, which is the property "this package computes a
+// keyed hash" as the standard library spells it.
+func keyScheduleKeyedHashImportsOf(parsed *ast.File) map[string]bool {
+	keyed := map[string]bool{}
+	for _, imported := range parsed.Imports {
+		path := strings.Trim(imported.Path.Value, "\"`")
+		segments := strings.Split(path, "/")
+		last := segments[len(segments)-1]
+		if last != "hmac" && last != "hkdf" {
+			continue
+		}
+		local := last
+		if imported.Name != nil {
+			local = imported.Name.Name
+		}
+		keyed[local] = true
 	}
-	return false
+	return keyed
+}
+
+// One file holding one of each shape, so a matcher that stopped matching fails HERE rather than
+// reporting the package clean.
+//
+// The last three are the negative half: an expansion carries no salt and so no transposition, a
+// hash with no key is not an extraction, and a LOCAL named extract is not a call to one.
+const keyScheduleExtractionControl = "package control\n" +
+	"\n" +
+	"import (\n" +
+	"\tmac \"crypto/hmac\"\n" +
+	"\t\"crypto/hkdf\"\n" +
+	"\t\"crypto/sha256\"\n" +
+	")\n" +
+	"\n" +
+	"func extractsThroughTheProvider(crypto Provider, salt []byte, ikm []byte) []byte {\n" +
+	"\treturn crypto.Extract(salt, ikm)\n" +
+	"}\n" +
+	"\n" +
+	"func extractsThroughTheOneCallKdf(salt []byte, ikm []byte) []byte {\n" +
+	"\tout, _ := hkdf.Key(sha256.New, ikm, salt, \"\", 32)\n" +
+	"\treturn out\n" +
+	"}\n" +
+	"\n" +
+	"func extractsThroughHkdfDirectly(salt []byte, ikm []byte) []byte {\n" +
+	"\tout, _ := hkdf.Extract(sha256.New, ikm, salt)\n" +
+	"\treturn out\n" +
+	"}\n" +
+	"\n" +
+	"func extractsWithARawHmacUnderAnAlias(salt []byte, ikm []byte) []byte {\n" +
+	"\tkeyed := mac.New(sha256.New, salt)\n" +
+	"\tkeyed.Write(ikm)\n" +
+	"\treturn keyed.Sum(nil)\n" +
+	"}\n" +
+	"\n" +
+	"func expandsOnly(crypto Provider, prk []byte) []byte {\n" +
+	"\treturn crypto.Expand(prk, []byte(\"label\"), 32)\n" +
+	"}\n" +
+	"\n" +
+	"func hashesWithoutAKey(message []byte) []byte {\n" +
+	"\tsum := sha256.Sum256(message)\n" +
+	"\treturn sum[:]\n" +
+	"}\n" +
+	"\n" +
+	"func namesALocalExtract(secret []byte) int {\n" +
+	"\textract := len(secret)\n" +
+	"\treturn extract\n" +
+	"}\n"
+
+// The control, held in both directions: the matcher must read the four extractions and must read
+// none of the three shapes that are not one.
+func TestTheExtractionMatcherSeparatesTheControlShapes(t *testing.T) {
+	fileSet := token.NewFileSet()
+	control, err := parser.ParseFile(fileSet, "the extraction control", keyScheduleExtractionControl, parser.ParseComments|parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parse the control: %v", err)
+	}
+	extracting := []string{}
+	for _, declaration := range control.Decls {
+		function, isFunction := declaration.(*ast.FuncDecl)
+		if !isFunction || function.Body == nil {
+			continue
+		}
+		if keyScheduleCallsAnExtractionEntryPoint(control, function.Body) {
+			extracting = append(extracting, function.Name.Name)
+		}
+	}
+	want := []string{
+		"extractsThroughTheProvider",
+		"extractsThroughTheOneCallKdf",
+		"extractsThroughHkdfDirectly",
+		"extractsWithARawHmacUnderAnAlias",
+	}
+	if !slices.Equal(extracting, want) {
+		t.Fatalf("the matcher read %v out of the control as extractions, want %v; it is not telling a keyed hash over a salt and an ikm from an expansion, from an unkeyed hash, or from a local that merely shares a name with one",
+			extracting, want)
+	}
 }
 
 // The name of every function called in a body, whether called bare or through a selector.

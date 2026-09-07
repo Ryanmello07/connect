@@ -77,7 +77,15 @@ const (
 // this function a caller can get wrong, and getting it wrong is invisible until the group's
 // first commit: every handle in the group changes at every epoch, no member can compute another
 // member's handle, and every write is refused by a server that cannot resolve the sender.
+// The width is refused here for the same reason the two handles below refuse a short group
+// handle key, and the argument was missing at this derivation until it was measured: a root
+// that is not thirty two octets expands to a well formed key, every member of the group
+// computes a different one, and the only thing that used to refuse anything was mls's own
+// expand -- which names mls's contract rather than this layer's, and only for a root SHORTER
+// than the hash. A root of sixty four octets, which is the plausible shape of a value decoded
+// out of durable storage, was accepted in silence.
 func GroupHandleKey(storageRootEpoch0 []byte) []byte {
+	refuseWrongWidthStorageRoot(storageRootEpoch0)
 	return keyScheduleExpand(storageRootEpoch0, []byte(groupHandleKeyInfo), groupHandleKeyBytes)
 }
 
@@ -96,8 +104,7 @@ func GroupHandleKey(storageRootEpoch0 []byte) []byte {
 // Nothing here is reachable from the network: the key is this member's own persisted derivation.
 func SenderHandle(groupHandleKey []byte, leaf uint32) [16]byte {
 	refuseShortGroupHandleKey(groupHandleKey)
-	info := append([]byte(senderHandleInfo), leafIndexLP(leaf)...)
-	return [16]byte(keyScheduleExpand(groupHandleKey, info, handleBytes))
+	return [16]byte(keyScheduleExpand(groupHandleKey, leafLabelledInfo(senderHandleInfo, leaf), handleBytes))
 }
 
 // WrapTargetHandle derives the handle one device wrap of one epoch is addressed to.
@@ -106,6 +113,16 @@ func SenderHandle(groupHandleKey []byte, leaf uint32) [16]byte {
 // targets -- which is what stops the server from following one device across a group's life by
 // watching which wrap it fetches.
 //
+// WHICH epoch is the one thing about this function a caller can get wrong, so the argument is
+// named for it. It is the CONTENT epoch -- the epoch whose secrets the wrap carries -- and it is
+// deliberately NOT the record's own epoch field. Spec A section 5.11 annotates the sibling wrap
+// info block in exactly those words, and sets it against an AAD_head block annotated "the
+// RECORD's epoch and the RECORD's stream index"; MASTER section 7's info table says the same of
+// u64(epoch), and MASTER section 8.3's WrapTag carries the content epoch. A caller reaching for
+// RecordHeader.Epoch here produces a well formed sixteen octet handle that no fetcher resolves,
+// with no error anywhere -- which is why GroupHandleKey's argument is named storageRootEpoch0
+// one derivation up, and this one had to carry the same care.
+//
 // leaf_index 0xFFFFFFFF is the snapshot's, per section 5.11, and it is COMPUTED here rather than
 // special cased. A branch for it would be a branch a second implementation might not have, and
 // the value is an ordinary leaf index to every line of this derivation.
@@ -113,11 +130,11 @@ func SenderHandle(groupHandleKey []byte, leaf uint32) [16]byte {
 // The leaf index is written RAW, four octets big endian, with no length prefix. That is not an
 // oversight and it is not consistency with sender_handle: MASTER writes the two differently and
 // this file follows MASTER. Open item M1-8 carries the asymmetry.
-func WrapTargetHandle(groupHandleKey []byte, epoch uint64, leafIndex uint32) [16]byte {
+func WrapTargetHandle(groupHandleKey []byte, contentEpoch uint64, leafIndex uint32) [16]byte {
 	refuseShortGroupHandleKey(groupHandleKey)
 	writer := syntax.NewWriter()
 	writer.WriteRaw([]byte(wrapTargetHandleInfo))
-	writer.WriteUint64(epoch)
+	writer.WriteUint64(contentEpoch)
 	writer.WriteUint32(leafIndex)
 	info, err := writer.Bytes()
 	if err != nil {
@@ -148,9 +165,45 @@ func leafIndexLP(leaf uint32) []byte {
 	return prefixed
 }
 
+// The ONE assembly of a label followed by a length prefixed leaf index, so that every
+// derivation MASTER writes as label | LP(leaf_index) is built by one body.
+//
+// It exists because this file used to hold two assembly styles for one family of preimages:
+// sender_handle appended to a converted string while wrap_target_handle wrote through
+// mls/syntax's writer. There is no behavioural difference between them today -- both KAT sets
+// reproduce either way -- and that is the point: a second assembly of one shape is a second
+// place for a conversion, an order or a prefix to drift, and this project's rule is one
+// assembly per preimage. record_key[0] is the second member of the family and it lands on this
+// helper rather than on a third spelling of it.
+//
+// It is a WriteRaw of the label and a WriteRaw of the prefix leafIndexLP already built, and not
+// a WriteOpaqueLP here: the length prefix belongs to the leaf index and lives in the one place
+// open item M1-8's ruling will land.
+func leafLabelledInfo(label string, leaf uint32) []byte {
+	writer := syntax.NewWriter()
+	writer.WriteRaw([]byte(label))
+	writer.WriteRaw(leafIndexLP(leaf))
+	info, err := writer.Bytes()
+	if err != nil {
+		panic(fmt.Errorf("messagegroup: the info around a labelled leaf index could not be built: %w", err))
+	}
+	return info
+}
+
 // The width refusal both handles make, in one place so the two cannot disagree about it.
 func refuseShortGroupHandleKey(groupHandleKey []byte) {
 	if len(groupHandleKey) != groupHandleKeyBytes {
 		panic(fmt.Errorf("%w: %d octets, want %d", ErrGroupHandleKeyLength, len(groupHandleKey), groupHandleKeyBytes))
+	}
+}
+
+// The width refusal every derivation taking a storage root makes.
+//
+// It is one body for the reason the one above is: GroupHandleKey and DeriveClassKeys both hang
+// a whole epoch off this value and a disagreement between them about what a root is would be a
+// disagreement about which of the two a wrong width is caught by.
+func refuseWrongWidthStorageRoot(storageRoot []byte) {
+	if len(storageRoot) != classKeyBytes {
+		panic(fmt.Errorf("%w: %d octets, want %d", ErrStorageRootLength, len(storageRoot), classKeyBytes))
 	}
 }

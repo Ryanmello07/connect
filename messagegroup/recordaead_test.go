@@ -92,20 +92,27 @@ func TestRecordAeadAlgIdIsTheCodePointMasterRegisters(t *testing.T) {
 	}
 }
 
-// Property 1, the "one constant" half.
+// Property 1, the "one name" half.
 //
-// The CLASS is derived and not listed: every package level constant of this package's
-// production source whose value is the literal MASTER registers, whatever it is called and
-// whatever file it is in. Exactly one may exist and it must be RecordAeadAlgId. A second
-// spelling of the same code point is the shape this tree keeps rediscovering -- two names for
-// one wire value, one of which is edited.
-func TestExactlyOneConstantOfThisPackageCarriesTheRecordAeadCodePoint(t *testing.T) {
+// The CLASS is derived and not listed: every package level DECLARATION of this package's
+// production source whose value is the number MASTER registers, whatever it is called, whatever
+// file it is in, whatever base it is written in and whether it is a const or a var. Exactly one
+// may exist and it must be RecordAeadAlgId. A second spelling of the same code point is the shape
+// this tree keeps rediscovering -- two names for one wire value, one of which is edited.
+//
+// Three axes, and two of them were measured as escapes before they were closed. The BASE was
+// already read as a number rather than as the text 0x0021, and a decimal 33 was caught. The other
+// two were not: a var recordAeadAlgIdWire uint16 = 0x0021 and a const written 0x0020 + 1 both
+// landed with the whole suite green, because the reading filtered on token.CONST and then on a
+// bare BasicLit. The property is "a second name for one wire value", and a var satisfies it as
+// well as a const, and an arithmetic expression satisfies it as well as a literal.
+func TestExactlyOneDeclarationOfThisPackageCarriesTheRecordAeadCodePoint(t *testing.T) {
 	fileSet, sources := messagegroupProductionSources(t)
 	carrying := []string{}
 	for _, source := range sources {
 		for _, declaration := range source.parsed.Decls {
 			general, isGeneral := declaration.(*ast.GenDecl)
-			if !isGeneral || general.Tok != token.CONST {
+			if !isGeneral || (general.Tok != token.CONST && general.Tok != token.VAR) {
 				continue
 			}
 			for _, spec := range general.Specs {
@@ -117,11 +124,8 @@ func TestExactlyOneConstantOfThisPackageCarriesTheRecordAeadCodePoint(t *testing
 					if len(value.Values) <= i {
 						continue
 					}
-					literal, isLiteral := value.Values[i].(*ast.BasicLit)
-					if !isLiteral || literal.Kind != token.INT {
-						continue
-					}
-					if !recordAeadLiteralIsTheCodePoint(literal.Value) {
+					folded, isInteger := recordAeadFoldedInteger(value.Values[i])
+					if !isInteger || folded != uint64(recordAeadAlgIdFromMaster) {
 						continue
 					}
 					carrying = append(carrying, name.Name+" at "+fileSet.Position(name.Pos()).String())
@@ -130,7 +134,7 @@ func TestExactlyOneConstantOfThisPackageCarriesTheRecordAeadCodePoint(t *testing
 		}
 	}
 	if len(carrying) != 1 {
-		t.Fatalf("%d package level constants of this package carry the record aead code point %#04x: %v; MASTER registers one identifier and a second name for it is one edit away from two implementations disagreeing",
+		t.Fatalf("%d package level declarations of this package carry the record aead code point %#04x: %v; MASTER registers one identifier and a second name for it is one edit away from two implementations disagreeing",
 			len(carrying), recordAeadAlgIdFromMaster, carrying)
 	}
 	if !strings.HasPrefix(carrying[0], "RecordAeadAlgId ") {
@@ -139,12 +143,60 @@ func TestExactlyOneConstantOfThisPackageCarriesTheRecordAeadCodePoint(t *testing
 	}
 }
 
-// Whether a go integer literal, in any spelling the language allows, is the code point.
+// The value of a constant integer EXPRESSION, folded.
 //
-// Read as a number rather than matched as the text 0x0021, because 33, 0o41 and 0b100001 are
-// the same constant and a gate that matched the hex spelling would report clean over any of
-// them.
-func recordAeadLiteralIsTheCodePoint(text string) bool {
+// A literal, a parenthesised one, a unary plus, and the four arithmetic operators over any of
+// those, so 0x0020 + 1 and 33 and 0x21 are one number to this reading. Anything naming an
+// identifier, or of any other kind, is not an integer this gate can decide and is reported as
+// such rather than as zero -- reporting it as zero would make every non-integer declaration a
+// match for a code point of zero.
+func recordAeadFoldedInteger(expr ast.Expr) (uint64, bool) {
+	switch typed := expr.(type) {
+	case *ast.BasicLit:
+		if typed.Kind != token.INT {
+			return 0, false
+		}
+		return recordAeadLiteralValue(typed.Value)
+	case *ast.ParenExpr:
+		return recordAeadFoldedInteger(typed.X)
+	case *ast.UnaryExpr:
+		if typed.Op != token.ADD {
+			return 0, false
+		}
+		return recordAeadFoldedInteger(typed.X)
+	case *ast.BinaryExpr:
+		left, leftIsInteger := recordAeadFoldedInteger(typed.X)
+		right, rightIsInteger := recordAeadFoldedInteger(typed.Y)
+		if !leftIsInteger || !rightIsInteger {
+			return 0, false
+		}
+		switch typed.Op {
+		case token.ADD:
+			return left + right, true
+		case token.SUB:
+			if left < right {
+				return 0, false
+			}
+			return left - right, true
+		case token.MUL:
+			return left * right, true
+		case token.OR:
+			return left | right, true
+		case token.SHL:
+			if 63 < right {
+				return 0, false
+			}
+			return left << right, true
+		}
+	}
+	return 0, false
+}
+
+// The value of one go integer literal, in any spelling the language allows.
+//
+// Read as a number rather than matched as the text 0x0021, because 33, 0o41 and 0b100001 are the
+// same constant and a gate that matched the hex spelling would report clean over any of them.
+func recordAeadLiteralValue(text string) (uint64, bool) {
 	cleaned := strings.ToLower(strings.ReplaceAll(text, "_", ""))
 	base := 10
 	switch {
@@ -158,17 +210,55 @@ func recordAeadLiteralIsTheCodePoint(text string) bool {
 		base, cleaned = 8, cleaned[1:]
 	}
 	if len(cleaned) == 0 {
-		return false
+		return 0, false
 	}
 	value := uint64(0)
 	for _, digit := range cleaned {
 		place := strings.IndexRune("0123456789abcdef", digit)
 		if place < 0 || base <= place {
-			return false
+			return 0, false
 		}
 		value = value*uint64(base) + uint64(place)
 	}
-	return value == uint64(recordAeadAlgIdFromMaster)
+	return value, true
+}
+
+// The folding, held to shapes it must read and shapes it must not, so a matcher that stopped
+// folding fails here rather than clearing the package.
+func TestTheCodePointFoldingReadsEverySpellingOfOneNumber(t *testing.T) {
+	for _, row := range []struct {
+		text    string
+		want    uint64
+		integer bool
+	}{
+		{text: "0x0021", want: 0x21, integer: true},
+		{text: "33", want: 33, integer: true},
+		{text: "0o41", want: 33, integer: true},
+		{text: "0b100001", want: 33, integer: true},
+		{text: "041", want: 33, integer: true},
+		{text: "0x0020 + 1", want: 33, integer: true},
+		{text: "(0x0020) + 1", want: 33, integer: true},
+		{text: "0x20 | 0x01", want: 33, integer: true},
+		{text: "0x22 - 1", want: 33, integer: true},
+		{text: "1 << 5 | 1", want: 33, integer: true},
+		{text: "3 * 11", want: 33, integer: true},
+		{text: "\"0x0021\"", integer: false},
+		{text: "someOtherName", integer: false},
+		{text: "someOtherName + 1", integer: false},
+	} {
+		parsed, err := parser.ParseExpr(row.text)
+		if err != nil {
+			t.Fatalf("parse %q: %v", row.text, err)
+		}
+		got, isInteger := recordAeadFoldedInteger(parsed)
+		if isInteger != row.integer {
+			t.Errorf("%q folded to an integer: %v, want %v", row.text, isInteger, row.integer)
+			continue
+		}
+		if isInteger && got != row.want {
+			t.Errorf("%q folded to %d, want %d", row.text, got, row.want)
+		}
+	}
 }
 
 // A key, a nonce, an aad and a plaintext that are each distinctive and none of which is a
@@ -460,5 +550,44 @@ func TestACiphertextSealedUnderOneRecordAadDoesNotOpenUnderTheOther(t *testing.T
 	}
 	if out, err := openRecordAead(key, nonce, otherHead, sealed); !errors.Is(err, ErrRecordAeadOpen) || out != nil {
 		t.Errorf("a ciphertext sealed under aad_head with alg_id %#04x opened under alg_id %#04x", RecordAeadAlgId, hkdfSha256AlgIdFromMaster)
+	}
+}
+
+// The aad is not optional on the seal side, and that is a refusal rather than a sentence.
+//
+// The header of sealRecordAead used to claim the aad "is never nil in practice" while nothing
+// enforced it: a nil aad sealed and returned a ciphertext whose epoch, stream index, sender handle
+// and retention class were authenticated by nothing at all, and it opened again just as happily
+// against the same nothing. Task 11 is the only caller and would have passed one, so the exposure
+// was prose stating an invariant as if it were held -- which is exactly the class this package's
+// own rule 11a sweep is for.
+//
+// The OPEN side deliberately keeps no such refusal, and the round trip below is what says so: an
+// empty aad on that side is a ciphertext that fails to authenticate, which is the answer it should
+// get, and a width check there would answer a different error to an attacker's choice of input.
+func TestTheRecordAeadRefusesToSealAgainstNoAad(t *testing.T) {
+	key, nonce, aad, plaintext := recordAeadFixture()
+	for _, empty := range [][]byte{nil, {}} {
+		sealed, err := sealRecordAead(key, nonce, empty, plaintext)
+		if !errors.Is(err, ErrRecordAeadAadMissing) {
+			t.Errorf("sealing against a %d octet aad answered %v, want ErrRecordAeadAadMissing", len(empty), err)
+		}
+		if sealed != nil {
+			t.Errorf("sealing against a %d octet aad answered %d octets of ciphertext", len(empty), len(sealed))
+		}
+	}
+	// a real aad is not refused, so the check is a refusal of the empty case and not of every
+	// case
+	sealed, err := sealRecordAead(key, nonce, aad, plaintext)
+	if err != nil {
+		t.Fatalf("sealing against a real aad: %v", err)
+	}
+	// and the open side still refuses an empty aad by failing to authenticate, which is the
+	// answer that carries no information about which check it failed
+	if _, err := openRecordAead(key, nonce, nil, sealed); !errors.Is(err, ErrRecordAeadOpen) {
+		t.Errorf("opening under an empty aad answered %v, want ErrRecordAeadOpen", err)
+	}
+	if opened, err := openRecordAead(key, nonce, aad, sealed); err != nil || string(opened) != string(plaintext) {
+		t.Errorf("the round trip under a real aad answered %v", err)
 	}
 }

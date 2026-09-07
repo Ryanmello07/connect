@@ -1166,6 +1166,12 @@ var typesTheEraseClassReachesThatOweNoErase = map[string]string{
 		"applies the result owns it, exactly as PathDecryptResult's row says of the state it hands out",
 	"CachedProposal": "a proposal this member received and the reference it is keyed by. Both went to every " +
 		"member of the group and to the delivery service; ProposalCache.byRef is excused for the same reason",
+	"ReceiverRatchetKey": "the two values one receiver ratchet is TRACKED under: the sender handle the message " +
+		"server routes on, which every member of the group computes and which is in the cleartext header of " +
+		"every record, and the retention class wire byte, which is one octet of that same header. It is " +
+		"BodyBinding one row up read again: both halves travel in the clear beside the ciphertext they " +
+		"address, so an erase here would remove nothing an attacker lacks. The key material is in the " +
+		"ReceiverRatchet the key points at, and that type is a member of this class in its own right",
 	"CommitResult": "the ENCODINGS a committer hands its caller to send -- the commit message, the welcome and " +
 		"the ratchet tree. Every octet of all three is about to be on the wire, which is the whole purpose of " +
 		"the structure. The key material this commit holds is in the staged epoch beside it, and that is a " +
@@ -1285,6 +1291,12 @@ var theFieldsOfTheEraseClassThatAreNotKeyMaterial = map[string]string{
 		"cleared by UnmarshalMLS, so a committer's copy of somebody else's key package holds no private half. " +
 		"Erasing it would remove nothing an attacker lacks and would destroy a value the caller still owns; " +
 		"the path secret beside it is the key material, and (*WelcomeJoiner).Zeroize erases that",
+	"SenderRatchet.groupId": "the id of the group this ratchet reserves its stream indices against. A group id " +
+		"is in the cleartext header of every record, is what the message server keys every row of its store on, " +
+		"and is what section 8.2 MessageStore takes as the first argument of both of its stream index methods. " +
+		"StagedCommit.groupId is excused three rows up in the same words. The ratchet holds a COPY of it -- so a " +
+		"caller reusing its buffer cannot move which row the reservations land in -- and that copy is as public " +
+		"as the one the caller kept",
 	"UpdatePathPlan.PublicKeys": "the public half of the path this commit publishes, which is exactly what the " +
 		"UpdatePath on the wire carries",
 	"UpdatePathPlan.LeafNode": "the re-signed leaf node this commit installs in the tree, which is public the " +

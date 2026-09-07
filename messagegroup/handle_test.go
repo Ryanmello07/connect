@@ -227,28 +227,47 @@ func TestWrapTargetHandleDependsOnBothTheEpochAndTheLeaf(t *testing.T) {
 	}
 }
 
-// Property 4: the two leaf index derivations agree about what LP(leaf_index) means, because one
-// of them routes through the one helper and the other deliberately does not.
+// Property 4: every derivation that binds a leaf index agrees about what LP(leaf_index) means,
+// because the ones that length prefix it route through the one helper and the one that does not
+// says so.
 //
-// The CLASS is derived: every production function of this package that takes a uint32 parameter
-// naming a leaf index AND expands under a label. Today that is SenderHandle and
-// WrapTargetHandle, and task 5's record_key[0] joins it on the commit that declares it.
+// THE CLASS IS DERIVED FROM THE PROPERTY AND NOT FROM A PARAMETER NAME, and that is this gate's
+// history rather than a preference. The version this replaces required a uint32 parameter whose
+// NAME contained "leaf". Measured on this package's own source: an exported
+// RecordKeyZero(classKey []byte, index uint32) taking the OPPOSITE, minimal encoding reading of
+// LP -- with its own inline WriteOpaqueLP, five octets where the helper produces eight, so the two
+// derivations disagree on the wire -- landed with every gate in the tree green, because it spelled
+// its parameter "index". Task 5's record_key[0] was the next commit and was the second wire
+// visible consumer of that unruled reading.
+//
+// So the class is: every production declaration of this package that takes a uint32 AND reaches
+// the key schedule, transitively through this package's own calls. A leaf index is the only
+// uint32 any derivation here binds, the reachability is what says "this number goes into a key",
+// and neither half can be satisfied by choosing a name.
 //
 // The table is held in BOTH directions, and it is a table rather than an assertion because
-// MASTER writes the two members differently: sender_handle length prefixes the index and
+// MASTER writes the members differently: sender_handle length prefixes the index and
 // wrap_target_handle writes it raw. A gate that demanded one reading of both would be a gate
 // against the spec. What it demands instead is that every member declare which reading it takes
 // and that the length prefixing members share one implementation of it, so open item M1-8's
 // ruling is one edit.
 var handleLeafIndexReadings = map[string]string{
+	"RecordKeyZero": "LP -- MASTER section 8.1 writes record_key[0] = HKDF-Expand(class_key, " +
+		"\"sender/v1\" | LP(leaf_index), 32), the same shape as sender_handle and through the same helper",
+	"NewSenderRatchet": "LP -- it binds the leaf only through RecordKeyZero, so its reading is that " +
+		"one, and a second spelling here would be a ladder head no peer reproduces",
+	"NewReceiverRatchet": "LP -- it binds the leaf only through RecordKeyZero, and a receiver whose " +
+		"ladder head disagreed with the sender's would open nothing at all",
 	"SenderHandle": "LP -- MASTER section 8 writes sender_handle as HKDF-Expand(group_handle_key, " +
 		"\"sh/v1\" | LP(leaf_index), 16), and this is the one place in the project where LP wraps an integer",
 	"WrapTargetHandle": "raw -- section 5.11 writes wrap_target_handle with u32(leaf_index) and no length " +
 		"prefix at all, which is the asymmetry open item M1-8 is about",
 }
 
-func TestBothLeafIndexDerivationsDeclareTheirReadingAndShareOneHelper(t *testing.T) {
+func TestEveryLeafIndexDerivationDeclaresItsReadingAndSharesOneHelper(t *testing.T) {
 	_, sources := messagegroupProductionSources(t)
+	reachesTheKdf := recordKeyKdfReachingFunctions(sources)
+	reachesTheHelper := messagegroupFunctionsReaching(sources, []string{"leafIndexLP"})
 	members := []string{}
 	callsHelper := map[string]bool{}
 	for _, source := range sources {
@@ -257,20 +276,17 @@ func TestBothLeafIndexDerivationsDeclareTheirReadingAndShareOneHelper(t *testing
 			if !isFunction || function.Body == nil {
 				continue
 			}
-			if !handleTakesALeafIndex(function) {
+			name := function.Name.Name
+			if !handleTakesAUint32(function) || !reachesTheKdf[name] {
 				continue
 			}
-			callees := keyScheduleCalleeNames(function.Body)
-			if !slices.Contains(callees, "keyScheduleExpand") {
-				continue
-			}
-			members = append(members, function.Name.Name)
-			callsHelper[function.Name.Name] = slices.Contains(callees, "leafIndexLP")
+			members = append(members, name)
+			callsHelper[name] = reachesTheHelper[name]
 		}
 	}
 	slices.Sort(members)
 	if len(members) == 0 {
-		t.Fatal("no production function of this package expands under a leaf index, so this gate held nothing to one reading of LP(leaf_index)")
+		t.Fatal("no production function of this package binds a uint32 into a derivation, so this gate held nothing to one reading of LP(leaf_index)")
 	}
 	for _, name := range members {
 		reading, hasRow := handleLeafIndexReadings[name]
@@ -293,25 +309,43 @@ func TestBothLeafIndexDerivationsDeclareTheirReadingAndShareOneHelper(t *testing
 				name)
 		}
 	}
-	// and the helper is the ONLY place a leaf index is length prefixed, derived over the calls
-	// rather than over a file name: any function writing an LP whose argument names a leaf is a
-	// second reading of M1-8.
-	prefixing := []string{}
+	// and the helper is the ONLY place a length prefix is written, and the only place besides the
+	// one declared raw reading where a uint32 becomes octets at all. Both halves are read off the
+	// CALLS -- a length prefix written, a thirty two bit encoding spelled -- rather than off an
+	// argument name, because a second reading arrives with whatever names its author chooses.
+	prefixing, encoding := []string{}, []string{}
 	for _, source := range sources {
 		for _, declaration := range source.parsed.Decls {
 			function, isFunction := declaration.(*ast.FuncDecl)
 			if !isFunction || function.Body == nil {
 				continue
 			}
-			if handlePrefixesALeafIndex(function.Body) {
+			if handleWritesALengthPrefix(function.Body) {
 				prefixing = append(prefixing, function.Name.Name)
+			}
+			if handleEncodesAUint32(function.Body) {
+				encoding = append(encoding, function.Name.Name)
 			}
 		}
 	}
 	slices.Sort(prefixing)
+	slices.Sort(encoding)
 	if !slices.Equal(prefixing, []string{"leafIndexLP"}) {
-		t.Errorf("a leaf index is length prefixed in %v; there is one reading of LP(leaf_index) in this package and it lives in leafIndexLP so that M1-8's ruling is a single edit",
+		t.Errorf("a length prefix is written in %v; there is one reading of LP(leaf_index) in this package and it lives in leafIndexLP so that M1-8's ruling is a single edit",
 			prefixing)
+	}
+	if len(encoding) == 0 {
+		t.Fatal("nothing in this package encodes a uint32, so this half of the gate read nothing")
+	}
+	for _, name := range encoding {
+		if name == "leafIndexLP" {
+			continue
+		}
+		reading, hasRow := handleLeafIndexReadings[name]
+		if !hasRow || !strings.HasPrefix(reading, "raw") {
+			t.Errorf("%s turns a uint32 into octets itself and is not the one helper that reads LP(leaf_index); only a member declared to write its index RAW may spell its own encoding",
+				name)
+		}
 	}
 	// the reading itself: eight octets, the length 00 00 00 04 then the index
 	for _, leaf := range []uint32{0, 1, 7, 0xFFFFFFFF} {
@@ -323,47 +357,47 @@ func TestBothLeafIndexDerivationsDeclareTheirReadingAndShareOneHelper(t *testing
 	}
 }
 
-// Whether a declaration takes a uint32 parameter that names a leaf index.
-func handleTakesALeafIndex(function *ast.FuncDecl) bool {
+// Whether a declaration takes a uint32 parameter, whatever it is called.
+//
+// The NAME is deliberately not read. A leaf index is the only uint32 any derivation in this
+// package binds, and the previous version of this predicate -- which required the name to contain
+// "leaf" -- let a second, contradicting reading of LP(leaf_index) into production under the name
+// "index" with every gate in the tree green.
+func handleTakesAUint32(function *ast.FuncDecl) bool {
 	if function.Type.Params == nil {
 		return false
 	}
 	for _, parameter := range function.Type.Params.List {
 		identifier, isIdentifier := parameter.Type.(*ast.Ident)
-		if !isIdentifier || identifier.Name != "uint32" {
-			continue
-		}
-		for _, name := range parameter.Names {
-			if strings.Contains(strings.ToLower(name.Name), "leaf") {
-				return true
-			}
+		if isIdentifier && identifier.Name == "uint32" && len(parameter.Names) != 0 {
+			return true
 		}
 	}
 	return false
 }
 
-// Whether a body writes a length prefix around something naming a leaf.
-func handlePrefixesALeafIndex(body ast.Node) bool {
-	found := false
-	ast.Inspect(body, func(node ast.Node) bool {
-		call, isCall := node.(*ast.CallExpr)
-		if !isCall {
+// Whether a body writes a length prefix at all.
+//
+// WriteOpaqueLP is mls/syntax's one LP implementation and is deliberately not WriteOpaque, mls's
+// varint: codec.go's header and mls/syntax/encode.go both say the two are never interchangeable.
+// Any call to it outside leafIndexLP is a second place LP is spelled.
+func handleWritesALengthPrefix(body ast.Node) bool {
+	return slices.Contains(keyScheduleCalleeNames(body), "WriteOpaqueLP")
+}
+
+// Whether a body turns a uint32 into octets.
+//
+// Derived from the SHAPE of the callee name rather than from a list of the three functions this
+// tree happens to use: anything ending in Uint32 is a thirty two bit encoding or decoding,
+// whichever package it comes from, so binary.BigEndian.AppendUint32, binary.BigEndian.PutUint32
+// and the syntax writer's WriteUint32 are all read, and so is one this module has not got yet.
+func handleEncodesAUint32(body ast.Node) bool {
+	for _, callee := range keyScheduleCalleeNames(body) {
+		if strings.HasSuffix(callee, "Uint32") {
 			return true
 		}
-		selector, isSelector := call.Fun.(*ast.SelectorExpr)
-		if !isSelector || selector.Sel.Name != "WriteOpaqueLP" {
-			return true
-		}
-		for _, argument := range call.Args {
-			for _, named := range keyScheduleIdentifiersIn(argument) {
-				if strings.Contains(strings.ToLower(named), "leaf") {
-					found = true
-				}
-			}
-		}
-		return true
-	})
-	return found
+	}
+	return false
 }
 
 // Property 5: a group handle key that is not thirty two octets is refused by both handles, with

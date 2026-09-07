@@ -97,12 +97,22 @@ func newRecordAead(key []byte, nonce []byte) (cipher.AEAD, error) {
 // sealRecordAead seals one of a record's two plaintexts under its own key, its own nonce and
 // its own additional authenticated data.
 //
-// The aad is not optional and is never nil in practice: ct_head is sealed against aad_head and
-// ct_body against aad_body, which is MASTER invariant I7, and the two preimages differ in
-// their label before they differ in anything else. Nothing is appended to a caller's buffer --
-// the destination is nil at every call -- so the ciphertext is a fresh allocation and an
-// aliased plaintext cannot be produced.
+// The aad is not optional, and that is now a refusal rather than a sentence. ct_head is sealed
+// against aad_head and ct_body against aad_body, which is MASTER invariant I7, and the two
+// preimages differ in their label before they differ in anything else. This header used to
+// claim the aad "is never nil in practice" while nothing enforced it: an empty aad sealed and
+// returned a ciphertext whose epoch, stream index, sender handle and retention class were
+// authenticated by nothing, and it opened again just as happily against the same nothing. The
+// open side is deliberately NOT given the same refusal -- an empty aad on that side is a
+// ciphertext that fails to authenticate, which is the answer it should get, and a width check
+// there would answer a different error to an attacker's choice of input.
+//
+// Nothing is appended to a caller's buffer -- the destination is nil at every call -- so the
+// ciphertext is a fresh allocation and an aliased plaintext cannot be produced.
 func sealRecordAead(key []byte, nonce []byte, aad []byte, plaintext []byte) ([]byte, error) {
+	if len(aad) == 0 {
+		return nil, fmt.Errorf("%w: %d octets of plaintext", ErrRecordAeadAadMissing, len(plaintext))
+	}
 	aead, err := newRecordAead(key, nonce)
 	if err != nil {
 		return nil, err
