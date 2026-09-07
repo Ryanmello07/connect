@@ -64,13 +64,17 @@ var (
 	// were authenticated by nothing at all.
 	ErrRecordAeadAadMissing = errors.New("messagegroup: a record aead was asked to seal against an empty aad")
 	// Fires when a stream index reservation is asked to go backwards -- a persisted high
-	// water behind an index already handed out. Spec A section 5.6 makes the counter write
-	// once, so a rewind is a store that lost a flush, and every index above it is a nonce
-	// this device may already have used.
+	// water behind an index already handed out, or an allocation that came back below the
+	// ladder standing on it. Spec A section 5.6 makes the counter write once, so a rewind is a
+	// store that lost a flush, and every index above it is a nonce this device may already
+	// have used.
 	ErrStreamIndexRewound = errors.New("messagegroup: a stream index reservation is behind an index already reserved")
-	// Fires when an index that has already been consumed is reserved a second time. This is
-	// the one section 5.6 spells out: a reused stream index is a reused nonce under a reused
-	// record key, which is a total break of both of a record's aeads.
+	// Fires when the store cannot allocate the next index of a stream at all: its next
+	// position is one it has already handed out and it has no way past it. Under ruling A1 the
+	// counter is the store's, so this is the store reporting a state it cannot leave rather
+	// than a caller being told no -- and the underlying hazard is the one section 5.6 spells
+	// out, that a reused stream index is a reused nonce under a reused record key, which is a
+	// total break of both of a record's aeads.
 	ErrStreamIndexConsumed = errors.New("messagegroup: a stream index has already been consumed")
 	// Fires when a stream index reserver is nil where one is required. The reservation is
 	// ordered BEFORE the key, so a ratchet without a sink is a ratchet that cannot make the
@@ -161,13 +165,18 @@ var (
 	// from thirty two zeros -- the SAME key, and so the same (key, nonce) pair, for every
 	// zeroized ratchet in the world, with the stream index durably consumed under it.
 	ErrRatchetZeroized = errors.New("messagegroup: this ratchet has been zeroized and can produce no further keys")
-	// Fires when the reserver refuses an index as already consumed. It is separated from a
-	// transient reservation failure because the two need opposite answers: a full disk is a
-	// retry and the same index is offered again, while an index that has already been consumed
-	// will never be free, so a ratchet that re-offered it would spin forever on a stream it
-	// can no longer extend. The ratchet is wedged rather than advanced, because advancing past
-	// it would hand out a rung under an index some record has already used.
-	ErrSenderRatchetWedged = errors.New("messagegroup: this sender ratchet's next stream index has already been consumed and it cannot advance past it")
+	// Fires when a sender ratchet can never serve another allocation its store makes. Three
+	// ways in and every one is permanent for that ratchet: the store refused to allocate at
+	// all, the store handed back an index at or below the one the ladder stands on, or it
+	// handed back one so far ahead that the catch-up walk exceeds maxLadderWalk -- which under
+	// ruling A1's shared counter is what a class that went quiet for a whole sender's stream
+	// meets, with no corrupt store in it. It is separated from a transient failure because the
+	// two need opposite answers: a full disk is a retry and the ladder does not move, while
+	// none of these three becomes true later, so a ratchet that went on asking would refuse
+	// every send forever while paying a durable write per attempt. The error wraps the
+	// underlying sentinel -- ErrStreamIndexConsumed, ErrStreamIndexRewound or
+	// ErrLadderWalkTooLong -- so a caller can tell the three apart with errors.Is.
+	ErrSenderRatchetWedged = errors.New("messagegroup: this sender ratchet can no longer serve the stream indices its store allocates")
 	// Fires when a ladder resume would cost more expansions than this package will pay. Both
 	// constructors walk one HKDF-Expand per index below their starting point, and neither the
 	// stream index in a record's cleartext header nor a high water read back out of a store is

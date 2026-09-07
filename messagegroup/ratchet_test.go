@@ -119,8 +119,25 @@ func TestEveryReservationIsCheckedBeforeTheKeyScheduleIsReached(t *testing.T) {
 	}
 }
 
-// The ordering, decided on one function body: the statement holding the Reserve call binds its
-// error and returns on non-nil, and no statement at or before it reaches the key schedule.
+// The ordering, decided on one function body: the statement holding the Reserve call binds EVERY
+// result it answers, the guard immediately after it returns, and no statement at or before it
+// reaches the key schedule.
+//
+// THIS READING MOVED WITH RULING A1 AND IT MOVED WIDER, which is recorded here because a reader
+// comparing it against the wave 1 version will otherwise read a loosening. Wave 1's Reserve
+// answered one value, so the gate required literally one spelling -- the call in an if's Init,
+// with exactly one name on the left. A1 makes Reserve an ALLOCATION answering (uint64, error), so
+// that spelling is no longer the one a correct body has; keeping it would have been a control
+// tuned to a signature rather than to a property, and the property is what this file is for.
+//
+// So the reading is now the property itself and it is STRICTER than what it replaced. Every
+// result is required to be bound to a real name, which under wave 1 meant only the error and now
+// means the INDEX as well -- and that clause is exactly the A1 defect a reader would otherwise
+// have to catch by eye: a Next that discarded the store's index and handed out its own next
+// number compiles, seals, and is undecryptable by every peer. Both spellings of the guard are
+// accepted -- the call in an if's Init, and the call in an assignment whose very next statement
+// is the guard -- because both make the reservation durable before the key exists, which is the
+// whole of what section 5.6 asks for.
 func ratchetCheckReservationOrder(t *testing.T, function *ast.FuncDecl, schedule map[string]bool) {
 	t.Helper()
 	reserveAt, scheduleAt := -1, -1
@@ -145,19 +162,40 @@ func ratchetCheckReservationOrder(t *testing.T, function *ast.FuncDecl, schedule
 		t.Errorf("%s reaches the key schedule at statement %d and reserves at statement %d; the reservation must be durable BEFORE the key exists",
 			function.Name.Name, scheduleAt, reserveAt)
 	}
-	guard, isIf := function.Body.List[reserveAt].(*ast.IfStmt)
-	if !isIf || guard.Init == nil {
-		t.Errorf("%s does not bind the reservation's error in the if that guards it; a discarded error is a reservation that did not happen", function.Name.Name)
+	// the two spellings, resolved to the same two things: the assignment that binds Reserve's
+	// results, and the if that refuses on them.
+	bound, guard := (*ast.AssignStmt)(nil), (*ast.IfStmt)(nil)
+	switch statement := function.Body.List[reserveAt].(type) {
+	case *ast.IfStmt:
+		guard = statement
+		bound, _ = statement.Init.(*ast.AssignStmt)
+	case *ast.AssignStmt:
+		bound = statement
+		if reserveAt+1 < len(function.Body.List) {
+			// the guard has to be the VERY NEXT statement. Anything between the
+			// allocation and its refusal is work done on the strength of an error
+			// nobody has looked at yet.
+			guard, _ = function.Body.List[reserveAt+1].(*ast.IfStmt)
+		}
+	}
+	if bound == nil {
+		t.Errorf("%s does not bind what Reserve answers; a discarded result is a reservation that did not happen", function.Name.Name)
 		return
 	}
-	bound, isAssign := guard.Init.(*ast.AssignStmt)
-	if !isAssign || len(bound.Lhs) != 1 {
-		t.Errorf("%s binds the reservation's result to %d names; the error is the whole of what Reserve answers", function.Name.Name, len(bound.Lhs))
+	if guard == nil {
+		t.Errorf("%s binds the reservation and does not refuse on it in the next statement; section 5.6 says the seal refuses to proceed on error", function.Name.Name)
 		return
 	}
-	if name, isName := bound.Lhs[0].(*ast.Ident); !isName || name.Name == "_" {
-		t.Errorf("%s discards the reservation's error", function.Name.Name)
-		return
+	// EVERY result, not only the error. Under A1 the index is the store's answer and a body
+	// that dropped it would hand out a rung of its own choosing under a number the store
+	// allocated to something else.
+	for at, target := range bound.Lhs {
+		name, isName := target.(*ast.Ident)
+		if !isName || name.Name == "_" {
+			t.Errorf("%s discards result %d of the reservation; under ruling A1 the store answers the index as well as the error and both are load bearing",
+				function.Name.Name, at)
+			return
+		}
 	}
 	returns := false
 	ast.Inspect(guard.Body, func(node ast.Node) bool {
@@ -339,12 +377,32 @@ func TestConcurrentNextCallsNeverHandOutOneIndex(t *testing.T) {
 // The ratchet is positioned at the last index a u64 holds by writing the field, because the only
 // other way there is 2^64 reservations. That is a test reaching into its own package and not a
 // production seam: nothing exported can set the position.
+//
+// THE STORE IS MOVED WITH IT, and that is ruling A1 rather than a convenience. Under wave 1 the
+// ratchet chose the index, so writing the field was the whole of getting it to the end of the
+// counter; under A1 the index is the STORE'S answer, and a ladder parked at the last index over a
+// store still at zero is not an exhausted stream at all -- it is a store that went backwards
+// under a live ladder, which is a different refusal this file holds one case over. So the store
+// is parked one below the end, its allocation is the last index, and the ladder is standing on
+// exactly it.
 func TestTheSenderRefusesRatherThanWrappingAtTheEndOfTheCounter(t *testing.T) {
-	ratchet, err := NewSenderRatchet(ratchetClassKey(), ratchetLeaf, ratchetGroup, newStreamIndexMemory())
+	reserver := newStreamIndexMemory()
+	reserver.image[streamIndexRowKey(ratchetGroup)] = ^uint64(0) - 1
+	ratchet, err := NewSenderRatchet(ratchetClassKey(), ratchetLeaf, ratchetGroup, reserver)
+	if err == nil {
+		t.Fatal("a ratchet resuming at the last index walked 2^64 rungs rather than refusing; the resume walk is bounded")
+	}
+	if !errors.Is(err, ErrLadderWalkTooLong) {
+		t.Fatalf("a resume at the end of the counter answered %v, want ErrLadderWalkTooLong", err)
+	}
+	// so the ladder is built at the bottom and then WRITTEN to the end, which is the same
+	// reach into the package the wave 1 case made and for the same reason.
+	ratchet, err = NewSenderRatchet(ratchetClassKey(), ratchetLeaf, ratchetGroup, newStreamIndexMemory())
 	if err != nil {
 		t.Fatalf("build the ratchet: %v", err)
 	}
 	ratchet.position = ^uint64(0)
+	ratchet.reserver = &streamIndexScripted{answers: []uint64{^uint64(0)}}
 	index, key, err := ratchet.Next()
 	if err != nil {
 		t.Fatalf("the last index was refused: %v", err)
@@ -364,6 +422,34 @@ func TestTheSenderRefusesRatherThanWrappingAtTheEndOfTheCounter(t *testing.T) {
 			t.Errorf("attempt %d past the end answered index %d and a %d octet key", attempt, index, len(key))
 		}
 	}
+	// AND THE SAME AT THE END OF A WALK, which is the shape ruling A1 makes reachable and the
+	// one the case above cannot see. A ladder no longer stands where the next index will be, so
+	// a ladder five rungs below the end handed the last index by its store has to finish
+	// standing ON that index: a body that walked the gap and left the position behind would
+	// report a stream that has not ended and refuse the next call naming a rung it never
+	// reached.
+	walked, err := NewSenderRatchet(ratchetClassKey(), ratchetLeaf, ratchetGroup, newStreamIndexMemory())
+	if err != nil {
+		t.Fatalf("build the walking ratchet: %v", err)
+	}
+	walked.position = ^uint64(0) - 5
+	walked.reserver = &streamIndexScripted{answers: []uint64{^uint64(0)}}
+	walkedIndex, walkedKey, err := walked.Next()
+	if err != nil {
+		t.Fatalf("the last index at the end of a walk was refused: %v", err)
+	}
+	if walkedIndex != ^uint64(0) || len(walkedKey) != recordKeyBytes {
+		t.Fatalf("the walk answered index %d with a %d octet key", walkedIndex, len(walkedKey))
+	}
+	zeroize(walkedKey)
+	if walked.Position() != ^uint64(0) {
+		t.Errorf("after walking to the last index the ladder stands at %d, want %d; a ladder that walked the gap and left its position behind reports a stream that has not ended",
+			walked.Position(), ^uint64(0))
+	}
+	if _, _, err := walked.Next(); !errors.Is(err, ErrSenderRatchetExhausted) {
+		t.Errorf("the call after the last index at the end of a walk answered %v, want ErrSenderRatchetExhausted", err)
+	}
+
 	// and a store whose high water is already the last index is refused at construction
 	exhausted := newStreamIndexMemory()
 	exhausted.image[streamIndexRowKey(ratchetGroup)] = ^uint64(0)

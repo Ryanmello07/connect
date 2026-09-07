@@ -114,59 +114,158 @@ func TestAZeroizedReceiverRatchetHandsOutNothing(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// two retention classes of one group do not share a counter
+// ruling A1: every retention class of one sender shares one counter
 // ---------------------------------------------------------------------------
 
-// Measured on the shape the reserver used to declare: two ratchets over one reserver, keyed on
-// the group alone, left the second answering "a stream index has already been consumed" on every
-// attempt with its position stuck at 1 forever. At most one retention class per group could ever
-// send, and no test in batch B constructed two sender ratchets over one reserver.
-func TestTwoRetentionClassesOfOneGroupDoNotShareACounter(t *testing.T) {
+// TWO LADDERS OF ONE SENDER SHARE ONE COUNTER, INTERLEAVE, AND NEITHER WEDGES THE OTHER.
+//
+// THIS IS THE OPPOSITE OF THE CASE IT REPLACES AND THE REVERSAL IS THE POINT. Wave 1's
+// TestTwoRetentionClassesOfOneGroupDoNotShareACounter required the durable and permanent ladders
+// of one group to count independently -- both at 1, both at 2 -- and it was right about the
+// hazard it was built for: under the ASSERT shape, two ladders keyed on the group alone left the
+// second answering "a stream index has already been consumed" forever with its position stuck at
+// 1, so at most one class per group could ever send. The owner's ruling of 2026-09-07 says the
+// key was the wrong place to fix that, because a per-class client counter disagrees with the
+// server's own (group_id, sender_handle) row and its second class's first record is refused as a
+// regression. The wedge is closed in the INTERFACE instead: Reserve allocates.
+//
+// So what is asserted here is what the ruling actually buys, and every clause of it can fail. The
+// two ladders interleave over one counter rather than repeating each other's numbers; the union
+// of what they take is a contiguous run with no index handed out twice; each one's own indices
+// climb; and -- the clause the wave 1 case shared and the one that matters most -- one index
+// under two class keys is never one record key.
+func TestTwoRetentionClassesOfOneSenderShareOneCounter(t *testing.T) {
 	reserver := newStreamIndexMemory()
 	classKeys := DeriveClassKeys(StorageRoot(keyScheduleKatInputs()))
-	group := streamKeyNamed("one group")
-	durableStream := group
-	durableStream.RetentionWire = 0x01
-	permStream := group
-	permStream.RetentionWire = 0x00
-	if durableStream == permStream {
-		t.Fatal("the two streams are the same value, so this case cannot tell a shared counter from a separate one")
-	}
-	durable, err := NewSenderRatchet(classKeys.Durable, ratchetLeaf, durableStream, reserver)
+	stream := streamKeyNamed("one sender of one group")
+	durable, err := NewSenderRatchet(classKeys.Durable, ratchetLeaf, stream, reserver)
 	if err != nil {
 		t.Fatalf("the durable ratchet: %v", err)
 	}
-	permanent, err := NewSenderRatchet(classKeys.Perm, ratchetLeaf, permStream, reserver)
+	permanent, err := NewSenderRatchet(classKeys.Perm, ratchetLeaf, stream, reserver)
 	if err != nil {
 		t.Fatalf("the permanent ratchet: %v", err)
 	}
+	taken := map[uint64]string{}
+	lastDurable, lastPerm := uint64(0), uint64(0)
 	for round := range 4 {
 		durableIndex, durableKey, err := durable.Next()
 		if err != nil {
-			t.Fatalf("round %d, the durable ratchet: %v", round, err)
+			t.Fatalf("round %d, the durable ratchet: %v; two ladders on one counter must not wedge each other", round, err)
 		}
 		permIndex, permKey, err := permanent.Next()
 		if err != nil {
-			t.Fatalf("round %d, the permanent ratchet: %v", round, err)
+			t.Fatalf("round %d, the permanent ratchet: %v; two ladders on one counter must not wedge each other", round, err)
 		}
-		if durableIndex != uint64(round+1) || permIndex != uint64(round+1) {
-			t.Errorf("round %d answered durable %d and permanent %d; two streams count independently",
-				round, durableIndex, permIndex)
+		for _, got := range []struct {
+			class string
+			index uint64
+		}{{"durable", durableIndex}, {"permanent", permIndex}} {
+			if earlier, isRepeat := taken[got.index]; isRepeat {
+				t.Errorf("round %d: index %d went to %s after %s; one index under two class keys is a stream the server cannot order",
+					round, got.index, got.class, earlier)
+			}
+			taken[got.index] = got.class
 		}
+		if durableIndex <= lastDurable && round != 0 {
+			t.Errorf("round %d: the durable ladder went from %d to %d", round, lastDurable, durableIndex)
+		}
+		if permIndex <= lastPerm && round != 0 {
+			t.Errorf("round %d: the permanent ladder went from %d to %d", round, lastPerm, permIndex)
+		}
+		lastDurable, lastPerm = durableIndex, permIndex
 		if bytes.Equal(durableKey, permKey) {
 			t.Errorf("round %d: the two classes answered one record key", round)
 		}
 		zeroize(durableKey)
 		zeroize(permKey)
 	}
+	// the union is a contiguous run from 1, which is the shape a single counter makes and the
+	// shape two counters cannot: two independent counters would have taken 1..4 twice.
+	for want := uint64(1); want <= 8; want += 1 {
+		if _, isTaken := taken[want]; !isTaken {
+			t.Errorf("index %d was taken by neither ladder; eight sends off one counter are indices 1 through 8", want)
+		}
+	}
+	if len(taken) != 8 {
+		t.Errorf("eight sends produced %d distinct indices", len(taken))
+	}
 }
 
-// An index the store has already consumed is a PERMANENT refusal, and the ratchet stops rather
-// than offering it again forever.
+// A sparse ladder walks the gaps its siblings made, and the rung it hands out is the one its
+// OWN index names.
 //
-// Both directions: a transient failure leaves the ratchet offering the same index -- which is what
-// makes a full disk a retry rather than a hole in the stream -- and a consumed one wedges it.
-func TestAConsumedIndexWedgesTheRatchetAndATransientFailureDoesNot(t *testing.T) {
+// This is the property that makes ruling A1's shared counter safe rather than merely
+// non-wedging, and it is the one a plausible wrong implementation fails: a Next that took the
+// store's index and handed out its own next rung -- one step per call, ignoring the gap --
+// compiles, round-trips against itself, and is undecryptable by every peer, because a receiver
+// derives record_key[stream_index] and nothing else. So the ladder's answer is compared against
+// an INDEPENDENT walk of the same ladder rather than against itself.
+func TestASparseLadderHandsOutTheRungItsOwnIndexNames(t *testing.T) {
+	reserver := newStreamIndexMemory()
+	classKeys := DeriveClassKeys(StorageRoot(keyScheduleKatInputs()))
+	stream := streamKeyNamed("a sparse ladder")
+	// the chatty sibling: it is the same stream and a different class key, so every index it
+	// takes is a gap in the quiet ladder below.
+	chatty, err := NewSenderRatchet(classKeys.Perm, ratchetLeaf, stream, reserver)
+	if err != nil {
+		t.Fatalf("the chatty ratchet: %v", err)
+	}
+	quiet, err := NewSenderRatchet(classKeys.Durable, ratchetLeaf, stream, reserver)
+	if err != nil {
+		t.Fatalf("the quiet ratchet: %v", err)
+	}
+	// the independent walk: a receiver's view of the quiet ladder, which knows nothing about
+	// the sender's own state and derives every rung from record_key[0].
+	receiver, err := NewReceiverRatchet(classKeys.Durable, ratchetLeaf, 0, DefaultRecordWindowSize)
+	if err != nil {
+		t.Fatalf("the receiver: %v", err)
+	}
+	gaps := 0
+	for round := range 6 {
+		for burst := range round + 1 {
+			index, key, err := chatty.Next()
+			if err != nil {
+				t.Fatalf("round %d burst %d: %v", round, burst, err)
+			}
+			gaps += 1
+			zeroize(key)
+			_ = index
+		}
+		index, key, err := quiet.Next()
+		if err != nil {
+			t.Fatalf("round %d, the quiet ladder: %v", round, err)
+		}
+		want, err := receiver.KeyFor(index)
+		if err != nil {
+			t.Fatalf("round %d, the receiver at index %d: %v", round, index, err)
+		}
+		if !bytes.Equal(key, want) {
+			t.Fatalf("round %d: the quiet ladder handed out a rung at index %d that a receiver deriving record_key[%d] does not compute; a sparse ladder that stepped once per send rather than once per index would seal records nothing can open",
+				round, index, index)
+		}
+		zeroize(key)
+		zeroize(want)
+	}
+	if gaps == 0 {
+		t.Error("the chatty ladder took no index, so the quiet ladder was never sparse and this case judged nothing")
+	}
+	if quiet.Position() <= uint64(gaps) {
+		t.Errorf("the quiet ladder stands at %d after %d indices went to its sibling; a ladder that ignored the gaps would stand at its own send count", quiet.Position(), gaps)
+	}
+}
+
+// A store the ratchet cannot follow is a PERMANENT stop, and the three ways in are told apart
+// from a transient failure and from each other.
+//
+// Under ruling A1 the ratchet no longer chooses an index, so "an index that has already been
+// consumed" is no longer something a caller can offer. What remains is what the STORE can answer
+// that a forward ladder cannot serve, and all three wedge: a refusal to allocate at all, an
+// allocation at or below where the ladder stands, and one so far ahead that the catch-up walk
+// exceeds maxLadderWalk. Each wraps its own sentinel, so a caller can tell them apart, and a
+// transient failure is none of them -- the ladder does not move and the next call asks again,
+// which is what makes a full disk a retry rather than a hole in the stream.
+func TestAStoreTheLadderCannotFollowWedgesItAndATransientFailureDoesNot(t *testing.T) {
 	transient := &streamIndexRefusing{err: errors.New("the disk is full")}
 	retrying, err := NewSenderRatchet(ratchetClassKey(), ratchetLeaf, ratchetGroup, transient)
 	if err != nil {
@@ -177,26 +276,170 @@ func TestAConsumedIndexWedgesTheRatchetAndATransientFailureDoesNot(t *testing.T)
 			t.Fatalf("attempt %d treated a transient failure as permanent", attempt)
 		}
 		if retrying.Position() != 1 {
-			t.Errorf("attempt %d moved the position to %d; a refused reservation offers the same index to the next call", attempt, retrying.Position())
+			t.Errorf("attempt %d moved the ladder to %d; a failed allocation leaves it standing where it was", attempt, retrying.Position())
 		}
+	}
+	if transient.reserves != 3 {
+		t.Errorf("a transiently failing store was asked %d times in three calls; a retryable failure is retried", transient.reserves)
 	}
 
-	consumed := &streamIndexRefusing{err: ErrStreamIndexConsumed}
-	wedged, err := NewSenderRatchet(ratchetClassKey(), ratchetLeaf, ratchetGroup, consumed)
+	for _, permanent := range []struct {
+		name     string
+		reserver StreamIndexReserver
+		sentinel error
+		asks     int
+	}{
+		{
+			name:     "the store will not allocate",
+			reserver: &streamIndexRefusing{err: ErrStreamIndexConsumed},
+			sentinel: ErrStreamIndexConsumed,
+			asks:     1,
+		},
+		{
+			// a ladder resumed at 1 meeting an allocation of 1 has already passed
+			// nothing, so the case that has to wedge is an allocation BELOW the
+			// standing position: here the ladder is walked to 3 and then handed 2.
+			name:     "the store went backwards under a live ladder",
+			reserver: &streamIndexScripted{answers: []uint64{3, 2}},
+			sentinel: ErrStreamIndexRewound,
+			asks:     2,
+		},
+		{
+			name:     "the walk to the allocation is past the bound",
+			reserver: &streamIndexScripted{answers: []uint64{maxLadderWalk + 2}},
+			sentinel: ErrLadderWalkTooLong,
+			asks:     1,
+		},
+	} {
+		t.Run(permanent.name, func(t *testing.T) {
+			ratchet, err := NewSenderRatchet(ratchetClassKey(), ratchetLeaf, ratchetGroup, permanent.reserver)
+			if err != nil {
+				t.Fatalf("build the ratchet: %v", err)
+			}
+			// the calls before the wedging one, if the case needs the ladder moved first
+			for warm := 1; warm < permanent.asks; warm += 1 {
+				if _, key, err := ratchet.Next(); err != nil {
+					t.Fatalf("warm-up call %d: %v", warm, err)
+				} else {
+					zeroize(key)
+				}
+			}
+			for attempt := range 3 {
+				index, key, err := ratchet.Next()
+				if !errors.Is(err, ErrSenderRatchetWedged) {
+					t.Errorf("attempt %d answered %v, want ErrSenderRatchetWedged", attempt, err)
+				}
+				if !errors.Is(err, permanent.sentinel) {
+					t.Errorf("attempt %d answered %v, which does not carry %v; the three ways to wedge want telling apart",
+						attempt, err, permanent.sentinel)
+				}
+				if key != nil || index != 0 {
+					t.Errorf("attempt %d answered index %d and a %d octet key", attempt, index, len(key))
+				}
+			}
+			asked := 0
+			switch counted := permanent.reserver.(type) {
+			case *streamIndexRefusing:
+				asked = counted.reserves
+			case *streamIndexScripted:
+				asked = counted.reserves
+			}
+			if asked != permanent.asks {
+				t.Errorf("the wedged ratchet asked the store %d times, want %d; the point of wedging is that it stops asking, and every ask is a durable write",
+					asked, permanent.asks)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// open item M1-25, made observable rather than described
+// ---------------------------------------------------------------------------
+
+// EPH TRANSIENTS SPEND THE ONE COUNTER, AND 1,025 OF THEM PUT THE NEXT DURABLE RECORD PERMANENTLY
+// OUT OF A RECEIVER'S WINDOW.
+//
+// THIS CASE RULES NOTHING. Open item M1-25 asks whether transients get a counter of their own and
+// it is not this commit's to answer -- giving them one re-opens the same collision for EPH heads
+// on the day item 152 rules them onto this root. What is owed here is that the hazard is
+// EXECUTABLE, because the alternative -- a comment claiming it -- is the thing this project has
+// been burned by: a sentence in a header cannot go red.
+//
+// The mechanism, which is arithmetic and not a guess. Section 5.6 makes an EPH(bucket 0)
+// transient consume a stream index locally. Ruling A1 puts every class of one sender on one
+// counter. A receiver's window is refused by DISTANCE from its head -- classifyLocked compares
+// index - head against windowSize -- and the head of a DURABLE receiver moves only when a DURABLE
+// record arrives. So transients between two durable records are pure distance: at windowSize
+// there is exactly one more than the window can hold, and the second durable record is
+// ErrOutOfWindow, which section 5.5 turns into a gap entry the message never comes back from.
+//
+// The eph ladder is driven through the reserver rather than through a session, because the eph
+// classes have no class key at all (MASTER invariant I4) and SealRecord refuses every class but
+// DURABLE until M1-6 is ruled. What the transients spend is the COUNTER, and that is the part
+// this case is about; which key they would be sealed under is item 152's.
+func TestTransientsOnTheSharedCounterStarveADurableReceiverWindow(t *testing.T) {
+	const windowSize = DefaultRecordWindowSize
+	reserver := newStreamIndexMemory()
+	classKeys := DeriveClassKeys(StorageRoot(keyScheduleKatInputs()))
+	stream := streamKeyNamed("a sender that types")
+	durable, err := NewSenderRatchet(classKeys.Durable, ratchetLeaf, stream, reserver)
 	if err != nil {
-		t.Fatalf("build the ratchet: %v", err)
+		t.Fatalf("the durable ratchet: %v", err)
 	}
-	for attempt := range 3 {
-		index, key, err := wedged.Next()
-		if !errors.Is(err, ErrSenderRatchetWedged) {
-			t.Errorf("attempt %d over a consumed index answered %v, want ErrSenderRatchetWedged", attempt, err)
-		}
-		if key != nil || index != 0 {
-			t.Errorf("attempt %d answered index %d and a %d octet key", attempt, index, len(key))
+	receiver, err := NewReceiverRatchet(classKeys.Durable, ratchetLeaf, 0, windowSize)
+	if err != nil {
+		t.Fatalf("the receiver: %v", err)
+	}
+	first, firstKey, err := durable.Next()
+	if err != nil {
+		t.Fatalf("the first durable record: %v", err)
+	}
+	if _, err := receiver.KeyFor(first); err != nil {
+		t.Fatalf("the receiver could not open the first durable record at index %d: %v", first, err)
+	}
+	zeroize(firstKey)
+
+	// one short of the wall first, so the failure below is attributable to the last transient
+	// and not to the window being wrong from the start.
+	for typed := 0; typed < windowSize-1; typed += 1 {
+		if _, err := reserver.Reserve(stream); err != nil {
+			t.Fatalf("transient %d: %v", typed, err)
 		}
 	}
-	if consumed.reserves != 1 {
-		t.Errorf("the wedged ratchet reserved %d times; the point of wedging is that it stops asking for an index that will never be free", consumed.reserves)
+	survivable, survivableKey, err := durable.Next()
+	if err != nil {
+		t.Fatalf("the durable record after %d transients: %v", windowSize-1, err)
+	}
+	if _, err := receiver.KeyFor(survivable); err != nil {
+		t.Fatalf("index %d is already out of window after %d transients, so this case is measuring the wrong wall: %v",
+			survivable, windowSize-1, err)
+	}
+	zeroize(survivableKey)
+
+	// and now one more than the window holds. The receiver's head is at the record it just
+	// opened, so this is pure distance.
+	for typed := 0; typed <= windowSize; typed += 1 {
+		if _, err := reserver.Reserve(stream); err != nil {
+			t.Fatalf("transient %d of the starving run: %v", typed, err)
+		}
+	}
+	starved, starvedKey, err := durable.Next()
+	if err != nil {
+		t.Fatalf("the durable record after %d transients: %v", windowSize+1, err)
+	}
+	zeroize(starvedKey)
+	if _, err := receiver.KeyFor(starved); !errors.Is(err, ErrOutOfWindow) {
+		t.Fatalf("index %d, %d positions past the receiver's head after %d transients, answered %v; M1-25 is open BECAUSE this is what a typing indicator costs, and a case that cannot see it is a case that cannot report it",
+			starved, starved-survivable, windowSize+1, err)
+	}
+	// and it is permanent: the record is undecryptable and stays that way, which section 5.5
+	// surfaces as a gap entry rather than as an error the caller can retry past.
+	if _, err := receiver.PeekFor(starved); !errors.Is(err, ErrOutOfWindow) {
+		t.Errorf("a second look at index %d answered %v; the refusal is a property of the distance and does not heal", starved, err)
+	}
+	if starved-survivable != uint64(windowSize+2) {
+		t.Errorf("the starved record is %d positions past the last one that opened; %d transients plus the durable record itself is %d",
+			starved-survivable, windowSize+1, windowSize+2)
 	}
 }
 
@@ -521,4 +764,161 @@ func TestNoProductionTypeOfThisPackageSatisfiesTheReserver(t *testing.T) {
 		t.Errorf("types.Implements does not read StreamIndexReserver as satisfying itself, so whatever it is comparing is not the interface and every negative above is a negative about nothing")
 	}
 	t.Logf("%d named type(s) type checked, %d satisfying the reserver: %v", judged, len(satisfying), satisfying)
+}
+
+// ---------------------------------------------------------------------------
+// what ruling A1 costs, measured on this tree rather than quoted from the ledger
+// ---------------------------------------------------------------------------
+
+// A CLASS'S USABLE OUT-OF-ORDER WINDOW IS THE WINDOW DIVIDED BY THE NUMBER OF CLASSES SHARING THE
+// COUNTER, and it is counted here rather than asserted at a number.
+//
+// The receiver window is refused by DISTANCE in stream index, and under ruling A1 a class's own
+// records are spread across every position its siblings also take. So a window of 1,024 positions
+// no longer holds 1,024 of a class's records; it holds about 1,024/k of them. That is a price of
+// the ruling and not a defect, and it is here so that a later change to either bound moves a
+// number somebody has to look at.
+//
+// The count is DERIVED: the case round-robins k ladders over one counter and asks the receiver
+// how far it can still reach, so the answer follows from DefaultRecordWindowSize and k rather than
+// from a constant written down beside them.
+func TestASharedCounterDividesAClassesOutOfOrderWindowByTheClassCount(t *testing.T) {
+	const ladders = 3
+	reserver := newStreamIndexMemory()
+	classKeys := DeriveClassKeys(StorageRoot(keyScheduleKatInputs()))
+	stream := streamKeyNamed("three classes, one counter")
+	// the class under measurement and its two siblings. They are three DIFFERENT class keys,
+	// which is what makes them three ladders, and one stream key, which is A1.
+	watched, err := NewSenderRatchet(classKeys.Durable, ratchetLeaf, stream, reserver)
+	if err != nil {
+		t.Fatalf("the watched ratchet: %v", err)
+	}
+	siblings := []*SenderRatchet{}
+	for _, classKey := range [][]byte{classKeys.Perm, classKeys.Media} {
+		sibling, err := NewSenderRatchet(classKey, ratchetLeaf, stream, reserver)
+		if err != nil {
+			t.Fatalf("a sibling ratchet: %v", err)
+		}
+		siblings = append(siblings, sibling)
+	}
+	if len(siblings)+1 != ladders {
+		t.Fatalf("this case built %d ladders and its arithmetic is written for %d", len(siblings)+1, ladders)
+	}
+	head, headKey, err := watched.Next()
+	if err != nil {
+		t.Fatalf("the first watched record: %v", err)
+	}
+	zeroize(headKey)
+	receiver, err := NewReceiverRatchet(classKeys.Durable, ratchetLeaf, head, DefaultRecordWindowSize)
+	if err != nil {
+		t.Fatalf("the receiver: %v", err)
+	}
+	// PeekFor and not KeyFor, so the head does not move: what is being counted is how far one
+	// window reaches from ONE head, which is what a receiver holding a gap actually has.
+	reachable := 0
+	for sent := 0; sent < DefaultRecordWindowSize; sent += 1 {
+		for _, sibling := range siblings {
+			_, siblingKey, err := sibling.Next()
+			if err != nil {
+				t.Fatalf("a sibling could not send: %v", err)
+			}
+			zeroize(siblingKey)
+		}
+		index, key, err := watched.Next()
+		if err != nil {
+			t.Fatalf("the watched ladder could not send: %v", err)
+		}
+		zeroize(key)
+		if _, err := receiver.PeekFor(index); err != nil {
+			if !errors.Is(err, ErrOutOfWindow) {
+				t.Fatalf("the receiver answered %v at index %d, want ErrOutOfWindow or a key", err, index)
+			}
+			break
+		}
+		reachable += 1
+	}
+	// the shape of the answer rather than the answer: about one window divided by the ladders
+	// sharing the counter, and unambiguously not a whole window.
+	want := DefaultRecordWindowSize / ladders
+	if reachable < want-ladders || want+ladders < reachable {
+		t.Errorf("a receiver reached %d of the watched class's records from one head; %d ladders sharing one counter put about %d of them inside a %d position window",
+			reachable, ladders, want, DefaultRecordWindowSize)
+	}
+	if DefaultRecordWindowSize <= reachable {
+		t.Errorf("a receiver reached %d records, which is a whole window; under one shared counter a class does not get a whole window and a case that saw one is not measuring A1",
+			reachable)
+	}
+	t.Logf("window %d positions, %d ladders on one counter: %d of the watched class's own records reachable from one head",
+		DefaultRecordWindowSize, ladders, reachable)
+}
+
+// The unit every cost in this package's comments is quoted in: one rung of the ladder.
+//
+// It is a benchmark rather than a constant because the only honest derivation of a cpu bound is a
+// measurement, which is the argument maxLadderWalk's own comment makes.
+func BenchmarkSenderLadderRung(b *testing.B) {
+	recordKey := RecordKeyZero(ratchetClassKey(), ratchetLeaf)
+	b.ResetTimer()
+	for range b.N {
+		recordKey = stepRecordKey(recordKey)
+	}
+	b.StopTimer()
+	zeroize(recordKey)
+}
+
+// What ruling A1 costs at an epoch change, which is the one cost the ruling was taken knowing.
+//
+// installEpochOnLoop drops every sender ratchet at a commit -- they hold the previous epoch's
+// rungs, which is what forward secrecy is about -- and each one is rebuilt by walking from
+// record_key[0] to the store's high water. Under per-class counters a sender that had sent P
+// records across k classes had k counters at about P/k each, so the rebuild was P rungs in total.
+// Under A1 there is ONE counter at P, and every one of the k ladders walks all of it: k x P, plus
+// the P the epoch's own sends walk, which is the (k+1) x P the ledger prices.
+//
+// The two shapes are benchmarked side by side so the ratio is measured rather than asserted, and
+// the last shape is the wall: a stream one rung past maxLadderWalk cannot be resumed at all.
+//
+// MEASURED 2026-09-07, Intel Core Ultra 9 275HX, windows/amd64, -benchtime 1x:
+//
+//	one rung (BenchmarkSenderLadderRung, 2e6 iterations)              417.7 ns
+//	per-class counters, k=3, P=100,000 (100,000 rungs)                41.7 ms
+//	one shared counter, k=3, P=100,000 (300,000 rungs)               131.5 ms
+//	one shared counter, k=3, P=maxLadderWalk-1 (3,145,725 rungs)       1.21 s
+//
+// AND THE MULTIPLIER IS k, NOT k+1, which is recorded because the ledger prices this at
+// (k+1) x P. The rebuild is k ladders each walking the whole shared counter and that is all it
+// is: 3 x 100,000 rungs, measured at 131.5 ms against 41.7 ms for the P rungs the per-class
+// shape paid. The ledger's 148 ms and 1.55 s are within a fifth of these because it quoted
+// 368.7 ns a rung against the 417.7 ns this machine measures, so the ARITHMETIC agreed by
+// accident where the FORMULA does not. The extra P the ledger counts is real work, but it is the
+// epoch's own sends walking their gaps rather than anything installEpochOnLoop does -- and that
+// half is k x P as well, for the same reason, so the honest per-epoch total is 2k x P against
+// the 2P a per-class counter paid.
+func BenchmarkEpochChangeRebuild(b *testing.B) {
+	classKeys := DeriveClassKeys(StorageRoot(keyScheduleKatInputs()))
+	ladderKeys := [][]byte{classKeys.Durable, classKeys.Perm, classKeys.Media}
+	for _, shape := range []struct {
+		name      string
+		highWater uint64
+	}{
+		{name: "per-class counters, k=3, P=100000", highWater: 100000/3 - 1},
+		{name: "one shared counter A1, k=3, P=100000", highWater: 100000 - 1},
+		{name: "one shared counter A1, k=3, P=maxLadderWalk-1", highWater: maxLadderWalk - 2},
+	} {
+		b.Run(shape.name, func(b *testing.B) {
+			stream := streamKeyNamed("a rebuilt sender")
+			reserver := newStreamIndexMemory()
+			reserver.image[streamIndexRowKey(stream)] = shape.highWater
+			b.ResetTimer()
+			for range b.N {
+				for _, classKey := range ladderKeys {
+					ratchet, err := NewSenderRatchet(classKey, ratchetLeaf, stream, reserver)
+					if err != nil {
+						b.Fatalf("rebuild: %v", err)
+					}
+					ratchet.Zeroize()
+				}
+			}
+		})
+	}
 }

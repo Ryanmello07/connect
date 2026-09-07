@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"go/ast"
 	"go/importer"
 	"go/parser"
@@ -659,65 +660,97 @@ func TestOpenRecordRefusesTheClassesAndTheBlobRungSealRecordRefuses(t *testing.T
 }
 
 // ---------------------------------------------------------------------------
-// the retention byte reaches the session's own stream key
+// ruling A1 at the session's own call site: one class blind counter per sender
 // ---------------------------------------------------------------------------
 
-// The StreamKey retention byte was reported as "the fix for a reproduced permanent wedge" and was
-// untested at the production call site: the repair case constructs its own StreamKeys and drives
-// NewSenderRatchet directly, so dropping RetentionWire from senderRatchetOnLoop's literal survived
-// all three trees. The session's call site is unreachable for a second class through SealRecord
-// today precisely because SealRecord refuses every class but DURABLE, so the repair becomes load
-// bearing on exactly the commit that lands M1-6, with nothing watching it.
+// EVERY LADDER OF ONE SESSION RESERVES IN ONE STREAM, AND NO TWO OF THEM TAKE ONE INDEX.
 //
-// It is reachable from inside the package, on the loop, which is where this case drives it.
-func TestTwoRetentionClassesOfOneSessionDoNotShareAStreamCounter(t *testing.T) {
-	fixture := newTestSession(t, "two-classes-one-session")
-	classes := []message.RetentionClass{message.RetentionDurable, message.RetentionPermanent, message.RetentionMedia}
-	ratchets := map[message.RetentionClass]*SenderRatchet{}
-	streams := map[message.RetentionClass]StreamKey{}
+// This case is the same call site the wave 1 case guarded and the OPPOSITE assertion, which is
+// recorded here rather than left for a reader to notice from the name. Wave 1 required the three
+// classes' stream keys to DIFFER in the retention byte; the owner's ruling of 2026-09-07 -- items
+// 143 and 169 together, shape A1 -- requires them to be identical, because
+// (group_id, sender_handle) is what spec B's schema, spec B's Q7 and the shipped message server
+// key the counter by. The wave 1 shape was a client/server split: the server would have refused
+// the second class's first record as a stream index regression.
+//
+// The class of ladders is DERIVED and not listed, which the wave 1 case did not do. The three
+// class names it wrote out were the three that had class keys at the time; a class ruled onto a
+// class key later -- which is exactly what item 152 does to EPH -- would have been outside a gate
+// nobody would have remembered to widen. So this walks every wire byte connect/message accepts,
+// asks the session for the ladder, and judges every one it gets. A class the session refuses
+// carries the one refusal MASTER invariant I4 allows, and that refusal is checked too: a session
+// that started answering something else for eph would be a class key this ruling never saw.
+func TestEveryRetentionClassOfOneSessionReservesInOneStream(t *testing.T) {
+	fixture := newTestSession(t, "one-counter-per-sender")
+	type ladder struct {
+		wire   byte
+		stream StreamKey
+		sender *SenderRatchet
+	}
+	ladders := []ladder{}
+	refused := []byte{}
 	var err error
 	if postErr := fixture.session.do(func() {
-		for _, class := range classes {
-			wire, wireErr := message.RetentionClassWire(class, 0)
+		for candidate := 0; candidate <= 0xff; candidate += 1 {
+			wire := byte(candidate)
+			class, bucket, wireErr := message.RetentionClassOf(wire)
 			if wireErr != nil {
-				err = wireErr
-				return
+				// not a legal retention byte at all, so there is no ladder to ask for
+				continue
 			}
 			ratchet, buildErr := fixture.session.senderRatchetOnLoop(class, wire)
+			if errors.Is(buildErr, ErrRetentionClassUnruled) {
+				// MASTER invariant I4: the eph classes deliberately have no class key,
+				// so a session cannot build a ladder for one. It is recorded rather
+				// than skipped, so this gate can say it saw the refusal it expects.
+				refused = append(refused, wire)
+				continue
+			}
 			if buildErr != nil {
-				err = buildErr
+				err = fmt.Errorf("wire %#02x (class %d bucket %d): %w", wire, class, bucket, buildErr)
 				return
 			}
-			ratchets[class] = ratchet
-			streams[class] = ratchet.stream
+			ladders = append(ladders, ladder{wire: wire, stream: ratchet.stream, sender: ratchet})
 		}
 	}); postErr != nil {
 		t.Fatalf("post the ratchet command: %v", postErr)
 	}
 	if err != nil {
-		t.Fatalf("build one sender ratchet per retention class: %v", err)
+		t.Fatalf("build one sender ratchet per accepted retention byte: %v", err)
 	}
-	// each class reserves its own index 1 and none of them wedges another
-	for _, class := range classes {
-		index, key, nextErr := ratchets[class].Next()
+	if len(ladders) < 2 {
+		t.Fatalf("this session built %d ladders, so nothing here could observe two of them sharing a counter", len(ladders))
+	}
+	if len(refused) == 0 {
+		t.Error("no accepted retention byte was refused a class key; MASTER invariant I4 keeps the eph classes out of ClassKeys, so a run that met none of them was not walking the whole wire byte class")
+	}
+	// ONE stream, whole and entire. It is compared as a value rather than field by field, so a
+	// field added to StreamKey later is inside this assertion without anybody widening it.
+	for _, built := range ladders[1:] {
+		if built.stream != ladders[0].stream {
+			t.Errorf("the ladder for wire %#02x reserves in a different stream from the one for %#02x; ruling A1 makes the counter class blind, and a client counting per class has its second class's first record refused by the server as a stream index regression",
+				built.wire, ladders[0].wire)
+		}
+	}
+	// and the indices are the counter's, so they are distinct and cover a contiguous run: no
+	// ladder wedges another, and none of them is handed a number another already has.
+	taken := map[uint64]byte{}
+	for _, built := range ladders {
+		index, key, nextErr := built.sender.Next()
 		if nextErr != nil {
-			t.Fatalf("class %d could not take an index: %v; two classes of one session sharing a counter is the permanent wedge this byte closes", class, nextErr)
+			t.Fatalf("the ladder for wire %#02x could not take an index: %v", built.wire, nextErr)
 		}
-		if index != 1 {
-			t.Errorf("class %d took index %d, want 1; a shared counter is what makes the second class start above the first", class, index)
+		if earlier, isRepeat := taken[index]; isRepeat {
+			t.Errorf("wire %#02x and wire %#02x were both handed index %d; one index under two class keys is two records the server cannot tell apart on the counter it keeps",
+				earlier, built.wire, index)
 		}
+		taken[index] = built.wire
 		zeroize(key)
 	}
-	// and the streams differ in the retention byte and in nothing else, which is what says the
-	// separation comes from the field rather than from an accident of the group or the handle
-	for i := 1; i < len(classes); i += 1 {
-		first, second := streams[classes[0]], streams[classes[i]]
-		if first.RetentionWire == second.RetentionWire {
-			t.Errorf("class %d and class %d reserve under the same retention byte %#02x", classes[0], classes[i], first.RetentionWire)
-		}
-		if first.GroupId != second.GroupId || first.SenderHandle != second.SenderHandle {
-			t.Errorf("class %d and class %d disagree about the group or the sender handle, so this case is not judging the retention byte",
-				classes[0], classes[i])
+	for want := uint64(1); want <= uint64(len(ladders)); want += 1 {
+		if _, isTaken := taken[want]; !isTaken {
+			t.Errorf("index %d was not taken by any ladder; %d ladders sharing one counter take %d consecutive indices",
+				want, len(ladders), len(ladders))
 		}
 	}
 }

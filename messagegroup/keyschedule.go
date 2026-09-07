@@ -264,8 +264,11 @@ func RecordKeyNext(recordKey []byte) []byte {
 // since it is always retained", while spec A section 5.3 gives this function and RecordAeadBody
 // the SAME record_key[i] argument. For a DURABLE record the two coincide and nothing at this
 // layer can tell them apart; for a PERMANENT, MEDIA or EPH record they are two rungs of two
-// different class ladders, and no document says how one record then has one stream_index. That
-// is open item M1-6. This derivation is exactly what section 5.3 declares -- one record key in,
+// different class ladders. WHICH rung each half takes is open item M1-6 and is not answered
+// here. That a record has ONE stream_index no longer needs answering: the owner's ruling of
+// 2026-09-07 -- shape A1 -- makes the counter class blind, so the index belongs to the SENDER
+// and to no ladder, and what M1-6 still owes is the pairing rather than the number. This
+// derivation is exactly what section 5.3 declares -- one record key in,
 // the head's material out -- and task 11 is where the ruling binds, because SealRecord is what
 // states which key it passes to each.
 func RecordAeadHead(recordKey []byte) (key []byte, nonce []byte) {

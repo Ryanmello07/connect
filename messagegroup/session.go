@@ -494,10 +494,17 @@ func (self *GroupSession) classKeyOnLoop(class message.RetentionClass) ([]byte, 
 
 // senderRatchetOnLoop is this session's own ladder for one retention class, built on first use.
 //
-// The stream it reserves in carries the group, this session's sender_handle and the retention
-// class wire byte, which is StreamKey's whole subject: a reserver keyed on the group alone would
-// let one class of this group consume the index the next class is about to reserve, and the
-// second class would then be refused forever.
+// THE LADDER IS PER CLASS AND THE COUNTER IS NOT, which is ruling A1 as it lands on this file.
+// The map below is keyed by the retention wire byte because record_key[0] binds the CLASS KEY, so
+// each class is a different ladder and always was. The stream those ladders reserve in carries
+// only the group and this session's sender_handle -- no class -- because that is the counter spec
+// B's schema, spec B's Q7 and the shipped message server all keep. A stream key that carried the
+// class would make this client the only party in the system counting per class, and the server
+// would refuse the first record of the second class as a stream index regression.
+//
+// What used to make that safe here was the retention byte in the key; what makes it safe now is
+// that Reserve ALLOCATES, so no two of these ladders can be handed the same index. See
+// StreamKey's comment for the ruling and SenderRatchet.Next for the shape.
 //
 // The caller is the loop goroutine.
 func (self *GroupSession) senderRatchetOnLoop(class message.RetentionClass, retentionWire byte) (*SenderRatchet, error) {
@@ -509,9 +516,8 @@ func (self *GroupSession) senderRatchetOnLoop(class message.RetentionClass, rete
 		return nil, err
 	}
 	ratchet, err := NewSenderRatchet(classKey, self.ownLeaf, StreamKey{
-		GroupId:       self.groupId,
-		SenderHandle:  self.senderHandle,
-		RetentionWire: retentionWire,
+		GroupId:      self.groupId,
+		SenderHandle: self.senderHandle,
 	}, self.reserver)
 	if err != nil {
 		return nil, err

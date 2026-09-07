@@ -10,9 +10,9 @@
 // exist -- so the fake is the crash injection harness section 5.6's own named test needs, and
 // every assertion below is an obligation the unwritten sdk store plan inherits.
 //
-// The fake is deliberately built in two layers. streamIndexFake is the protocol -- the consumed
-// check, the ordering of the flush against the return, the high water -- and streamIndexDurable
-// is the medium under it. That seam is what makes "Reserve returns only after the write is
+// The fake is deliberately built in two layers. streamIndexFake is the protocol -- the
+// allocation, the ordering of the flush against the return, the high water -- and
+// streamIndexDurable is the medium under it. That seam is what makes "Reserve returns only after the write is
 // durable" observable in a go test at all: a real file cannot demonstrate it in process, because
 // an unsynced write is still visible to a reader on the same machine. A restart here is a fresh
 // streamIndexFake over the same medium, holding nothing the medium did not persist, which is the
@@ -27,6 +27,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -119,8 +120,8 @@ func (self *streamIndexImageStore) save(image map[string]uint64) error {
 	return nil
 }
 
-// streamIndexFake is the protocol half: the consumed refusal, the durable flush ordered before
-// the return, and the high water a ratchet resumes from.
+// streamIndexFake is the protocol half: the allocation, the durable flush ordered before the
+// return, and the high water a ratchet resumes from.
 type streamIndexFake struct {
 	lock    sync.Mutex
 	durable streamIndexDurable
@@ -152,34 +153,41 @@ func newStreamIndexMemory() *streamIndexFake {
 	return fake
 }
 
-func (self *streamIndexFake) Reserve(stream StreamKey, index uint64) error {
+// Reserve is the ALLOCATION ruling A1 requires, and the shape of this body is the argument for
+// it: the read of the high water, the choice of the next index and the durable write are one
+// critical section under one lock, so there is no window in which two callers can be handed the
+// same number. The assert shape this replaced could not have that property, because the caller's
+// choice happened outside the store.
+func (self *streamIndexFake) Reserve(stream StreamKey) (uint64, error) {
 	self.lock.Lock()
 	defer self.lock.Unlock()
 	self.reserves += 1
 	key := streamIndexRowKey(stream)
-	if index <= self.image[key] {
-		// not idempotent. "I already have that one" and "I am about to encrypt under that
-		// one" are the same call from this interface's side, so the second one is a
-		// refusal.
-		return fmt.Errorf("%w: index %d, high water %d", ErrStreamIndexConsumed, index, self.image[key])
+	held := self.image[key]
+	if held == ^uint64(0) {
+		// the stream has spent the last index a u64 holds, and there is no next one. It is
+		// ErrStreamIndexConsumed because from the caller's side it is the one permanent
+		// answer this interface has: the store cannot allocate and never will again.
+		return 0, fmt.Errorf("%w: the high water is %d and there is no successor", ErrStreamIndexConsumed, held)
 	}
+	index := held + 1
 	proposed := map[string]uint64{}
-	for existing, held := range self.image {
-		proposed[existing] = held
+	for existing, at := range self.image {
+		proposed[existing] = at
 	}
 	proposed[key] = index
 	if self.saveErr != nil {
-		return self.saveErr
+		return 0, self.saveErr
 	}
 	if err := self.durable.save(proposed); err != nil {
-		return err
+		return 0, err
 	}
 	// AFTER the flush. Everything below this line is state a caller may rely on, and moving
-	// either of these two lines above the save is the whole defect this fake exists to make
-	// observable.
+	// any of these lines above the save is the whole defect this fake exists to make
+	// observable: an index answered before it is durable is an index a crash re-issues.
 	self.image = proposed
 	self.handedOut[key] = index
-	return nil
+	return index, nil
 }
 
 func (self *streamIndexFake) HighWater(stream StreamKey) (uint64, error) {
@@ -192,12 +200,34 @@ func (self *streamIndexFake) HighWater(stream StreamKey) (uint64, error) {
 
 // streamIndexRowKey flattens a StreamKey into the row identity a store would use. It is the
 // fake's own choice and not the interface's: what the interface fixes is which stream a
-// reservation belongs to, and a store is free to hash, concatenate or index the three fields
-// however it likes as long as two distinct streams are two distinct rows -- which is what
-// TestTwoRetentionClassesOfOneGroupDoNotShareACounter holds it to.
+// reservation belongs to, and a store is free to hash, concatenate or index the fields however
+// it likes as long as two distinct streams are two distinct rows -- which is what
+// TestTheReserverIsTotalOverItsKeySpaceAndSeparatesGroups holds it to.
+//
+// It is derived off the type rather than written as a list, which is what keeps ruling A1
+// checkable HERE as well as in the production key: a field added to StreamKey and forgotten here
+// would silently merge two streams into one row, and a field REMOVED -- which is what A1 did to
+// the retention byte -- would leave this line naming something that no longer compiles. Both
+// failures are the same one, and reflection over the fields is what makes them impossible to
+// have quietly.
 func streamIndexRowKey(stream StreamKey) string {
-	return hex.EncodeToString(stream.GroupId[:]) + "/" + hex.EncodeToString(stream.SenderHandle[:]) +
-		"/" + hex.EncodeToString([]byte{stream.RetentionWire})
+	value := reflect.ValueOf(stream)
+	parts := make([]string, 0, value.NumField())
+	for i := range value.NumField() {
+		field := value.Field(i)
+		if field.Kind() == reflect.Array {
+			octets := make([]byte, field.Len())
+			for at := range field.Len() {
+				octets[at] = byte(field.Index(at).Uint())
+			}
+			parts = append(parts, hex.EncodeToString(octets))
+			continue
+		}
+		// %#v rather than a kind switch, so a scalar field of a kind nobody anticipated
+		// still lands in the row identity instead of being dropped out of it.
+		parts = append(parts, fmt.Sprintf("%#v", field.Interface()))
+	}
+	return strings.Join(parts, "/")
 }
 
 // reload re-reads the medium, and refuses if it came back behind an index this instance has
@@ -224,9 +254,9 @@ type streamIndexRefusing struct {
 	reserves int
 }
 
-func (self *streamIndexRefusing) Reserve(stream StreamKey, index uint64) error {
+func (self *streamIndexRefusing) Reserve(stream StreamKey) (uint64, error) {
 	self.reserves += 1
-	return self.err
+	return 0, self.err
 }
 
 func (self *streamIndexRefusing) HighWater(stream StreamKey) (uint64, error) { return 0, nil }
@@ -234,9 +264,31 @@ func (self *streamIndexRefusing) HighWater(stream StreamKey) (uint64, error) { r
 // A reserver whose HighWater fails, so a constructor that ignored the read is visible.
 type streamIndexUnreadable struct{ err error }
 
-func (self *streamIndexUnreadable) Reserve(stream StreamKey, index uint64) error { return nil }
+func (self *streamIndexUnreadable) Reserve(stream StreamKey) (uint64, error) { return 1, nil }
 
 func (self *streamIndexUnreadable) HighWater(stream StreamKey) (uint64, error) { return 0, self.err }
+
+// A reserver that allocates whatever it is told to, so a ladder can be driven onto an index its
+// own counter would never have produced. It exists for the two answers ruling A1 makes a ladder
+// have to survive -- a store that went backwards under it, and one that jumped further ahead
+// than the walk bound -- neither of which any honest allocation reaches.
+type streamIndexScripted struct {
+	answers  []uint64
+	at       int
+	reserves int
+}
+
+func (self *streamIndexScripted) Reserve(stream StreamKey) (uint64, error) {
+	self.reserves += 1
+	if len(self.answers) <= self.at {
+		return 0, fmt.Errorf("the script has %d answers and this is call %d", len(self.answers), self.at+1)
+	}
+	answer := self.answers[self.at]
+	self.at += 1
+	return answer, nil
+}
+
+func (self *streamIndexScripted) HighWater(stream StreamKey) (uint64, error) { return 0, nil }
 
 var streamIndexGroup = streamKeyNamed("grp-1")
 
@@ -264,8 +316,8 @@ func TestReserveReturnsOnlyAfterTheReservationIsDurable(t *testing.T) {
 	}
 	// the happy path first, so the assertion below is about durability and not about the
 	// fake being broken
-	if err := fake.Reserve(streamIndexGroup, 1); err != nil {
-		t.Fatalf("reserve index 1: %v", err)
+	if index, err := fake.Reserve(streamIndexGroup); err != nil || index != 1 {
+		t.Fatalf("the first allocation answered %d (%v), want 1", index, err)
 	}
 	restarted, err := openStreamIndexFake(&streamIndexFileStore{path: store.path})
 	if err != nil {
@@ -277,8 +329,9 @@ func TestReserveReturnsOnlyAfterTheReservationIsDurable(t *testing.T) {
 	// and now the failure point between the write and the flush
 	injected := errors.New("the disk is full")
 	fake.saveErr = injected
-	if err := fake.Reserve(streamIndexGroup, 2); !errors.Is(err, injected) {
-		t.Errorf("Reserve answered %v when the flush failed, want the flush's own error; a swallowed flush error is a reservation that is not one", err)
+	if index, err := fake.Reserve(streamIndexGroup); !errors.Is(err, injected) || index != 0 {
+		t.Errorf("Reserve answered index %d and %v when the flush failed, want no index and the flush's own error; a swallowed flush error is a reservation that is not one",
+			index, err)
 	}
 	afterFailure, err := openStreamIndexFake(&streamIndexFileStore{path: store.path})
 	if err != nil {
@@ -287,10 +340,11 @@ func TestReserveReturnsOnlyAfterTheReservationIsDurable(t *testing.T) {
 	if got, _ := afterFailure.HighWater(streamIndexGroup); got != 1 {
 		t.Errorf("the medium holds high water %d after a failed flush, want 1", got)
 	}
-	// the index is still free, so the refused seal consumed nothing
+	// the counter did not move, so the seal that was refused consumed no nonce: the next
+	// allocation is still 2 and not 3
 	fake.saveErr = nil
-	if err := fake.Reserve(streamIndexGroup, 2); err != nil {
-		t.Errorf("index 2 was refused after its own reservation failed to flush: %v", err)
+	if index, err := fake.Reserve(streamIndexGroup); err != nil || index != 2 {
+		t.Errorf("the allocation after a failed flush answered %d (%v), want 2: a failed reservation must burn no index", index, err)
 	}
 	if 2 <= store.saves && store.saves != 2 {
 		// two successful saves and no more: the failed one never reached the medium
@@ -319,13 +373,12 @@ func TestStreamIndexNeverReused(t *testing.T) {
 		if err != nil {
 			t.Fatalf("restart %d: %v", seal, err)
 		}
-		highWater, err := fake.HighWater(streamIndexGroup)
+		// under ruling A1 the caller no longer chooses the number, so this loop does not
+		// compute one: it asks, and the whole property is about what the store answers
+		// across ten thousand process deaths.
+		index, err := fake.Reserve(streamIndexGroup)
 		if err != nil {
-			t.Fatalf("high water at restart %d: %v", seal, err)
-		}
-		index := highWater + 1
-		if err := fake.Reserve(streamIndexGroup, index); err != nil {
-			t.Fatalf("reserve %d at restart %d: %v", index, seal, err)
+			t.Fatalf("allocate at restart %d: %v", seal, err)
 		}
 		if earlier, isRepeat := produced[index]; isRepeat {
 			t.Fatalf("index %d was produced at seal %d and again at seal %d; a reused stream index is a reused nonce under a reused record key",
@@ -352,9 +405,13 @@ func TestHighWaterNeverRewinds(t *testing.T) {
 		t.Fatalf("open the reserver: %v", err)
 	}
 	previous := uint64(0)
-	for index := uint64(1); index <= 64; index += 1 {
-		if err := fake.Reserve(streamIndexGroup, index); err != nil {
-			t.Fatalf("reserve %d: %v", index, err)
+	for round := uint64(1); round <= 64; round += 1 {
+		index, err := fake.Reserve(streamIndexGroup)
+		if err != nil {
+			t.Fatalf("allocate at round %d: %v", round, err)
+		}
+		if index != round {
+			t.Fatalf("round %d allocated index %d; the allocation of a stream with no gaps is its round number", round, index)
 		}
 		got, err := fake.HighWater(streamIndexGroup)
 		if err != nil {
@@ -380,27 +437,48 @@ func TestHighWaterNeverRewinds(t *testing.T) {
 	}
 }
 
-// Property 4: a consumed index is refused and never overwritten, with a typed sentinel.
-func TestAConsumedStreamIndexIsRefusedAndNotOverwritten(t *testing.T) {
+// Property 3 of the contract, restated for ruling A1: no index is ever handed out twice, and the
+// permanent refusal is the store's own -- a stream with no successor left.
+//
+// WHY THIS CASE IS NOT THE ONE IT REPLACES, said here because a reader comparing the two will
+// otherwise read a weakening. Wave 1's clause 3 was "reserving a consumed index answers
+// ErrStreamIndexConsumed", and the case that held it reserved index 2 after index 5 to see the
+// refusal. Under A1 there is no call that says which index, so that case could not be written at
+// all -- what it protected has moved into the store, and what is checked here is the property
+// rather than the refusal: every answer across every restart is distinct and strictly greater,
+// and the one thing that CAN still be permanently refused -- a counter with no successor -- is
+// still a typed sentinel and not a bool.
+func TestNoStreamIndexIsEverAllocatedTwiceAndExhaustionIsTyped(t *testing.T) {
 	fake := newStreamIndexMemory()
-	if err := fake.Reserve(streamIndexGroup, 1); err != nil {
-		t.Fatalf("reserve 1: %v", err)
-	}
-	if err := fake.Reserve(streamIndexGroup, 5); err != nil {
-		t.Fatalf("reserve 5, a legal gap: %v", err)
-	}
-	// every index at or below the high water is consumed, including the gap the server's
-	// monotonicity rule allows
-	for _, index := range []uint64{0, 1, 2, 4, 5} {
-		if err := fake.Reserve(streamIndexGroup, index); !errors.Is(err, ErrStreamIndexConsumed) {
-			t.Errorf("reserving consumed index %d answered %v, want ErrStreamIndexConsumed", index, err)
+	seen := map[uint64]bool{}
+	last := uint64(0)
+	for round := 1; round <= 64; round += 1 {
+		index, err := fake.Reserve(streamIndexGroup)
+		if err != nil {
+			t.Fatalf("round %d: %v", round, err)
 		}
+		if seen[index] {
+			t.Fatalf("round %d was handed index %d a second time; a reused stream index is a reused nonce under a reused record key", round, index)
+		}
+		if index <= last && round != 1 {
+			t.Errorf("round %d answered %d after %d; the counter is monotone", round, index, last)
+		}
+		seen[index] = true
+		last = index
 	}
-	if got, _ := fake.HighWater(streamIndexGroup); got != 5 {
-		t.Errorf("the refusals moved the high water to %d, want 5", got)
+	if got, _ := fake.HighWater(streamIndexGroup); got != last {
+		t.Errorf("the high water is %d after the last allocation answered %d", got, last)
 	}
-	if err := fake.Reserve(streamIndexGroup, 6); err != nil {
-		t.Errorf("index 6 was refused after the refusals: %v", err)
+	// and the one permanent refusal a store can make. A stream parked at the last index a u64
+	// holds has no successor, so the allocation is a typed fatal error rather than a wrap:
+	// wrapping re-issues every record key and every nonce this sender has used.
+	spent := streamKeyNamed("a stream at the end of the counter")
+	fake.image[streamIndexRowKey(spent)] = ^uint64(0)
+	if index, err := fake.Reserve(spent); !errors.Is(err, ErrStreamIndexConsumed) || index != 0 {
+		t.Errorf("a stream with no successor answered index %d and %v, want no index and ErrStreamIndexConsumed", index, err)
+	}
+	if got, _ := fake.HighWater(streamIndexGroup); got != last {
+		t.Errorf("the refusal on one stream moved another stream's high water to %d, want %d", got, last)
 	}
 }
 
@@ -418,19 +496,58 @@ func TestTheReserverIsTotalOverItsKeySpaceAndSeparatesGroups(t *testing.T) {
 	}
 	left := streamKeyNamed("group-left")
 	right := streamKeyNamed("group-right")
-	for index := uint64(1); index <= 4; index += 1 {
-		if err := fake.Reserve(left, index); err != nil {
-			t.Fatalf("reserve %d for the left group: %v", index, err)
+	for round := 1; round <= 4; round += 1 {
+		if _, err := fake.Reserve(left); err != nil {
+			t.Fatalf("allocate round %d for the left group: %v", round, err)
 		}
 	}
 	if got, _ := fake.HighWater(right); got != 0 {
 		t.Errorf("the right group's high water is %d after four reservations against the left group; the counter is per group and a shared one burns indices in one and re-issues them in the other", got)
 	}
-	if err := fake.Reserve(right, 1); err != nil {
-		t.Errorf("index 1 was refused for a group that has never used it: %v", err)
+	if index, err := fake.Reserve(right); err != nil || index != 1 {
+		t.Errorf("the right group's first allocation answered %d (%v), want 1: a group that has never sent starts at 1 however far another group has run", index, err)
 	}
 	if got, _ := fake.HighWater(left); got != 4 {
-		t.Errorf("the left group's high water is %d after a reservation against the right group, want 4", got)
+		t.Errorf("the left group's high water is %d after an allocation against the right group, want 4", got)
+	}
+	// EVERY FIELD OF THE KEY SEPARATES A ROW, derived off the type rather than written as the
+	// two cases this type happens to have today. Ruling A1 says the counter is keyed by
+	// (group_id, sender_handle), which is two claims and not one: two groups do not share a
+	// counter, AND two senders of one group do not either. A row key that dropped a field --
+	// or a field added later and forgotten -- merges two streams into one, and the merged one
+	// hands the second stream indices the first has already used.
+	streamKeyType := reflect.TypeOf(StreamKey{})
+	if streamKeyType.NumField() == 0 {
+		t.Fatal("StreamKey has no fields, so this half read nothing")
+	}
+	for i := range streamKeyType.NumField() {
+		field := streamKeyType.Field(i)
+		base := StreamKey{}
+		apart := StreamKey{}
+		differing := reflect.ValueOf(&apart).Elem().Field(i)
+		if differing.Kind() != reflect.Array {
+			// a scalar field: one is enough to tell it from zero
+			differing.SetUint(1)
+		} else {
+			differing.Index(0).SetUint(1)
+		}
+		if base == apart {
+			t.Fatalf("StreamKey.%s could not be made to differ, so this case cannot judge it", field.Name)
+		}
+		separate := newStreamIndexMemory()
+		for round := 1; round <= 3; round += 1 {
+			if _, err := separate.Reserve(base); err != nil {
+				t.Fatalf("StreamKey.%s: allocate round %d on the base stream: %v", field.Name, round, err)
+			}
+		}
+		index, err := separate.Reserve(apart)
+		if err != nil {
+			t.Fatalf("StreamKey.%s: allocate on the differing stream: %v", field.Name, err)
+		}
+		if index != 1 {
+			t.Errorf("two streams differing only in StreamKey.%s share a counter: the second one's first allocation is %d and not 1, so it is being handed indices the first stream has already used",
+				field.Name, index)
+		}
 	}
 }
 

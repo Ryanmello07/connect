@@ -12,10 +12,11 @@
 //	GapReason == "out_of_window" -- NOT as an error.
 //
 // THE LADDER POSITION IS THE STREAM INDEX, and that pin is the most consequential decision in
-// this file. Nothing rules it: ledger item 143 files it as "the device wrap still owes a
-// normative stream_index-to-ratchet-position mapping" and proposes exactly this repair, and it
-// is taken here rather than left open because the alternative is unsafe and the unsafety is
-// invisible.
+// this file. It is now RULED rather than proposed: ledger item 143 filed it as "the device wrap
+// still owes a normative stream_index-to-ratchet-position mapping", and the owner's ruling of
+// 2026-09-07 settles items 143 and 169 together as shape A1 -- one class blind stream_index per
+// (group_id, sender_handle), which is the counter spec B's schema, spec B's Q7 and the shipped
+// message server already keep. streamindex.go carries the ruling and its evidence.
 //
 // The reasoning, because a later reader will be tempted to undo it for the cost it carries. The
 // record nonce is expanded from the record key, so key and nonce uniqueness IS uniqueness of the
@@ -27,13 +28,22 @@
 // only by a 32 bit reuse_guard. The only state this layer can recover after a restart is the
 // reserver's high water, so the position has to BE that number.
 //
-// The price, stated because it is real and because no document carries it. Resuming at index n
+// Under A1 that pin is held by CONSTRUCTION rather than by discipline. The index comes back from
+// the store's allocation, and Next walks the ladder to it before handing anything out, so the
+// rung a record is sealed under is record_key[its own stream_index] whatever this process
+// remembers. What used to be a rule the sender had to keep is now the only thing the code can
+// express.
+//
+// The price, stated because it is real and because no document carries it. Standing at index n
 // costs n HKDF-Expand calls, and a class key is per EPOCH, so the walk is paid again at every
-// commit and grows for the life of the group. Section 5.6's interface has no field a client
-// could persist a ladder position in, which is what would make the walk unnecessary -- the same
-// interface open item M1-5 is already about. It is filed rather than worked around: a bound
-// invented here would be policy this file has no standing to make, and a lazy walk moves the
-// cost to the first send rather than removing it.
+// commit and grows for the life of the group -- and A1 multiplies it, because one shared counter
+// makes every one of a sender's k ladders walk the WHOLE sender's stream rather than its own
+// class's share of it. Measured on this tree, an epoch change rebuild costs (k+1) x P expansions
+// where it cost P; the benchmarks in ratchetrepairs_test.go carry the numbers. Section 5.6's
+// interface has no field a client could persist a ladder position in, which is what would make
+// the walk unnecessary -- the same interface open item M1-5 is already about. It is filed rather
+// than worked around: a bound invented here would be policy this file has no standing to make,
+// and a lazy walk moves the cost to the first send rather than removing it.
 //
 // WHAT THIS PACKAGE'S WINDOW DOES NOT HAVE, and connect/mls's does. mls's peekFor lets a
 // too-far-ahead generation MOVE the head, and ledger 2026-09-04 argues that is safe there
@@ -109,12 +119,22 @@ const (
 const maxLadderWalk = 1 << 20
 
 // SenderRatchet is one sender's ladder over record_key[i] for one retention class, with the
-// durable index reservation ordered in front of every key it hands out.
+// durable index allocation ordered in front of every key it hands out.
 //
 // stateLock guards recordKey, position and exhausted. reserver and groupId are written once by
 // the constructor and read without it, which is what lets Next hold the lock over the whole
-// reserve-then-advance sequence: two concurrent calls that interleaved between the reservation
-// and the advance would hand one index to both.
+// allocate-then-advance sequence: two concurrent calls that interleaved between the allocation
+// and the walk would advance one ladder past the rung the other is about to hand out.
+//
+// THE POSITION IS NO LONGER THIS RATCHET'S TO CHOOSE, which is ruling A1's whole effect on this
+// type. Under wave 1 the field below was "the stream index the next call will reserve": the
+// ratchet picked the number and the store asserted it. A1 puts every retention class of one
+// sender on ONE class blind counter, and two ladders that each pick their own number out of one
+// counter is the permanent wedge ledger item 168 measured. So the counter is the store's, Next
+// ASKS for the next index rather than announcing it, and the field below is what it is: the rung
+// this ladder is standing on, which the next allocation walks forward from. A ladder is therefore
+// SPARSE -- it pays one expansion for each index its siblings took -- and that is the price
+// StreamKey's comment records.
 //
 // THE SIGNATURE IS THE THREE VALUED FORM AND THAT IS PROVISIONAL. Section 5.5 declares
 // Next() (index uint64, recordKey []byte) with no error; section 5.6 requires Reserve to
@@ -130,21 +150,32 @@ type SenderRatchet struct {
 	stream    StreamKey
 	// record_key[position], this ratchet's own copy, erased by the Next that passes it on.
 	recordKey []byte
-	// the stream index the next call will reserve, and the ladder position that goes with it.
+	// the ladder position this ratchet stands on: the LOWEST index it can still produce a
+	// rung for. It is not the index the next call will take -- the store chooses that, and it
+	// is at or above this one -- and every index in between is a rung this ladder walks past
+	// and erases, which is what makes a shared counter safe rather than merely tolerable.
 	position uint64
 	// set when position reached the last index a u64 holds, so it cannot wrap to zero.
 	exhausted bool
 	// set by Zeroize. Without it Zeroize left this ratchet fully operational and the next
 	// Next handed out the rung derived from thirty two zeros -- the same key, and so the same
 	// (key, nonce) pair, for every zeroized ratchet in the world, with the stream index
-	// durably consumed under it. It is checked BEFORE the reservation so that a call after
+	// durably consumed under it. It is checked BEFORE the allocation so that a call after
 	// Zeroize costs no index either.
 	zeroized bool
-	// set when the reserver refused this ratchet's next index as already consumed. That
-	// refusal is permanent -- the index will never be free again -- so the ratchet stops
-	// rather than re-offering it, which is what a transient failure gets. A caller that wants
-	// to go on rebuilds the ratchet from the store's own high water.
+	// set when this ladder can never serve another allocation the store makes. Three ways in,
+	// and every one of them is permanent for THIS ratchet: the store refused to allocate at
+	// all, the store handed back an index this ladder has already passed, or it handed back
+	// one so far ahead that walking to it exceeds maxLadderWalk. A transient failure is none
+	// of these and does not set it. A caller that wants to go on rebuilds the ratchet from the
+	// store's own high water, which is the one thing that puts a ladder back under its counter.
 	wedged bool
+	// why it wedged, kept so that the SECOND call answers the same classification the first
+	// one did. Without it a caller that retried -- which is what a caller does when it cannot
+	// tell a permanent answer from a transient one -- was told ErrSenderRatchetWedged with no
+	// cause under it, so the one call that carried ErrStreamIndexRewound or
+	// ErrLadderWalkTooLong was the call it had already missed.
+	wedgeCause error
 }
 
 // NewSenderRatchet builds a sender's ladder for one class key and one leaf, resumed from the
@@ -154,14 +185,19 @@ type SenderRatchet struct {
 // instruction -- "the constructor takes the sink to make it explicit". A ratchet without one is
 // a ratchet that cannot make the ordering it exists to make.
 //
-// The stream is the group, the sender handle and the retention class wire byte together, and
-// StreamKey's own comment says why all three: a sender ratchet is per retention class, so two
-// classes of one group reserving out of one counter wedge each other permanently.
+// The stream is the group and the sender handle, and it is CLASS BLIND: ruling A1 puts every
+// retention class of one sender on one counter, which is what spec B's schema, spec B's Q7 and
+// the shipped server already key on. StreamKey's own comment carries the ruling and the price.
 //
-// The resume is HighWater() + 1 and is never a recomputed value. A ratchet that recomputed its
-// position from its own state would restart at zero after a crash, which is the reuse the file
-// comment above is about; a ratchet that resumed AT the high water would re-issue the last index
-// the store handed out, which is the same defect one rung shallower.
+// The resume is HighWater() + 1 and is never a recomputed value, and under A1 that number is
+// bounded from ABOVE rather than pinned. Next takes its index from the store, and the rung it
+// hands out is always record_key[that index] because it walks to it -- so a ladder that resumed
+// too LOW is merely slow, and (key, nonce) uniqueness now follows from index uniqueness alone
+// rather than from this line. What a ladder must never do is resume ABOVE the store's next
+// allocation: it would stand past an index the store is about to hand out, and the only honest
+// answer to that is the rewind wedge in Next. HighWater() + 1 is exactly the store's next
+// allocation, which is why it is still what this constructor reads and why it is still read from
+// the store rather than recomputed from anything this process remembers.
 //
 // The walk is the cost the file comment prices, and it is BOUNDED by maxLadderWalk. It advances
 // the ladder once per index below the resume point, erasing each rung as it passes, so the
@@ -197,14 +233,32 @@ func NewSenderRatchet(classKey []byte, leaf uint32, stream StreamKey, reserver S
 	}, nil
 }
 
-// Next reserves the next stream index durably, then hands out the rung of the ladder that goes
-// with it and advances past it.
+// Next allocates the next stream index of this sender's stream durably, walks the ladder up to
+// it, and hands out the rung that goes with it.
 //
-// THE ORDER IS THE PROPERTY. The reservation is made first, its error is checked first, and the
+// THE ORDER IS THE PROPERTY. The allocation is made first, its error is checked first, and the
 // function returns on a non-nil error before anything of the key schedule is reached. A body
 // that called Reserve and carried on regardless is reachability-identical to this one and is a
 // nonce reuse machine, which is why ratchet_test.go asserts the order off the syntax tree as
 // well as through an injected failing reserver.
+//
+// THE INDEX IS THE STORE'S ANSWER AND THE LADDER FOLLOWS IT. Ruling A1 shares one counter across
+// every retention class of one sender, so between two of this ladder's own sends its siblings may
+// have taken any number of positions. The catch-up walk is what keeps i = stream_index true in
+// the face of that: each skipped rung is derived and immediately erased by stepRecordKey, so the
+// ratchet ends holding record_key[index] with nothing below it, and the rung it hands out is the
+// one the receiver at that index will derive. A body that took the store's index and handed out
+// its own next rung would compile, round-trip against itself, and be undecryptable by every peer.
+//
+// Three answers from the store are PERMANENT for this ladder and all three wedge it, because
+// none of them can become true later and a ratchet that retried would burn a durable index per
+// attempt. The store refusing to allocate at all is one. An index at or below this ladder's own
+// position is a store that went backwards under a live process, and walking backwards is
+// impossible for a forward ratchet -- it is also the exact reading that catches a resume set too
+// high. And an index further ahead than maxLadderWalk is a walk this package will not pay, for
+// the reason maxLadderWalk itself exists: it is unbounded work on the say-so of a number nothing
+// has authenticated. A transient failure is none of these; the ladder does not move and the next
+// call asks again, which is what makes a full disk a retry rather than a hole in the stream.
 //
 // What is handed out is a COPY, and the ratchet's own array is erased in place. Section 5.5 asks
 // for exactly that -- "Next() overwrites the previous key with zeros before returning" -- and
@@ -218,35 +272,70 @@ func NewSenderRatchet(classKey []byte, leaf uint32, stream StreamKey, reserver S
 func (self *SenderRatchet) Next() (uint64, []byte, error) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	// the two dead states are refused BEFORE the reservation, so a call on either costs no
-	// index: a zeroized ratchet would otherwise burn a durable index under a key of thirty two
-	// zeros, and a wedged one would burn nothing but would spin on an index it can never have.
+	// the three dead states are refused BEFORE the allocation, so a call on any of them costs
+	// no index: a zeroized ratchet would otherwise burn a durable index under a key of thirty
+	// two zeros, and a wedged or exhausted one would burn one it can never serve.
 	if self.zeroized {
 		return 0, nil, fmt.Errorf("%w: it holds no ladder to answer from", ErrRatchetZeroized)
 	}
 	if self.wedged {
-		return 0, nil, fmt.Errorf("%w: index %d", ErrSenderRatchetWedged, self.position)
+		// the cause is carried on every call and not only on the first, so a caller that
+		// retried still learns which of the three permanent answers it met.
+		return 0, nil, fmt.Errorf("%w: this ladder stands at index %d: %w",
+			ErrSenderRatchetWedged, self.position, self.wedgeCause)
 	}
 	if self.exhausted {
 		return 0, nil, fmt.Errorf("%w: index %d was the last", ErrSenderRatchetExhausted, self.position)
 	}
-	index := self.position
-	if err := self.reserver.Reserve(self.stream, index); err != nil {
+	index, err := self.reserver.Reserve(self.stream)
+	if err != nil {
 		if errors.Is(err, ErrStreamIndexConsumed) {
 			// PERMANENT, and told apart from the transient case because the two want
-			// opposite answers. An index already consumed will never be free again, so a
-			// ratchet that went on offering it would refuse every send forever while
-			// reporting a retryable error; and one that skipped past it would hand out a
-			// rung under an index some record has already used, which is the nonce reuse
-			// the reservation exists to prevent. So the ratchet stops and says so.
-			self.wedged = true
-			return 0, nil, fmt.Errorf("%w: index %d: %w", ErrSenderRatchetWedged, index, err)
+			// opposite answers. A store that cannot allocate will not start being able
+			// to, so a ratchet that went on asking would refuse every send forever while
+			// reporting a retryable error and would pay a durable write for each attempt.
+			// So the ratchet stops and says so.
+			self.wedged, self.wedgeCause = true, err
+			return 0, nil, fmt.Errorf("%w: the store would not allocate: %w", ErrSenderRatchetWedged, err)
 		}
-		// no index and no key leave this function on a failed reservation, and the ratchet
-		// does not move: the same index is offered to the next call, which is what makes a
-		// full disk a retry rather than a hole in the stream.
-		return 0, nil, fmt.Errorf("messagegroup: a sender ratchet could not reserve stream index %d: %w", index, err)
+		// no index and no key leave this function on a failed allocation, and the ratchet
+		// does not move.
+		return 0, nil, fmt.Errorf("messagegroup: a sender ratchet could not allocate its next stream index: %w", err)
 	}
+	if index < self.position {
+		// the store went backwards under a live ladder. Serving it would mean deriving a
+		// rung this ladder has already erased -- which it cannot -- or handing out a
+		// different rung under an index some record already used, which is the reuse the
+		// reservation exists to prevent.
+		self.wedged, self.wedgeCause = true, ErrStreamIndexRewound
+		return 0, nil, fmt.Errorf("%w: the store allocated index %d and this ladder stands at %d: %w",
+			ErrSenderRatchetWedged, index, self.position, ErrStreamIndexRewound)
+	}
+	if maxLadderWalk < index-self.position {
+		// the sparse ladder's own ceiling. Under one shared counter a quiet class walks the
+		// gaps its siblings made, so this is reachable without a corrupt store at all -- it
+		// is what a class that went silent for maxLadderWalk of its sender's records meets.
+		// Either way the answer is the same one the constructor gives: refuse the walk, and
+		// let a caller that wants to go on rebuild from the store's own high water.
+		self.wedged, self.wedgeCause = true, ErrLadderWalkTooLong
+		return 0, nil, fmt.Errorf("%w: the store allocated index %d, this ladder stands at %d and the walk bound is %d: %w",
+			ErrSenderRatchetWedged, index, self.position, maxLadderWalk, ErrLadderWalkTooLong)
+	}
+	// the catch-up. Every rung between where this ladder stood and where the store put it is
+	// derived and erased in the same step, so the gap costs cpu and leaves nothing behind.
+	//
+	// The walk runs on a local ALIASING this ratchet's own array rather than on the field, and
+	// that is a reading rather than a style: connect/mls reads a write to a field holding key
+	// material as a drop site and decides it POSITIONALLY, so a field walked in place --
+	// self.recordKey = stepRecordKey(self.recordKey), inside a loop -- reads there as an
+	// overwrite with no erase in front of it. Walking a local and writing the field ONCE puts
+	// the erase where the reading can see it, and it is the same shape PeekFor already uses.
+	walking := self.recordKey
+	for at := self.position; at < index; at += 1 {
+		walking = stepRecordKey(walking)
+	}
+	self.recordKey = walking
+	self.position = index
 	handed := append([]byte(nil), self.recordKey...)
 	self.recordKey = stepRecordKey(self.recordKey)
 	if index == ^uint64(0) {
@@ -260,8 +349,13 @@ func (self *SenderRatchet) Next() (uint64, []byte, error) {
 	return index, handed, nil
 }
 
-// Position is the stream index this ratchet will reserve next, for a caller that has to report
-// where a sender is without consuming an index to find out.
+// Position is the ladder position this ratchet stands on -- the lowest stream index it can still
+// produce a rung for -- for a caller that has to report where a sender is without consuming an
+// index to find out.
+//
+// It is NOT "the index the next call will take". Under ruling A1 the store chooses that, and it
+// is at or above this number by however many positions this sender's other retention classes
+// have taken in between.
 func (self *SenderRatchet) Position() uint64 {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()

@@ -1240,11 +1240,13 @@ var typesTheEraseClassReachesThatOweNoErase = map[string]string{
 		"none of this process's storage; it is in this class only because the field reading resolves the bare " +
 		"name Reader to the decoder this package declares, which is a collision across two packages and not a " +
 		"byte slice anybody could erase",
-	"StreamKey": "the group, the sender handle and the retention class wire byte a reservation belongs " +
-		"to. All three are in the CLEARTEXT header of every record: the server keys its rows on the group " +
-		"id, routes on the sender handle and prunes on the retention byte. There is nothing here to erase, " +
-		"which is why the row is a whole-type one rather than three field rows -- a type all of whose " +
-		"fields are excused is a type this class swept in, and this one holds no secret at all",
+	"StreamKey": "the group and the sender handle a reservation belongs to, which is what spec B's " +
+		"schema, spec B's Q7 and the shipped message server all key the stream index counter by. Both are " +
+		"in the CLEARTEXT header of every record: the server keys its rows on the group id and routes on " +
+		"the sender handle. There is nothing here to erase, which is why the row is a whole-type one " +
+		"rather than two field rows -- a type all of whose fields are excused is a type this class swept " +
+		"in, and this one holds no secret at all. It carried a third field, the retention class wire " +
+		"byte, until the owner's ruling of 2026-09-07 made the counter class blind",
 	"EngineProcessed": "it is an ANSWER and not storage. (*connectMlsHandle).Process builds one per call " +
 		"and hands it to a caller that owns the plaintext it carries; no production declaration of either " +
 		"package holds one in a field, so there is no drop site an erase could be reachable from. Raw is " +
@@ -1312,13 +1314,12 @@ var theFieldsOfTheEraseClassThatAreNotKeyMaterial = map[string]string{
 		"cleared by UnmarshalMLS, so a committer's copy of somebody else's key package holds no private half. " +
 		"Erasing it would remove nothing an attacker lacks and would destroy a value the caller still owns; " +
 		"the path secret beside it is the key material, and (*WelcomeJoiner).Zeroize erases that",
-	"SenderRatchet.stream": "the group, the sender handle and the retention class this ratchet reserves " +
-		"its stream indices under. Every one of the three is in the cleartext header of every record: the " +
-		"message server keys its store rows on the group id, routes on the sender handle and prunes on the " +
-		"retention byte. StagedCommit.groupId is excused three rows up in the same words. The ratchet holds " +
-		"a StreamKey by VALUE -- no field of it is a reference a caller can write through -- so a caller " +
-		"reusing its buffers cannot move which row the reservations land in, and the copy is as public as " +
-		"the one the caller kept",
+	"SenderRatchet.stream": "the group and the sender handle this ratchet allocates its stream indices " +
+		"under. Both are in the cleartext header of every record: the message server keys its store rows " +
+		"on the group id and routes on the sender handle. StagedCommit.groupId is excused three rows up in " +
+		"the same words. The ratchet holds a StreamKey by VALUE -- no field of it is a reference a caller " +
+		"can write through -- so a caller reusing its buffers cannot move which row the reservations land " +
+		"in, and the copy is as public as the one the caller kept",
 	"GroupSession.groupId": "the id of the group this session is a view of, which is in the cleartext " +
 		"header of every record it seals and is what the message server keys every row of its store on; " +
 		"see SenderRatchet.stream and StagedCommit.groupId",
