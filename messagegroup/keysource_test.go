@@ -611,11 +611,16 @@ func TestEveryKeyedOctetOfARecordIsReproducibleFromTheExporterAndTheTwoInjectedV
 		// header: a second key source on the open side alone is a record that does not open. The
 		// open ran in the fixture, which is the one function outside the gate below; what is
 		// compared here is what it answered.
-		if string(sealed.openedHeads[i]) != string(sealed.heads[i]) ||
-			string(sealed.openedBodies[i]) != string(sealed.bodies[i]) {
-			t.Errorf("record %d: opened to %d and %d octets, want %d and %d",
-				i, len(sealed.openedHeads[i]), len(sealed.openedBodies[i]),
-				len(sealed.heads[i]), len(sealed.bodies[i]))
+		// the two halves are reported SEPARATELY and by their octets: a message that named only
+		// the lengths said "opened to 18 and 100 octets, want 18 and 100" under a mutation that
+		// moved a byte, which is a failure a reader has to re-derive before it says anything.
+		if string(sealed.openedHeads[i]) != string(sealed.heads[i]) {
+			t.Errorf("record %d: the head opened to %x and %x is what went in", i,
+				sealed.openedHeads[i], sealed.heads[i])
+		}
+		if string(sealed.openedBodies[i]) != string(sealed.bodies[i]) {
+			t.Errorf("record %d: the body opened to %x and %x is what went in", i,
+				sealed.openedBodies[i], sealed.bodies[i])
 		}
 	}
 	t.Logf("%d records rebuilt byte for byte from Export(%q, nil, %d), pq_secret and server_nonce",
@@ -1630,11 +1635,26 @@ func TestTheFixtureCanHandTheReproductionNothingItCouldSealWith(t *testing.T) {
 		t.Fatal("keySourceSealed has no fields, so this check certified an empty boundary")
 	}
 	slices.Sort(carrying)
-	// exactly one field may reach the module, and it is the SUBJECT: the records themselves.
-	// Anything else is a value the reproduction's side of the boundary could derive with.
-	if len(carrying) != 1 || !strings.HasPrefix(carrying[0], "records reaches ") {
-		t.Errorf("the fields of keySourceSealed that reach the module under test are %v, and the only one that may is the records themselves; everything else the fixture hands across must be octets",
-			carrying)
+	// WHAT MAY CROSS IS JUDGED BY THE TYPE REACHED, NOT BY THE FIELD'S NAME. The name is an
+	// instance and the type is the property: the one thing the fixture may hand the
+	// reproduction's side is the SUBJECT, and the subject is a record. It is transcribed here
+	// for the reason every label in this file is -- a check that read the answer off the
+	// boundary it is judging would agree with whatever the boundary carried -- and it must be
+	// reached DIRECTLY, since a record arriving through a test struct means that struct is on
+	// the boundary too and whatever else it holds came with it.
+	const subject = "message.Record"
+	crossing := 0
+	for _, held := range carrying {
+		if strings.Contains(held, subject+" (") && !strings.Contains(held, " -> ") {
+			crossing += 1
+			continue
+		}
+		t.Errorf("keySourceSealed's %s, and %s reached directly is the only module type the fixture may hand across; everything else it hands the reproduction's side must be octets",
+			held, subject)
+	}
+	if crossing == 0 {
+		t.Errorf("no field of keySourceSealed reaches %s, so the fixture hands the comparison no subject at all and this check read nothing",
+			subject)
 	}
 	t.Logf("%d fields on the boundary, %d of them reaching the module: %v", fields, len(carrying), carrying)
 }
