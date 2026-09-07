@@ -6308,6 +6308,21 @@ var packageDeclarationsAwaitingTheirFirstCaller = map[string]awaitingFirstCaller
 	// is the first thing with a countersignature to check.
 	"./successionPreimage": {firstCaller: "ValidateSuccession",
 		why: "the countersignature preimage of MASTER section 11, landed beside the nomination it covers rather than beside the validator that reads it"},
+	//
+	// The twelfth and thirteenth are m1 wave 1 task 1's, and they are the ninth and tenth's shape
+	// exactly: spec A section 5.3's record aead's seal and its open land TOGETHER, because the
+	// property that matters about them is not that either works -- it is that the open is the
+	// seal's inverse over XChaCha20-Poly1305 with a twenty four octet nonce rather than over
+	// whatever the seal happened to do, and a task that landed one without the other would leave
+	// that to whoever needed the second. They are the first entries this table has held for
+	// ../messagegroup, which is why the address carries that root: an unrelated declaration of
+	// the same name in either other root neither excuses these nor keeps their excuse alive.
+	// Neither has a production caller until m1 task 11 assembles the record builder around them;
+	// both come off by FAILING on the commit that gives them one.
+	"../messagegroup/sealRecordAead": {firstCaller: "SealRecord",
+		why: "the record aead's seal, landed beside the open it is the inverse of rather than beside the record builder that will call both"},
+	"../messagegroup/openRecordAead": {firstCaller: "OpenRecord",
+		why: "the record aead's open, landed beside the seal it inverts rather than beside the record reader that will call both"},
 }
 
 // ---------------------------------------------------------------------------

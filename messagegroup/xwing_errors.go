@@ -3,12 +3,14 @@
 // open is not a warning, it is a member who cannot read the epoch, and a KEM that reported one
 // and carried on would hand the layer above it thirty two bytes that are not a shared secret.
 //
-// They are here rather than in errors.go because that file's opening comment is an argument
-// about which of its sentinels spec A section 12.1 publishes to the server, and none of these
-// four is on that surface at all: the server never wraps, never unwraps and never holds an
-// X-Wing key, so an error it cannot reach is one that would widen its allowlist with a name no
-// server can match. That is the same rule errors.go applies to the four it keeps off the block,
-// applied one file over.
+// They are here rather than in an errors.go because connect/message's errors.go -- the file this
+// pair was written beside, before the split moved them -- opens with an argument about which of
+// its sentinels spec A section 12.1 publishes to the server, and none of these four is on that
+// surface at all: the server never wraps, never unwraps and never holds an X-Wing key, so an
+// error it cannot reach is one that would widen its allowlist with a name no server can match.
+// That is the same rule that file applies to the four it keeps off the block, applied one file
+// over. This package now has an errors.go of its own and the same reasoning keeps these four out
+// of it: it groups the record layer's refusals, and a KEM's belong beside the KEM.
 package messagegroup
 
 import "errors"

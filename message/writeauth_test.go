@@ -74,6 +74,7 @@ import (
 	"io/fs"
 	"maps"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -2190,11 +2191,25 @@ func authModuleOf(t testing.TB, dir string) (string, string) {
 }
 
 // Where one import path's source is read from: the standard library under the toolchain's own
-// GOROOT, or this module's own tree for a path under its module line.
+// GOROOT, this module's own tree for a path under its module line, or the module cache for a
+// requirement of this module.
 //
-// A path that resolves to neither is fatal rather than skipped. A skipped package is a package
-// every call into it is cleared for, silently, which is the shape of gate this file exists to
-// not be.
+// A path that resolves to none of the three is fatal rather than skipped. A skipped package is a
+// package every call into it is cleared for, silently, which is the shape of gate this file
+// exists to not be.
+//
+// The third arm arrived with connect/messagegroup's first import outside both of the first two.
+// It is a WIDENING and not an exemption, and the difference is the whole of why it is written
+// this way: this function refused an unresolvable path by fatalling, so the day a scanned root
+// imported golang.org/x/crypto/chacha20poly1305 the gate went red and said what it could not
+// read. The repair available then was either to teach it to read that package or to step over
+// the path -- and stepping over it would have cleared every call into that package for ever,
+// which is exactly the silence the fatal exists to prevent. So the resolution is widened, that
+// package's comparator surface enters the derived class like every other import's, and nothing
+// is excused. The go tool is what resolves it, because a module requirement's directory is the
+// go command's answer and no path this file could assemble is: the cache layout, the version
+// suffix and any replace directive are all its business. mls/crossplatform_test.go already runs
+// the go tool from a test of this tree for the same reason.
 func authImportedPackageDir(t testing.TB, scan authScan, path string) string {
 	t.Helper()
 	candidate := filepath.Join(build.Default.GOROOT, "src", filepath.FromSlash(path))
@@ -2208,8 +2223,35 @@ func authImportedPackageDir(t testing.TB, scan authScan, path string) string {
 			return candidate
 		}
 	}
+	if resolved := authModuleRequirementDir(scan, path); resolved != "" {
+		return resolved
+	}
 	t.Fatalf("the import %q resolves to no directory this gate can read; the comparators of a package it cannot read are comparators it cannot ban", path)
 	return ""
+}
+
+// The directory the go command reads one module requirement's source out of, or "".
+//
+// It answers "" rather than fatalling, so the caller above states the one refusal and a reader
+// finds it in one place. Nothing here interprets the module cache's layout: the go command is
+// asked where the package is and the answer is used only if it is a directory that exists, so a
+// tool that is missing, a module that is not required, or an answer that is not a path all end
+// as the caller's fatal rather than as a package quietly cleared.
+func authModuleRequirementDir(scan authScan, path string) string {
+	command := exec.Command("go", "list", "-f", "{{.Dir}}", "--", path)
+	command.Dir = scan.dir
+	out, err := command.Output()
+	if err != nil {
+		return ""
+	}
+	resolved := strings.TrimSpace(string(out))
+	if resolved == "" {
+		return ""
+	}
+	if info, err := os.Stat(resolved); err != nil || !info.IsDir() {
+		return ""
+	}
+	return resolved
 }
 
 // Every function declaration of one imported package, read out of that package's own source.
@@ -2555,7 +2597,7 @@ func authReportAnEmptyComparatorClass(t testing.TB, scan authScan, comparators [
 	}
 	slices.Sort(paths)
 	paths = slices.Compact(paths)
-	t.Logf("%s: that class is empty BY CONSTRUCTION and not because the scan read nothing. Its %d imported packages were read (%v) and none of them exports a function that answers a question about two data shaped arguments, which is the whole of what the class is. That makes this an ARMED TRIPWIRE and not a dead gate: a comparator cannot be called without its package being imported, so the edit that first compares data over there brings that package's entire comparator surface into this class on the same run, with nobody remembering to add it. Nothing over that directory is a rule in force today, the derived scope check included: TestEveryPackageBuiltOnThisOneIsUnderTheConstantTimeGate walks this module for the production packages that import connect/message, connect/messagegroup is not one of them yet, and a check whose derived class is empty never reaches its assertion either -- it arms at Task 1, the first connect/messagegroup file that calls into connect/message. The residual is recorded as M1-50.",
+	t.Logf("%s: that class is empty BY CONSTRUCTION and not because the scan read nothing. Its %d imported packages were read (%v) and none of them exports a function that answers a question about two data shaped arguments, which is the whole of what the class is. That makes this an ARMED TRIPWIRE and not a dead gate: a comparator cannot be called without its package being imported, so the edit that first compares data over there brings that package's entire comparator surface into this class on the same run, with nobody remembering to add it. Nothing over that directory is a rule in force today, the derived scope check included: TestEveryPackageBuiltOnThisOneIsUnderTheConstantTimeGate walks this module for the production packages that import connect/message, connect/messagegroup is not one of them yet, and a check whose derived class is empty never reaches its assertion either -- it arms on the first connect/messagegroup PRODUCTION file that calls into connect/message. That is NOT m1 wave 1 task 1, which this sentence used to name and which the tree now falsifies: the record aead, the zeroizer, the key schedule and the three handles reach connect/mls, golang.org/x/crypto and the standard library only, and it is task 11's SealRecord -- the first caller of AADHead and AADBody -- that arms it. The residual is recorded as M1-50.",
 		scan.dir, len(paths), paths)
 }
 

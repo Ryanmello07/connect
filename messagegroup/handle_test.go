@@ -1,0 +1,417 @@
+package messagegroup
+
+import (
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"go/ast"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/urnetwork/connect/mls"
+)
+
+// The vectors, computed outside this tree with python's hmac and hashlib and checked here
+// against keyschedule_test.go's RFC 5869 reference as well.
+//
+// THE DERIVATION, so a reader can re-derive every octet without running this package. The root
+// is keyschedule_test.go's, whose own derivation is written out there:
+//
+//	storage_root[0]  = 62215de7bddcea7e2c4047ff6bb94f8d18262fc8b3f3648134bb7d44158ff84d
+//
+//	group_handle_key = HKDF-Expand(storage_root[0], "gh/v1", 32)
+//	                 = 055505841d44bc6facf297fd79e5f6a56c56a2f98e3db503ce971c4747792b09
+//
+//	sender_handle(leaf) = HKDF-Expand(group_handle_key, "sh/v1" | 00000004 | u32(leaf), 16)
+//	  leaf 0          -> 8f5de131289090faef3a7bcbf254bbc6   info 73682f76310000000400000000
+//	  leaf 1          -> 42125b55b0fd5f50e76ca4265338d00b   info 73682f76310000000400000001
+//	  leaf 7          -> 3cf7a0467604f64bfa2ec484db8345e8   info 73682f76310000000400000007
+//	  leaf 0xffffffff -> 1c3e2e142a21e15a555e1904b440f94c   info 73682f763100000004ffffffff
+//
+//	wrap_target_handle(epoch, leaf) = HKDF-Expand(group_handle_key,
+//	                                      "wt/v1" | u64(epoch) | u32(leaf), 16)
+//	  (0, 0)          -> a5efcfa3de97c83f86b9fae0849f5ef6   info 77742f7631000000000000000000000000
+//	  (1, 0)          -> 84257bd51e7d0cd53a1c5b5a77de205b   info 77742f7631000000000000000100000000
+//	  (0, 1)          -> fd5e35e16341698af5cc69dca1223990   info 77742f7631000000000000000000000001
+//	  (7, 3)          -> 9287ccbeb9e0b1fee02780aacd7cf3f4   info 77742f7631000000000000000700000003
+//	  (2^64-1, 2^32-1)-> 2bb4e49e93e06a0b9a1844462d4cb388   info 77742f7631ffffffffffffffffffffffff
+//
+// Note the two info strings side by side: the sender handle's leaf index is LENGTH PREFIXED --
+// 00 00 00 04 then the four octets -- and the wrap target's is not. That asymmetry is MASTER's
+// and is open item M1-8; a vector for each is what makes it hold.
+const groupHandleKeyKatHex = "055505841d44bc6facf297fd79e5f6a56c56a2f98e3db503ce971c4747792b09"
+
+var senderHandleKat = map[uint32]string{
+	0:          "8f5de131289090faef3a7bcbf254bbc6",
+	1:          "42125b55b0fd5f50e76ca4265338d00b",
+	7:          "3cf7a0467604f64bfa2ec484db8345e8",
+	0xFFFFFFFF: "1c3e2e142a21e15a555e1904b440f94c",
+}
+
+var wrapTargetHandleKat = []struct {
+	epoch uint64
+	leaf  uint32
+	hex   string
+}{
+	{epoch: 0, leaf: 0, hex: "a5efcfa3de97c83f86b9fae0849f5ef6"},
+	{epoch: 1, leaf: 0, hex: "84257bd51e7d0cd53a1c5b5a77de205b"},
+	{epoch: 0, leaf: 1, hex: "fd5e35e16341698af5cc69dca1223990"},
+	{epoch: 7, leaf: 3, hex: "9287ccbeb9e0b1fee02780aacd7cf3f4"},
+	{epoch: 0xFFFFFFFFFFFFFFFF, leaf: 0xFFFFFFFF, hex: "2bb4e49e93e06a0b9a1844462d4cb388"},
+}
+
+// The epoch zero storage root every vector above hangs off.
+func handleKatRoot() []byte {
+	mlsSecret, pqSecret := keyScheduleKatInputs()
+	return StorageRoot(mlsSecret, pqSecret)
+}
+
+// Property 1, and the KAT for all three: three distinct labels, three distinct outputs, at
+// thirty two, sixteen and sixteen octets, each pinned against an independent expansion.
+func TestTheThreeHandleDerivationsAreDistinctAndPinned(t *testing.T) {
+	root := handleKatRoot()
+	key := GroupHandleKey(root)
+	want := mustKeyScheduleHex(t, groupHandleKeyKatHex)
+	if reference := keyScheduleReferenceExpand(root, []byte(groupHandleKeyInfo), groupHandleKeyBytes); string(reference) != string(want) {
+		t.Fatalf("RFC 5869 written out in keyschedule_test.go gives %x for %q and the pinned vector is %x", reference, groupHandleKeyInfo, want)
+	}
+	if string(key) != string(want) {
+		t.Errorf("GroupHandleKey(storage_root[0]) = %x, want %x", key, want)
+	}
+	if len(key) != groupHandleKeyBytes {
+		t.Errorf("the group handle key is %d octets, want %d", len(key), groupHandleKeyBytes)
+	}
+	for leaf, pinned := range senderHandleKat {
+		got := SenderHandle(key, leaf)
+		if got != [16]byte(mustKeyScheduleHex(t, pinned)) {
+			t.Errorf("SenderHandle(gh, %d) = %x, want %s", leaf, got, pinned)
+		}
+	}
+	for _, pinned := range wrapTargetHandleKat {
+		got := WrapTargetHandle(key, pinned.epoch, pinned.leaf)
+		if got != [16]byte(mustKeyScheduleHex(t, pinned.hex)) {
+			t.Errorf("WrapTargetHandle(gh, %d, %d) = %x, want %s", pinned.epoch, pinned.leaf, got, pinned.hex)
+		}
+	}
+	// the three labels are three distinct constants and no one of them is a prefix of another
+	labels := []string{groupHandleKeyInfo, senderHandleInfo, wrapTargetHandleInfo}
+	for i := range labels {
+		for j := range labels {
+			if i == j {
+				continue
+			}
+			shorter := min(len(labels[i]), len(labels[j]))
+			if labels[i][:shorter] == labels[j][:shorter] {
+				t.Errorf("%q and %q agree over the whole of the shorter one", labels[i], labels[j])
+			}
+		}
+	}
+	// and three distinct outputs from the same key, which is what the labels buy
+	sender := SenderHandle(key, 3)
+	wrap := WrapTargetHandle(key, 0, 3)
+	if sender == wrap {
+		t.Error("the sender handle and the wrap target handle of one leaf are the same sixteen octets, so their two labels separate nothing")
+	}
+	if string(key[:handleBytes]) == string(sender[:]) || string(key[:handleBytes]) == string(wrap[:]) {
+		t.Error("a handle is the first sixteen octets of the group handle key, so it is a truncation rather than a derivation")
+	}
+}
+
+// Property 1's other half, and the in-scope reading of the epoch zero obligation: the group
+// handle key is a function of the root it is handed.
+//
+// The obligation itself -- that the root be epoch ZERO's and be persisted for the life of the
+// group -- is a property of the CALLER, which task 10 writes; there is no site inside this
+// function that could get it wrong, because the root arrives as an argument. What is holdable
+// here is the consequence that makes the caller's mistake fatal rather than survivable: two
+// epochs' roots give two different keys, so every handle in the group moves, no member can
+// compute another's, and every write is refused by a server that cannot resolve the sender.
+func TestTheGroupHandleKeyIsAFunctionOfTheRootItIsGiven(t *testing.T) {
+	epochZero := handleKatRoot()
+	mlsSecret, pqSecret := keyScheduleKatInputs()
+	// a plausible second epoch: the same members, one commit later, a different pq contribution
+	epochOne := StorageRoot(mlsSecret, append(slices.Clone(pqSecret[:31]), 0xFF))
+	if string(epochZero) == string(epochOne) {
+		t.Fatal("the two epoch roots are equal, so this reading cannot see a key derived from the wrong one")
+	}
+	zeroKey := GroupHandleKey(epochZero)
+	oneKey := GroupHandleKey(epochOne)
+	if string(zeroKey) == string(oneKey) {
+		t.Fatal("GroupHandleKey does not depend on the root it is handed, so a caller reaching for the current epoch's root instead of epoch zero's would be indistinguishable from a correct one")
+	}
+	for leaf := uint32(0); leaf < 4; leaf++ {
+		if SenderHandle(zeroKey, leaf) == SenderHandle(oneKey, leaf) {
+			t.Errorf("leaf %d has the same sender handle under two epochs' group handle keys", leaf)
+		}
+	}
+}
+
+// Property 2: the sender handle depends on the leaf and on nothing else, and no two leaves this
+// group can reach collide.
+//
+// The range is derived from connect/mls's own lifecycle ceilings rather than picked: a group
+// holds at most MaxGroupMembers identities and each at most MaxDeviceLeavesPerIdentity device
+// leaves, so the largest leaf index a v1 group can reach is their product.
+func TestSenderHandleSeparatesEveryLeafThisGroupCanReach(t *testing.T) {
+	key := GroupHandleKey(handleKatRoot())
+	reach := mls.MaxGroupMembers * mls.MaxDeviceLeavesPerIdentity
+	if reach < 4000 {
+		t.Fatalf("the derived reach is %d leaves; connect/mls gives %d members times %d device leaves and a reach this small is a ceiling that stopped deriving",
+			reach, mls.MaxGroupMembers, mls.MaxDeviceLeavesPerIdentity)
+	}
+	seen := make(map[[16]byte]uint32, reach)
+	for leaf := uint32(0); int(leaf) < reach; leaf++ {
+		handle := SenderHandle(key, leaf)
+		if previous, collided := seen[handle]; collided {
+			t.Fatalf("leaves %d and %d share the sender handle %x", previous, leaf, handle)
+		}
+		seen[handle] = leaf
+	}
+	// and the extremes, which are outside the reach and must still separate
+	for _, leaf := range []uint32{0xFFFFFFFE, 0xFFFFFFFF} {
+		handle := SenderHandle(key, leaf)
+		if previous, collided := seen[handle]; collided {
+			t.Errorf("leaf %d collides with leaf %d", leaf, previous)
+		}
+		seen[handle] = leaf
+	}
+	// on nothing else: the same key and leaf give the same handle every time, and a different
+	// key gives a different one
+	for leaf := uint32(0); leaf < 8; leaf++ {
+		if SenderHandle(key, leaf) != SenderHandle(key, leaf) {
+			t.Fatalf("SenderHandle is not a function of its arguments at leaf %d", leaf)
+		}
+	}
+	other := GroupHandleKey(append(slices.Clone(handleKatRoot()[:31]), 0x00))
+	if SenderHandle(key, 0) == SenderHandle(other, 0) {
+		t.Error("the sender handle does not depend on the group handle key")
+	}
+}
+
+// Property 3: the wrap target handle depends on the epoch AND the leaf, and the snapshot's leaf
+// index is computed rather than special cased.
+func TestWrapTargetHandleDependsOnBothTheEpochAndTheLeaf(t *testing.T) {
+	key := GroupHandleKey(handleKatRoot())
+	seen := map[[16]byte]string{}
+	for epoch := uint64(0); epoch < 24; epoch++ {
+		for leaf := uint32(0); leaf < 24; leaf++ {
+			handle := WrapTargetHandle(key, epoch, leaf)
+			at := fmt.Sprintf("epoch %d leaf %d", epoch, leaf)
+			if previous, collided := seen[handle]; collided {
+				t.Fatalf("%s and %s share the wrap target handle %x", previous, at, handle)
+			}
+			seen[handle] = at
+		}
+	}
+	// the same leaf at two epochs is two targets, which is what stops the server following one
+	// device across a group's life
+	if WrapTargetHandle(key, 0, 5) == WrapTargetHandle(key, 1, 5) {
+		t.Error("the wrap target handle does not depend on the epoch, so one device keeps one address forever")
+	}
+	if WrapTargetHandle(key, 5, 0) == WrapTargetHandle(key, 5, 1) {
+		t.Error("the wrap target handle does not depend on the leaf")
+	}
+	// the snapshot's leaf index is an ordinary value to this derivation: it is what the pinned
+	// vector for (2^64-1, 2^32-1) says, and it equals the independent expansion rather than any
+	// constant this file could have branched to.
+	const snapshotLeaf = uint32(0xFFFFFFFF)
+	for _, epoch := range []uint64{0, 1, 9} {
+		info := append([]byte(wrapTargetHandleInfo), binary.BigEndian.AppendUint64(nil, epoch)...)
+		info = binary.BigEndian.AppendUint32(info, snapshotLeaf)
+		want := keyScheduleReferenceExpand(key, info, handleBytes)
+		if got := WrapTargetHandle(key, epoch, snapshotLeaf); got != [16]byte(want) {
+			t.Errorf("WrapTargetHandle(gh, %d, 0x%08x) = %x and the independent expansion of the same info gives %x; the snapshot's leaf index is special cased here",
+				epoch, snapshotLeaf, got, want)
+		}
+	}
+}
+
+// Property 4: the two leaf index derivations agree about what LP(leaf_index) means, because one
+// of them routes through the one helper and the other deliberately does not.
+//
+// The CLASS is derived: every production function of this package that takes a uint32 parameter
+// naming a leaf index AND expands under a label. Today that is SenderHandle and
+// WrapTargetHandle, and task 5's record_key[0] joins it on the commit that declares it.
+//
+// The table is held in BOTH directions, and it is a table rather than an assertion because
+// MASTER writes the two members differently: sender_handle length prefixes the index and
+// wrap_target_handle writes it raw. A gate that demanded one reading of both would be a gate
+// against the spec. What it demands instead is that every member declare which reading it takes
+// and that the length prefixing members share one implementation of it, so open item M1-8's
+// ruling is one edit.
+var handleLeafIndexReadings = map[string]string{
+	"SenderHandle": "LP -- MASTER section 8 writes sender_handle as HKDF-Expand(group_handle_key, " +
+		"\"sh/v1\" | LP(leaf_index), 16), and this is the one place in the project where LP wraps an integer",
+	"WrapTargetHandle": "raw -- section 5.11 writes wrap_target_handle with u32(leaf_index) and no length " +
+		"prefix at all, which is the asymmetry open item M1-8 is about",
+}
+
+func TestBothLeafIndexDerivationsDeclareTheirReadingAndShareOneHelper(t *testing.T) {
+	_, sources := messagegroupProductionSources(t)
+	members := []string{}
+	callsHelper := map[string]bool{}
+	for _, source := range sources {
+		for _, declaration := range source.parsed.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || function.Body == nil {
+				continue
+			}
+			if !handleTakesALeafIndex(function) {
+				continue
+			}
+			callees := keyScheduleCalleeNames(function.Body)
+			if !slices.Contains(callees, "keyScheduleExpand") {
+				continue
+			}
+			members = append(members, function.Name.Name)
+			callsHelper[function.Name.Name] = slices.Contains(callees, "leafIndexLP")
+		}
+	}
+	slices.Sort(members)
+	if len(members) == 0 {
+		t.Fatal("no production function of this package expands under a leaf index, so this gate held nothing to one reading of LP(leaf_index)")
+	}
+	for _, name := range members {
+		reading, hasRow := handleLeafIndexReadings[name]
+		if !hasRow {
+			t.Errorf("%s expands under a leaf index and handleLeafIndexReadings has no row for it; open item M1-8 is wire visible and every member of this class owes a stated reading",
+				name)
+			continue
+		}
+		wantsLP := strings.HasPrefix(reading, "LP")
+		if wantsLP && !callsHelper[name] {
+			t.Errorf("%s is declared to length prefix its leaf index and does not call leafIndexLP; a second spelling of LP(leaf_index) is how the two derivations come to disagree", name)
+		}
+		if !wantsLP && callsHelper[name] {
+			t.Errorf("%s is declared to write its leaf index raw and calls leafIndexLP", name)
+		}
+	}
+	for name := range handleLeafIndexReadings {
+		if !slices.Contains(members, name) {
+			t.Errorf("handleLeafIndexReadings has a row for %s, which no longer expands under a leaf index; a row that outlived its call site reads as coverage",
+				name)
+		}
+	}
+	// and the helper is the ONLY place a leaf index is length prefixed, derived over the calls
+	// rather than over a file name: any function writing an LP whose argument names a leaf is a
+	// second reading of M1-8.
+	prefixing := []string{}
+	for _, source := range sources {
+		for _, declaration := range source.parsed.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || function.Body == nil {
+				continue
+			}
+			if handlePrefixesALeafIndex(function.Body) {
+				prefixing = append(prefixing, function.Name.Name)
+			}
+		}
+	}
+	slices.Sort(prefixing)
+	if !slices.Equal(prefixing, []string{"leafIndexLP"}) {
+		t.Errorf("a leaf index is length prefixed in %v; there is one reading of LP(leaf_index) in this package and it lives in leafIndexLP so that M1-8's ruling is a single edit",
+			prefixing)
+	}
+	// the reading itself: eight octets, the length 00 00 00 04 then the index
+	for _, leaf := range []uint32{0, 1, 7, 0xFFFFFFFF} {
+		got := leafIndexLP(leaf)
+		want := append([]byte{0x00, 0x00, 0x00, 0x04}, binary.BigEndian.AppendUint32(nil, leaf)...)
+		if string(got) != string(want) {
+			t.Errorf("leafIndexLP(%d) = %x, want %x", leaf, got, want)
+		}
+	}
+}
+
+// Whether a declaration takes a uint32 parameter that names a leaf index.
+func handleTakesALeafIndex(function *ast.FuncDecl) bool {
+	if function.Type.Params == nil {
+		return false
+	}
+	for _, parameter := range function.Type.Params.List {
+		identifier, isIdentifier := parameter.Type.(*ast.Ident)
+		if !isIdentifier || identifier.Name != "uint32" {
+			continue
+		}
+		for _, name := range parameter.Names {
+			if strings.Contains(strings.ToLower(name.Name), "leaf") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// Whether a body writes a length prefix around something naming a leaf.
+func handlePrefixesALeafIndex(body ast.Node) bool {
+	found := false
+	ast.Inspect(body, func(node ast.Node) bool {
+		call, isCall := node.(*ast.CallExpr)
+		if !isCall {
+			return true
+		}
+		selector, isSelector := call.Fun.(*ast.SelectorExpr)
+		if !isSelector || selector.Sel.Name != "WriteOpaqueLP" {
+			return true
+		}
+		for _, argument := range call.Args {
+			for _, named := range keyScheduleIdentifiersIn(argument) {
+				if strings.Contains(strings.ToLower(named), "leaf") {
+					found = true
+				}
+			}
+		}
+		return true
+	})
+	return found
+}
+
+// Property 5: a group handle key that is not thirty two octets is refused by both handles, with
+// the sentinel as the panic value so a caller that recovers can name what it caught.
+func TestBothHandlesRefuseAGroupHandleKeyOfTheWrongWidth(t *testing.T) {
+	for _, width := range []int{0, 1, 15, 16, 31, 33, 64} {
+		key := make([]byte, width)
+		for _, refusal := range []struct {
+			name string
+			call func()
+		}{
+			{name: "SenderHandle", call: func() { SenderHandle(key, 3) }},
+			{name: "WrapTargetHandle", call: func() { WrapTargetHandle(key, 1, 3) }},
+		} {
+			caught := handleRecoveredFrom(refusal.call)
+			if caught == nil {
+				t.Errorf("%s accepted a %d octet group handle key; a handle derived from a truncated key is a well formed handle no other member computes",
+					refusal.name, width)
+				continue
+			}
+			if !errors.Is(caught, ErrGroupHandleKeyLength) {
+				t.Errorf("%s refused a %d octet group handle key with %v, want ErrGroupHandleKeyLength", refusal.name, width, caught)
+			}
+		}
+	}
+	// and the correct width is not refused
+	key := GroupHandleKey(handleKatRoot())
+	if caught := handleRecoveredFrom(func() { SenderHandle(key, 3) }); caught != nil {
+		t.Errorf("SenderHandle refused a thirty two octet key with %v", caught)
+	}
+	if caught := handleRecoveredFrom(func() { WrapTargetHandle(key, 1, 3) }); caught != nil {
+		t.Errorf("WrapTargetHandle refused a thirty two octet key with %v", caught)
+	}
+}
+
+// The error one call panicked with, or nil.
+func handleRecoveredFrom(call func()) (caught error) {
+	defer func() {
+		recovered := recover()
+		if recovered == nil {
+			return
+		}
+		if asError, isError := recovered.(error); isError {
+			caught = asError
+			return
+		}
+		caught = errors.New("messagegroup: panicked with a non error value")
+	}()
+	call()
+	return nil
+}

@@ -26,10 +26,13 @@
 // either. connect/layering_test.go holds all of that, because until this package's first call
 // into connect/message there is no cycle for the compiler to refuse.
 //
-// What is here today is the X-Wing hybrid key encapsulation of draft-connolly-cfrg-xwing-kem and
-// its four sentinels. What lands here next is the rest of spec A section 5: the key schedule, the
-// sender and receiver ratchets, the durable stream_index reservation, the session, the sealer and
-// the epoch fan-out. Nothing in this package logs a failure and carries on, and no function here
+// What is here today is the X-Wing hybrid key encapsulation of draft-connolly-cfrg-xwing-kem with
+// its four sentinels, and the prefix of spec A section 5 that m1 wave 1 lands: the record aead and
+// the algorithm identifier MASTER section 7.1 registers for it, this package's own best effort
+// zeroization, the storage root and the three retention class keys, and the three handles a record
+// is routed by. What lands here next is the rest of section 5: the record key ratchet's four
+// derivations, the sender and receiver ratchets, the durable stream_index reservation, the session,
+// the sealer and the epoch fan-out. Nothing in this package logs a failure and carries on, and no function here
 // takes a clock -- one that needs the time takes an injected nowMs func() int64, so that this
 // package keeps the property connect/mls and connect/message have, of having no timing-sensitive
 // test in it at all.
