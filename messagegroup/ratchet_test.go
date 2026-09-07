@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"go/ast"
 	"slices"
-	"strings"
 	"sync"
 	"testing"
 )
@@ -86,21 +85,15 @@ func TestNextProducesNothingWhenTheReservationFails(t *testing.T) {
 // fatal on arrival or pass having followed nothing. Task 11 owes it.
 func TestEveryReservationIsCheckedBeforeTheKeyScheduleIsReached(t *testing.T) {
 	_, sources := messagegroupProductionSources(t)
-	// the key schedule's own declarations, read off the file they are declared in rather
-	// than listed, so a derivation added to keyschedule.go joins this gate with it
-	schedule := map[string]bool{}
-	for _, source := range sources {
-		if !strings.HasSuffix(source.path, "keyschedule.go") {
-			continue
-		}
-		for _, declaration := range source.parsed.Decls {
-			if function, isFunction := declaration.(*ast.FuncDecl); isFunction {
-				schedule[function.Name.Name] = true
-			}
-		}
-	}
-	if len(schedule) == 0 {
-		t.Fatal("no declaration was read out of keyschedule.go, so the ordering below had nothing to be an ordering against")
+	// "the key schedule" is DERIVED as everything that reaches this package's one expansion or
+	// its one extraction, transitively, and not as the declarations of a file called
+	// keyschedule.go. The first version of this gate did the second, which is rule 5's own
+	// second half -- a gate that derives its class and then enumerates its SCOPE is not a
+	// derived gate -- and it would have read a derivation added in any other file as not being
+	// part of the key schedule at all.
+	schedule := recordKeyKdfReachingFunctions(sources)
+	if len(schedule) < 3 {
+		t.Fatalf("only %d declarations of this package reach the kdf, so the ordering below had almost nothing to be an ordering against", len(schedule))
 	}
 	reserving := []string{}
 	for _, source := range sources {

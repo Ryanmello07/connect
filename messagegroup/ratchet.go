@@ -427,11 +427,19 @@ func (self *ReceiverRatchet) retainIntoWindowLocked(index uint64, secret []byte)
 
 // eraseLocked zeroizes one retained rung and drops it.
 //
-// It is the SINGLE erase site for a window entry: evictOldestLocked chooses which rung goes and
-// then comes here, and Zeroize walks the map into here, so the erasure cannot be present on one
-// path and missing on the other. A bare delete leaves live record keys wherever the allocator
-// puts them next and nothing this ratchet still reaches can see the difference, which is a shape
-// connect/mls has already measured passing every test it had.
+// It is the one erase site for a rung leaving the window WHILE THE RATCHET IS RUNNING:
+// evictOldestLocked chooses which rung goes and then comes here, so the two ways an entry is
+// dropped for room cannot have the erasure on one path and not the other. A bare delete leaves
+// live record keys wherever the allocator puts them next and nothing this ratchet still reaches
+// can see the difference, which is a shape connect/mls has already measured passing every test it
+// had.
+//
+// The two erasures that are NOT here, named rather than left for a reader to find contradicting
+// the sentence above. Zeroize walks the whole map itself, because connect/mls reads erasure FIELD
+// BY FIELD off the source and cannot follow an erase that reaches a field only through a helper
+// taking an index. retainIntoWindowLocked erases what it would overwrite, for the same reading.
+// Both are the whole map or one entry going for a reason this one does not cover, and both are
+// held by the same test.
 //
 // Total by design: erasing an index that was never retained is a no-op.
 //
