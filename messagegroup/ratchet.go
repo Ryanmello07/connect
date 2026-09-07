@@ -307,6 +307,14 @@ func (self *SenderRatchet) Next() (uint64, []byte, error) {
 		// rung this ladder has already erased -- which it cannot -- or handing out a
 		// different rung under an index some record already used, which is the reuse the
 		// reservation exists to prevent.
+		//
+		// This arm is REDUNDANT against the unsigned subtraction below and is kept anyway,
+		// which is the argument classifyLocked's "below the head" arm already makes one type
+		// over. With it deleted, index-self.position underflows to an enormous number and the
+		// bound below wedges the same call -- so no input tells the two spellings apart, and
+		// the caller is told its walk was too long when what actually happened is that its
+		// store rewound. Measured: deleting it left the wedge intact and changed only which
+		// sentinel came back, which is exactly why the sentinel is asserted per cause.
 		self.wedged, self.wedgeCause = true, ErrStreamIndexRewound
 		return 0, nil, fmt.Errorf("%w: the store allocated index %d and this ladder stands at %d: %w",
 			ErrSenderRatchetWedged, index, self.position, ErrStreamIndexRewound)

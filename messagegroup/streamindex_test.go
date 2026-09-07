@@ -129,10 +129,31 @@ type streamIndexFake struct {
 	// the indices this instance has told a caller it may use. A reload that came back
 	// behind one of these is the rewind ErrStreamIndexRewound names.
 	handedOut map[string]uint64
-	// an injected flush failure, which is the only way a test can stand between the write
-	// and its durability.
-	saveErr  error
-	reserves int
+	reserves  int
+}
+
+// A medium whose flush fails, which is the only way a test can stand between the write and its
+// durability.
+//
+// IT WRAPS THE MEDIUM AND IS NOT A FIELD ON THE FAKE, and that position is the whole of what it
+// is for. This injection used to be a saveErr field consulted just BEFORE the medium's save, and
+// a mutation moved the fake's own commit -- image and handedOut -- in front of the save and
+// SURVIVED: the early return fired above the moved lines, so a store that committed its state
+// and then failed to flush looked exactly like a correct one. Standing at the medium instead
+// puts the failure after anything the protocol half does, which is where a lost flush actually
+// happens.
+type streamIndexFailingMedium struct {
+	under streamIndexDurable
+	err   error
+}
+
+func (self *streamIndexFailingMedium) load() (map[string]uint64, error) { return self.under.load() }
+
+func (self *streamIndexFailingMedium) save(image map[string]uint64) error {
+	if self.err != nil {
+		return self.err
+	}
+	return self.under.save(image)
 }
 
 func openStreamIndexFake(durable streamIndexDurable) (*streamIndexFake, error) {
@@ -176,9 +197,6 @@ func (self *streamIndexFake) Reserve(stream StreamKey) (uint64, error) {
 		proposed[existing] = at
 	}
 	proposed[key] = index
-	if self.saveErr != nil {
-		return 0, self.saveErr
-	}
 	if err := self.durable.save(proposed); err != nil {
 		return 0, err
 	}
@@ -310,7 +328,8 @@ func streamKeyNamed(name string) StreamKey {
 // afterwards, so the seal that was refused did not silently consume a nonce.
 func TestReserveReturnsOnlyAfterTheReservationIsDurable(t *testing.T) {
 	store := &streamIndexFileStore{path: filepath.Join(t.TempDir(), "stream.index")}
-	fake, err := openStreamIndexFake(store)
+	medium := &streamIndexFailingMedium{under: store}
+	fake, err := openStreamIndexFake(medium)
 	if err != nil {
 		t.Fatalf("open the reserver: %v", err)
 	}
@@ -328,7 +347,7 @@ func TestReserveReturnsOnlyAfterTheReservationIsDurable(t *testing.T) {
 	}
 	// and now the failure point between the write and the flush
 	injected := errors.New("the disk is full")
-	fake.saveErr = injected
+	medium.err = injected
 	if index, err := fake.Reserve(streamIndexGroup); !errors.Is(err, injected) || index != 0 {
 		t.Errorf("Reserve answered index %d and %v when the flush failed, want no index and the flush's own error; a swallowed flush error is a reservation that is not one",
 			index, err)
@@ -342,7 +361,7 @@ func TestReserveReturnsOnlyAfterTheReservationIsDurable(t *testing.T) {
 	}
 	// the counter did not move, so the seal that was refused consumed no nonce: the next
 	// allocation is still 2 and not 3
-	fake.saveErr = nil
+	medium.err = nil
 	if index, err := fake.Reserve(streamIndexGroup); err != nil || index != 2 {
 		t.Errorf("the allocation after a failed flush answered %d (%v), want 2: a failed reservation must burn no index", index, err)
 	}
