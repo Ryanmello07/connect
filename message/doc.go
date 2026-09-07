@@ -41,9 +41,14 @@
 // attachment.go, is the server attachment of spec A section 5.11: the one structured field
 // of a record the server may read, its four kinds and their kind discriminator, and every
 // question spec B section 5.1 check 3 asks of a parsed one, so that the server asks rather
-// than re-derives. The key schedule does NOT land beside them: it lands in
-// connect/messagegroup, which is where it will take these types from when it lands and
-// which no message server links.
+// than re-derives. The key schedule does NOT land beside them and no longer lands at all:
+// it IS in connect/messagegroup, which no message server links, and it takes these types
+// from here. As of m1 wave 1 that package holds the storage root and the three retention
+// class keys, the record key ladder, both ratchets, the group engine and its connect/mls
+// adapter, the session, and SealRecord and OpenRecord -- which are the only two callers of
+// this package's two aad builders and of ComputeWriteAuth, and which are the reason the
+// edge from there to here exists at all. The edge is one way: nothing here imports
+// connect/messagegroup, and connect/layering_test.go holds that from the other side.
 // Nothing in this package logs a failure and carries on: every error here is one of the
 // sentinels in errors.go, and the only bare bools are the three constant time verifiers
 // of spec A section 5.7 and that class predicate, none of which reports a failure. The

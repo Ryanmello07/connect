@@ -27,11 +27,13 @@
 // into connect/message there is no cycle for the compiler to refuse.
 //
 // What is here today is the X-Wing hybrid key encapsulation of draft-connolly-cfrg-xwing-kem with
-// its four sentinels, and the prefix of spec A section 5 that m1 wave 1 lands: the record aead and
-// the algorithm identifier MASTER section 7.1 registers for it, this package's own best effort
-// zeroization, the storage root and the three retention class keys, the three handles a record is
-// routed by, the record key ladder's four derivations, the stream index reserver's INTERFACE, and
-// the sender and receiver ratchets with the skipped key window.
+// its four sentinels, and the whole of what m1 wave 1 lands: the record aead and the algorithm
+// identifier MASTER section 7.1 registers for it, this package's own best effort zeroization, the
+// storage root and the three retention class keys, the three handles a record is routed by, the
+// record key ladder's four derivations, the stream index reserver's INTERFACE, the sender and
+// receiver ratchets with the skipped key window, spec A section 6's GroupEngine and GroupHandle
+// with the connect/mls adapter that satisfies them, the GroupSession every method of section 5.2
+// hangs off, and SealRecord and OpenRecord.
 //
 // The stream index reserver has no implementation here and that is deliberate. Spec A section 8.2
 // assigns the durable store to sdk's MessageStore, method for method; neither half of the record
@@ -40,11 +42,23 @@
 // implementation owes, so a reader who finds no implementation finds the reason instead of writing
 // one.
 //
-// What lands here next is the rest of section 5: the group engine and its connect/mls adapter, the
-// session, the sealer and its reader, and the epoch fan-out. Nothing in this package logs a failure
-// and carries on, and no function here takes a clock -- one that needs the time takes an injected
-// nowMs func() int64, so that this package keeps the property connect/mls and connect/message have,
-// of having no timing-sensitive test in it at all.
+// WHAT IS ABSENT MATTERS MORE THAN WHAT IS PRESENT, and the honest inventory is this. This package
+// can seal and open ONE client's records in memory. It cannot join a group: the adapter's
+// JoinFromWelcome refuses, because connect/mls keeps a minted key package's signature private half
+// on an unexported field and StateStore.TakeKeyPackage does not carry it, so no caller outside that
+// package can assemble the mls.JoinKeyMaterial a Welcome join takes. It seals only the DURABLE
+// retention class, because MASTER section 8.1 and section 5.3 disagree about which record_key seals
+// ct_head and open item M1-6 has not ruled -- so the permanent, media and eph classes are refused
+// rather than guessed at. It reaches no message server: every task of wave 1 stops at a *Record in
+// memory, and the submit path belongs to sdk plans that do not exist. And its stream index reserver
+// is an INTERFACE with no durable implementation anywhere, so a run over this package's test fake
+// proves the record layer and not the client.
+//
+// What lands here next is the rest of section 5: pq_secret and the provisional epoch state, the
+// device wrap, the epoch fan-out and its snapshot, and the joining member. Nothing in this package
+// logs a failure and carries on, and no function here takes a clock -- one that needs the time takes
+// an injected nowMs func() int64, so that this package keeps the property connect/mls and
+// connect/message have, of having no timing-sensitive test in it at all.
 //
 // Two gates of other packages judge what lands here, and both had to be told this directory
 // exists. mls/crypto_forbidden_test.go's forbiddenScanRoots -- which five further mls gates

@@ -227,11 +227,18 @@ func (self *GroupSession) do(action func()) error {
 // leaked loop as a failure rather than as a slow test.
 func (self *GroupSession) Close() error {
 	self.closeOnce.Do(func() {
+		// the handle's own error is carried out on a LOCAL and written to the field here,
+		// off the loop, on purpose: closeErr is the only field of this session no command
+		// touches, and a field the loop writes is one nothing may read afterwards without
+		// posting -- which is what the shape gate in session_test.go derives and what a
+		// close that stored its answer from inside the command would quietly break.
+		closed := error(nil)
 		postErr := self.do(func() {
 			self.closing = true
 			self.zeroizeOnLoop()
-			self.closeErr = self.handle.Close()
+			closed = self.handle.Close()
 		})
+		self.closeErr = closed
 		if postErr != nil && !errors.Is(postErr, ErrSessionClosed) {
 			self.closeErr = postErr
 		}

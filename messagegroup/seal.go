@@ -105,7 +105,7 @@ func (self *GroupSession) sealRecordOnLoop(class message.RetentionClass, ephBuck
 	if expireAt != 0 && expireAt <= uint64(self.nowMs()) {
 		return nil, fmt.Errorf("%w: expire_at %d is not after now", ErrRecordExpired, expireAt)
 	}
-	builder, err := self.newRecordBuilder(class, ephBucket, isCommit, len(bodyPlain), expireAt, serverAttachment)
+	builder, err := self.newRecordBuilderOnLoop(class, ephBucket, isCommit, len(bodyPlain), expireAt, serverAttachment)
 	if err != nil {
 		return nil, err
 	}
@@ -134,14 +134,14 @@ type recordBuilder struct {
 	bucket    message.SizeBucket
 }
 
-// newRecordBuilder reserves the stream index and stages the header.
+// newRecordBuilderOnLoop reserves the stream index and stages the header.
 //
 // THE RESERVATION IS FIRST AND IS THE WHOLE POINT OF THIS FUNCTION EXISTING. Section 5.6 requires
 // a device to record "index k consumed" durably BEFORE encrypting, and SenderRatchet.Next is
 // where that ordering is made; every path from SealRecord to a record aead derivation runs
 // through here, and seal_test.go walks the call graph to say so rather than trusting this
 // sentence.
-func (self *GroupSession) newRecordBuilder(class message.RetentionClass, ephBucket uint8,
+func (self *GroupSession) newRecordBuilderOnLoop(class message.RetentionClass, ephBucket uint8,
 	isCommit bool, bodyLength int, expireAt uint64,
 	serverAttachment *message.ServerAttachment) (*recordBuilder, error) {
 
