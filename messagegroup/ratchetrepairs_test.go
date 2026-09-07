@@ -15,6 +15,7 @@ import (
 	"go/token"
 	"go/types"
 	"os"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -283,6 +284,7 @@ func TestAStoreTheLadderCannotFollowWedgesItAndATransientFailureDoesNot(t *testi
 		t.Errorf("a transiently failing store was asked %d times in three calls; a retryable failure is retried", transient.reserves)
 	}
 
+	permanentWedges := []string{}
 	for _, permanent := range []struct {
 		name     string
 		reserver StreamIndexReserver
@@ -311,6 +313,7 @@ func TestAStoreTheLadderCannotFollowWedgesItAndATransientFailureDoesNot(t *testi
 			asks:     1,
 		},
 	} {
+		permanentWedges = append(permanentWedges, permanent.name)
 		t.Run(permanent.name, func(t *testing.T) {
 			ratchet, err := NewSenderRatchet(ratchetClassKey(), ratchetLeaf, ratchetGroup, permanent.reserver)
 			if err != nil {
@@ -350,6 +353,54 @@ func TestAStoreTheLadderCannotFollowWedgesItAndATransientFailureDoesNot(t *testi
 			}
 		})
 	}
+	// AND THE TABLE ABOVE IS COMPLETE, checked against the production source rather than
+	// against the sentence that introduces it. "Three ways in" is exactly the kind of claim
+	// this project has been burned by -- a table named "every rule of the CreateGroup carve
+	// out" held five of six -- so the count is DERIVED: every site in Next that sets the wedge
+	// is one permanent answer, and a fourth added later leaves this table visibly short.
+	if wedges := senderRatchetWedgeSites(t); wedges != len(permanentWedges) {
+		t.Errorf("Next wedges the ladder at %d site(s) and this case drives %d of them (%v); a way in that no case drives is a permanent refusal nothing has ever seen",
+			wedges, len(permanentWedges), permanentWedges)
+	}
+}
+
+// senderRatchetWedgeSites is how many places in SenderRatchet.Next set the wedge, read off this
+// package's own source.
+//
+// It counts ASSIGNMENTS to the field and not calls to a helper, because the field is set inline
+// at each site; if that ever changes, this reader answers zero and the fatal below is the report.
+func senderRatchetWedgeSites(t *testing.T) int {
+	t.Helper()
+	_, sources := messagegroupProductionSources(t)
+	sites := 0
+	for _, source := range sources {
+		for _, declaration := range source.parsed.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || function.Name.Name != "Next" || function.Recv == nil {
+				continue
+			}
+			if recordKeyReceiverTypeName(function.Recv.List[0].Type) != "SenderRatchet" {
+				continue
+			}
+			ast.Inspect(function.Body, func(node ast.Node) bool {
+				assign, isAssign := node.(*ast.AssignStmt)
+				if !isAssign {
+					return true
+				}
+				for _, left := range assign.Lhs {
+					selector, isSelector := left.(*ast.SelectorExpr)
+					if isSelector && selector.Sel.Name == "wedged" {
+						sites += 1
+					}
+				}
+				return true
+			})
+		}
+	}
+	if sites == 0 {
+		t.Fatal("no assignment to the wedge was found in SenderRatchet.Next, so the completeness check above read nothing")
+	}
+	return sites
 }
 
 // ---------------------------------------------------------------------------
@@ -783,26 +834,42 @@ func TestNoProductionTypeOfThisPackageSatisfiesTheReserver(t *testing.T) {
 // how far it can still reach, so the answer follows from DefaultRecordWindowSize and k rather than
 // from a constant written down beside them.
 func TestASharedCounterDividesAClassesOutOfOrderWindowByTheClassCount(t *testing.T) {
-	const ladders = 3
 	reserver := newStreamIndexMemory()
 	classKeys := DeriveClassKeys(StorageRoot(keyScheduleKatInputs()))
-	stream := streamKeyNamed("three classes, one counter")
-	// the class under measurement and its two siblings. They are three DIFFERENT class keys,
-	// which is what makes them three ladders, and one stream key, which is A1.
+	stream := streamKeyNamed("every class key, one counter")
+	// k IS THE NUMBER OF CLASS KEYS AND IS READ OFF ClassKeys, not written down beside a
+	// hard-coded 3. A fourth class key -- which is what item 152 adds if it rules the eph
+	// classes onto this root -- makes the divisor 4 here without anybody remembering to change
+	// it, and a case that went on dividing by 3 would report a cost that is not the one being
+	// paid. The watched ladder is the durable one, because that is the class SealRecord seals.
+	ladderKeys := reflect.ValueOf(*classKeys)
+	if ladderKeys.NumField() < 2 {
+		t.Fatalf("ClassKeys declares %d field(s), so nothing here could share a counter", ladderKeys.NumField())
+	}
 	watched, err := NewSenderRatchet(classKeys.Durable, ratchetLeaf, stream, reserver)
 	if err != nil {
 		t.Fatalf("the watched ratchet: %v", err)
 	}
 	siblings := []*SenderRatchet{}
-	for _, classKey := range [][]byte{classKeys.Perm, classKeys.Media} {
+	for i := range ladderKeys.NumField() {
+		classKey, isOctets := ladderKeys.Field(i).Interface().([]byte)
+		if !isOctets {
+			t.Fatalf("ClassKeys.%s is not a class key, so this case cannot count the ladders",
+				ladderKeys.Type().Field(i).Name)
+		}
+		if bytes.Equal(classKey, classKeys.Durable) {
+			// the watched ladder is already built; every other field is a sibling.
+			continue
+		}
 		sibling, err := NewSenderRatchet(classKey, ratchetLeaf, stream, reserver)
 		if err != nil {
-			t.Fatalf("a sibling ratchet: %v", err)
+			t.Fatalf("the sibling for ClassKeys.%s: %v", ladderKeys.Type().Field(i).Name, err)
 		}
 		siblings = append(siblings, sibling)
 	}
-	if len(siblings)+1 != ladders {
-		t.Fatalf("this case built %d ladders and its arithmetic is written for %d", len(siblings)+1, ladders)
+	ladders := len(siblings) + 1
+	if ladders != ladderKeys.NumField() {
+		t.Fatalf("ClassKeys declares %d class keys and this case built %d ladders", ladderKeys.NumField(), ladders)
 	}
 	head, headKey, err := watched.Next()
 	if err != nil {
