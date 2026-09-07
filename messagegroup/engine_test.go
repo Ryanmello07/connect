@@ -349,6 +349,7 @@ func TestEngineProcessedKeepsItsStagedReferenceUnexported(t *testing.T) {
 // clean run of a complete gate.
 func TestNoReaderOfAnEngineProcessedInspectsRaw(t *testing.T) {
 	_, sources := messagegroupProductionSources(t)
+	fields := engineProcessedFieldNames(t)
 	readers := []string{}
 	inspectors := []string{}
 	for _, source := range sources {
@@ -361,7 +362,7 @@ func TestNoReaderOfAnEngineProcessedInspectsRaw(t *testing.T) {
 			inspectsRaw := false
 			ast.Inspect(function.Body, func(node ast.Node) bool {
 				selector, isSelector := node.(*ast.SelectorExpr)
-				if isSelector && engineProcessedFieldNames[selector.Sel.Name] {
+				if isSelector && fields[selector.Sel.Name] {
 					readsAField = true
 				}
 				// what "inspects" means, read off the SHAPE rather than off a list of
@@ -391,14 +392,99 @@ func TestNoReaderOfAnEngineProcessedInspectsRaw(t *testing.T) {
 	t.Logf("%d production declaration(s) read an EngineProcessed: %v", len(readers), readers)
 }
 
-// The field names of EngineProcessed, derived off the type rather than written down, so a field
-// added to section 6's struct joins the reader class without an edit here.
-var engineProcessedFieldNames = engineProcessedFields()
+// The producer half of Property 3: what this adapter WRITES.
+//
+// Batch C measured the gap this closes. Nothing behavioural in wave 1 can drive Process at all --
+// a one member group has no inbound message, because the joining member is wave 2's and the
+// adapter's JoinFromWelcome refuses -- so "the staged commit goes in stagedRef and never in Raw"
+// had no case that could fail. Deleting the stagedRef the adapter puts there SURVIVED the whole
+// suite.
+//
+// So it is read off the source instead. The scope question (R3a): the SCOPE is this package's
+// production source, because stagedRef is unexported and only a member of this package can
+// populate one -- which is the whole of what section 6's unforgeability argument confines. The
+// CLASS is every composite literal of an EngineProcessed, derived off the syntax tree, and the
+// assertion is that each one populates stagedRef with something other than the nil literal. It
+// fatals on an empty class, so a refactor that stopped building them here fails rather than
+// reporting clean.
+func TestEveryEngineProcessedThisPackageBuildsCarriesAStagedCommit(t *testing.T) {
+	_, sources := messagegroupProductionSources(t)
+	literals := 0
+	for _, source := range sources {
+		ast.Inspect(source.parsed, func(node ast.Node) bool {
+			literal, isLiteral := node.(*ast.CompositeLit)
+			if !isLiteral {
+				return true
+			}
+			named, isNamed := literal.Type.(*ast.Ident)
+			if !isNamed || named.Name != "EngineProcessed" {
+				return true
+			}
+			literals += 1
+			staged := ast.Expr(nil)
+			for _, element := range literal.Elts {
+				pair, isPair := element.(*ast.KeyValueExpr)
+				if !isPair {
+					continue
+				}
+				if key, isKey := pair.Key.(*ast.Ident); isKey && key.Name == "stagedRef" {
+					staged = pair.Value
+				}
+			}
+			if staged == nil {
+				t.Errorf("%s builds an EngineProcessed with no stagedRef; a value staged by this engine and carried in Raw instead is one this package can read and rebuild, which is exactly what section 6's unforgeability sentence is about",
+					source.path)
+				return true
+			}
+			if identifier, isIdentifier := staged.(*ast.Ident); isIdentifier && identifier.Name == "nil" {
+				t.Errorf("%s builds an EngineProcessed whose stagedRef is nil; ApplyCommit then has nothing unforgeable to check and whatever the caller needs must have gone into Raw",
+					source.path)
+			}
+			return true
+		})
+	}
+	if literals == 0 {
+		t.Fatal("no production declaration of this package builds an EngineProcessed, so this gate is reporting clean having read nothing")
+	}
+	t.Logf("%d EngineProcessed literal(s) in production source", literals)
+}
 
-func engineProcessedFields() map[string]bool {
+// engineProcessedFieldNames reads the field names off the DECLARATION, so a field added to
+// section 6's struct joins the reader class with no edit here.
+//
+// It was a written down list of six names under a comment claiming it was derived, which is the
+// defect class this batch was sent to close pointed at this batch's own work: a class derived
+// from the instance in front of it rather than from the property it names. The seventh field
+// would have been invisible to it.
+func engineProcessedFieldNames(t *testing.T) map[string]bool {
+	t.Helper()
+	_, sources := messagegroupProductionSources(t)
 	names := map[string]bool{}
-	for _, name := range []string{"Kind", "SenderLeaf", "Aad", "Plaintext", "Raw", "stagedRef"} {
-		names[name] = true
+	for _, source := range sources {
+		for _, declaration := range source.parsed.Decls {
+			general, isGeneral := declaration.(*ast.GenDecl)
+			if !isGeneral || general.Tok != token.TYPE {
+				continue
+			}
+			for _, spec := range general.Specs {
+				typeSpec, isType := spec.(*ast.TypeSpec)
+				if !isType || typeSpec.Name.Name != "EngineProcessed" {
+					continue
+				}
+				structure, isStruct := typeSpec.Type.(*ast.StructType)
+				if !isStruct {
+					continue
+				}
+				for _, field := range structure.Fields.List {
+					for _, name := range field.Names {
+						names[name.Name] = true
+					}
+				}
+			}
+		}
+	}
+	if len(names) == 0 {
+		t.Fatal("EngineProcessed declares no field this reading can see, so every gate keyed on its field set is reporting clean having read nothing")
 	}
 	return names
 }

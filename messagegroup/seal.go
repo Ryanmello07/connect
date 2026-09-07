@@ -360,10 +360,20 @@ func (self *GroupSession) openRecordOnLoop(record *message.Record) ([]byte, []by
 	if err != nil {
 		return nil, nil, err
 	}
-	// body_hash against the ciphertext in hand, BEFORE either aead runs. It is the one field of
-	// the header that is a promise about the body rather than a description of the record, and a
-	// reader that skipped it would open a body whose hash the header disclaims -- which is what
-	// a pruned record's retained hash is later compared against.
+	// body_hash against the ciphertext in hand, BEFORE either aead runs.
+	//
+	// WHAT IT BUYS IS AN EARLIER AND CHEAPER REFUSAL AND NOT AN AUTHENTICATION, which is worth
+	// writing down because the sentence that used to stand here read as the second. Measured:
+	// disabling this check survives the whole of ./mls/ ./message/ ./messagegroup/. It has to --
+	// a moved ct_body fails the body aead, and a moved body_hash changes aad_head so the HEAD
+	// fails, so every input this refuses is one something below would refuse anyway. What it
+	// changes is that a record whose two halves disagree costs no peek of the receiver's ladder
+	// and no aead at all, and that it is refused by the field that says what the body was rather
+	// than by a tag failure that says nothing.
+	//
+	// It also makes the "no partial plaintext" hazard on the BODY path unreachable rather than
+	// merely guarded: with this check in front, no input opens ct_head and then fails ct_body.
+	// The guards are still there, and seal_test.go holds them off the source for that reason.
 	bodyHash := sha256.Sum256(record.CtBody)
 	if subtle.ConstantTimeCompare(bodyHash[:], header.BodyHash[:]) != 1 {
 		return nil, nil, fmt.Errorf("%w: the header's body_hash is not the hash of this ct_body", ErrRecordAeadOpen)

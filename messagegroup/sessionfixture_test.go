@@ -6,9 +6,15 @@
 // satisfy every case in this package while leaving that bar exactly as far away as it was before
 // task 9a. So the fixture builds an mls.CryptoProvider, an mls.StateStore, a signature key pair
 // and an X-Wing leaf key, founds a group through NewConnectMlsEngine, and hands the session the
-// adapter over it. The only value here that is not what the product will use is pq_secret, which
-// task 13 produces and which the session takes as a required argument with no default -- absent
-// rather than defaulted, which is the discipline this project's own rule states.
+// adapter over it. Every KEY on that path is the real one.
+//
+// FOUR VALUES HERE ARE THE TEST'S AND NOT THE PRODUCT'S, named rather than left for a reader to
+// find: pq_secret, which task 13 produces and which the session takes as a required argument with
+// no default -- absent rather than defaulted, which is the discipline this project's own rule
+// states; the state store, which is a map and persists nothing; the clock, which is a constant
+// because this package has no timing sensitive test and must not gain one; and the server nonce,
+// which the submitting connection chooses and there is no connection. None of the four is a KEY,
+// which is the distinction CP3b's "no test-only key source anywhere on the path" draws.
 //
 // The state store is in memory and is test-only by construction: it is declared in a _test.go
 // file, so no production build of this package can reach it, and imports_test.go's pin over the

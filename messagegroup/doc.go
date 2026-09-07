@@ -22,9 +22,11 @@
 // The layering is one way and the direction is the point. This package may import connect/mls,
 // and that import is correct rather than tolerated: this is the half that holds the group.
 // It may import connect/message, for the record types and the preimages the two authenticators
-// run over. connect/message must never import this package, and connect must never import
-// either. connect/layering_test.go holds all of that, because until this package's first call
-// into connect/message there is no cycle for the compiler to refuse.
+// run over, and since m1 wave 1's sealer it DOES: SealRecord and OpenRecord are the two callers
+// of that package's aad builders and of its write_auth mac. connect/message must never import
+// this package, and connect must never import either. connect/layering_test.go holds all of
+// that; the compiler holds the one direction that would be a cycle, and holds nothing about the
+// other two.
 //
 // What is here today is the X-Wing hybrid key encapsulation of draft-connolly-cfrg-xwing-kem with
 // its four sentinels, and the whole of what m1 wave 1 lands: the record aead and the algorithm

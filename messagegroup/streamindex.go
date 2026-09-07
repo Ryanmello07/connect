@@ -19,9 +19,10 @@
 // of writing one. Three facts and together they are the argument.
 //
 // Neither half of the record layer imports an I/O package at all. Measured over the production
-// files of connect/message and connect/messagegroup, the whole import set is the standard
-// library's crypto, encoding/binary, errors, fmt, io, sync, mls and mls/syntax; the heaviest is
-// io, for an io.Reader parameter. Adding a file format here would make the client half a storage
+// files of connect/message and connect/messagegroup after m1 wave 1, the whole import set is the
+// standard library's crypto, encoding/binary, errors, fmt, io, sync, mls, mls/syntax and -- from
+// the client half onto the server-safe one, in that direction only -- connect/message; the
+// heaviest is io, for an io.Reader parameter. Adding a file format here would make the client half a storage
 // engine, and it is a RECORD layer with a group attached. connect/mls's import gate holds that
 // as a test rather than as a sentence: every production import of this directory is pinned in
 // mls's own suite, so an os arriving here fails a test over there on the commit that adds it.

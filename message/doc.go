@@ -17,10 +17,11 @@
 // split exists to make true rather than to state: what it reads and writes wire vectors
 // with is connect/mls/syntax, which spec B section 2.2 allows by name and which is not an
 // MLS implementation. connect/messagegroup is where the one reviewed x25519 call site is
-// reached from, and it MAY import this package — but as of 2026-09-05 it does not, which
-// is measured rather than remembered. writeauth_test.go's
+// reached from, and it MAY import this package — and since m1 wave 1's sealer it DOES,
+// which is measured rather than remembered. writeauth_test.go's
 // TestEveryPackageBuiltOnThisOneIsUnderTheConstantTimeGate walks this module for the
-// production packages that import connect/message and reports none of them, and
+// production packages that import connect/message and reports connect/messagegroup as the
+// one; its constant time class over that directory is armed rather than empty, and
 // connect/layering_test.go holds the same direction as a rule from the other side. This
 // package must never import connect/messagegroup, and connect/mls must not reach back into
 // either — connect/mls imports only the standard library, golang.org/x/crypto, and its own

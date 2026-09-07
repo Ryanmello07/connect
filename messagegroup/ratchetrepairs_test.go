@@ -10,6 +10,13 @@ import (
 	"bytes"
 	"errors"
 	"go/ast"
+	"go/importer"
+	"go/parser"
+	"go/token"
+	"go/types"
+	"os"
+	"slices"
+	"strings"
 	"testing"
 )
 
@@ -436,55 +443,82 @@ func TestTheLastRungOfTheLadderErasesTheChainArray(t *testing.T) {
 // EMBEDDING it -- a decorator, a cache, a nop reserver -- is invisible to that reading, and the
 // probe survived the whole suite.
 //
-// This is the half that reads the SHAPE instead. The class is every production type declaration of
-// this package, and the property is that none of them satisfies the interface -- by declaring its
-// methods OR by embedding something that has them. The embedded case is what the declaration
-// reading cannot see, and it is read here off the anonymous fields.
-func TestNoProductionTypeOfThisPackageSatisfiesTheReserverByEmbeddingIt(t *testing.T) {
-	_, sources := messagegroupProductionSources(t)
-	embedding := []string{}
-	types := 0
-	for _, source := range sources {
-		for _, declaration := range source.parsed.Decls {
-			general, isGeneral := declaration.(*ast.GenDecl)
-			if !isGeneral {
-				continue
-			}
-			for _, spec := range general.Specs {
-				typeSpec, isType := spec.(*ast.TypeSpec)
-				if !isType {
-					continue
-				}
-				types += 1
-				structure, isStruct := typeSpec.Type.(*ast.StructType)
-				if !isStruct {
-					continue
-				}
-				for _, field := range structure.Fields.List {
-					if 0 < len(field.Names) {
-						continue
-					}
-					// an anonymous field: the type it names contributes its whole method
-					// set to this one, which is how a decorator satisfies an interface
-					// without declaring a single method.
-					if named, isNamed := field.Type.(*ast.Ident); isNamed && named.Name == "StreamIndexReserver" {
-						embedding = append(embedding, typeSpec.Name.Name)
-					}
-					if star, isStar := field.Type.(*ast.StarExpr); isStar {
-						if named, isNamed := star.X.(*ast.Ident); isNamed && named.Name == "StreamIndexReserver" {
-							embedding = append(embedding, typeSpec.Name.Name)
-						}
-					}
-				}
-			}
+// THIS ASKS GO/TYPES INSTEAD OF READING SHAPES, and that is the repair rather than a third shape
+// added to a list of two. A gate that read "declares the methods" and then also read "embeds the
+// interface" would be two enumerated shapes with a third waiting -- a named type whose underlying
+// type is a function... a struct embedding a struct that embeds the interface... a defined type
+// over a pointer to one. Assignability is the property; every shape is a way of having it, and
+// types.Implements answers the property.
+//
+// The scope question (R3a), answered separately from the class question: the SCOPE is this
+// package's production files, type checked as the package they are, because a durable reserver
+// arriving here is what section 8.2's assignment to sdk forbids and a type in another package is
+// that package's own question. The CLASS is every package level named type the checker reports,
+// which is total by construction -- the reading IS the class -- and it fatals if the checker
+// reports none.
+func TestNoProductionTypeOfThisPackageSatisfiesTheReserver(t *testing.T) {
+	fileSet := token.NewFileSet()
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read this package's directory: %v", err)
+	}
+	files := []*ast.File{}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		parsed, err := parser.ParseFile(fileSet, name, nil, parser.ParseComments)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		files = append(files, parsed)
+	}
+	if len(files) == 0 {
+		t.Fatal("no production file was read, so this gate type checked nothing")
+	}
+	config := types.Config{Importer: importer.ForCompiler(fileSet, "source", nil)}
+	checked, err := config.Check("github.com/urnetwork/connect/messagegroup", fileSet, files, nil)
+	if err != nil {
+		t.Fatalf("type check this package's production source: %v", err)
+	}
+	reserverObject := checked.Scope().Lookup("StreamIndexReserver")
+	if reserverObject == nil {
+		t.Fatal("this package declares no StreamIndexReserver, so this gate is holding nothing")
+	}
+	reserver, isInterface := reserverObject.Type().Underlying().(*types.Interface)
+	if !isInterface {
+		t.Fatal("StreamIndexReserver is not an interface")
+	}
+	if reserver.NumMethods() == 0 {
+		t.Fatal("StreamIndexReserver declares no method, so every type in this package satisfies it and this gate would report the whole package")
+	}
+	judged, satisfying := 0, []string{}
+	for _, name := range checked.Scope().Names() {
+		named, isNamed := checked.Scope().Lookup(name).(*types.TypeName)
+		if !isNamed {
+			continue
+		}
+		judged += 1
+		subject := named.Type()
+		if types.Implements(subject, reserver) || types.Implements(types.NewPointer(subject), reserver) {
+			satisfying = append(satisfying, name)
 		}
 	}
-	if types == 0 {
-		t.Fatal("no type declaration was read out of this package's production source, so this gate examined nothing")
+	if judged == 0 {
+		t.Fatal("the checker reported no named type in this package, so this gate examined nothing")
 	}
-	for _, name := range embedding {
-		t.Errorf("%s embeds StreamIndexReserver, so it satisfies the interface without declaring a method: a decorator, a cache or a nop reserver is exactly that shape, and section 8.2 assigns the durable store to sdk",
+	for _, name := range satisfying {
+		if name == "StreamIndexReserver" {
+			continue
+		}
+		t.Errorf("%s satisfies StreamIndexReserver in production source; section 8.2 assigns the durable store to sdk's MessageStore, and section 5.6's argument rests on neither half of the record layer implementing one",
 			name)
 	}
-	t.Logf("%d production type declaration(s) read, %d embedding the reserver", types, len(embedding))
+	// and the reading is not vacuous: the interface satisfies itself, which is the one member
+	// this class must always have.
+	if !slices.Contains(satisfying, "StreamIndexReserver") {
+		t.Errorf("types.Implements does not read StreamIndexReserver as satisfying itself, so whatever it is comparing is not the interface and every negative above is a negative about nothing")
+	}
+	t.Logf("%d named type(s) type checked, %d satisfying the reserver: %v", judged, len(satisfying), satisfying)
 }

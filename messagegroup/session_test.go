@@ -420,6 +420,17 @@ func TestCloseIsIdempotentStopsTheLoopAndErasesEveryKey(t *testing.T) {
 	if _, err := fixture.session.SenderHandle(); !errors.Is(err, ErrSessionClosed) {
 		t.Errorf("asking for the sender handle after Close answered %v, want ErrSessionClosed", err)
 	}
+	// AND THE HANDLE IS CLOSED WITH IT. Without this the session erased its own octets and left
+	// the group's epoch secrets -- its key schedule, its secret tree and the staged epoch behind
+	// them -- live in the heap, which is the larger half of what a close is for. Measured:
+	// replacing Close's call into the handle with nil survived every other case here.
+	if authenticator := fixture.handle.EpochAuthenticator(); authenticator != nil {
+		t.Errorf("the group handle is still open after the session closed: its epoch authenticator is %d octets, and mls answers nil for a closed group",
+			len(authenticator))
+	}
+	if secret, err := fixture.handle.Export(mlsSecretLabel, nil, mlsSecretBytes); err == nil {
+		t.Errorf("the group handle still exports %d octets after the session closed", len(secret))
+	}
 }
 
 // The session is safe for concurrent use, which is what the loop is for. This is not a race

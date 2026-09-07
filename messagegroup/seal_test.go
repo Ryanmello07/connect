@@ -940,6 +940,86 @@ func TestNoPlaintextIsReturnedBesideAnError(t *testing.T) {
 	}
 }
 
+// Property 5, held off the SOURCE because no input can reach the path it is about.
+//
+// Measured while mutation testing this batch: returning the head plaintext beside a body refusal
+// survives every behavioural case here, and so does removing the outer guard as well, and the
+// reason is that the two are unreachable rather than untested. body_hash is checked before either
+// aead runs, and aad_head covers body_hash, so a record whose ct_body was moved is refused before
+// the head is opened and one whose body_hash was moved fails at the HEAD. There is no input that
+// opens ct_head and then fails ct_body.
+//
+// A guard nothing can reach is still a guard worth keeping -- the reachability argument above
+// rests on two other checks, and either of them moving would make this one load bearing again --
+// so it is held by a reading of the source instead. The scope question (R3a): the SCOPE is this
+// package's production source. The CLASS is every declaration answering exactly ([]byte, []byte,
+// error), derived off the signature and never listed, and the assertion is that no return
+// statement in one of them answers a non-nil error beside a plaintext.
+func TestNoDeclarationAnsweringTwoPlaintextsReturnsOneBesideAnError(t *testing.T) {
+	_, sources := messagegroupProductionSources(t)
+	judged := 0
+	for _, source := range sources {
+		for _, declaration := range source.parsed.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || function.Body == nil || !sealAnswersTwoPlaintextsAndAnError(function) {
+				continue
+			}
+			judged += 1
+			ast.Inspect(function.Body, func(node ast.Node) bool {
+				returned, isReturn := node.(*ast.ReturnStmt)
+				if !isReturn || len(returned.Results) != 3 {
+					return true
+				}
+				if sealIsNilLiteral(returned.Results[2]) {
+					return true
+				}
+				for at, result := range returned.Results[:2] {
+					if !sealIsNilLiteral(result) {
+						t.Errorf("%s returns result %d beside a non-nil error; a caller that rendered whatever came back would be rendering attacker chosen octets",
+							function.Name.Name, at)
+					}
+				}
+				return true
+			})
+		}
+	}
+	if judged == 0 {
+		t.Fatal("no production declaration answers two plaintexts and an error, so this gate is reporting clean having read nothing")
+	}
+	t.Logf("%d declaration(s) answer two plaintexts and an error", judged)
+}
+
+// sealAnswersTwoPlaintextsAndAnError reads the signature rather than the name: exactly three
+// results, the first two byte slices and the last an error.
+func sealAnswersTwoPlaintextsAndAnError(function *ast.FuncDecl) bool {
+	if function.Type.Results == nil {
+		return false
+	}
+	kinds := []string{}
+	for _, field := range function.Type.Results.List {
+		rendered := ""
+		switch result := field.Type.(type) {
+		case *ast.ArrayType:
+			if element, isIdentifier := result.Elt.(*ast.Ident); isIdentifier && result.Len == nil {
+				rendered = "[]" + element.Name
+			}
+		case *ast.Ident:
+			rendered = result.Name
+		}
+		count := max(len(field.Names), 1)
+		for range count {
+			kinds = append(kinds, rendered)
+		}
+	}
+	return len(kinds) == 3 && kinds[0] == "[]byte" && kinds[1] == "[]byte" && kinds[2] == "error"
+}
+
+// sealIsNilLiteral answers whether one expression is the identifier nil.
+func sealIsNilLiteral(expression ast.Expr) bool {
+	identifier, isIdentifier := expression.(*ast.Ident)
+	return isIdentifier && identifier.Name == "nil"
+}
+
 // OpenRecord never trusts RecordId. It is server assigned and authenticated by nothing.
 //
 // Both halves: the open path's source names no such field, derived off the syntax tree; and a
