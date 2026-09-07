@@ -107,6 +107,29 @@ func (self *iceInterfaceNet) InterfaceByName(name string) (*transport.Interface,
 // connect()-only UDP dial (no packet is sent; the kernel resolves the route
 // and assigns a local address) and wraps each as a synthetic pion interface
 // carrying a host address. Nil entries (no route for a family) are skipped.
+// egressIPv6Usable reports whether the device can actually send an IPv6 packet
+// to the internet. A connect()-only UDP dial is not enough: on Android the
+// kernel has a native IPv6 route (e.g. from AT&T cellular) so connect()
+// succeeds, but the VPN tunnel swallows outbound v6 traffic, making every STUN
+// and DTLS attempt stall. We send a single zero-byte UDP datagram to Google
+// DNS over IPv6; if sendto returns "network is unreachable" we know the tunnel
+// blackholes v6 and must not gather IPv6 ICE candidates.
+func egressIPv6Usable() bool {
+	pc, err := net.ListenPacket("udp6", "[::]:0")
+	if err != nil {
+		return false
+	}
+	defer pc.Close()
+	_, err = pc.WriteTo([]byte{0}, &net.UDPAddr{IP: net.ParseIP("2001:4860:4860::8888"), Port: 80})
+	return err == nil
+}
+
+// egressIPv4Usable reports whether the kernel has a default IPv4 route to the
+// internet, using the connect()-only dial trick.
+func egressIPv4Usable() bool {
+	return dialLocalIP("udp4", "8.8.8.8:80") != nil
+}
+
 func localEgressInterfaces() []*transport.Interface {
 	var out []*transport.Interface
 	nativeInterfaces, nativeInterfacesErr := net.Interfaces()

@@ -62,6 +62,28 @@ func newWebRtcPeerConnectionFactory(
 	logIceInterfaces(log)
 	selectedNet := settings.Network
 	callerOwnedNet := selectedNet != nil
+	// Restrict Pion's ICE/STUN gathering to address families that actually
+	// have a route. When the tunnel this process provides (or the device
+	// network) has no IPv6 route, every IPv6 STUN gather fails with
+	// "sendmsg: network is unreachable", Pion waits the full STUN timeout on a
+	// path that can never answer, and the peer connection is torn down before
+	// DTLS establishes. Detect it with the same connect-only dial the egress
+	// interface uses and tell Pion not to gather the dead family.
+	// The full family set is kept when an injected Network owns enumeration or
+	// when the caller explicitly requested loopback-only (tests), where the
+	// synthetic egress probe is not authoritative.
+	if settings.Network == nil && !settings.UseLoopbackOnlyIceInterfaces {
+		networkTypes := make([]webrtc.NetworkType, 0, 4)
+		if egressIPv4Usable() {
+			networkTypes = append(networkTypes, webrtc.NetworkTypeUDP4, webrtc.NetworkTypeTCP4)
+		}
+		if egressIPv6Usable() {
+			networkTypes = append(networkTypes, webrtc.NetworkTypeUDP6, webrtc.NetworkTypeTCP6)
+		}
+		if 0 < len(networkTypes) {
+			s.SetNetworkTypes(networkTypes)
+		}
+	}
 	if selectedNet != nil {
 		// An injected network owns candidate enumeration and socket routing.
 	} else if settings.UseLoopbackOnlyIceInterfaces {
