@@ -262,6 +262,9 @@ var handleLeafIndexReadings = map[string]string{
 		"\"sh/v1\" | LP(leaf_index), 16), and this is the one place in the project where LP wraps an integer",
 	"WrapTargetHandle": "raw -- section 5.11 writes wrap_target_handle with u32(leaf_index) and no length " +
 		"prefix at all, which is the asymmetry open item M1-8 is about",
+	"TrackSender": "LP -- it binds the leaf only through SenderHandle and NewReceiverRatchet, so its " +
+		"reading is theirs, and a receiver installed under a handle the sender does not compute is a ladder nothing routes to",
+	"trackSenderOnLoop": "LP -- TrackSender's body, and the same reading for the same reason",
 }
 
 func TestEveryLeafIndexDerivationDeclaresItsReadingAndSharesOneHelper(t *testing.T) {
@@ -313,26 +316,42 @@ func TestEveryLeafIndexDerivationDeclaresItsReadingAndSharesOneHelper(t *testing
 	// one declared raw reading where a uint32 becomes octets at all. Both halves are read off the
 	// CALLS -- a length prefix written, a thirty two bit encoding spelled -- rather than off an
 	// argument name, because a second reading arrives with whatever names its author chooses.
-	prefixing, encoding := []string{}, []string{}
+	// THE CLASS HERE IS "a length prefix over an INDEX" AND NOT "a length prefix", and the
+	// narrowing is recorded rather than made quietly. It used to be every declaration calling
+	// WriteOpaqueLP, which was the class derived from the one INSTANCE that existed when it was
+	// written -- and the moment task 11's body padder landed, a function that length prefixes a
+	// MESSAGE BODY failed a gate whose stated property is about LP(leaf_index). Deriving from
+	// the property instead: a member of this class writes a length prefix AND has an integer in
+	// reach to write it over, read off the calls and the signature rather than off a name. A
+	// padder over a []byte is not in it; a second reading of LP(leaf_index) under any name is.
+	prefixingAnIndex, prefixingAnything, encoding := []string{}, []string{}, []string{}
 	for _, source := range sources {
 		for _, declaration := range source.parsed.Decls {
 			function, isFunction := declaration.(*ast.FuncDecl)
 			if !isFunction || function.Body == nil {
 				continue
 			}
-			if handleWritesALengthPrefix(function.Body) {
-				prefixing = append(prefixing, function.Name.Name)
+			writesLP := handleWritesALengthPrefix(function.Body)
+			if writesLP {
+				prefixingAnything = append(prefixingAnything, function.Name.Name)
+			}
+			if writesLP && (handleEncodesAUint32(function.Body) || handleTakesAUint32(function)) {
+				prefixingAnIndex = append(prefixingAnIndex, function.Name.Name)
 			}
 			if handleEncodesAUint32(function.Body) {
 				encoding = append(encoding, function.Name.Name)
 			}
 		}
 	}
-	slices.Sort(prefixing)
+	slices.Sort(prefixingAnIndex)
+	slices.Sort(prefixingAnything)
 	slices.Sort(encoding)
-	if !slices.Equal(prefixing, []string{"leafIndexLP"}) {
-		t.Errorf("a length prefix is written in %v; there is one reading of LP(leaf_index) in this package and it lives in leafIndexLP so that M1-8's ruling is a single edit",
-			prefixing)
+	if len(prefixingAnything) == 0 {
+		t.Fatal("nothing in this package writes a length prefix at all, so the matcher this half rests on has stopped matching and the whole half is reporting clean having read nothing")
+	}
+	if !slices.Equal(prefixingAnIndex, []string{"leafIndexLP"}) {
+		t.Errorf("a length prefix is written over an index in %v; there is one reading of LP(leaf_index) in this package and it lives in leafIndexLP so that M1-8's ruling is a single edit",
+			prefixingAnIndex)
 	}
 	if len(encoding) == 0 {
 		t.Fatal("nothing in this package encodes a uint32, so this half of the gate read nothing")

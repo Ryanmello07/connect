@@ -5972,8 +5972,17 @@ func TestProviderHasNoRemainingStubs(t *testing.T) {
 // make([]byte, 10)" passes every shape here, and is caught by fourteen published vector
 // tests. That is where the class sits for the declarations no behavioural gate reaches.
 //
-// Bodies of function literals are skipped, so a return or a panic written inside a closure
-// is read as the closure's and not as the declaration's.
+// Bodies of function literals are skipped for the RETURN and PANIC halves, so a return or a
+// panic written inside a closure is read as the closure's and not as the declaration's.
+//
+// THE PARAMETER HALF READS THEM, and the difference is not a nicety. A parameter a body hands
+// to a closure it builds is a parameter that body read; the two halves want opposite answers
+// because a closure's own return is not the declaration's and a closure's own read IS. It was
+// one reading until m1 wave 1 landed connect/messagegroup's GroupSession, whose section 3.6
+// concurrency contract makes every public method post a command -- so every parameter of
+// SealRecord, OpenRecord, TrackSender and AdvanceEpoch is read inside a function literal and
+// nowhere else, and all eleven of them were reported as placeholders in a body that reads
+// every one.
 func providerStubShapesIn(parsed parsedSource) []string {
 	shapes := []string{}
 	for _, declaration := range parsed.file.Decls {
@@ -5988,7 +5997,7 @@ func providerStubShapesIn(parsed parsedSource) []string {
 				returns = true
 			}
 		})
-		read := identifiersReadIn(function.Body)
+		read := identifiersReadAnywhereIn(function.Body)
 		if function.Type.Results != nil && len(function.Type.Results.List) != 0 && !returns {
 			shapes = append(shapes, where+" declares a result and never returns one")
 		}
@@ -6049,6 +6058,35 @@ func identifiersReadIn(body *ast.BlockStmt) map[string]bool {
 		if identifier, isIdentifier := node.(*ast.Ident); isIdentifier && !tails[identifier] {
 			read[identifier.Name] = true
 		}
+	})
+	return read
+}
+
+// identifiersReadAnywhereIn is identifiersReadIn over the WHOLE body, function literals
+// included.
+//
+// It is the parameter half's reading and providerStubShapesIn's comment says why the two
+// differ. The tails filter is the same one and for the same reason: a selector's tail and a
+// field name in a struct type are not reads of a parameter that shares their spelling.
+func identifiersReadAnywhereIn(body *ast.BlockStmt) map[string]bool {
+	tails := map[*ast.Ident]bool{}
+	ast.Inspect(body, func(node ast.Node) bool {
+		switch found := node.(type) {
+		case *ast.SelectorExpr:
+			tails[found.Sel] = true
+		case *ast.Field:
+			for _, name := range found.Names {
+				tails[name] = true
+			}
+		}
+		return true
+	})
+	read := map[string]bool{}
+	ast.Inspect(body, func(node ast.Node) bool {
+		if identifier, isIdentifier := node.(*ast.Ident); isIdentifier && !tails[identifier] {
+			read[identifier.Name] = true
+		}
+		return true
 	})
 	return read
 }
@@ -6138,6 +6176,20 @@ func stubThatAnswersZeroes(secret []byte, length int) []byte {
 
 func stubThatReadsOneOfTwo(secret []byte, length int) []byte {
 	return make([]byte, length)
+}
+
+func stubThatReadsItsParameterOnlyInsideAClosure(secret []byte, length int) []byte {
+	answer := []byte(nil)
+	run := func() { answer = append(secret, byte(length)) }
+	run()
+	return answer
+}
+
+func stubThatDropsAParameterAndClosesOverTheOther(secret []byte, length int) []byte {
+	answer := []byte(nil)
+	run := func() { answer = make([]byte, length) }
+	run()
+	return answer
 }
 
 func stubThatNamesAFieldInstead(params []byte, length int) []byte {
@@ -6308,21 +6360,6 @@ var packageDeclarationsAwaitingTheirFirstCaller = map[string]awaitingFirstCaller
 	// is the first thing with a countersignature to check.
 	"./successionPreimage": {firstCaller: "ValidateSuccession",
 		why: "the countersignature preimage of MASTER section 11, landed beside the nomination it covers rather than beside the validator that reads it"},
-	//
-	// The twelfth and thirteenth are m1 wave 1 task 1's, and they are the ninth and tenth's shape
-	// exactly: spec A section 5.3's record aead's seal and its open land TOGETHER, because the
-	// property that matters about them is not that either works -- it is that the open is the
-	// seal's inverse over XChaCha20-Poly1305 with a twenty four octet nonce rather than over
-	// whatever the seal happened to do, and a task that landed one without the other would leave
-	// that to whoever needed the second. They are the first entries this table has held for
-	// ../messagegroup, which is why the address carries that root: an unrelated declaration of
-	// the same name in either other root neither excuses these nor keeps their excuse alive.
-	// Neither has a production caller until m1 task 11 assembles the record builder around them;
-	// both come off by FAILING on the commit that gives them one.
-	"../messagegroup/sealRecordAead": {firstCaller: "SealRecord",
-		why: "the record aead's seal, landed beside the open it is the inverse of rather than beside the record builder that will call both"},
-	"../messagegroup/openRecordAead": {firstCaller: "OpenRecord",
-		why: "the record aead's open, landed beside the seal it inverts rather than beside the record reader that will call both"},
 }
 
 // ---------------------------------------------------------------------------
@@ -6863,6 +6900,11 @@ func TestNoStubShapesRemainInSource(t *testing.T) {
 	want := []string{
 		"control.stubThatAnswersZeroes does not read length",
 		"control.stubThatAnswersZeroes does not read secret",
+		// the closure half, in the direction that must still be reported: this one drops
+		// secret entirely and closes over length. Its twin,
+		// stubThatReadsItsParameterOnlyInsideAClosure, reads BOTH inside a closure and is
+		// absent from this list, which is the other direction of the same reading.
+		"control.stubThatDropsAParameterAndClosesOverTheOther does not read secret",
 		"control.stubThatNamesAFieldInstead does not read params",
 		"control.stubThatPanics declares a result and never returns one",
 		"control.stubThatPanics does not read secret",
@@ -7961,6 +8003,11 @@ var cryptoImportPaths = []string{
 	// reviewed ECDH call site in the tree: X-Wing's x25519 half goes through X25519GenerateKey,
 	// X25519PrivateKey, X25519PublicKey and X25519DH rather than through crypto/ecdh, so the
 	// low order point refusal those wrap cannot be bypassed by writing the exchange again.
+	// ../messagegroup's edge onto the server-safe half: the record types, the two aad
+	// builders and the write_auth mac the sealer runs over. The direction is one way and it is
+	// the ruling -- connect/message never imports connect/messagegroup -- so this row is the
+	// client half reaching the shared half and never the reverse.
+	`"github.com/urnetwork/connect/message"`,
 	`"github.com/urnetwork/connect/mls"`,
 	`"github.com/urnetwork/connect/mls/syntax"`,
 	`"golang.org/x/crypto/chacha20poly1305"`,

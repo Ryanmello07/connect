@@ -50,8 +50,17 @@
 // handle the old leaf's high water -- burning indices, benign -- or, on any local state
 // divergence, lets a fresh handle start at 1 while a stale row says otherwise. That is open item
 // M1-5, it is the highest priority of the non blocking items because this is the one piece of
-// durable on-disk state that cannot be migrated by recomputation, and the parameter set here is
-// the one both documents declare. Implement the ruling; do not choose it in this file.
+// durable on-disk state that cannot be migrated by recomputation. Implement the ruling; do not
+// choose it in this file.
+//
+// WHAT THIS FILE DOES ANSWER, AND WHY IT HAD TO. The parameter set here is NO LONGER the one
+// both documents declare: Reserve and HighWater take a StreamKey carrying the group, the sender
+// handle and the retention class wire byte, and StreamKey's own comment carries the
+// measurement. The two documents' groupId-only parameter is not an open question about keying,
+// it is a permanent wedge -- a sender ratchet is per retention class, so two classes of one
+// group reserving out of one counter leave the second refused forever at its first index. The
+// keying M1-5 rules is which of these fields a STORE ROW is identified by; the keying here is
+// which stream a RESERVATION belongs to, and only the second was in this package's reach.
 package messagegroup
 
 // StreamIndexReserver is the durable sink a sender ratchet reserves its stream indices in.
@@ -69,7 +78,7 @@ package messagegroup
 //     ErrStreamIndexRewound.
 //  3. A consumed index is refused and never overwritten, with ErrStreamIndexConsumed. A typed
 //     fatal error per section 5.9 G7, never a bool and never a log line.
-//  4. The store is TOTAL over its key space. A group never seen answers HighWater 0 with no
+//  4. The store is TOTAL over its key space. A stream never seen answers HighWater 0 with no
 //     error, so highWater + 1 is a well defined start; section 5.1 makes record_id = 0 the
 //     "from the beginning" cursor by the same reasoning and the two must not disagree in shape.
 //  5. Reserve is not idempotent. Reserving an index a second time is condition 3 and not a
@@ -84,9 +93,35 @@ package messagegroup
 type StreamIndexReserver interface {
 	// Reserve records that this device is about to encrypt at index, and returns only after
 	// that record is durable. The error is fatal to the seal: SealRecord refuses to proceed.
-	Reserve(groupId []byte, index uint64) error
-	// HighWater is the highest index this store has ever reserved for the group, or 0 for a
-	// group it has never seen. The ratchet resumes at highWater + 1 and never at a
+	Reserve(stream StreamKey, index uint64) error
+	// HighWater is the highest index this store has ever reserved for the stream, or 0 for a
+	// stream it has never seen. The ratchet resumes at highWater + 1 and never at a
 	// recomputed value.
-	HighWater(groupId []byte) (uint64, error)
+	HighWater(stream StreamKey) (uint64, error)
+}
+
+// StreamKey is the stream one reservation belongs to: the group, the sender and the retention
+// class, which is what spec A section 5.5 scopes a ladder to.
+//
+// IT DIVERGES FROM BOTH DOCUMENTS' PARAMETER SET AND THE DIVERGENCE IS THE REPAIR. Section 5.6's
+// interface and section 8.2's MessageStore both declare the reservation over groupId alone. A
+// sender ratchet is per (class key, leaf), because record_key[0] binds the class key, so one
+// group has one ratchet per retention class -- and over a groupId keyed reserver the durable and
+// the permanent ladders of one group reserve out of one counter. Measured on the shape this
+// file used to declare: the durable ratchet took index 1, and every later call on the permanent
+// ratchet answered ErrStreamIndexConsumed forever with its position stuck, so at most one
+// retention class per group could ever send. That is not a tuning question, it is a permanent
+// wedge, and it is invisible to any test that builds one ratchet.
+//
+// So the key carries all three, and the flattening to a store row is the implementer's. Open
+// item M1-5 is still what rules the keying; what this type does is refuse to let the unruled
+// question be answered by an accident of the parameter list.
+//
+// It is a comparable struct with no slice in it, and that is deliberate twice over: a stream key
+// can be a map key without a second encoding, and a group id that moved under a ratchet cannot
+// reserve indices against one row and use them against another.
+type StreamKey struct {
+	GroupId       [32]byte
+	SenderHandle  [16]byte
+	RetentionWire byte
 }

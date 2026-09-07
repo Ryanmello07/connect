@@ -123,9 +123,13 @@ func sealRecordAead(key []byte, nonce []byte, aad []byte, plaintext []byte) ([]b
 // openRecordAead opens one of a record's two ciphertexts, or refuses.
 //
 // It answers no plaintext on a refusal, and that is the whole of its contract beyond the
-// widths. cipher.AEAD.Open already promises not to write the destination on a tag failure;
-// this returns nil explicitly beside the error so a caller that ignored the error is holding
-// nothing rather than holding a prefix of unauthenticated octets. The underlying error is not
+// widths. THE GUARANTEE IS THE LIBRARY'S AND NOT THIS FILE'S, which is worth writing down
+// because the sentence that used to stand here read as though this line were what held it:
+// today's chacha20poly1305.Open answers a nil slice on a tag failure, so returning "plaintext"
+// beside the error instead of nil is a mutation no test in this tree can tell apart. What the
+// explicit nil buys is that the contract does not MOVE if the library's does -- a caller that
+// ignored the error holds nothing rather than a prefix of unauthenticated octets, whatever
+// crypto/cipher decides to do with its destination next. The underlying error is not
 // wrapped: it says only "message authentication failed", it is the same for every cause, and a
 // caller distinguishing causes here would be distinguishing what an attacker chose.
 func openRecordAead(key []byte, nonce []byte, aad []byte, ciphertext []byte) ([]byte, error) {

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"go/ast"
+	"reflect"
 	"slices"
 	"sync"
 	"testing"
@@ -18,7 +19,7 @@ func ratchetClassKey() []byte {
 
 const ratchetLeaf uint32 = 3
 
-var ratchetGroup = []byte{0x67, 0x72, 0x70, 0x07}
+var ratchetGroup = streamKeyNamed("grp-7")
 
 // The ladder as an independent walk, so every test below can say WHICH rung it expected rather
 // than only that two calls agreed.
@@ -365,8 +366,8 @@ func TestTheSenderRefusesRatherThanWrappingAtTheEndOfTheCounter(t *testing.T) {
 	}
 	// and a store whose high water is already the last index is refused at construction
 	exhausted := newStreamIndexMemory()
-	exhausted.image[""] = ^uint64(0)
-	if _, err := NewSenderRatchet(ratchetClassKey(), ratchetLeaf, nil, exhausted); !errors.Is(err, ErrSenderRatchetExhausted) {
+	exhausted.image[streamIndexRowKey(ratchetGroup)] = ^uint64(0)
+	if _, err := NewSenderRatchet(ratchetClassKey(), ratchetLeaf, ratchetGroup, exhausted); !errors.Is(err, ErrSenderRatchetExhausted) {
 		t.Errorf("a ratchet resumed past the end of the counter answered %v, want ErrSenderRatchetExhausted", err)
 	}
 }
@@ -382,24 +383,64 @@ func TestTheSenderRatchetRefusesAMissingOrUnreadableReserver(t *testing.T) {
 	}
 }
 
-// The group id is the ratchet's own copy: a caller that reuses its buffer must not move which
-// row the reservations land in.
-func TestTheSenderRatchetHoldsItsOwnGroupId(t *testing.T) {
+// A caller that reuses its buffer must not move which row a ratchet's reservations land in.
+//
+// This used to be a behavioural case over a []byte group id: build a ratchet, overwrite the
+// caller's array, and require the reservation to land under the original. StreamKey removed the
+// hazard rather than fixing it -- every field is an array or a byte, so there is no reference for
+// a caller to write through -- and the case is stated that way now, DERIVED off the type rather
+// than written as a list of its fields, so a field added later that IS a reference is a failure
+// here rather than a silent return of the aliasing this replaced.
+//
+// It is recorded as a replacement and not as a repair: the old case can no longer fail, and a
+// case that cannot fail is the thing this project's first rule is about.
+func TestNoFieldOfAStreamKeyIsSomethingACallerCanWriteThrough(t *testing.T) {
+	streamKeyType := reflect.TypeOf(StreamKey{})
+	if streamKeyType.NumField() == 0 {
+		t.Fatal("StreamKey has no fields at all, so this gate read nothing")
+	}
+	for i := range streamKeyType.NumField() {
+		field := streamKeyType.Field(i)
+		switch field.Type.Kind() {
+		case reflect.Array, reflect.Bool, reflect.Uint8, reflect.Uint16, reflect.Uint32,
+			reflect.Uint64, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32,
+			reflect.Int64, reflect.String:
+		default:
+			t.Errorf("StreamKey.%s is a %s, which a caller goes on holding: a stream key that aliased its caller's storage would reserve indices against one row and use them against another",
+				field.Name, field.Type.Kind())
+		}
+	}
+	// and the type is comparable, which is what lets a store use it as a map key without a
+	// second encoding of it. It is asserted by USING it as one: go refuses a map key type that
+	// is not comparable at compile time, so this line is the assertion and a reflective
+	// Comparable() would be a weaker restatement of it.
+	rows := map[StreamKey]bool{streamKeyNamed("a"): true}
+	if !rows[streamKeyNamed("a")] {
+		t.Error("two equal stream keys did not answer one map row")
+	}
+	// the behavioural half the old case had: two distinct streams do not share a counter.
 	reserver := newStreamIndexMemory()
-	groupId := append([]byte(nil), ratchetGroup...)
-	ratchet, err := NewSenderRatchet(ratchetClassKey(), ratchetLeaf, groupId, reserver)
+	first, err := NewSenderRatchet(ratchetClassKey(), ratchetLeaf, streamKeyNamed("one"), reserver)
 	if err != nil {
-		t.Fatalf("build the ratchet: %v", err)
+		t.Fatalf("build the first ratchet: %v", err)
 	}
-	for i := range groupId {
-		groupId[i] = 0xFF
+	second, err := NewSenderRatchet(ratchetClassKey(), ratchetLeaf, streamKeyNamed("two"), reserver)
+	if err != nil {
+		t.Fatalf("build the second ratchet: %v", err)
 	}
-	if _, _, err := ratchet.Next(); err != nil {
-		t.Fatalf("next: %v", err)
+	firstIndex, firstKey, err := first.Next()
+	if err != nil {
+		t.Fatalf("the first ratchet could not reserve: %v", err)
 	}
-	if got, _ := reserver.HighWater(ratchetGroup); got != 1 {
-		t.Errorf("the reservation landed under a group id the caller overwrote; the original group's high water is %d, want 1", got)
+	secondIndex, secondKey, err := second.Next()
+	if err != nil {
+		t.Fatalf("the second ratchet could not reserve: %v", err)
 	}
+	if firstIndex != 1 || secondIndex != 1 {
+		t.Errorf("two distinct streams answered %d and %d, want 1 and 1: they are sharing a counter", firstIndex, secondIndex)
+	}
+	zeroize(firstKey)
+	zeroize(secondKey)
 }
 
 // ---------------------------------------------------------------------------

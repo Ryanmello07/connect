@@ -50,11 +50,20 @@
 // own two numbers, read off that package rather than restated, because M1-12's labelled
 // recommendation is to adopt its shape: a TREE WIDE retained bound, so adding senders adds no
 // memory at all, and eviction from the FULLEST window, so a member holding a handful of skipped
-// keys never pays for a member holding a thousand. Section 5.5's "evict the oldest sender"
-// starves whoever went quiet, which is the member most likely to need the window.
+// keys never pays for a member holding more than its own share. THE PROPERTY IS THE FAIR SHARE
+// AND NOT "a handful never pays for a thousand", which is the looser sentence this file carried
+// and which is FALSE: evicting from the fullest equalises, so once the bound is exceeded every
+// holder above bound/senders loses rungs. Measured at the shipped defaults, where the table
+// bound and one window are the same number: three honest senders, two holding four hundred
+// skipped rungs each and a third taking a full window reorder, left the two at 341 -- fifty
+// nine and fifty eight honest rungs permanently gone, with no attacker in it. What IS true, and
+// what pruneRetainedLocked's own comment states and a three sender case holds, is that a member
+// holding fewer than bound/senders never loses a rung at all. Section 5.5's "evict the oldest
+// sender" starves whoever went quiet, which is the member most likely to need the window.
 package messagegroup
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 
@@ -77,6 +86,28 @@ const (
 	DefaultRetainedRecordKeys = mls.MaxRetainedWindowKeys
 )
 
+// The most expansions either constructor will pay to walk a ladder to its starting point.
+//
+// It is a COST CEILING and not a class, which is why it is a number here rather than something
+// derived off the tree: what it bounds is how much CPU one call may spend, and the only honest
+// derivation of that is a measurement. Measured on this machine at roughly four hundred
+// nanoseconds per rung, so this bound is about four tenths of a second in the worst case, and
+// the next power of two up is nearly a second.
+//
+// It exists because BOTH walks are driven by a number nothing has authenticated at the moment
+// it is read. A receiver's head index is a position in a peer's stream and the only value
+// available for it is the record header's cleartext stream_index; a sender's resume is whatever
+// a store hands back, and a store that has been rolled back or corrupted hands back anything. An
+// unbounded walk over either is a denial with no ceiling: 2^32 is about half an hour of one core
+// and 2^63 never returns.
+//
+// What the bound COSTS is stated rather than hidden: a stream that has genuinely passed this
+// many records cannot be resumed at all, and the refusal is ErrLadderWalkTooLong rather than a
+// silent restart at zero -- which would re-issue every record key under an unmoved class key.
+// Open item M1-12 is where a real ceiling on a stream's length belongs; until it exists this is
+// the ceiling on the WALK, which is the part that is this package's to bound.
+const maxLadderWalk = 1 << 20
+
 // SenderRatchet is one sender's ladder over record_key[i] for one retention class, with the
 // durable index reservation ordered in front of every key it hands out.
 //
@@ -96,13 +127,24 @@ const (
 type SenderRatchet struct {
 	stateLock sync.Mutex
 	reserver  StreamIndexReserver
-	groupId   []byte
+	stream    StreamKey
 	// record_key[position], this ratchet's own copy, erased by the Next that passes it on.
 	recordKey []byte
 	// the stream index the next call will reserve, and the ladder position that goes with it.
 	position uint64
 	// set when position reached the last index a u64 holds, so it cannot wrap to zero.
 	exhausted bool
+	// set by Zeroize. Without it Zeroize left this ratchet fully operational and the next
+	// Next handed out the rung derived from thirty two zeros -- the same key, and so the same
+	// (key, nonce) pair, for every zeroized ratchet in the world, with the stream index
+	// durably consumed under it. It is checked BEFORE the reservation so that a call after
+	// Zeroize costs no index either.
+	zeroized bool
+	// set when the reserver refused this ratchet's next index as already consumed. That
+	// refusal is permanent -- the index will never be free again -- so the ratchet stops
+	// rather than re-offering it, which is what a transient failure gets. A caller that wants
+	// to go on rebuilds the ratchet from the store's own high water.
+	wedged bool
 }
 
 // NewSenderRatchet builds a sender's ladder for one class key and one leaf, resumed from the
@@ -112,19 +154,26 @@ type SenderRatchet struct {
 // instruction -- "the constructor takes the sink to make it explicit". A ratchet without one is
 // a ratchet that cannot make the ordering it exists to make.
 //
+// The stream is the group, the sender handle and the retention class wire byte together, and
+// StreamKey's own comment says why all three: a sender ratchet is per retention class, so two
+// classes of one group reserving out of one counter wedge each other permanently.
+//
 // The resume is HighWater() + 1 and is never a recomputed value. A ratchet that recomputed its
 // position from its own state would restart at zero after a crash, which is the reuse the file
 // comment above is about; a ratchet that resumed AT the high water would re-issue the last index
 // the store handed out, which is the same defect one rung shallower.
 //
-// The walk is the cost the file comment prices. It advances the ladder once per index below the
-// resume point, erasing each rung as it passes, so the ratchet holds record_key[position] and
-// nothing below it when the constructor returns.
-func NewSenderRatchet(classKey []byte, leaf uint32, groupId []byte, reserver StreamIndexReserver) (*SenderRatchet, error) {
+// The walk is the cost the file comment prices, and it is BOUNDED by maxLadderWalk. It advances
+// the ladder once per index below the resume point, erasing each rung as it passes, so the
+// ratchet holds record_key[position] and nothing below it when the constructor returns; a high
+// water further out than that bound is refused rather than walked, because a store that hands
+// back an enormous number is a store that has been rolled back or corrupted and the walk is
+// otherwise unbounded work on its say so.
+func NewSenderRatchet(classKey []byte, leaf uint32, stream StreamKey, reserver StreamIndexReserver) (*SenderRatchet, error) {
 	if reserver == nil {
 		return nil, fmt.Errorf("%w: a sender ratchet reserves before it derives", ErrNilStreamIndexReserver)
 	}
-	highWater, err := reserver.HighWater(groupId)
+	highWater, err := reserver.HighWater(stream)
 	if err != nil {
 		return nil, fmt.Errorf("messagegroup: a sender ratchet could not read its stream index high water: %w", err)
 	}
@@ -132,15 +181,17 @@ func NewSenderRatchet(classKey []byte, leaf uint32, groupId []byte, reserver Str
 		return nil, fmt.Errorf("%w: the high water is already %d", ErrSenderRatchetExhausted, highWater)
 	}
 	position := highWater + 1
+	if maxLadderWalk < position {
+		return nil, fmt.Errorf("%w: resuming at %d would walk %d rungs and the bound is %d",
+			ErrLadderWalkTooLong, position, position, maxLadderWalk)
+	}
 	recordKey := RecordKeyZero(classKey, leaf)
 	for walked := uint64(0); walked < position; walked += 1 {
 		recordKey = stepRecordKey(recordKey)
 	}
 	return &SenderRatchet{
-		reserver: reserver,
-		// a copy, because the caller's slice is its own: a group id that moved under this
-		// ratchet would reserve indices against one store row and use them against another.
-		groupId:   append([]byte(nil), groupId...),
+		reserver:  reserver,
+		stream:    stream,
 		recordKey: recordKey,
 		position:  position,
 	}, nil
@@ -167,11 +218,30 @@ func NewSenderRatchet(classKey []byte, leaf uint32, groupId []byte, reserver Str
 func (self *SenderRatchet) Next() (uint64, []byte, error) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	// the two dead states are refused BEFORE the reservation, so a call on either costs no
+	// index: a zeroized ratchet would otherwise burn a durable index under a key of thirty two
+	// zeros, and a wedged one would burn nothing but would spin on an index it can never have.
+	if self.zeroized {
+		return 0, nil, fmt.Errorf("%w: it holds no ladder to answer from", ErrRatchetZeroized)
+	}
+	if self.wedged {
+		return 0, nil, fmt.Errorf("%w: index %d", ErrSenderRatchetWedged, self.position)
+	}
 	if self.exhausted {
 		return 0, nil, fmt.Errorf("%w: index %d was the last", ErrSenderRatchetExhausted, self.position)
 	}
 	index := self.position
-	if err := self.reserver.Reserve(self.groupId, index); err != nil {
+	if err := self.reserver.Reserve(self.stream, index); err != nil {
+		if errors.Is(err, ErrStreamIndexConsumed) {
+			// PERMANENT, and told apart from the transient case because the two want
+			// opposite answers. An index already consumed will never be free again, so a
+			// ratchet that went on offering it would refuse every send forever while
+			// reporting a retryable error; and one that skipped past it would hand out a
+			// rung under an index some record has already used, which is the nonce reuse
+			// the reservation exists to prevent. So the ratchet stops and says so.
+			self.wedged = true
+			return 0, nil, fmt.Errorf("%w: index %d: %w", ErrSenderRatchetWedged, index, err)
+		}
 		// no index and no key leave this function on a failed reservation, and the ratchet
 		// does not move: the same index is offered to the next call, which is what makes a
 		// full disk a retry rather than a hole in the stream.
@@ -211,6 +281,11 @@ func (self *SenderRatchet) Zeroize() {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	zeroize(self.recordKey)
+	// AND THE RATCHET IS DEAD, which is the half that was missing. Erasing the array in place
+	// and leaving the ratchet live left Next handing out the rung expanded from thirty two
+	// zeros -- a value every party in the world can compute, identical across every zeroized
+	// ratchet, with the stream index durably consumed under it.
+	self.zeroized = true
 }
 
 // ReceiverRatchet is one sender's ladder as a receiver walks it, with the rungs it has skipped
@@ -239,6 +314,10 @@ type ReceiverRatchet struct {
 	// allocates no window at all.
 	window     map[uint64][]byte
 	windowSize int
+	// set by Zeroize, for SenderRatchet.zeroized's reason: a receiver whose window and whose
+	// chain array had been erased in place went on answering, and what it answered was the
+	// rung expanded from thirty two zeros.
+	zeroized bool
 	// the order this ratchet was tracked in, which is how the table below breaks a tie
 	// between two equally full windows. It is a counter and not a comparison of the two
 	// senders octets: guardrail G8 sends every comparison of octets in this tree through
@@ -265,6 +344,10 @@ func NewReceiverRatchet(classKey []byte, leaf uint32, headIndex uint64, windowSi
 	if windowSize <= 0 {
 		return nil, fmt.Errorf("%w: window size %d", ErrWindowSize, windowSize)
 	}
+	if maxLadderWalk < headIndex {
+		return nil, fmt.Errorf("%w: a head of %d would walk %d rungs and the bound is %d",
+			ErrLadderWalkTooLong, headIndex, headIndex, maxLadderWalk)
+	}
 	secret := RecordKeyZero(classKey, leaf)
 	for walked := uint64(0); walked < headIndex; walked += 1 {
 		secret = stepRecordKey(secret)
@@ -276,16 +359,101 @@ func NewReceiverRatchet(classKey []byte, leaf uint32, headIndex uint64, windowSi
 	}, nil
 }
 
-// KeyFor answers the record key for one stream index, filling and pruning the window on the way.
+// PeekFor answers the record key for one stream index WITHOUT moving this ratchet.
 //
-// The three cases and the order they are decided in. A retained rung is handed over and dropped
-// from the window, so a second request for it is refused: a window that hands the same key out
-// twice is a window that survives a replay. An index the head has already passed is refused,
-// because this ratchet no longer holds it and cannot re-derive it -- that is the forward secrecy
-// of the ladder, not a lookup failure. An index further ahead than the window is refused AND THE
-// HEAD DOES NOT MOVE, which is where this ratchet parts company with connect/mls's peekFor: the
-// argument that lets mls advance on a refusal is that the generation was authenticated before the
-// window saw it, and nothing authenticates a stream index at this layer.
+// IT IS THE FORM AN UNAUTHENTICATED INDEX IS READ THROUGH, and that is the whole reason it
+// exists. The stream index arrives in a record's cleartext header; write_auth is a mac under the
+// group's write key, which spec A hands to the SERVER, and aad_head binds stream_index only when
+// the aead opens -- which is AFTER a key exists. So at the moment this ratchet is asked for a
+// key, nothing has authenticated the number it is being asked about. Measured on the committing
+// form: two forged headers at head+window moved a window-16 ratchet's head from 0 to 34 and made
+// honest indices 1, 2 and 3 permanently undecryptable, and one forged header against a 64 sender
+// table at the shipped bounds destroyed 1008 honest retained rungs across the other 63 senders.
+// A peek costs at most windowSize expansions and changes NOTHING, so the residual an attacker
+// buys with a forged index is cpu and never another member's messages.
+//
+// The three cases are KeyFor's, decided in the same order, and every one of them answers without
+// a write. A retained rung is COPIED rather than handed over, because the window must go on
+// holding it until the record it belongs to has actually opened. An index the head has passed is
+// refused, because this ratchet no longer holds it and cannot re-derive it -- that is the
+// forward secrecy of the ladder and not a lookup failure. An index further ahead than the window
+// is refused, and the head does not move on a refusal here for the same reason it does not move
+// on an acceptance.
+//
+// The noinline directive is the convention connect/mls's peekFor states: the walk below erases
+// every temporary rung it passes, and those stores are dead in the compiler's reading.
+//
+//go:noinline
+func (self *ReceiverRatchet) PeekFor(index uint64) ([]byte, error) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.zeroized {
+		return nil, fmt.Errorf("%w: it holds no ladder to answer from", ErrRatchetZeroized)
+	}
+	if retained, isRetained := self.window[index]; isRetained {
+		return append([]byte(nil), retained...), nil
+	}
+	if err := self.classifyLocked(index); err != nil {
+		return nil, err
+	}
+	// a temporary walk over a COPY. The ratchet's own chain array is not touched, so a peek
+	// that is never committed leaves this ratchet exactly where it was; the temporaries are
+	// erased as the walk passes them, which is stepRecordKey's whole reason for existing.
+	walking := append([]byte(nil), self.secret...)
+	for at := self.head; at < index; at += 1 {
+		walking = stepRecordKey(walking)
+	}
+	handed := append([]byte(nil), walking...)
+	zeroize(walking)
+	return handed, nil
+}
+
+// Commit applies the movement PeekFor described, once the record at that index has authenticated.
+//
+// It is the second half of the two phase read and it is where every write lives: the retained
+// rung is erased and dropped, or the ladder walks forward, filling the window with the rungs it
+// passes and pruning afterwards. A caller that never commits has cost this ratchet nothing.
+//
+// It answers the same classification PeekFor does, so a commit for an index that has since gone
+// out of window is a refusal rather than a walk -- which is what makes the pair safe to call
+// with a lock released in between, even though today's caller does not.
+//
+// The noinline directive is KeyFor's: the prune at the end erases through storage that outlives
+// this call.
+//
+//go:noinline
+func (self *ReceiverRatchet) Commit(index uint64) error {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.zeroized {
+		return fmt.Errorf("%w: it holds no ladder to commit against", ErrRatchetZeroized)
+	}
+	handed, err := self.consumeLocked(index)
+	// the rung consumeLocked answers is the one PeekFor already handed the caller, and this
+	// caller does not want a second live copy of it: it is erased rather than dropped.
+	zeroize(handed)
+	return err
+}
+
+// KeyFor is PeekFor and Commit in one call, for a caller that has ALREADY authenticated the
+// index it is asking about.
+//
+// It is kept because that caller exists -- a sender's own replay of its own stream, and every
+// case in this package's tests -- and because the two phase form is the same walk written twice
+// when the index is known good. What it must not be used for is a stream index straight off a
+// record header: PeekFor's comment carries the measurement of what that costs.
+//
+//go:noinline
+func (self *ReceiverRatchet) KeyFor(index uint64) ([]byte, error) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.zeroized {
+		return nil, fmt.Errorf("%w: it holds no ladder to answer from", ErrRatchetZeroized)
+	}
+	return self.consumeLocked(index)
+}
+
+// classifyLocked decides whether an index is answerable at all, without touching anything.
 //
 // Both refusals are ErrOutOfWindow, and the conflation is deliberate but is not free. A rung
 // erased because it was answered and a rung evicted because the window filled are the same state
@@ -294,20 +462,36 @@ func NewReceiverRatchet(classKey []byte, leaf uint32, headIndex uint64, windowSi
 // one; what a caller CANNOT do with this error is tell a replay from a loss, and open item M1-15
 // is where that has to be settled if sdk needs to.
 //
+// The "below the head" arm is redundant against an unsigned subtraction and is kept anyway: with
+// it deleted, index-self.head underflows to an enormous number and the window check refuses the
+// same index with the same sentinel, so no input tells the two spellings apart -- which is
+// exactly why the arm has to say what it means rather than be left to arithmetic. What it is NOT
+// redundant for is the exhausted case, where index == head is below and not ahead.
+//
+// The caller holds stateLock.
+func (self *ReceiverRatchet) classifyLocked(index uint64) error {
+	if index < self.head || (self.exhausted && index == self.head) {
+		return fmt.Errorf("%w: index %d is below this receiver's head %d", ErrOutOfWindow, index, self.head)
+	}
+	if uint64(self.windowSize) < index-self.head {
+		return fmt.Errorf("%w: index %d is %d ahead of head %d, and the window is %d",
+			ErrOutOfWindow, index, index-self.head, self.head, self.windowSize)
+	}
+	return nil
+}
+
+// consumeLocked answers one rung and applies every write that goes with it.
+//
+// A retained rung is handed over and dropped from the window, so a second request for it is
+// refused: a window that hands the same key out twice is a window that survives a replay.
+//
 // The common case allocates nothing: an index equal to the head takes one step and never touches
 // the window, which is section 5.5's first requirement of this function.
 //
-// The noinline directive is carried by the convention connect/mls's peekFor states rather than
-// because the class zeroize_test.go derives holds this function: the prune at the end erases
-// through storage that outlives the call, and the directive is what keeps those stores across a
-// boundary the compiler cannot see through. The derived class follows a hand-off by ARGUMENT and
-// this erasure is reached through a method call on the receiver, which is the line mls draws and
-// the reason it draws it.
+// The caller holds stateLock.
 //
 //go:noinline
-func (self *ReceiverRatchet) KeyFor(index uint64) ([]byte, error) {
-	self.stateLock.Lock()
-	defer self.stateLock.Unlock()
+func (self *ReceiverRatchet) consumeLocked(index uint64) ([]byte, error) {
 	if retained, isRetained := self.window[index]; isRetained {
 		// the caller owns it from here, so it is dropped rather than erased: erasing it
 		// would hand back thirty two zeros, which is a key every party in the world can
@@ -316,12 +500,8 @@ func (self *ReceiverRatchet) KeyFor(index uint64) ([]byte, error) {
 		delete(self.window, index)
 		return retained, nil
 	}
-	if index < self.head || (self.exhausted && index == self.head) {
-		return nil, fmt.Errorf("%w: index %d is below this receiver's head %d", ErrOutOfWindow, index, self.head)
-	}
-	if uint64(self.windowSize) < index-self.head {
-		return nil, fmt.Errorf("%w: index %d is %d ahead of head %d, and the window is %d",
-			ErrOutOfWindow, index, index-self.head, self.head, self.windowSize)
+	if err := self.classifyLocked(index); err != nil {
+		return nil, err
 	}
 	// Every rung leaves this ratchet as a COPY and the chain array is erased as the ladder
 	// passes it, which is the sender discipline applied on this side too. Without the copy the
@@ -376,6 +556,8 @@ func (self *ReceiverRatchet) Zeroize() {
 		zeroize(secret)
 		delete(self.window, index)
 	}
+	// and the ratchet is dead, for SenderRatchet.Zeroize's reason.
+	self.zeroized = true
 }
 
 // retainLocked puts one skipped rung in the window, allocating the window on first use.
@@ -438,8 +620,10 @@ func (self *ReceiverRatchet) retainIntoWindowLocked(index uint64, secret []byte)
 // the sentence above. Zeroize walks the whole map itself, because connect/mls reads erasure FIELD
 // BY FIELD off the source and cannot follow an erase that reaches a field only through a helper
 // taking an index. retainIntoWindowLocked erases what it would overwrite, for the same reading.
-// Both are the whole map or one entry going for a reason this one does not cover, and both are
-// held by the same test.
+// Both are the whole map or one entry going for a reason this one does not cover.
+// retainIntoWindowLocked's arm is held by a case that calls it twice at one index directly, which
+// is the only way to reach it: it is a defect in this ratchet rather than a state a peer can
+// cause, so no behaviour through the public surface gets there.
 //
 // Total by design: erasing an index that was never retained is a no-op.
 //
@@ -465,6 +649,11 @@ func (self *ReceiverRatchet) eraseLocked(index uint64) {
 //
 //go:noinline
 func (self *ReceiverRatchet) evictOldestLocked() {
+	// deleting this guard changes nothing an input can observe -- eraseLocked on an index that
+	// was never retained is already a no-op, and over an empty map the loop below leaves oldest
+	// at the sentinel -- so it is a statement of the precondition rather than a check that
+	// catches anything. It is kept for that, and it is recorded here rather than claimed as a
+	// refusal something holds.
 	if len(self.window) == 0 {
 		return
 	}
@@ -509,8 +698,10 @@ type ReceiverRatchetKey struct {
 // Section 5.5 caps the tracked senders at 64 and evicts the OLDEST sender. That is not what this
 // does, and the divergence is open item M1-12's labelled recommendation rather than an oversight:
 // connect/mls solves the same problem with a bound on the retained keys of the WHOLE table, so
-// adding senders adds no memory, and evicts from the FULLEST window, so a member holding a
-// handful of skipped keys never pays for a member holding a thousand. Section 5.5's rule starves
+// adding senders adds no memory, and evicts from the FULLEST window, so a member holding FEWER
+// THAN ITS FAIR SHARE of the bound never pays for a member holding a thousand -- which is the
+// property that is true, and not the looser "a handful never pays for a thousand" this file used
+// to claim in both places. pruneRetainedLocked carries the measurement. Section 5.5's rule starves
 // whoever went quiet, which is the member most likely to need the window. Section 14 open item 7
 // is what has to finalise this and it blocks the A6 freeze; the number is a constructor parameter
 // for that reason.
@@ -557,8 +748,49 @@ func (self *ReceiverRatchets) Track(key ReceiverRatchetKey, ratchet *ReceiverRat
 	self.ratchets[key] = ratchet
 }
 
+// PeekFor answers one tracked sender's record key for one stream index without moving anything.
+//
+// It is the form the open path reads an UNAUTHENTICATED stream index through, and
+// (*ReceiverRatchet).PeekFor's comment carries the measurement of what the committing form costs
+// when the index turns out to be forged. Nothing is retained, nothing is evicted and no head
+// moves, so the whole table is unchanged when this returns -- which is why the prune the
+// committing form owes is not here.
+func (self *ReceiverRatchets) PeekFor(key ReceiverRatchetKey, index uint64) ([]byte, error) {
+	self.tableLock.Lock()
+	defer self.tableLock.Unlock()
+	ratchet, isTracked := self.ratchets[key]
+	if !isTracked {
+		return nil, fmt.Errorf("%w: sender %x retention %#02x", ErrNoReceiverRatchet, key.SenderHandle, key.RetentionWire)
+	}
+	return ratchet.PeekFor(index)
+}
+
+// Commit applies the movement PeekFor described, once the record has authenticated, and holds
+// the whole table to its retained bound afterwards.
+//
+// The noinline directive is the convention the two ratchets keep: the prune at the end erases
+// through storage that outlives this call.
+//
+//go:noinline
+func (self *ReceiverRatchets) Commit(key ReceiverRatchetKey, index uint64) error {
+	self.tableLock.Lock()
+	defer self.tableLock.Unlock()
+	ratchet, isTracked := self.ratchets[key]
+	if !isTracked {
+		return fmt.Errorf("%w: sender %x retention %#02x", ErrNoReceiverRatchet, key.SenderHandle, key.RetentionWire)
+	}
+	if err := ratchet.Commit(index); err != nil {
+		return err
+	}
+	self.pruneRetainedLocked()
+	return nil
+}
+
 // KeyFor answers one tracked sender's record key for one stream index, and holds the whole table
 // to its retained bound afterwards.
+//
+// It is PeekFor and Commit in one call and it carries their warning: this is the form for an
+// index the caller has already authenticated, and the open path uses the two phase pair instead.
 //
 // The noinline directive is the convention the two ratchets keep: the prune at the end erases
 // through storage that outlives this call. It is also what the derived class demands, because
@@ -620,9 +852,23 @@ func (self *ReceiverRatchets) retainedLocked() int {
 // The choice of WHICH window is the half that matters. Evicting the globally oldest rung would
 // let one flooding sender push out the handful of keys an honest out of order sender is holding,
 // which turns a memory bound into a way to drop other members' messages; taking from the largest
-// holder puts the pressure on whoever created it. The tie between two equally full windows is
+// holder puts the pressure on whoever created it.
+//
+// WHAT THAT BUYS, STATED AS THE PROPERTY IT ACTUALLY IS. Eviction only ever touches the fullest
+// window, so a ratchet holding fewer rungs than every other holder is never the victim; and a
+// ratchet holding fewer than retainedBound/len(ratchets) is never the victim at all, because for
+// it to be the fullest every other window would have to be no larger and the total would then
+// already be under the bound. That is the sentence this file used to write as "a handful never
+// pays for a thousand", which is a DIFFERENT and false claim: above the fair share everyone
+// pays, and at the shipped defaults -- where the table bound equals one window -- a single full
+// window reorder takes rungs from every other honest sender. The fair share form is what a three
+// sender case can falsify and the loose form is what two senders cannot.
+//
+// The tie between two equally full windows is
 // broken by the order the two were TRACKED in rather than by go's randomised map iteration, so the
-// behaviour can be stated and tested rather than merely bounded. It is not broken by comparing
+// behaviour can be stated and tested rather than merely bounded -- and it IS tested: the earlier
+// tracked of two equally full windows is the one that gives up a rung, and Track's stamp is what
+// makes that an order rather than a coin toss. It is not broken by comparing
 // the two senders handles: guardrail G8 sends every comparison of octets in this tree through
 // subtle.ConstantTimeCompare, which answers equality and cannot answer an ordering, and the rule
 // is derived over the whole tree rather than argued case by case.

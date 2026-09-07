@@ -152,11 +152,11 @@ func newStreamIndexMemory() *streamIndexFake {
 	return fake
 }
 
-func (self *streamIndexFake) Reserve(groupId []byte, index uint64) error {
+func (self *streamIndexFake) Reserve(stream StreamKey, index uint64) error {
 	self.lock.Lock()
 	defer self.lock.Unlock()
 	self.reserves += 1
-	key := hex.EncodeToString(groupId)
+	key := streamIndexRowKey(stream)
 	if index <= self.image[key] {
 		// not idempotent. "I already have that one" and "I am about to encrypt under that
 		// one" are the same call from this interface's side, so the second one is a
@@ -182,12 +182,22 @@ func (self *streamIndexFake) Reserve(groupId []byte, index uint64) error {
 	return nil
 }
 
-func (self *streamIndexFake) HighWater(groupId []byte) (uint64, error) {
+func (self *streamIndexFake) HighWater(stream StreamKey) (uint64, error) {
 	self.lock.Lock()
 	defer self.lock.Unlock()
-	// total over the key space: a group never seen is 0 and not an error, so highWater + 1
+	// total over the key space: a stream never seen is 0 and not an error, so highWater + 1
 	// is a well defined start.
-	return self.image[hex.EncodeToString(groupId)], nil
+	return self.image[streamIndexRowKey(stream)], nil
+}
+
+// streamIndexRowKey flattens a StreamKey into the row identity a store would use. It is the
+// fake's own choice and not the interface's: what the interface fixes is which stream a
+// reservation belongs to, and a store is free to hash, concatenate or index the three fields
+// however it likes as long as two distinct streams are two distinct rows -- which is what
+// TestTwoRetentionClassesOfOneGroupDoNotShareACounter holds it to.
+func streamIndexRowKey(stream StreamKey) string {
+	return hex.EncodeToString(stream.GroupId[:]) + "/" + hex.EncodeToString(stream.SenderHandle[:]) +
+		"/" + hex.EncodeToString([]byte{stream.RetentionWire})
 }
 
 // reload re-reads the medium, and refuses if it came back behind an index this instance has
@@ -214,21 +224,30 @@ type streamIndexRefusing struct {
 	reserves int
 }
 
-func (self *streamIndexRefusing) Reserve(groupId []byte, index uint64) error {
+func (self *streamIndexRefusing) Reserve(stream StreamKey, index uint64) error {
 	self.reserves += 1
 	return self.err
 }
 
-func (self *streamIndexRefusing) HighWater(groupId []byte) (uint64, error) { return 0, nil }
+func (self *streamIndexRefusing) HighWater(stream StreamKey) (uint64, error) { return 0, nil }
 
 // A reserver whose HighWater fails, so a constructor that ignored the read is visible.
 type streamIndexUnreadable struct{ err error }
 
-func (self *streamIndexUnreadable) Reserve(groupId []byte, index uint64) error { return nil }
+func (self *streamIndexUnreadable) Reserve(stream StreamKey, index uint64) error { return nil }
 
-func (self *streamIndexUnreadable) HighWater(groupId []byte) (uint64, error) { return 0, self.err }
+func (self *streamIndexUnreadable) HighWater(stream StreamKey) (uint64, error) { return 0, self.err }
 
-var streamIndexGroup = []byte{0x67, 0x72, 0x70, 0x01}
+var streamIndexGroup = streamKeyNamed("grp-1")
+
+// streamKeyNamed is one distinct stream per name, so a case that wants two streams says so
+// rather than assembling a struct literal each time.
+func streamKeyNamed(name string) StreamKey {
+	stream := StreamKey{}
+	copy(stream.GroupId[:], name)
+	copy(stream.SenderHandle[:], name)
+	return stream
+}
 
 // Property 1: Reserve returns only after the reservation survives a process death.
 //
@@ -355,7 +374,7 @@ func TestHighWaterNeverRewinds(t *testing.T) {
 	}
 	// and a medium that lost a flush is ErrStreamIndexRewound, not a fresh start: every
 	// index above what it now holds is a nonce this device may already have used
-	store.image[hex.EncodeToString(streamIndexGroup)] = 7
+	store.image[streamIndexRowKey(streamIndexGroup)] = 7
 	if err := fake.reload(); !errors.Is(err, ErrStreamIndexRewound) {
 		t.Errorf("a medium that came back at 7 after 64 was handed out answered %v, want ErrStreamIndexRewound", err)
 	}
@@ -388,7 +407,7 @@ func TestAConsumedStreamIndexIsRefusedAndNotOverwritten(t *testing.T) {
 // Property 5: the store is total over its key space, and two groups do not share a counter.
 func TestTheReserverIsTotalOverItsKeySpaceAndSeparatesGroups(t *testing.T) {
 	fake := newStreamIndexMemory()
-	for _, unseen := range [][]byte{nil, {}, {0x01}, []byte("a group nothing has written to")} {
+	for _, unseen := range []StreamKey{{}, streamKeyNamed("x"), streamKeyNamed("a stream nothing has written to")} {
 		got, err := fake.HighWater(unseen)
 		if err != nil {
 			t.Errorf("HighWater of an unseen group answered %v; a group never seen is 0 with no error, so highWater + 1 is a well defined start", err)
@@ -397,8 +416,8 @@ func TestTheReserverIsTotalOverItsKeySpaceAndSeparatesGroups(t *testing.T) {
 			t.Errorf("HighWater of an unseen group is %d, want 0", got)
 		}
 	}
-	left := []byte("group-left")
-	right := []byte("group-right")
+	left := streamKeyNamed("group-left")
+	right := streamKeyNamed("group-right")
 	for index := uint64(1); index <= 4; index += 1 {
 		if err := fake.Reserve(left, index); err != nil {
 			t.Fatalf("reserve %d for the left group: %v", index, err)

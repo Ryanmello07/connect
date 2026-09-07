@@ -1240,6 +1240,27 @@ var typesTheEraseClassReachesThatOweNoErase = map[string]string{
 		"none of this process's storage; it is in this class only because the field reading resolves the bare " +
 		"name Reader to the decoder this package declares, which is a collision across two packages and not a " +
 		"byte slice anybody could erase",
+	"StreamKey": "the group, the sender handle and the retention class wire byte a reservation belongs " +
+		"to. All three are in the CLEARTEXT header of every record: the server keys its rows on the group " +
+		"id, routes on the sender handle and prunes on the retention byte. There is nothing here to erase, " +
+		"which is why the row is a whole-type one rather than three field rows -- a type all of whose " +
+		"fields are excused is a type this class swept in, and this one holds no secret at all",
+	"EngineProcessed": "it is an ANSWER and not storage. (*connectMlsHandle).Process builds one per call " +
+		"and hands it to a caller that owns the plaintext it carries; no production declaration of either " +
+		"package holds one in a field, so there is no drop site an erase could be reachable from. Raw is " +
+		"the message these values were read out of -- octets the delivery service and every member saw -- " +
+		"and the staged commit is behind an unexported field whose own type, mls.Processed, is a member of " +
+		"this class in its own right. PathDecryptResult is excused in the same words for the same shape",
+	"recordBodySealed": "one stage of the sealer's construction order. Every octet it declares is a " +
+		"CIPHERTEXT already destined for the wire, and the one value on the chain that is key material -- " +
+		"record_key -- is recordBuilder's, which erases it on every exit including the refusals. A stage " +
+		"that erased its own ciphertext would blank the record its caller is about to send",
+	"recordBodyBound":  "one stage of the sealer's construction order; see recordBodySealed",
+	"recordHeadSealed": "one stage of the sealer's construction order; see recordBodySealed",
+	"stagedProcessed": "what the connect/mls adapter puts in EngineProcessed.stagedRef: the handle that " +
+		"staged a commit and the mls.Processed it staged. It declares no octets of its own -- both fields " +
+		"are pointers -- and both types it points at are members of this class in their own right, which " +
+		"is where the obligation belongs",
 	"PathDecryptResult": "it is an ANSWER and not storage. DecryptUpdatePath builds one per call and hands " +
 		"it to a caller that installs both halves into the epoch it is entering, and no production " +
 		"declaration holds one in a field, so there is no drop site an erase could be reachable from. " +
@@ -1291,12 +1312,34 @@ var theFieldsOfTheEraseClassThatAreNotKeyMaterial = map[string]string{
 		"cleared by UnmarshalMLS, so a committer's copy of somebody else's key package holds no private half. " +
 		"Erasing it would remove nothing an attacker lacks and would destroy a value the caller still owns; " +
 		"the path secret beside it is the key material, and (*WelcomeJoiner).Zeroize erases that",
-	"SenderRatchet.groupId": "the id of the group this ratchet reserves its stream indices against. A group id " +
-		"is in the cleartext header of every record, is what the message server keys every row of its store on, " +
-		"and is what section 8.2 MessageStore takes as the first argument of both of its stream index methods. " +
-		"StagedCommit.groupId is excused three rows up in the same words. The ratchet holds a COPY of it -- so a " +
-		"caller reusing its buffer cannot move which row the reservations land in -- and that copy is as public " +
-		"as the one the caller kept",
+	"SenderRatchet.stream": "the group, the sender handle and the retention class this ratchet reserves " +
+		"its stream indices under. Every one of the three is in the cleartext header of every record: the " +
+		"message server keys its store rows on the group id, routes on the sender handle and prunes on the " +
+		"retention byte. StagedCommit.groupId is excused three rows up in the same words. The ratchet holds " +
+		"a StreamKey by VALUE -- no field of it is a reference a caller can write through -- so a caller " +
+		"reusing its buffers cannot move which row the reservations land in, and the copy is as public as " +
+		"the one the caller kept",
+	"GroupSession.groupId": "the id of the group this session is a view of, which is in the cleartext " +
+		"header of every record it seals and is what the message server keys every row of its store on; " +
+		"see SenderRatchet.stream and StagedCommit.groupId",
+	"GroupSession.senderHandle": "the handle this session's own records are ROUTED by. It is in the " +
+		"cleartext header of every record it seals, which is the whole reason it exists -- the server has " +
+		"to be able to route on it without being able to link it to a leaf. The value it is derived FROM, " +
+		"group_handle_key, is the secret, and zeroizeOnLoop erases that",
+	"GroupSession.serverNonce": "the submitting connection's nonce, which the SERVER chose and sent in " +
+		"the clear. write_auth is a mac over it under the group's write key; the key is the secret and the " +
+		"nonce is the challenge",
+	"recordBuilder.session": "a pointer to the session this record is being sealed by, which is a member " +
+		"of this class in its own right and erases everything it holds",
+	"recordBuilder.header": "the record's own cleartext header. Every field of it is one the message " +
+		"server reads and acts on -- MASTER invariant I6 -- and it is what aad_head and the write_auth " +
+		"preimage are taken over",
+	"connectMlsEngine.cred": "this device's credential, which is its identity public key. It is published " +
+		"in the leaf node of every group this engine founds, every member holds it and every joiner is " +
+		"handed it in its Welcome; Group.cred is excused in the same words",
+	"connectMlsEngine.leafKeys": "the encoded urmessage_leaf_keys body: an algorithm identifier and this " +
+		"device's X-Wing ENCAPSULATION key. It is the public half, it travels in this device's leaf into " +
+		"every group's ratchet tree, and it is exactly what a peer needs in order to wrap to this device",
 	"UpdatePathPlan.PublicKeys": "the public half of the path this commit publishes, which is exactly what the " +
 		"UpdatePath on the wire carries",
 	"UpdatePathPlan.LeafNode": "the re-signed leaf node this commit installs in the tree, which is public the " +

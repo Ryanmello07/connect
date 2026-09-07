@@ -415,6 +415,23 @@ type seamCandidate struct {
 	exported bool
 	// every identifier its body names.
 	names map[string]bool
+	// the callee names its body writes in CALL POSITION, whether or not the answer is used.
+	//
+	// It is what the reachability walk follows, and it is narrower than names for a reason that
+	// only appeared once the scan covered three packages: a selector tail carries no receiver AND
+	// no distinction between a call and a FIELD READ, so processed.Commit -- a field of this
+	// package's own Processed -- reads in names exactly like a call of a method named Commit. The
+	// day connect/messagegroup declared (*connectMlsHandle).Commit, which reaches the wire door
+	// through CreateCommit, every declaration of this package that so much as reads .Commit off a
+	// struct became reachable: measured, 24 production declarations of this package -- the whole
+	// framing layer, its codecs and its preimages -- were reported as construction bypasses, and
+	// every one of them was a false positive of the walk rather than a widening of the class.
+	//
+	// It is narrower than consumes, deliberately: consumes drops a call whose answer is thrown
+	// away, and a forge that assembles a message and sends it as a STATEMENT has still put it on
+	// the wire. What this reads is "this body calls that", which is what an edge in a call graph
+	// means.
+	calls map[string]bool
 	// the callees its body CALLS and whose answer it does not throw away: a call in a return,
 	// in an if's init or condition, in an assignment to something other than the blank
 	// identifier, or nested inside another call's arguments.
@@ -689,6 +706,7 @@ func seamCandidatesIn(parsed []parsedSource) []seamCandidate {
 				file:        source.fileSet.Position(function.Pos()).Filename,
 				exported:    function.Name.IsExported(),
 				names:       map[string]bool{},
+				calls:       map[string]bool{},
 				answersFrom: map[string]bool{},
 				consumes:    map[string]bool{},
 				chooses:     map[string]bool{},
@@ -800,12 +818,18 @@ func seamCandidatesIn(parsed []parsedSource) []seamCandidate {
 				// door that was run from one that was named. The callee's own identifier is
 				// excluded from the chosen set above by nothing -- a call is a value position --
 				// so the two readings are kept apart here rather than conflated.
-				if call, isCall := node.(*ast.CallExpr); isCall && !discarded[call] {
+				if call, isCall := node.(*ast.CallExpr); isCall {
 					switch callee := call.Fun.(type) {
 					case *ast.Ident:
-						candidate.consumes[callee.Name] = true
+						candidate.calls[callee.Name] = true
+						if !discarded[call] {
+							candidate.consumes[callee.Name] = true
+						}
 					case *ast.SelectorExpr:
-						candidate.consumes[callee.Sel.Name] = true
+						candidate.calls[callee.Sel.Name] = true
+						if !discarded[call] {
+							candidate.consumes[callee.Sel.Name] = true
+						}
 					}
 				}
 				// and the answered callees on their own, which is the door chain's edge. A
@@ -1065,7 +1089,7 @@ func seamsReachingTheWireDoor(candidates []seamCandidate, doors seamWireDoors) m
 				grew = true
 				continue
 			}
-			for named := range candidate.names {
+			for named := range candidate.calls {
 				followed := false
 				for _, index := range byBareName[named] {
 					if reaches[candidates[index].name] {

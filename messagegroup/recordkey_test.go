@@ -17,6 +17,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/urnetwork/connect/message"
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
@@ -512,7 +513,7 @@ var recordKeyOneWayProbes = map[string]func(secret []byte) [][]byte{
 		return [][]byte{key, nonce}
 	},
 	"NewSenderRatchet": func(secret []byte) [][]byte {
-		ratchet, err := NewSenderRatchet(secret, recordKeyKatLeaf, []byte("one-way"), newStreamIndexMemory())
+		ratchet, err := NewSenderRatchet(secret, recordKeyKatLeaf, streamKeyNamed("one-way"), newStreamIndexMemory())
 		if err != nil {
 			return nil
 		}
@@ -523,7 +524,7 @@ var recordKeyOneWayProbes = map[string]func(secret []byte) [][]byte{
 		return [][]byte{key}
 	},
 	"Next": func(secret []byte) [][]byte {
-		ratchet, err := NewSenderRatchet(secret, recordKeyKatLeaf, []byte("one-way"), newStreamIndexMemory())
+		ratchet, err := NewSenderRatchet(secret, recordKeyKatLeaf, streamKeyNamed("one-way"), newStreamIndexMemory())
 		if err != nil {
 			return nil
 		}
@@ -563,6 +564,122 @@ var recordKeyOneWayProbes = map[string]func(secret []byte) [][]byte{
 		}
 		return produced
 	},
+	"PeekFor": func(secret []byte) [][]byte {
+		ratchet, err := NewReceiverRatchet(secret, recordKeyKatLeaf, 0, 8)
+		if err != nil {
+			return nil
+		}
+		produced := [][]byte{}
+		for index := uint64(0); index < 3; index += 1 {
+			key, err := ratchet.PeekFor(index)
+			if err != nil {
+				return produced
+			}
+			produced = append(produced, key)
+		}
+		return produced
+	},
+	"Commit": func(secret []byte) [][]byte {
+		ratchet, err := NewReceiverRatchet(secret, recordKeyKatLeaf, 0, 8)
+		if err != nil {
+			return nil
+		}
+		produced := [][]byte{}
+		for index := uint64(0); index < 3; index += 1 {
+			key, err := ratchet.PeekFor(index)
+			if err != nil {
+				return produced
+			}
+			produced = append(produced, key)
+			if err := ratchet.Commit(index); err != nil {
+				return produced
+			}
+		}
+		return produced
+	},
+	// The session surface. Each of these is handed the rung as pq_secret -- the one secret the
+	// constructor takes and does not derive -- and answers every octet string the member under
+	// test hands back. What the property asks of them is the same thing it asks of a derivation:
+	// nothing that comes out is a rung the ladder has already passed.
+	"NewGroupSession": func(secret []byte) [][]byte {
+		fixture, err := buildProbeSession(secret)
+		if err != nil {
+			return nil
+		}
+		defer fixture.session.Close()
+		handle, err := fixture.session.SenderHandle()
+		if err != nil {
+			return nil
+		}
+		return [][]byte{handle[:]}
+	},
+	"TrackSender": func(secret []byte) [][]byte {
+		fixture, err := buildProbeSession(secret)
+		if err != nil {
+			return nil
+		}
+		defer fixture.session.Close()
+		if err := fixture.session.TrackSender(fixture.handle.OwnLeafIndex(), message.RetentionDurable, 0, 0); err != nil {
+			return nil
+		}
+		handle, err := fixture.session.SenderHandle()
+		if err != nil {
+			return nil
+		}
+		return [][]byte{handle[:]}
+	},
+	"SealRecord": func(secret []byte) [][]byte {
+		fixture, err := buildProbeSession(secret)
+		if err != nil {
+			return nil
+		}
+		defer fixture.session.Close()
+		record, err := fixture.session.SealRecord(message.RetentionDurable, 0, false,
+			[]byte("head"), []byte("body"), 0, nil)
+		if err != nil {
+			return nil
+		}
+		return [][]byte{record.CtHead, record.CtBody, record.WriteAuth[:], record.Header.BodyHash[:],
+			record.Header.SenderHandle[:]}
+	},
+	"OpenRecord": func(secret []byte) [][]byte {
+		fixture, err := buildProbeSession(secret)
+		if err != nil {
+			return nil
+		}
+		defer fixture.session.Close()
+		if err := fixture.session.TrackSender(fixture.handle.OwnLeafIndex(), message.RetentionDurable, 0, 0); err != nil {
+			return nil
+		}
+		record, err := fixture.session.SealRecord(message.RetentionDurable, 0, false,
+			[]byte("head"), []byte("body"), 0, nil)
+		if err != nil {
+			return nil
+		}
+		headPlain, bodyPlain, err := fixture.session.OpenRecord(record)
+		if err != nil {
+			return nil
+		}
+		return [][]byte{headPlain, bodyPlain}
+	},
+	"AdvanceEpoch": func(secret []byte) [][]byte {
+		fixture, err := buildProbeSession(testPqSecret())
+		if err != nil {
+			return nil
+		}
+		defer fixture.session.Close()
+		// the rung arrives as the NEW epoch's pq_secret, so everything the session produces
+		// afterwards is produced from it.
+		if err := fixture.session.AdvanceEpoch(secret); err != nil {
+			return nil
+		}
+		record, err := fixture.session.SealRecord(message.RetentionDurable, 0, false,
+			[]byte("head"), []byte("body"), 0, nil)
+		if err != nil {
+			return nil
+		}
+		return [][]byte{record.CtHead, record.CtBody, record.WriteAuth[:], record.Header.BodyHash[:]}
+	},
 }
 
 func TestNothingExportedLeadsBackwardsAlongTheLadder(t *testing.T) {
@@ -579,6 +696,16 @@ func TestNothingExportedLeadsBackwardsAlongTheLadder(t *testing.T) {
 	for name := range recordKeyOneWayProbes {
 		if !slices.Contains(members, name) {
 			t.Errorf("recordKeyOneWayProbes has a row for %s, which no longer reaches the key schedule; a row that outlived its subject reads as coverage", name)
+		}
+	}
+	// A PROBE THAT ANSWERS NOTHING CHECKS NOTHING, so every row is required to produce at least
+	// one octet string over a real rung before the walk below reads its answers. Without this the
+	// table could go on holding rows for members whose probe had quietly started failing, and the
+	// whole gate would report clean over an empty answer -- which is the shape this project's
+	// first rule is about.
+	for name, probe := range recordKeyOneWayProbes {
+		if len(probe(recordKeyKatClassKey())) == 0 {
+			t.Errorf("the probe for %s answered no octets at all, so the one way property is being asserted over nothing", name)
 		}
 	}
 	classKey := recordKeyKatClassKey()
