@@ -129,7 +129,16 @@ func TestTheSealConstructionOrderIsAChainOfTypesAndNotASequenceOfStatements(t *t
 			}
 		}
 	}
-	for _, ordered := range []string{"AADBody", "AADHead", "ComputeWriteAuth"} {
+	// EncodeRecord is in this list for Property 5 -- "the record EncodeRecord refuses is the record
+	// SealRecord refuses" -- which was held by a comment. Measured: deleting the internal
+	// message.EncodeRecord call from the last stage survived all three trees, because
+	// TestASealedRecordIsExactlyItsRungAndIsOneTheCodecAccepts calls EncodeRecord itself on the
+	// output and so passes identically with or without it, and no case drives SealRecord to a
+	// record the codec would refuse. Whether one is reachable TODAY is not the property: the
+	// property is that the sealer asks the codec rather than reimplementing checkRecord, and that
+	// is a fact about the source, so it is asserted here where the stage each call lands in is
+	// already being read.
+	for _, ordered := range []string{"AADBody", "AADHead", "ComputeWriteAuth", "EncodeRecord"} {
 		if _, isCalled := where[ordered]; !isCalled {
 			t.Fatalf("no stage of the chain calls message.%s; this gate is asserting an order over a step that is not there, which is the vacuous shape it exists to avoid",
 				ordered)
@@ -139,8 +148,14 @@ func TestTheSealConstructionOrderIsAChainOfTypesAndNotASequenceOfStatements(t *t
 		t.Errorf("the order read off the chain is AADBody at %d, AADHead at %d, ComputeWriteAuth at %d; MASTER section 8 fixes it as body, then head, then mac, and a circular aad appears to work until two implementations disagree",
 			where["AADBody"], where["AADHead"], where["ComputeWriteAuth"])
 	}
-	t.Logf("stage chain: %v; AADBody@%d AADHead@%d ComputeWriteAuth@%d",
-		chain, where["AADBody"], where["AADHead"], where["ComputeWriteAuth"])
+	// and the codec is asked LAST, in the stage that answers the record, so what SealRecord hands
+	// back has been through the encoder it will be encoded by.
+	if where["EncodeRecord"] != len(chain)-2 {
+		t.Errorf("message.EncodeRecord is called from stage %d of %v and the last staging type is stage %d; Property 5 rests on the finished record going through the codec rather than on checkRecord being reimplemented here",
+			where["EncodeRecord"], chain, len(chain)-2)
+	}
+	t.Logf("stage chain: %v; AADBody@%d AADHead@%d ComputeWriteAuth@%d EncodeRecord@%d",
+		chain, where["AADBody"], where["AADHead"], where["ComputeWriteAuth"], where["EncodeRecord"])
 }
 
 type sealTransition struct {

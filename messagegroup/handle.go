@@ -32,11 +32,20 @@
 // section of any spec says where it lives. group_handle_key takes storage_root[0] specifically,
 // so that -- MASTER section 8 -- "group_handle_key is what makes sender_handle and
 // wrap_target_handle survive an epoch change. A member that does not hold it cannot compute its
-// own handle and therefore cannot write." The group's FIRST storage root must therefore be
-// computed and durably persisted at group creation, separately from the current one, for the
-// life of the group. Task 10 gives it a home in GroupSession's construction; open item M1-4
-// records that the spec does not. Deriving this key from the current epoch's root instead
-// passes every single epoch test there is and breaks every group at its first commit.
+// own handle and therefore cannot write."
+//
+// WHAT IS PERSISTED IS THIS KEY AND NOT THE ROOT IT CAME FROM, and the distinction is worth the
+// sentence because both values are thirty two octets and the wrong one is a working program.
+// MASTER's clause is about what a member HOLDS, and it names the key. storage_root[0] is strictly
+// more: every class key, the write key and the read key of epoch zero expand from it, so a device
+// that kept it for the life of the group would be keeping epoch zero's whole key schedule forever
+// in order to recover a routing identifier every member of the group already knows. So this
+// derivation is computed ONCE, at group creation, and its ANSWER is what is durably kept; the root
+// it was expanded from is dropped with the rest of the epoch. GroupSession's construction is where
+// the kept value lives and its parameter is named groupHandleKeyEpoch0 for exactly that reason;
+// open item M1-4 records that the spec says neither. Deriving this key from the current epoch's
+// root instead passes every single epoch test there is and breaks every group at its first
+// commit.
 package messagegroup
 
 import (

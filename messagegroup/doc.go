@@ -56,6 +56,20 @@
 // is an INTERFACE with no durable implementation anywhere, so a run over this package's test fake
 // proves the record layer and not the client.
 //
+// AND THE RECORD LAYER HAS NO SENDER AUTHENTICATION AT ALL, which belongs in this inventory
+// because it is the absence a reader is least likely to guess from what is here. Every key a
+// record is sealed under is derived from a GROUP wide secret: the class keys expand from the
+// storage root every member holds, record_key[0] takes the leaf index as an INPUT rather than as
+// a credential, sender_handle is likewise computable by every member for every leaf, and
+// RecordHeader carries no signature -- write_auth is a mac under a key spec A hands to the
+// server. So any member of a group can write a record attributed to any other leaf and it opens
+// cleanly at every other member, and this was reproduced from exported symbols alone rather than
+// argued. That may be inherent to spec A rather than a defect in this code, and it is not
+// something this package can repair on its own authority; what would repair it is a signature
+// over the header, which no section declares. It is recorded here so the absence is in the
+// inventory, and a case in seal_test.go holds it so that the day it stops being true this
+// paragraph is what fails.
+//
 // What lands here next is the rest of section 5: pq_secret and the provisional epoch state, the
 // device wrap, the epoch fan-out and its snapshot, and the joining member. Nothing in this package
 // logs a failure and carries on, and no function here takes a clock -- one that needs the time takes

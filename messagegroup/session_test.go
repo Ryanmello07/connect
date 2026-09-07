@@ -285,7 +285,11 @@ func TestTheGroupHandleKeyDoesNotMoveWhenTheEpochDoes(t *testing.T) {
 	if err := fixture.session.AdvanceEpoch(testPqSecret()); err != nil {
 		t.Fatalf("AdvanceEpoch: %v", err)
 	}
-	if epoch := fixture.session.Epoch(); epoch != 1 {
+	epoch, err := fixture.session.Epoch()
+	if err != nil {
+		t.Fatalf("Epoch: %v", err)
+	}
+	if epoch != 1 {
 		t.Fatalf("the session is at epoch %d after an advance, want 1", epoch)
 	}
 	after, err := fixture.session.SenderHandle()
@@ -307,8 +311,8 @@ func TestTheGroupHandleKeyDoesNotMoveWhenTheEpochDoes(t *testing.T) {
 	// one, which is the other direction of the same property.
 	orphan, err := NewGroupSession(fixture.handle, testPqSecret(), nil, newStreamIndexMemory(),
 		testClock(), testServerNonce())
-	if !errors.Is(err, ErrEpochZeroRootMissing) {
-		t.Errorf("a session opened at epoch 1 with no epoch zero group handle key answered %v, want ErrEpochZeroRootMissing", err)
+	if !errors.Is(err, ErrEpochZeroHandleKeyMissing) {
+		t.Errorf("a session opened at epoch 1 with no epoch zero group handle key answered %v, want ErrEpochZeroHandleKeyMissing", err)
 	}
 	if orphan != nil {
 		orphan.Close()

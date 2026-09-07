@@ -209,7 +209,7 @@ var (
 	// key. group_handle_key is fixed at group creation and is PERSISTED state; a constructor
 	// that recomputed it from the current epoch would give every epoch a different
 	// sender_handle, so a member's stream would end at every commit.
-	ErrEpochZeroRootMissing = errors.New("messagegroup: a session past epoch zero requires the group handle key it was founded with")
+	ErrEpochZeroHandleKeyMissing = errors.New("messagegroup: a session past epoch zero requires the group handle key it was founded with")
 	// Fires when a record is sealed with an expire_at that has already passed. It is advisory
 	// and may only shorten retention, so a value in the past is a record the server is entitled
 	// to prune before anyone reads it -- which is a caller's mistake and not a policy.
@@ -221,6 +221,14 @@ var (
 	// never a guess, because a PERMANENT or an EPH record sealed under the wrong reading is
 	// wire visible and unrecoverable after the A6 freeze.
 	ErrRetentionClassUnruled = errors.New("messagegroup: only the durable retention class is sealed until open item M1-6 rules which record key seals ct_head")
+	// Fires when a stage of the seal chain is reached with the value the previous stage owed it
+	// missing. Section 5.2's title is "Construction order is a type, not a convention" and the
+	// staging types are unexported, so the order IS a type to every other package; inside this
+	// one a keyed composite literal can assemble a later stage over an earlier stage's zero
+	// value, and a head sealed that way produced a record with body_hash all zero that
+	// message.EncodeRecord accepted. Each stage carries what the next needs and the next checks
+	// it, so a skipped stage is this refusal rather than a wire visible record no reader opens.
+	ErrRecordStageOrder = errors.New("messagegroup: a record was assembled out of the order MASTER section 8 fixes")
 	// Fires when a body plaintext does not fit any rung of the size ladder. The ladder tops out
 	// at the 64 KiB rung and the blob rung carries no body at all, so a longer body is a blob
 	// and a blob is task 20's.

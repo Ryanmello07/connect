@@ -2586,6 +2586,15 @@ func authVerifiersUnderGate(t testing.TB, scans []authScan) map[string][]string 
 // is a measurement, while a class derived from zero imports is a broken scan -- which
 // authDataComparators refuses one step earlier, and which this line makes visible without
 // having to trust that refusal.
+//
+// AND IT DOES NOT EXECUTE TODAY, which is worth stating where the line is rather than leaving a
+// reader to discover it by grepping a -v run for a sentence that never printed. Every root this
+// gate scans now has a non-empty comparator class -- connect/message's own, and connect/messagegroup's
+// three since m1 wave 1's SealRecord and OpenRecord became the first callers of AADHead, AADBody
+// and the write_auth mac -- so the early return above is taken for both and this Logf is
+// unreachable. It is kept because the class it describes is the class of a root ADDED LATER, and
+// what it must therefore not do is name a directory: a sentence that named connect/messagegroup
+// stood here while being about, if it ever fired at all, some other root entirely.
 func authReportAnEmptyComparatorClass(t testing.TB, scan authScan, comparators []string) {
 	t.Helper()
 	if len(comparators) > 0 {
@@ -2597,7 +2606,7 @@ func authReportAnEmptyComparatorClass(t testing.TB, scan authScan, comparators [
 	}
 	slices.Sort(paths)
 	paths = slices.Compact(paths)
-	t.Logf("%s: that class is empty BY CONSTRUCTION and not because the scan read nothing. Its %d imported packages were read (%v) and none of them exports a function that answers a question about two data shaped arguments, which is the whole of what the class is. That makes this an ARMED TRIPWIRE and not a dead gate: a comparator cannot be called without its package being imported, so the edit that first compares data over there brings that package's entire comparator surface into this class on the same run, with nobody remembering to add it. Nothing over such a directory is a rule in force today, the derived scope check included: TestEveryPackageBuiltOnThisOneIsUnderTheConstantTimeGate walks this module for the production packages that import connect/message, and a check whose derived class is empty never reaches its assertion either -- it arms on the first PRODUCTION file under that root that calls into connect/message. THE connect/messagegroup ROOT HAS ARMED and this sentence no longer describes it: m1 wave 1 task 11's SealRecord is the first caller of AADHead and AADBody, task 12's OpenRecord is the second, and that directory's comparator class is three members rather than none. The sentence named task 1 before task 11 landed and the tree falsified that too, which is why it now says which root it is about rather than which task. The residual is recorded as M1-50.",
+	t.Logf("%s: that class is empty BY CONSTRUCTION and not because the scan read nothing. Its %d imported packages were read (%v) and none of them exports a function that answers a question about two data shaped arguments, which is the whole of what the class is. That makes this an ARMED TRIPWIRE and not a dead gate: a comparator cannot be called without its package being imported, so the edit that first compares data over there brings that package's entire comparator surface into this class on the same run, with nobody remembering to add it. Nothing over THIS directory is a rule in force today, the derived scope check included: TestEveryPackageBuiltOnThisOneIsUnderTheConstantTimeGate walks this module for the production packages that import connect/message, and a check whose derived class is empty never reaches its assertion either -- it arms on the first production file under this root that calls into connect/message. This line says nothing about any OTHER root, and it names none: every root the gate scans reports its own comparator class one line up, so which of them have armed is read there rather than asserted here by a sentence that goes stale. The residual is recorded as M1-50.",
 		scan.dir, len(paths), paths)
 }
 

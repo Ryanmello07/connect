@@ -14,6 +14,7 @@ import (
 	"go/ast"
 	"go/printer"
 	"go/token"
+	"go/types"
 	"maps"
 	"slices"
 	"strings"
@@ -402,51 +403,145 @@ func TestNoReaderOfAnEngineProcessedInspectsRaw(t *testing.T) {
 //
 // So it is read off the source instead. The scope question (R3a): the SCOPE is this package's
 // production source, because stagedRef is unexported and only a member of this package can
-// populate one -- which is the whole of what section 6's unforgeability argument confines. The
-// CLASS is every composite literal of an EngineProcessed, derived off the syntax tree, and the
-// assertion is that each one populates stagedRef with something other than the nil literal. It
-// fatals on an empty class, so a refactor that stopped building them here fails rather than
-// reporting clean.
+// populate one -- which is the whole of what section 6's unforgeability argument confines.
+//
+// THE CLASS IS WHAT THE VALUE CARRIES WHEN IT LEAVES THE FUNCTION, and it had to be re-derived
+// once already for exactly the reason this batch was sent to close: the first version read only
+// COMPOSITE LITERALS, so an assignment one statement later escaped it. Measured -- inserting
+// `answer.stagedRef = nil` immediately after the literal in (*connectMlsHandle).Process survived
+// all three trees while making ApplyCommit refuse every commit this engine processed, and
+// `stagedRef: any(nil)` escaped the same way because the nil check read an *ast.Ident. So:
+//
+//   - the class of PRODUCERS is every production declaration answering a *EngineProcessed, read
+//     off the signature. It fatals on an empty class, so a refactor that stopped building them
+//     here fails rather than reporting clean.
+//   - every producer must WRITE stagedRef at least once, where a write is a keyed element of an
+//     EngineProcessed literal or an assignment through a .stagedRef selector -- both shapes,
+//     because both reach the field.
+//   - and every such write ANYWHERE in production source, inside a producer or not, must not be
+//     nil. "Is nil" is asked of go/types rather than of the syntax, after unwrapping parentheses
+//     and conversions, so any(nil) and (nil) are the same answer the bare identifier gives.
+//
+// The limit, stated rather than hidden: a write of a VARIABLE that happens to hold nil is outside
+// this reading, because deciding that needs dataflow rather than a type. Every shape the review
+// walked past is inside it.
 func TestEveryEngineProcessedThisPackageBuildsCarriesAStagedCommit(t *testing.T) {
-	_, sources := messagegroupProductionSources(t)
-	literals := 0
-	for _, source := range sources {
-		ast.Inspect(source.parsed, func(node ast.Node) bool {
-			literal, isLiteral := node.(*ast.CompositeLit)
-			if !isLiteral {
-				return true
+	info, sources := repairTypeCheckProduction(t)
+	producers, literals, writes := 0, 0, 0
+	for _, file := range sources {
+		for _, declaration := range file.parsed.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || function.Body == nil {
+				continue
 			}
-			named, isNamed := literal.Type.(*ast.Ident)
-			if !isNamed || named.Name != "EngineProcessed" {
-				return true
+			isProducer := engineAnswersAnEngineProcessed(function)
+			if isProducer {
+				producers += 1
 			}
-			literals += 1
-			staged := ast.Expr(nil)
-			for _, element := range literal.Elts {
-				pair, isPair := element.(*ast.KeyValueExpr)
-				if !isPair {
-					continue
+			written := 0
+			ast.Inspect(function.Body, func(node ast.Node) bool {
+				switch typed := node.(type) {
+				case *ast.CompositeLit:
+					named, isNamed := typed.Type.(*ast.Ident)
+					if !isNamed || named.Name != "EngineProcessed" {
+						return true
+					}
+					literals += 1
+					staged := ast.Expr(nil)
+					for _, element := range typed.Elts {
+						pair, isPair := element.(*ast.KeyValueExpr)
+						if !isPair {
+							continue
+						}
+						if key, isKey := pair.Key.(*ast.Ident); isKey && key.Name == "stagedRef" {
+							staged = pair.Value
+						}
+					}
+					if staged == nil {
+						t.Errorf("%s builds an EngineProcessed with no stagedRef; a value staged by this engine and carried in Raw instead is one this package can read and rebuild, which is exactly what section 6's unforgeability sentence is about",
+							file.path)
+						return true
+					}
+					written += 1
+					writes += 1
+					if engineExpressionIsNil(info, staged) {
+						t.Errorf("%s builds an EngineProcessed whose stagedRef is nil; ApplyCommit then has nothing unforgeable to check and whatever the caller needs must have gone into Raw",
+							file.path)
+					}
+				case *ast.AssignStmt:
+					for at, target := range typed.Lhs {
+						selector, isSelector := target.(*ast.SelectorExpr)
+						if !isSelector || selector.Sel.Name != "stagedRef" || len(typed.Rhs) <= at {
+							continue
+						}
+						written += 1
+						writes += 1
+						if engineExpressionIsNil(info, typed.Rhs[at]) {
+							t.Errorf("%s assigns nil to a stagedRef after the value was built; a processed message that leaves this package with no staged commit is one ApplyCommit refuses, and no behavioural case in wave 1 can drive Process at all",
+								file.path)
+						}
+					}
 				}
-				if key, isKey := pair.Key.(*ast.Ident); isKey && key.Name == "stagedRef" {
-					staged = pair.Value
-				}
-			}
-			if staged == nil {
-				t.Errorf("%s builds an EngineProcessed with no stagedRef; a value staged by this engine and carried in Raw instead is one this package can read and rebuild, which is exactly what section 6's unforgeability sentence is about",
-					source.path)
 				return true
+			})
+			if isProducer && written == 0 {
+				t.Errorf("%s answers a *EngineProcessed and writes no stagedRef; section 6's unforgeability is that only a member of this package can populate that field, and a producer that populates none has handed the caller a value ApplyCommit refuses",
+					function.Name.Name)
 			}
-			if identifier, isIdentifier := staged.(*ast.Ident); isIdentifier && identifier.Name == "nil" {
-				t.Errorf("%s builds an EngineProcessed whose stagedRef is nil; ApplyCommit then has nothing unforgeable to check and whatever the caller needs must have gone into Raw",
-					source.path)
-			}
-			return true
-		})
+		}
+	}
+	if producers == 0 {
+		t.Fatal("no production declaration of this package answers a *EngineProcessed, so this gate is reporting clean having read nothing")
 	}
 	if literals == 0 {
-		t.Fatal("no production declaration of this package builds an EngineProcessed, so this gate is reporting clean having read nothing")
+		t.Fatal("no production declaration of this package builds an EngineProcessed, so the literal half of this gate read nothing")
 	}
-	t.Logf("%d EngineProcessed literal(s) in production source", literals)
+	t.Logf("%d producer(s), %d EngineProcessed literal(s), %d stagedRef write(s) in production source",
+		producers, literals, writes)
+}
+
+// engineAnswersAnEngineProcessed reads the SIGNATURE: any result that is a *EngineProcessed.
+func engineAnswersAnEngineProcessed(function *ast.FuncDecl) bool {
+	if function.Type.Results == nil {
+		return false
+	}
+	for _, field := range function.Type.Results.List {
+		star, isStar := field.Type.(*ast.StarExpr)
+		if !isStar {
+			continue
+		}
+		if named, isNamed := star.X.(*ast.Ident); isNamed && named.Name == "EngineProcessed" {
+			return true
+		}
+	}
+	return false
+}
+
+// engineExpressionIsNil asks the type checker, after unwrapping parentheses and conversions, so
+// nil, (nil) and any(nil) are one answer.
+func engineExpressionIsNil(info *types.Info, expr ast.Expr) bool {
+	for {
+		switch typed := expr.(type) {
+		case *ast.ParenExpr:
+			expr = typed.X
+			continue
+		case *ast.CallExpr:
+			// a CONVERSION and not a call: the callee names a type. A call answering a value is
+			// left alone, which is what keeps a staging constructor out of this reading.
+			if len(typed.Args) == 1 && info.Types[typed.Fun].IsType() {
+				expr = typed.Args[0]
+				continue
+			}
+		}
+		break
+	}
+	if kind, isKnown := info.Types[expr]; isKnown {
+		return kind.IsNil()
+	}
+	// nothing the checker saw: fall back to the identifier, so a gate over an expression the
+	// info missed still reports the obvious shape rather than silently passing it.
+	identifier, isIdentifier := expr.(*ast.Ident)
+	return isIdentifier && identifier.Name == "nil"
 }
 
 // engineProcessedFieldNames reads the field names off the DECLARATION, so a field added to

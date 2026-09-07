@@ -10,6 +10,19 @@
 // section 5.3 adds an epoch zero storage root it must have persisted since group creation. Open
 // item M1-4.
 //
+// WHAT THE CONSTRUCTOR IS HANDED FOR EPOCH ZERO IS THE GROUP HANDLE KEY AND NOT THE ROOT, and the
+// two are one HKDF-Expand apart and both thirty two octets, so the name is the only thing telling
+// them apart. Section 5.3's own sentence is about the ROOT -- it says a session past epoch zero
+// must have persisted storage_root[0] -- and this file diverges from it deliberately: MASTER
+// section 8 says what a member has to HOLD is group_handle_key ("a member that does not hold it
+// cannot compute its own handle and therefore cannot write"), and storage_root[0] is strictly more
+// than that. Every class key, the write key and the read key of epoch zero hang off the root, so a
+// device that persisted it for the life of the group would be persisting epoch zero's whole key
+// schedule forever -- the exact material forward secrecy is about -- to recover a routing
+// identifier every member already knows. So the persisted value is the EXPANSION, the parameter is
+// named for it, and both branches of installEpochOnLoop end holding the same kind of thing. Open
+// item M1-4 carries the divergence.
+//
 // THE CONCURRENCY CONTRACT IS QUOTED, because its shape is the reason it exists. Section 3.6:
 //
 //	messagegroup.GroupSession -- Safe for concurrent use. Owns exactly one mls.Group and
@@ -75,10 +88,16 @@ type GroupSession struct {
 	// set by the Close command, read by the loop to decide whether to return.
 	closing bool
 
-	// the epoch zero storage root's expansion, PERSISTED and never recomputed from a later
-	// epoch. Section 5.3 fixes group_handle_key at group creation; a session that recomputed it
+	// group_handle_key: the epoch zero storage root's expansion, PERSISTED and never recomputed
+	// from a later epoch. Section 5.3 fixes it at group creation; a session that recomputed it
 	// from the current root would give every epoch a different sender_handle, so a member's
 	// stream would end at every commit and the server would route the next record nowhere.
+	//
+	// It is what the constructor takes and what AdvanceEpoch hands back, so the value in this
+	// field, the value the parameter names and the value the epoch zero branch derives are one
+	// kind of thing. They were not: the parameter was named for the ROOT and used verbatim as
+	// this key, so a device persisting what the doc told it to persist computed a different
+	// sender_handle than its own group after every restart at epoch > 0.
 	groupHandleKey []byte
 
 	groupId       [32]byte
@@ -110,10 +129,14 @@ type GroupSession struct {
 // produce a perfectly good storage root, both clients would agree, every test would pass, and the
 // PQ half of the design would be silently gone.
 //
-// storageRootEpoch0 is the root group_handle_key is expanded from and it is PERSISTED state. A
-// session opened at epoch 0 may leave it nil, because the current root IS the epoch zero root and
-// the constructor derives it; a session opened at any later epoch must supply it, and is refused
-// if it does not, because the alternative is a handle key recomputed from the wrong epoch.
+// groupHandleKeyEpoch0 IS group_handle_key -- HKDF-Expand(storage_root[0], "gh/v1", 32) -- and it
+// is PERSISTED state. A session opened at epoch 0 may leave it nil, because the current root IS
+// the epoch zero root and the constructor expands it; a session opened at any later epoch must
+// supply it, and is refused if it does not, because the alternative is a handle key recomputed
+// from the wrong epoch. It is the KEY and not the root it came from, for the reason the file
+// comment gives: the root is epoch zero's whole key schedule and this is a routing identifier.
+// A value of any other width is refused with a typed error rather than left to panic out of the
+// first expansion that meets it, which is what a value decoded out of durable storage deserves.
 //
 // The reserver is refused if nil rather than defaulted to an in-memory one. Section 5.6 says the
 // constructor takes the sink to make it explicit, and a default in-memory reserver is the exact
@@ -125,7 +148,7 @@ type GroupSession struct {
 // this call.
 //
 //go:noinline
-func NewGroupSession(handle GroupHandle, pqSecret []byte, storageRootEpoch0 []byte,
+func NewGroupSession(handle GroupHandle, pqSecret []byte, groupHandleKeyEpoch0 []byte,
 	reserver StreamIndexReserver, nowMs func() int64, serverNonce []byte) (*GroupSession, error) {
 
 	if handle == nil {
@@ -168,7 +191,7 @@ func NewGroupSession(handle GroupHandle, pqSecret []byte, storageRootEpoch0 []by
 		return nil, err
 	}
 	self.receivers = receivers
-	if err := self.installEpochOnLoop(storageRootEpoch0); err != nil {
+	if err := self.installEpochOnLoop(groupHandleKeyEpoch0); err != nil {
 		return nil, err
 	}
 	// the loop starts LAST, after every field it will read is written, so there is no window
@@ -248,12 +271,24 @@ func (self *GroupSession) Close() error {
 }
 
 // Epoch is the epoch this session is at.
-func (self *GroupSession) Epoch() uint64 {
+//
+// It answers an error rather than a zero, because a closed session's zero is indistinguishable
+// from epoch 0 -- which is the epoch every group spends its first commit in, so the ambiguity is
+// over the value a caller is most likely to meet. SenderHandle one method down already answers
+// this shape and for the same reason.
+func (self *GroupSession) Epoch() (uint64, error) {
 	var epoch uint64
-	if err := self.do(func() { epoch = self.epoch }); err != nil {
-		return 0
+	var err error
+	if postErr := self.do(func() {
+		if self.closing {
+			err = ErrSessionClosed
+			return
+		}
+		epoch = self.epoch
+	}); postErr != nil {
+		return 0, postErr
 	}
-	return epoch
+	return epoch, err
 }
 
 // SenderHandle is the handle this session's own records are routed by.
@@ -274,10 +309,11 @@ func (self *GroupSession) SenderHandle() ([16]byte, error) {
 
 // AdvanceEpoch installs the epoch the handle is now at, with a fresh pq_secret.
 //
-// GROUP_HANDLE_KEY DOES NOT MOVE. It is expanded from the epoch zero root, which this session
-// persisted at construction, and the whole reason it is persisted is that recomputing it from
-// the current root is a one line "simplification" that changes every sender_handle in the group
-// at every commit.
+// GROUP_HANDLE_KEY DOES NOT MOVE. It was expanded from the epoch zero root ONCE, and what this
+// session has held since construction is that answer rather than the root -- so there is nothing
+// here to re-expand and the field is handed straight back to the install. The whole reason it is
+// persisted is that recomputing it from the current root is a one line "simplification" that
+// changes every sender_handle in the group at every commit.
 //
 // Every ratchet is dropped and zeroized. A ratchet held across an epoch is holding the previous
 // epoch's rungs, which are exactly the octets forward secrecy is about, and the class keys it
@@ -356,11 +392,18 @@ func (self *GroupSession) trackSenderOnLoop(leaf uint32, class message.Retention
 
 // installEpochOnLoop derives every key of the epoch the handle is at.
 //
-// storageRootEpoch0 is nil only when the handle is at epoch 0, and the refusal for every other
+// groupHandleKeyEpoch0 is nil only when the handle is at epoch 0, and the refusal for every other
 // epoch is what makes group_handle_key persisted state rather than a value this function could
 // invent. An aged out epoch is reported and never silently zero: mls.ErrEpochErased comes back
 // out of Export and travels, because a storage root computed over an empty exporter output is
 // thirty two well formed octets that no other member ever reproduces.
+//
+// BOTH BRANCHES END HOLDING THE SAME KIND OF VALUE, which is the whole of what the switch below
+// is for and is what it did not do. One arm took the argument VERBATIM and the other expanded a
+// root through GroupHandleKey; both answers are thirty two octets, so nothing refused the
+// disagreement, and a device restarted at epoch > 0 with the value its own doc told it to persist
+// computed a sender_handle no peer computes and no peer's ReceiverRatchetKey matches. The argument
+// is the KEY, so the epoch zero arm is the only one that expands anything.
 //
 // The caller is the loop goroutine, or the constructor before the loop exists.
 //
@@ -368,7 +411,7 @@ func (self *GroupSession) trackSenderOnLoop(leaf uint32, class message.Retention
 // erased in it first, and those stores are the receiver's own.
 //
 //go:noinline
-func (self *GroupSession) installEpochOnLoop(storageRootEpoch0 []byte) error {
+func (self *GroupSession) installEpochOnLoop(groupHandleKeyEpoch0 []byte) error {
 	mlsSecret, err := self.handle.Export(mlsSecretLabel, nil, mlsSecretBytes)
 	if err != nil {
 		return fmt.Errorf("messagegroup: this session could not export its epoch's mls_secret: %w", err)
@@ -379,15 +422,27 @@ func (self *GroupSession) installEpochOnLoop(storageRootEpoch0 []byte) error {
 	root := StorageRoot(mlsSecret, self.pqSecret)
 	handleKey := []byte(nil)
 	switch {
-	case 0 < len(storageRootEpoch0):
+	case 0 < len(groupHandleKeyEpoch0):
+		// the width is refused HERE rather than at the first expansion that meets it. A
+		// persisted value comes out of durable storage, so sixty four octets is its plausible
+		// wrong shape, and SenderHandle's refusal is a panic carrying the sentinel -- which
+		// would surface on the caller's goroutine out of a constructor whose every other
+		// refusal is a typed error.
+		if len(groupHandleKeyEpoch0) != groupHandleKeyBytes {
+			return fmt.Errorf("%w: %d octets, want %d", ErrGroupHandleKeyLength,
+				len(groupHandleKeyEpoch0), groupHandleKeyBytes)
+		}
 		// a COPY, taken before the erase below, because AdvanceEpoch passes this session's own
 		// group_handle_key back in: erasing the field first would erase the argument.
-		handleKey = append([]byte(nil), storageRootEpoch0...)
+		handleKey = append([]byte(nil), groupHandleKeyEpoch0...)
 	case self.epoch == 0:
+		// the ONE expansion, and the only branch that has a root to expand. What it produces is
+		// the same kind of value the branch above is handed, which is what makes the two arms
+		// agree about what this parameter is.
 		handleKey = GroupHandleKey(root)
 	default:
 		return fmt.Errorf("%w: this handle is at epoch %d and no epoch zero group handle key was given",
-			ErrEpochZeroRootMissing, self.epoch)
+			ErrEpochZeroHandleKeyMissing, self.epoch)
 	}
 	// EVERY FIELD IS ERASED HERE, IN THIS BODY, IMMEDIATELY BEFORE IT IS OVERWRITTEN. It is
 	// spelled out rather than delegated to zeroizeOnLoop for the reason that method's own comment

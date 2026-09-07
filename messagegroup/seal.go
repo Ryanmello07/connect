@@ -17,6 +17,23 @@
 // same move connect/mls made when it turned its proposal buckets into derived accessors so that
 // divergence became unrepresentable.
 //
+// THE SCOPE OF THAT SENTENCE, because the unqualified version of it was false where it mattered.
+// The staging types are unexported, so no other package can build one at all and the order is a
+// TYPE across the package boundary. INSIDE this package a keyed composite literal of any of them
+// is legal go, and the stages used to be wrappers over one shared message.RecordHeader that
+// bindBodyHash mutated as a side effect -- so a member of this package could assemble a
+// recordBodyBound with no hash in it, seal the head first, and get a record message.EncodeRecord
+// accepted with body_hash all zero. That was measured rather than imagined, and tasks 13 to 16 are
+// the next members of this package.
+//
+// Two repairs, both below. Each stage now CARRIES the value the next one needs rather than
+// reaching for it through a shared pointer, so bindBodyHash is a pure function of the ct_body and
+// sealHead is the only writer of header.BodyHash; and sealHead refuses a stage whose carried hash
+// is not the hash of the ct_body it wraps, with ErrRecordStageOrder, which is what a skipped stage
+// now costs. The cost is one sha256 over a rung sized buffer per record, which is the same hash
+// the open path already pays. engine.go states the same kind of scope distinction for
+// EngineProcessed.stagedRef, and this file states it rather than claiming the stronger thing.
+//
 // The four functions the order runs through already carry it in their SIGNATURES, and this file
 // derives nothing: AADBody takes a BodyBinding with no hash within reach, which is guardrail G4
 // built as a signature; AADHead reads body_hash off the header; WriteAuthPreimage takes
@@ -225,20 +242,27 @@ type recordBodySealed struct {
 	ctBody  []byte
 }
 
-// bindBodyHash writes H(ct_body) into the header.
+// bindBodyHash takes H(ct_body) and hands it to the next stage.
 //
 // It is SHA-256 OF THE CIPHERTEXT and never of the plaintext, and never of the unpadded
 // plaintext: section 5.1 keeps body_hash after ct_body has been pruned, so it is what a pruned
 // record still says about what it carried, and a hash of anything else would be a value no
 // holder of the record can recompute.
+//
+// It writes NOTHING. It used to mutate the shared header and answer a stage carrying no value at
+// all, which is what made the stage skippable inside this package: the next stage's zero value was
+// as good as the real one. The hash travels in the stage now, so the only way to hold a
+// recordBodyBound that sealHead accepts is to have run this.
 func (self *recordBodySealed) bindBodyHash() *recordBodyBound {
-	self.builder.header.BodyHash = sha256.Sum256(self.ctBody)
-	return &recordBodyBound{sealed: self}
+	return &recordBodyBound{sealed: self, bodyHash: sha256.Sum256(self.ctBody)}
 }
 
-// recordBodyBound is the third stage: the header is complete and nothing of the head exists.
+// recordBodyBound is the third stage: the body's hash exists and nothing of the head does.
 type recordBodyBound struct {
 	sealed *recordBodySealed
+	// H(ct_body), carried rather than written into the shared header, so this stage's zero value
+	// is not a usable one.
+	bodyHash [32]byte
 }
 
 // sealHead seals the head plaintext under record_key's head half.
@@ -250,6 +274,17 @@ type recordBodyBound struct {
 // will ever reproduce.
 func (self *recordBodyBound) sealHead(headPlain []byte) (*recordHeadSealed, error) {
 	builder := self.sealed.builder
+	// THE STAGE IS CHECKED, because inside this package a keyed composite literal can build one
+	// with no hash in it. A recordBodyBound whose carried hash is not the hash of the ct_body it
+	// wraps is a stage nothing produced, and the answer is a refusal here rather than a record
+	// with a zero body_hash that the codec accepts and every reader refuses.
+	bound := sha256.Sum256(self.sealed.ctBody)
+	if subtle.ConstantTimeCompare(self.bodyHash[:], bound[:]) != 1 {
+		return nil, fmt.Errorf("%w: the head cannot be sealed before H(ct_body) is bound", ErrRecordStageOrder)
+	}
+	// and this is the ONE writer of body_hash, so the field a reader meets in the header is the
+	// value the previous stage produced and not one some earlier statement left there.
+	builder.header.BodyHash = self.bodyHash
 	aadHead, err := message.AADHead(RecordAeadAlgId, &builder.header, builder.header.ServerAttachment)
 	if err != nil {
 		return nil, err
@@ -466,8 +501,14 @@ func bucketForBody(bodyLength int) (message.SizeBucket, error) {
 // or an attacker chose; a scheme that put the length outside, or that inferred it from a trailing
 // byte pattern, would be recovering a length from an unauthenticated place.
 //
-// The tail is zeros. It is inside the aead too, so it authenticates, and a reader that ignored it
-// would be accepting two encodings of one message.
+// THE TAIL IS ZEROS AND THE WRITER IS WHAT MAKES IT SO. It is inside the aead, so whatever fill
+// this side chooses is authenticated -- which means the reader can safely ignore it, and the two
+// halves of that are not in tension: one encoding of one message exists because the SEALER emits
+// exactly one, not because the opener refuses the others. The fill byte is wire visible under open
+// item M1-7 in the sense a second implementation cares about, since two clients padding with
+// different bytes produce different ct_body and different body_hash for one message. It is zero,
+// and m1w1repairs_test.go pins it octet by octet, because a value no test records is a value the
+// next implementer has to guess.
 func padBody(bucket message.SizeBucket, bodyPlain []byte) ([]byte, error) {
 	rung := message.SizeBucketBytes(bucket)
 	if rung < 0 {
@@ -494,9 +535,11 @@ func padBody(bucket message.SizeBucket, bodyPlain []byte) ([]byte, error) {
 // rung. Both refusals are over octets the aead already authenticated, so reaching either means
 // the sealer and the reader disagree rather than that somebody tampered.
 //
-// The zero tail is NOT checked and that is deliberate: checking it would make the padding a
-// second authenticator over bytes the aead already covers, and a reader that refused a record
-// whose tail was not zero would be refusing a record its own key opened.
+// The zero tail is NOT checked and that is deliberate, and it does not contradict padBody's
+// sentence about it: the aead already covers those octets, so a check here would be a second
+// authenticator over authenticated bytes, and a reader that refused a record whose tail was not
+// zero would be refusing a record its own key opened. What keeps one message to one encoding is
+// that the SEALER emits one fill, not that the opener polices it.
 func unpadBody(bucket message.SizeBucket, padded []byte) ([]byte, error) {
 	rung := message.SizeBucketBytes(bucket)
 	if rung < 0 {
