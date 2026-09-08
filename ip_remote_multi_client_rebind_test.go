@@ -466,3 +466,60 @@ func TestRebindRemoveClientSourceAnchors(t *testing.T) {
 		t.Error("clientReceivePacket does not pass the local port to destinationReachable")
 	}
 }
+
+// The teardown detach. A torn-down flow's path-map entry must not survive the
+// removal. Left in place it holds no client and no race, so every later packet
+// for that 5-tuple -- including the peer's retransmits -- is discarded at the
+// "receive no race and no client" branch, and nothing rebinds it. The retire
+// path already detaches for this reason; teardown must too, or a window with
+// one exit (nothing to migrate to) black-holes the flow for good.
+//
+// The rebound flow is the control: it moved rather than died, so its entry
+// must still resolve.
+func TestRemoveClientDetachesTornDownFlowsFromPathMap(t *testing.T) {
+	settings := DefaultMultiClientSettings()
+	candidate := rebindTestCandidate(settings)
+	parent, dying, forwarded, _ := rebindTestParent(t, true, []*multiClientChannel{candidate})
+
+	establishedQuic := rebindTestFlow(parent, dying, rebindUdp443Path(10, 40001), true)
+	tornDownTcp := rebindTestFlow(parent, dying, rebindTcpPath(12, 40003), true)
+	tornDownQuic := rebindTestFlow(parent, dying, rebindUdp443Path(11, 40002), false)
+
+	quicPath := establishedQuic.ipPath.ToIp4Path()
+	tcpPath := tornDownTcp.ipPath.ToIp4Path()
+	unestablishedPath := tornDownQuic.ipPath.ToIp4Path()
+
+	parent.removeClient(dying)
+
+	parent.stateLock.Lock()
+	defer parent.stateLock.Unlock()
+
+	// the torn-down flows are detached: the next packet for either 5-tuple
+	// builds a clean generation instead of resolving to a nil-client entry
+	if _, ok := parent.ip4PathUpdates[tcpPath]; ok {
+		t.Error("torn-down tcp flow survived in the path map with no client and no race")
+	}
+	if _, ok := parent.ip4PathUpdates[unestablishedPath]; ok {
+		t.Error("torn-down udp flow survived in the path map with no client and no race")
+	}
+
+	// the rebound flow moved rather than died, so it must still resolve
+	if got := parent.ip4PathUpdates[quicPath]; got != establishedQuic {
+		t.Error("rebound flow was detached from the path map; it moved, it is not dead")
+	}
+	if establishedQuic.client.Load() != candidate {
+		t.Error("rebound flow lost its replacement binding")
+	}
+
+	// the teardown signal is still produced -- detaching must not cost the
+	// source the rst that tells it to reconnect
+	rst := 0
+	for _, p := range *forwarded {
+		if p.IpPath != nil && p.IpPath.Protocol == IpProtocolTcp {
+			rst += 1
+		}
+	}
+	if rst == 0 {
+		t.Error("no tcp teardown signal was produced for the torn-down flow")
+	}
+}

@@ -4968,6 +4968,30 @@ func (self *RemoteUserNatMultiClient) removeClient(client *multiClientChannel) {
 		for _, update := range teardownUpdates {
 			update.client.Store(nil)
 
+			// Detach the exact generation, for the same reason the retire
+			// path does it: the teardown signal below tells the source to
+			// reconnect, and the packet that follows must be free to create a
+			// clean generation and race a healthy exit. Without the detach the
+			// entry survives in the path map with no client and no race, so
+			// every later packet for that 5-tuple -- the peer's retransmits
+			// included -- is discarded at the "receive no race and no client"
+			// branch, and nothing ever rebinds it. With one exit in the field
+			// there is no migration to paper over it and the flow black-holes
+			// for good.
+			if update.ipPath != nil {
+				switch update.ipPath.Version {
+				case 4:
+					if path := update.ipPath.ToIp4Path(); self.ip4PathUpdates[path] == update {
+						delete(self.ip4PathUpdates, path)
+					}
+				case 6:
+					if path := update.ipPath.ToIp6Path(); self.ip6PathUpdates[path] == update {
+						delete(self.ip6PathUpdates, path)
+					}
+				}
+			}
+			delete(self.flowUpdates, update)
+
 			// the update's ipPath is egress-oriented, so the remote
 			// endpoint the user is waiting on is the destination.
 			lostDestinations = append(lostDestinations, newRecoveryKey(
@@ -4988,6 +5012,13 @@ func (self *RemoteUserNatMultiClient) removeClient(client *multiClientChannel) {
 					Packet:      packet,
 				}
 				rstPackets = append(rstPackets, rstPacket)
+			}
+
+			// Done last: the generation is finished only once its teardown
+			// signal has been built. IsDone() is what the ingress lookup
+			// consults to build a fresh generation for the next packet.
+			if update.cancel != nil {
+				update.cancel()
 			}
 		}
 	}()
@@ -9770,7 +9801,25 @@ func (self *multiClientWindow) convictSendStalls(stallTimeout time.Duration) boo
 			}
 			continue
 		}
-		if !receivingElsewhere(client) {
+		// The uplink-corroboration hold below is only meaningful when some
+		// OTHER exit could prove the uplink. With a single exit in the window
+		// -- a user pinned to one provider, or a field that has narrowed to
+		// one -- no sibling can ever report a receive, so `receivingElsewhere`
+		// is false forever and the hold never opens: the exit is never
+		// convicted, never demoted, never re-raced, and its flows black-hole
+		// for the rest of the session while the window still reports the exit
+		// proven and unquarantined. Absence of a corroborator is not evidence
+		// of innocence, so fall through to the ordinary verdict, which still
+		// demands real evidence about THIS exit -- a probe timeout, or two
+		// consecutive unsendable probes -- before it convicts.
+		corroboratorAvailable := false
+		for _, other := range self.unorderedClients() {
+			if other != client {
+				corroboratorAvailable = true
+				break
+			}
+		}
+		if corroboratorAvailable && !receivingElsewhere(client) {
 			// held, not acquitted: the stall clock is deliberately NOT
 			// refreshed, so the evidence carries into the next pass and a
 			// real stall still convicts the moment a sibling proves the
