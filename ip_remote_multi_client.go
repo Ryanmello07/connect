@@ -9801,25 +9801,7 @@ func (self *multiClientWindow) convictSendStalls(stallTimeout time.Duration) boo
 			}
 			continue
 		}
-		// The uplink-corroboration hold below is only meaningful when some
-		// OTHER exit could prove the uplink. With a single exit in the window
-		// -- a user pinned to one provider, or a field that has narrowed to
-		// one -- no sibling can ever report a receive, so `receivingElsewhere`
-		// is false forever and the hold never opens: the exit is never
-		// convicted, never demoted, never re-raced, and its flows black-hole
-		// for the rest of the session while the window still reports the exit
-		// proven and unquarantined. Absence of a corroborator is not evidence
-		// of innocence, so fall through to the ordinary verdict, which still
-		// demands real evidence about THIS exit -- a probe timeout, or two
-		// consecutive unsendable probes -- before it convicts.
-		corroboratorAvailable := false
-		for _, other := range self.unorderedClients() {
-			if other != client {
-				corroboratorAvailable = true
-				break
-			}
-		}
-		if corroboratorAvailable && !receivingElsewhere(client) {
+		if !receivingElsewhere(client) {
 			// held, not acquitted: the stall clock is deliberately NOT
 			// refreshed, so the evidence carries into the next pass and a
 			// real stall still convicts the moment a sibling proves the

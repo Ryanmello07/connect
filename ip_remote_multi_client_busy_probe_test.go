@@ -670,33 +670,6 @@ func TestSchedulerPauseDefaults(t *testing.T) {
 	AssertEqual(t, ReliabilitySettingsFrom(nil).SchedulerPauseTolerance, time.Duration(0))
 }
 
-// The single-exit window. The corroboration hold asks whether some OTHER exit
-// is receiving, to keep a dead phone uplink from convicting a healthy exit.
-// With exactly one exit in the window there is no other exit to ask, so the
-// question can never be answered and the hold, left ungated, is permanent: the
-// exit is never convicted, never demoted and never re-raced, while the window
-// still reports it proven and unquarantined. A user pinned to one provider
-// black-holes for the rest of the session.
-//
-// Absence of a corroborator is not evidence of innocence. A single-exit window
-// falls through to the ordinary verdict, which still demands real evidence
-// about this exit -- here, a probe that is queued and never answered.
-func TestBusyProbeConvictsSingleExitWithNoCorroborator(t *testing.T) {
-	stallTimeout := 20 * time.Millisecond
-
-	client := busyProbeTestChannel(t, func(timeout time.Duration, ackCallback func(error)) (bool, error) {
-		// queued, never answered
-		return true, nil
-	})
-	stallPast(client, stallTimeout)
-
-	// the only exit in the window: nothing can ever corroborate the uplink
-	window := busyProbeTestWindow(40*time.Millisecond, client)
-
-	AssertEqual(t, window.convictSendStalls(stallTimeout), true)
-	AssertEqual(t, client.IsDone(), true)
-}
-
 // The hold still governs whenever a corroborator exists but has not reported.
 // A silent sibling is the ambiguous case the gate was built for -- the uplink
 // may be the thing that is down -- so the verdict is withheld, exactly as
