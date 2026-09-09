@@ -3,11 +3,13 @@
 What this file is for: `mls`, `message` and `messagegroup` defend most of their properties with
 **gates** — a test that derives a class of things and then asserts something over every member. A
 gate is only ever as good as its class, and this project has now shipped the same class defect
-**seven times at seven altitudes**, each one green, each one found by a reviewer a round later at
+**eight times at eight altitudes**, each one green, each one found by a reviewer a round later at
 full cost.
 
-The sixth and the seventh were both this file, the seventh inside the fix for the sixth. It is
-worth stating plainly, because it is the reason the file no longer looks the way it did:
+The sixth, the seventh and the eighth were all this file, each one inside the fix for the one
+before it. It is worth stating plainly, because it is the reason the file no longer looks the way
+it did — and because three rounds in a row is the argument for deciding a claim in a test rather
+than agreeing with it in prose:
 
 > The artifact written to stop the fifth instance contained the defect. Its table opened
 > *"Every arity- or name-shaped narrowing over a reflected class"* and held **eight of the
@@ -24,14 +26,28 @@ worth stating plainly, because it is the reason the file no longer looks the way
 > sixty-eight keys stood one door over**, unindexed and unprinted, and a planted one passed all
 > four gates below. Every one of the six findings that raised this file happened to be about a
 > method, so the scope reproduced the shape of its instances.
+>
+> And the fix for THAT contained the EIGHTH, one altitude down. The doors were derived and the
+> **readings off what a door hands back** were left as two literals: the selector `Name` and the
+> selector `Type`. A member descriptor carries more — `reflect.Method` is a name, a package path,
+> a type, a func and an index, and `reflect.StructField` adds a tag, an offset and an embedding
+> flag — and every one of them is a fact about the member, so a predicate deciding by one narrows
+> the same class. **That complement, six spellings, was stated nowhere and printed nowhere.** Four
+> narrowings over it were planted and all five gates stayed green, the derived class stayed
+> byte-identical, and the recall fraction did not move. Worse, the boundary paragraph offered
+> `go/types` as the remedy for what this file cannot see, and **a go/types rebuild would have
+> caught none of the four**: a struct tag is a spelling the parse tree already holds.
 
 So the table below is no longer written. It is **derived**, from the parse tree, by
 `gates_index_test.go`, and the two are required to be the same set in both directions. The query
 below is no longer trusted. It is **run**, and its recall against that derivation is measured on
-every test run and published here as a fraction this file is held to. And the **doors** that
-derivation reads a member through are no longer named either: they are derived from reflect's own
-source, by the property that makes something a door, so a door Go adds in a later release joins
-this reading on the day the toolchain moves.
+every test run and published here as a fraction this file is held to. The **doors** that derivation
+reads a member through are no longer named either: they are derived from reflect's own source, by
+the property that makes something a door, so a door Go adds in a later release joins this reading
+on the day the toolchain moves. And the **readings** off what a door hands back are no longer named
+either: the fields a member descriptor carries are found by the same sentence that admits the
+descriptor, so a field Go adds to `reflect.Method` or `reflect.StructField` joins this reading on
+the same day — and the ones this file does not read as a name or a type are printed on every run.
 
 ---
 
@@ -67,7 +83,7 @@ is the sixth instance, and the tests named at the bottom of this file are it, cl
 
 ---
 
-## The seven, and what each narrowed by
+## The eight, and what each narrowed by
 
 1. **A class dispositioned by a COUNT instead of a grep.** The number of members stood in for the
    members. A count cannot have a complement, which is why nothing could be read off it.
@@ -108,6 +124,24 @@ is the sixth instance, and the tests named at the bottom of this file are it, cl
    by hand, without printing one of them. Closed by deriving the doors from reflect's own API
    rather than from the findings: see `gatesDeriveDoors`. The index went from 54 rows to **148**,
    and the published query's recall from **54/55** to **99/158**.
+8. **This file a third time, inside the fix for the seventh, and the READING half.** The doors
+   were derived; what a door HANDS BACK was still two spellings, `Name` and `Type`, written into
+   two functions under no sentence at all. A member descriptor carries eight exported fields
+   between the two of them, and the six the derivation did not read —
+   `PkgPath`, `Func`, `Index`, `Tag`, `Offset`, `Anonymous` — are facts about the member exactly
+   as its name is. Four planted narrowings over that complement (`field.Tag`, `field.PkgPath`,
+   `field.Anonymous`, `len(member.Index)`) left **all five gates green**, the derived class
+   byte-identical at 158 occurrences over 148 keys, and the recall fraction unmoved. **Three live
+   sites were already in the tree**, each dropping a struct field carrying no `json` tag, two of
+   them under a doc comment invoking the very rule they broke. And the sentence this file printed
+   about what it could not see — *"it under-reaches in exactly three places, and all three want
+   the same thing: a TYPE"* — was measurably wrong: none of the four wants a type, and the
+   `go/types` rebuild it proposed would have found none of them. Closed by deriving the fields
+   from the descriptor itself, in `gatesDescriptorFields`: see `gatesIsMemberAttribute`. The index
+   went from 148 rows to **160**, and the published query's recall from **99/158** to **99/170**.
+   The same round's self-check, run over its own diff, found one more of the shape one level down
+   and closed it: the predicate class itself was narrowed by ARITY — "a function answering exactly
+   one `bool`" — with an empty, unprinted complement.
 
 ---
 
@@ -133,13 +167,24 @@ spellings, two of which it over-reports and says so, and the whole set is printe
 beside the exported structs the descriptor sentence removed. Naming the two method doors instead
 was the seventh instance.
 
+**AND THE READINGS OFF WHAT A DOOR HANDS BACK ARE DERIVED TOO, which was the eighth instance.**
+A member descriptor does not carry two facts about a member, it carries eight; the field that NAMES
+the member is read as a name narrowing, the field that carries its TYPE as a shape narrowing, and
+**every other exported field of a descriptor** is read as a narrowing over a fact the descriptor
+carries. Those fields are found by the same sentence that admits the descriptor rather than spelled
+here, the six that are neither the name nor the type are printed on every run, and a field Go adds
+to either descriptor joins the reading on the day the toolchain moves. Reading only the first two
+left `field.Tag`, `field.PkgPath`, `field.Anonymous` and `member.Index` invisible to every gate in
+this file.
+
 The receiver can be spelled anything at all; a member reached through a door directly, through a
 `[]reflect.Method` or a `[]reflect.StructField` a helper was handed, or through a `reflect.Value`
 whose signature comes back from `Type()`, all reach the same reading. **And a predicate is a
 predicate however it is spelled**: the condition of an `if`, `for`, `switch` or `case`; an
 identifier bound to a member reading above the line that decides by it (`drop :=
-strings.HasPrefix(member.Name, "Gamma")` then `if drop`); or the result of a function or literal
-that answers one `bool`. That is the half a grep cannot do, and it is why the eight-row table was
+strings.HasPrefix(member.Name, "Gamma")` then `if drop`, or `key, _, _ :=
+strings.Cut(field.Tag.Get("json"), ",")` then `if key == ""`); or the result of a function or
+literal that answers one `bool`. That is the half a grep cannot do, and it is why the eight-row table was
 wrong for a round.
 
 The greps below are the **first cut**, kept because a reader wants something to run:
@@ -154,7 +199,7 @@ grep -rnE '(if|for|case) .*\.Name|\.Type\.(In|Out|Kind|Elem|NumIn|NumOut|IsVaria
 Their recall against the derivation is measured on every run and stated here, and the sites they do
 not reach are named in the test log:
 
-**gates-recall: 99/158**
+**gates-recall: 99/170**
 
 **That fraction is a MEASUREMENT and not a claim.** These patterns were fitted against the tree as
 it stands, which is instance-derived by construction — which is exactly why the number is published
@@ -163,13 +208,15 @@ wrong and `TestTheQueryGatesPublishesIsMeasuredAgainstTheDerivationRatherThanTru
 **The correct response is to update the fraction, not to chase the pattern.** The derivation is the
 query; the greps are a convenience whose honesty is enforced.
 
-It is **not** 158/158, and the gap is wide rather than narrow, which is the mechanism working
-rather than a defect. The **59 occurrences these patterns miss sit in 38 functions**, and they miss
-them for three reasons a pattern cannot fix: a predicate that hands a member's type straight to a
+It is **not** 170/170, and the gap is wide rather than narrow, which is the mechanism working
+rather than a defect. The **71 occurrences these patterns miss sit in 45 functions**, and they miss
+them for four reasons a pattern cannot fix: a predicate that hands a member's type straight to a
 function (`typeReachesByteStorageThrough(field.Type(), entered)`) carries none of the spellings a
 grep can key on; a predicate bound to a name decides on a line that mentions no member at all (`if
-!driven`); and a member reached through a helper's parameter is only a member because of a
-declaration in another file. Every one of them is named in the test log on every run. That is what
+!driven`); a member reached through a helper's parameter is only a member because of a
+declaration in another file; and a fact cut out of a member's descriptor is decided two lines
+later, by an identifier the patterns cannot tell from any other string (`key == ""`). Every one of
+them is named in the test log on every run. That is what
 printing a query's complement looks like, and it is also the argument for why the derivation and
 not the grep is the query.
 
@@ -215,8 +262,9 @@ rather than agreeing with it in prose.
 ## The index
 
 Every narrowing over a reflected **member** set in these three trees — through every door reflect
-offers onto one, methods and fields alike, and whichever of the three ways a predicate is spelled.
-It is not written — it is **derived**, and `TestTheGatesTableIsTheDerivedClassAndNotAListOfIt`
+offers onto one, methods and fields alike; by every fact a member's descriptor carries, its name
+and its type and the six besides; and whichever of the three ways a predicate is spelled. It is not
+written — it is **derived**, and `TestTheGatesTableIsTheDerivedClassAndNotAListOfIt`
 holds the two equal in both directions: a site in the tree and not here fails, and a row here whose
 narrowing no longer exists fails too.
 
@@ -230,13 +278,27 @@ the control rather than discovered later: it binds an identifier to a member for
 function it is bound in, not for the block Go scopes it to; it treats anything reached from a
 member's signature as a reading of that signature; and in reflect's Value half it admits two
 element readings that take the same arguments a field door takes. Over-reporting is the safe
-direction; a site it reports that is not really a narrowing gets a row saying so, and three rows
-below say exactly that. **It under-reaches in exactly three places, and all three want the same
-thing: a TYPE.** A member reached through a parameter declared `reflect.Value`; a member held in a
+direction; a site it reports that is not really a narrowing gets a row saying so, and four rows
+below say exactly that.
+
+**AND WHAT IT UNDER-REACHES IS STATED HERE AS A LIST OF WHAT IS DRIVEN, NOT AS A COUNT OF WHAT
+EXISTS — which is the repair of a sentence that was measurably wrong.** This paragraph read *"it
+under-reaches in exactly three places, and all three want the same thing: a TYPE… closing any of
+them needs `go/types` and a full type-check"*, and that sentence was the eighth instance's cover:
+four narrowings over the fields a member descriptor carries besides its name and its type were
+invisible to this derivation, **none of them wanted a type**, and the `go/types` rebuild this
+paragraph proposed would have found none of them — a struct tag is a selector the parse tree
+already holds. A count of what a derivation cannot see is a claim about the unseen, and this file
+has now been wrong about it twice.
+
+So what is written here is what is **driven through the control and asserted NOT found**, and
+nothing more: a member reached through a parameter declared `reflect.Value`; a member held in a
 struct FIELD whose type is declared in another declaration; and a predicate answering a DEFINED
-type whose underlying type is `bool`. Closing any of them needs `go/types` and a full type-check,
-which is the one rebuild this file has not had. Those boundaries are not sentences here: each is
-driven through the control and asserted NOT found, so none can quietly stop being true.
+type whose underlying type is `bool`. Each of those three does want a type, and `go/types` would
+close each of them. **That is not the same as saying they are all that is missing**, and the reader
+who wants the next instance should look where this file has twice found it: at what the derivation
+reads its class THROUGH — the doors in the seventh round, the descriptor's own fields in the eighth
+— rather than at the class itself.
 
 Each row carries one verdict:
 
@@ -246,7 +308,7 @@ Each row carries one verdict:
 | `NARROWING/refusal` | A name- or arity-shaped test that removes members and **reports each one** (`t.Errorf`/`t.Fatalf`). Nothing leaves the class silently, so there is no complement to print — the failure is the print. |
 | `CLASS/results` | Membership is decided by a reading of the member's own **result, argument or field TYPES**. That is the property itself rather than a narrowing of it, so there is no separate exclusion predicate to hold a complement. (The word was "result or argument" while the class was method-shaped; a field's own type is the same reading one door over.) |
 | `DRIVER` | Walks a member's own arguments, results or fields, calls the member, recurses through it, or IS the assertion. It removes nobody: every member still reaches every rule. |
-| `NOT-A-MEMBER` | The derivation over-reports here, and the row says why. No row carries this verdict today, and that is not the same as no over-report: the three sites where the derivation over-reports share a (file, function, condition) key with an occurrence that IS a member, so they carry `DRIVER` and say so in the reading. A key whose every occurrence is a non-member would carry this. |
+| `NOT-A-MEMBER` | The derivation over-reports here, and the row says why. **One row carries it**, added with the eighth instance: `sameRegistryVectors` reads `lf.Index(j)`, which is reflect.Value's ELEMENT reading and not the descriptor field spelled the same way — two of this derivation's stated over-reports meeting on one line. The other over-reporting sites share a (file, function, condition) key with an occurrence that IS a member, so they carry `DRIVER` and say so in the reading. |
 | `OPEN` | Unmeasured. **This verdict is RED.** Recording a narrowing as open is not closing it: the two rows this table carried as OPEN at `81b97ca` were still open when the next reviewer arrived. |
 
 <!-- gates-index:begin -->
@@ -281,6 +343,7 @@ Each row carries one verdict:
 | `mls/commit_vector_join_test.go` `TestEveryExportedMethodOfAProposalCacheRefusesANilCacheRatherThanPanicking` | shape | `method.Type.Out(at) != reflect.TypeFor[error]()` | DRIVER — finds the error among the member's results. |
 | `mls/commit_vector_join_test.go` `TestEveryExportedMethodOfAProposalCacheRefusesANilCacheRatherThanPanicking` | shape | `method.Type.Out(at).Kind()` | DRIVER — reads one result's kind to decide how to read it back. |
 | `mls/crypto_labels_test.go` `TestEveryPublishedFieldOfTheKeyScheduleCorpusIsDecodedAndRead` | name | `!slices.Contains(readings, name)` | NARROWING/refusal — a published field nothing reads off a corpus epoch is reported. |
+| `mls/crypto_labels_test.go` `TestEveryPublishedFieldOfTheKeyScheduleCorpusIsDecodedAndRead` | attribute | `!tagged where tagged = field.Tag.Lookup("json")` | NARROWING/refusal — the eighth instance's own shape, and the one site in these trees that already had it right: a field of `labelKatEpoch` carrying no json tag is FATAL, so nothing leaves the decoded class in silence. |
 | `mls/crypto_labels_test.go` `theEpochsFieldOf` | shape | `field.Type.Kind() == reflect.Slice && field.Type.Elem() == epoch` | CLASS/results — the field is found by its own type, and a type declaring no such field is fatal. |
 | `mls/crypto_test.go` `providerStructByteFields` | shape | `(field.Kind() == reflect.Slice \|\| field.Kind() == reflect.Array) && field.Type().Elem().Kind() == reflect.Uint8` | CLASS/results — membership is "this field carries octets", read off the field's own type. The array arm is in the same case as the slice because reading only the slice made a fixed width field render as no bytes at all. |
 | `mls/crypto_test.go` `providerStructByteFields` | shape | `field.Kind() == reflect.Map && field.Type().Elem().Kind() == reflect.Slice && field.Type().Elem().Elem().Kind() == reflect.Uint8` | CLASS/results — the map arm of the same "carries octets" reading. |
@@ -295,6 +358,7 @@ Each row carries one verdict:
 | `mls/extension_test.go` `capabilityPredicates` | name | `selected[method.Name]` | DRIVER — the complement printer itself, walking the method set to name what no field paired with. |
 | `mls/extension_test.go` `generatedRegistryStructs` | shape | `got != typeName` | NARROWING/refusal — a field whose element type is not the name given is fatal. |
 | `mls/extension_test.go` `requiredCapabilityFields` | shape | `capabilities.Field(j).Type == field.Type` | CLASS/results — the pairing is decided by the two members' own types, and a pairing that is not exactly one is fatal. |
+| `mls/extension_test.go` `sameRegistryVectors` | attribute | `lf.Index(j).Uint() != rf.Index(j).Uint()` | NOT-A-MEMBER — `Index` here is reflect.Value's ELEMENT reading and not the descriptor field of that spelling: `lf` is `l.Field(i)`, a Value, and `lf.Index(j)` is its j'th element. Two stated over-reports meet on one line — the Value-half door admitted because it takes a field door's arguments, and the selector admitted because a descriptor carries a field spelled that way. The first row to carry this verdict. |
 | `mls/external_provenance_test.go` `TestNoKeyScheduleAnswersAVerifiedGroupContext` | shape | `method.Type.Out(at) != verified` | DRIVER — walks results looking for the forbidden one; every member is looked at. |
 | `mls/external_provenance_test.go` `TestTheOnlyExportedDoorOntoAVerifiedGroupContextIsAVerifiedGroupInfo` | shape | `door.Type.In(at) == tree` | DRIVER — walks one named door's own arguments. |
 | `mls/external_provenance_test.go` `externalDoorsOntoAVerifiedGroupContext` | shape | `!isSignature where isSignature = method.Type().(*types.Signature)` | DRIVER — three occurrences share this key. Two read a *types.Object out of a package scope and are not members at all — the derivation binds an identifier for the whole function rather than the block it is scoped to, which is its stated over-report and why the predicate text here is carried from the third. The third guards a type assertion over a go/types method set whose complement is empty by construction, a *types.Func's type being always a signature, so it removes nobody. |
@@ -362,13 +426,19 @@ Each row carries one verdict:
 | `mls/key_schedule_test.go` `tagVerifierPairs` | shape | `verify.Type.NumOut() != 1 \|\| verify.Type.Out(0).Kind() != reflect.Bool` | CLASS/results — the class is "answers exactly one bool", read off the results; the members that do are logged beside the pairs. |
 | `mls/leaf_node_test.go` `TestLeafNodeValidateEnforcesEveryRequiredCapabilitiesVector` | name | `!written where written = byField[name]` | NARROWING/refusal — a field of RequiredCapabilities with no row is reported. |
 | `mls/leaf_node_test.go` `leafNodeFieldPathsOf` | shape | `field.Type.Kind() == reflect.Struct && !leafNodeFieldIsDelegated(field.Type)` | DRIVER — decides whether a field is descended into or emitted as a leaf path; every field yields at least one path. |
+| `mls/message_protection_kat_test.go` `TestMessageProtectionVectorDecodesEveryColumnTheCorpusPublishes` | attribute | `mineKey != key where key = strings.Cut(field.Tag.Get("json"), ",") where mineKey = strings.Cut(mine.Tag.Get("json"), ",")` | NARROWING/refusal — two structs decoding one corpus row are held key against key, and a disagreement is reported rather than skipped. |
+| `mls/message_protection_kat_test.go` `messageProtectionColumnTags` | attribute | `key == "" where key = strings.Cut(shape.Field(index).Tag.Get("json"), ",")` | NARROWING/refusal — RESTATED THIS ROUND. It read `if key != "" { tags = append(tags, key) }`: a field carrying no json tag left the column table in silence and its complement was EMPTY, which the table above calls the dangerous case. `encoding/json` decodes an untagged field under its GO NAME, so the column exists and this table, whose whole claim is "every json key this struct decodes", would not name it. Now fatal. |
 | `mls/message_protection_kat_test.go` `theGroupContextParameters` | shape | `isSignature where isSignature = method.Type().(*types.Signature)` | DRIVER — the same shape as externalDoorsOntoAVerifiedGroupContext's row: two occurrences, one over a scope object that is not a member and one over a go/types method set whose complement is empty by construction. The predicate text is carried across blocks by the derivation's stated function-wide binding. |
+| `mls/messages_kat_test.go` `TestMessagesCodecsReadTheColumnTheyAreNamedAfter` | attribute | `key == "" where key = strings.Cut(shape.Field(index).Tag.Get("json"), ",")` | NARROWING/refusal — RESTATED THIS ROUND, for `messagesColumnTags`' reason: an untagged field was skipped and left empty in the marker, and every codec reading it would then answer the empty string — which reads here as a codec naming the wrong column. Now fatal. |
+| `mls/messages_kat_test.go` `messagesColumnTags` | attribute | `key == "" where key = strings.Cut(shape.Field(index).Tag.Get("json"), ",")` | NARROWING/refusal — RESTATED THIS ROUND. The same shape and the same empty complement as `messageProtectionColumnTags`; an untagged field is now fatal rather than skipped. |
 | `mls/proposal_ceiling_test.go` `TestTheCachesAccountingIsAlwaysAViewOfTheEntriesItHolds` | name | `exempt \|\| compared[name] where exempt = entries[name]` | NARROWING/refusal — a field of the cache that neither table accounts for is reported, and the loop below reports a table key with no field, so both directions are judged. |
 | `mls/proposal_ceiling_test.go` `testArmNamesALeaf` | shape | `arm.Field(i).Type() == names` | CLASS/results — "the arm names a leaf" is read off the field's own type. |
 | `mls/proposal_ceiling_test.go` `testArmReplacesItsSendersLeaf` | shape | `arm.Field(i).Type() == replaces` | CLASS/results — "the arm replaces its sender's leaf" is read off the field's own type. |
 | `mls/proposal_list_derivation_test.go` `TestAProposalListKeepsItsProposalsInExactlyOnePlace` | shape | `held.Type != want` | NARROWING/refusal — reported: anything but a []CachedProposal has lost the commit order. |
 | `mls/proposal_list_derivation_test.go` `TestAProposalListKeepsItsProposalsInExactlyOnePlace` | name | `unicode.IsUpper([]rune(held.Name)[0])` | NARROWING/refusal — an exported storage field is reported. |
 | `mls/proposal_list_derivation_test.go` `TestEveryPerTypeViewOfAProposalListIsItsCommitOrderFiltered` | name | `!joined where joined = carriedBy[method.Name]` | NARROWING/refusal — a view nothing names the filtered type of is reported. |
+| `mls/proposal_list_derivation_test.go` `TestEveryPerTypeViewOfAProposalListIsItsCommitOrderFiltered` | name | `entry.Proposal.ProposalType != carries where carries = carriedBy[method.Name]` | DRIVER — IS the assertion: a view answering a proposal of another type is reported, and no member is removed. |
+| `mls/proposal_list_derivation_test.go` `TestEveryPerTypeViewOfAProposalListIsItsCommitOrderFiltered` | name | `entry.Proposal.ProposalType == carries where carries = carriedBy[method.Name]` | DRIVER — builds the sequence the view is COMPARED against, filtering the commit order rather than the member set. Every view still reaches every rule. |
 | `mls/proposal_list_derivation_test.go` `proposalListStorageFields` | shape | `carries(held.Field(i).Type, entered)` | DRIVER — the reachability walk into every field. |
 | `mls/proposal_list_derivation_test.go` `proposalListStorageFields` | shape | `carries(structure.Field(i).Type, map[reflect.Type]bool{})` | CLASS/results — membership is "this field can carry a cached proposal", read off the field's own type. |
 | `mls/proposal_list_test.go` `proposalListViewAnswer` | shape | `at < bound.Type().NumIn()` | DRIVER — walks the member's own arguments to build the zero row. An argument-taking view is DRIVEN here rather than dropped, which is what closing the row above required. |
@@ -382,6 +452,8 @@ Each row carries one verdict:
 | `mls/psk_test.go` `providerPskInputBytePaths` | shape | `field.Type.Kind() == reflect.Struct` | DRIVER — descends into a nested structure so its octet fields join the same class. |
 | `mls/secret_tree_test.go` `TestEveryExportedSecretTreeMethodRefusesAfterZeroize` | shape | `at < method.Type.NumIn()` | DRIVER — walks the member's own arguments. |
 | `mls/secret_tree_test.go` `TestSecretTreeCachedGeometryIsDerivedFromTheLeafCount` | name | `!onTheType[name]` | NARROWING/refusal — a table naming a field the type does not declare is reported. |
+| `mls/secret_tree_test.go` `TestSecretTreeCachedGeometryIsDerivedFromTheLeafCount` | name | `geometry == state where geometry = secretTreeGeometryFields[name] where state = secretTreeStateFields[name]` | NARROWING/refusal — a field of `SecretTree` judged by both tables or by neither is reported; nothing leaves the comparison silently. |
+| `mls/secret_tree_test.go` `TestSecretTreeCachedGeometryIsDerivedFromTheLeafCount` | name | `got != want where want = secretTreeGeometryFields[name](t, n)` | DRIVER — IS the assertion. The `name` it reads is the geometry table's own key and not a member's name at all; the derivation binds an identifier for the whole function it is bound in, which is its first stated over-report. |
 | `mls/secret_tree_test.go` `stMethodsAnsweringBytes` | shape | `method.Type.Out(result) == byteSlice` | CLASS/results — membership is "some result of this member is a byte slice". |
 | `mls/secret_tree_test.go` `stMethodsAnsweringBytes` | shape | `result < method.Type.NumOut()` | DRIVER — walks the member's own results. |
 | `mls/transcript_test.go` `trRecordLayerCodecMethods` | name | `strings.HasSuffix(name, "LP")` | NARROWING/complement — the third site the receiver-keyed query missed. The suffix is the naming rule `encode.go` states (LP is the master design's notation for a fixed 32-bit big-endian length), and the twenty-odd methods it removes are now named rather than counted. |
@@ -396,11 +468,50 @@ Each row carries one verdict:
 | `mls/validate_commit_test.go` `TestTheSectionTwelveTwoInputThisFileBuildsIsThisCommitsOwnFields` | name | `!written where written = expected[name]` | NARROWING/refusal — a field of the section 12.2 input nothing says the provenance of is reported. |
 | `mls/validate_commit_test.go` `TestValidateCommitRefusesAListThatIsNotTheCommitsOwnProposalVector` | name | `!driven[name]` | NARROWING/refusal — a field of ProposalOrRef no row makes the list and the vector disagree over is reported. |
 | `mls/validate_commit_test.go` `TestValidateCommitRefusesAListThatIsNotTheCommitsOwnProposalVector` | name | `!onTheType[name]` | NARROWING/refusal — the other direction: a row naming a field the type does not carry is reported. |
+| `mls/vectors_runner_test.go` `theJsonKeyOf` | attribute | `key == "" where key = strings.Cut(found.Tag.Get("json"), ",")` | NARROWING/refusal — a field with no json key is fatal, because a lookup under its go name would answer "absent" about a corpus that publishes the column perfectly well. |
 | `mls/welcome_test.go` `TestTheGroupInfoSignatureCoversEveryFieldOfItsToBeSigned` | name | `name == "Signature"` | NARROWING/complement — CLOSED THIS ROUND: the removed member is now printed beside the class it is removed from. It is one member, named by a literal of this test, and the sentence that puts it out is that a signature does not cover itself. |
 | `mls/welcome_test.go` `changeGroupInfoField` | shape | `value.Type().Elem().Kind() == reflect.Uint8` | DRIVER — chooses how to move a value of this kind; the switch's default is fatal, so a kind with no move fails rather than being reported covered. |
 | `mls/welcome_test.go` `groupInfoTbsFieldPaths` | shape | `field.Type.Kind() == reflect.Struct` | DRIVER — descends into a nested structure; every field yields a path. |
 | `mls/welcome_test.go` `providerGroupInfoPerturbations` | name | `!written where written = edits[name]` | NARROWING/refusal — fatal: a field of GroupInfo no perturbation moves would answer identically under every move this gate makes. |
+| `mls/welcome_test.go` `providerWelcomeJoinerPerturbations` | name | `moves == excused where excused = theWelcomeJoinerFieldTheSealDoesNotRead[name] where moves = edits[name]` | NARROWING/refusal — fatal: a field of WelcomeJoiner that is neither moved nor written down as unread by the seal, or that is both, is reported. |
 <!-- gates-index:end -->
+
+---
+
+## The nine rows that are here by coincidence, measured rather than excused
+
+Nine rows of the index above — eight functions: `typeReachesByteStorageThrough`,
+`epochCachesHeldBy`, `externalDoorsOntoAVerifiedGroupContext`, `externalShadowHasThisTypesShape`,
+`comparesOctets`, `theGroupContextParameters`, `reachesByteSliceType` and
+`typeReachesNamedThrough` — narrow a **`go/types`** member set, not a reflect one. **They are in
+this index by accident, and the accident is that `go/types` spells two of its member doors
+`Field` and `Method`, exactly as reflect spells two of its own.** The derivation reads a selector
+spelling; it does not know which library the value came from.
+
+That is worth saying out loud rather than letting the rows read as coverage, and it is
+**measured** by `TestTheGoTypesRowsOfTheIndexAreACoincidenceOfSPELLINGAndTheCoincidenceIsMeasured`
+rather than asserted here. On Go 1.26 that gate reports:
+
+- the member-descriptor sentence — an exported STRUCT carrying a name beside a type — admits
+  **0 of `go/types`' 38 exported structs**, because `go/types` hands a member back as an OBJECT
+  whose name and type are METHODS. So no door of `go/types` is reached by rule;
+- asking the same sentence of a method set instead finds **9 exported named types** of `go/types`
+  that name a member and answer its type, reached through **23 exported doors**;
+- of those 23, exactly **2 — `Field` and `Method` — are spelled the way a reflect door is.** That
+  is the whole of the coincidence and the whole reason those nine rows exist;
+- and the **complement is 21 spellings this index does not reach at all**: `At`, `ExplicitMethod`,
+  `Insert`, `Lookup`, `LookupFieldOrMethod`, `LookupMethod`, `LookupParent`, `MissingMethod`,
+  `NewConst`, `NewField`, `NewFunc`, `NewLabel`, `NewParam`, `NewPkgName`, `NewTypeName`,
+  `NewVar`, `Obj`, `ObjectOf`, `Origin`, `PkgNameOf`, `Recv`. These trees use several of them —
+  `At`, `Params`, `Results` and `NumFields` all appear in `_test.go` source here — so a narrowing
+  spelled over a `*types.Tuple` is outside this index today.
+
+**The decision is to state the boundary and measure it, not to widen it quietly.** Making the
+overlap a rule means a second derivation with its own scope, its own over-reports and its own
+complement to print — a round's work rather than a line — and a half-built one would put every
+`go/types` member set inside this file's universal claim while reaching a tenth of them, which is
+the defect this file is about. The gate fails if the coincidence ever becomes total or ever
+becomes a rule, so this paragraph cannot quietly stop being true.
 
 ---
 
@@ -424,7 +535,7 @@ its own: it will also mis-resolve two production methods of different types that
 
 ## What holds this file to the tree
 
-Five tests in `mls/gates_index_test.go`, and they are the whole reason this file is worth reading:
+Seven tests in `mls/gates_index_test.go`, and they are the whole reason this file is worth reading:
 
 - `TestTheGatesTableIsTheDerivedClassAndNotAListOfIt` — the index above equals the derived class in
   both directions, every row carries a verdict from the vocabulary, and an `OPEN` row is red.
@@ -433,9 +544,9 @@ Five tests in `mls/gates_index_test.go`, and they are the whole reason this file
   the sites they do not reach are named in the log.
 - `TestAQueryKeyedToOneSpellingOfTheReceiverStillMissesTheSitesItMissed` — the query this file
   published at `81b97ca`, kept verbatim, is run against the same derivation. Measured today it
-  reaches **48 of the 158** narrowing occurrences and misses 110, in seventy-one functions. The
-  claim that it was insufficient is a measurement anybody can re-run, and reverting the published
-  query to a receiver-keyed one goes red rather than green.
+  reaches **48 of the 170** narrowing occurrences and misses 122, in eighty functions. The claim
+  that it was insufficient is a measurement anybody can re-run, and reverting the published query
+  to a receiver-keyed one goes red rather than green.
 
   **One thing that measurement says out loud, because it is the whole argument.** Of the three sites
   the reviewer named, two — `TestNoVectorRunnerCanSkip` and `trRecordLayerCodecMethods` — are still
@@ -459,21 +570,50 @@ Five tests in `mls/gates_index_test.go`, and they are the whole reason this file
 
 - `TestTheGatesDerivationSeesANarrowingHoweverItsReceiverIsSpelled` — the derivation is driven over
   a control holding one narrowing of each shape it claims to read, with the receiver spelled four
-  different ways, and four shapes it must NOT read. A derivation that reported nothing would agree
+  different ways, and six shapes it must NOT read. A derivation that reported nothing would agree
   with a document that indexed nothing.
 
-  **It is also what holds this file's stated BOUNDARY to something.** Seven shapes it must see: a
-  name narrowing over a method set, an arity narrowing in another function, a shape narrowing
-  through a bound signature, **a name narrowing over a FIELD set**, **a shape narrowing through a
-  bound field descriptor**, **a predicate bound to a name and used as a condition**, and **a
-  predicate spelled as a function literal's result**. Four it must not: a struct field spelled
-  `name`, a directory entry's name, an accumulator of member names consumed by `len()`, and **the
-  one under-reach this file states** — a signature read off a parameter declared `reflect.Value`.
-  The last of those is the difference between a boundary and a paragraph. The boundary list at the
-  top of `gates_index_test.go` was defended by nothing for a round, and it was incomplete while it
-  read as complete: a predicate bound to a name was on neither of the two lines that claimed to say
-  what could not be seen, and it was invisible to the derivation, to both published greps and to all
-  four gates here. It is now read rather than listed.
+  **It is also what holds this file's stated BOUNDARY to something.** Thirteen shapes it must see:
+  a name narrowing over a method set, an arity narrowing in another function, a shape narrowing
+  through a bound signature, a name narrowing over a FIELD set, a shape narrowing through a bound
+  field descriptor, a predicate bound to a name and used as a condition, a predicate spelled as a
+  function literal's result, **the five the eighth instance added** — a narrowing by a descriptor's
+  `Tag`, by its `PkgPath`, by its `Anonymous`, by the length of its `Index`, and by a key CUT out
+  of a tag and compared two lines further down, which is how the three live sites in `mls` are
+  spelled — and **one the eighth round's own self-check turned up**: a predicate answering a bool
+  BESIDE another result. "A function answering exactly one `bool`" was an ARITY narrowing over the
+  predicate class, which is the shape Q1 above calls always suspect, sitting inside the file that
+  publishes the warning; its complement was unprinted and, probed, EMPTY, so nothing would have
+  gone red on the day the first `(bool, error)` predicate landed. Six it must not: a struct field spelled `name`, a directory entry's name, an
+  accumulator of member names consumed by `len()`, and **the three under-reaches this file
+  states** — a signature read off a parameter declared `reflect.Value`, a member held in a struct
+  field declared elsewhere, and a predicate answering a defined type whose underlying type is
+  `bool`.
+
+  The last three are the difference between a boundary and a paragraph, and the boundary has now
+  been wrong twice while reading as complete. In the sixth round a predicate bound to a name was on
+  neither of the two lines that claimed to say what could not be seen. In the seventh the paragraph
+  said "exactly three, and all three want a TYPE" while four narrowings over a descriptor's own
+  fields wanted no type at all. **Both were counts of the unseen.** What is driven is a list of
+  what is asserted NOT found; it is not a proof that nothing else is missing, and this file no
+  longer says otherwise.
+
+- `TestEveryComplementThisDerivationComputesIsPrintedByIt` — this file's own rule, turned on this
+  file. The derivation narrows three times before it reads a line of these trees: the exported
+  structs the descriptor sentence removed, the exported spellings the door sentence removed, and
+  the descriptor fields that are neither the name nor the type. It prints all three, and until
+  this test existed **nothing held it there** — deleting any one of those `t.Logf` calls left
+  every other gate here green, and that mutation was reported as a survivor in two rounds running.
+  The class is derived from `gatesDoorSet`'s own declaration, so a complement added to that struct
+  in a later round must be printed on the commit that adds it. Like the row gate it is a PROXY —
+  it decides that the field is named in a reporter's arguments, not that what is printed is the
+  set — and what it does not read, the door map itself, is printed beside the complements it does.
+
+- `TestTheGoTypesRowsOfTheIndexAreACoincidenceOfSPELLINGAndTheCoincidenceIsMeasured` — the nine
+  rows of the index that sit over a `go/types` member set are held to being a coincidence: the
+  member-descriptor sentence admits nothing in `go/types`, the two spellings the two libraries
+  share are named, and the twenty-one `go/types` member doors this index does NOT reach are
+  printed. It goes red if the overlap ever becomes total or ever becomes a rule.
 
 ## Two rules for anything added here
 

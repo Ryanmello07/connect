@@ -618,14 +618,26 @@ func TestMessagesFamilyIsInstalled(t *testing.T) {
 //
 // Derived by reflection over the struct rather than listed, for guardrail 5's reason: a listed
 // class understates itself the moment a field lands beside the ones somebody remembered.
-func messagesColumnTags() []string {
+//
+// AND AN UNTAGGED FIELD IS FATAL RATHER THAN SKIPPED, which is the repair of a narrowing this
+// package indexes in GATES.md. The skip read as harmless because the complement is EMPTY today --
+// every field of the struct carries a tag -- and an empty complement is the one GATES.md's own
+// table calls the dangerous case: it removes nothing now and begins removing real columns on the
+// commit that adds the first untagged field. encoding/json decodes such a field under its GO
+// NAME, so the column would decode perfectly well and this function, whose whole claim is "every
+// json key this struct decodes", would answer without it -- and every count derived from it would
+// be one short against a corpus that publishes the key.
+func messagesColumnTags(t *testing.T) []string {
+	t.Helper()
 	tags := []string{}
 	shape := reflect.TypeOf(messagesVector{})
 	for index := 0; index < shape.NumField(); index++ {
 		key, _, _ := strings.Cut(shape.Field(index).Tag.Get("json"), ",")
-		if key != "" {
-			tags = append(tags, key)
+		if key == "" {
+			t.Fatalf("messagesVector.%s carries no json key, so it decodes under its go name and this table would name every column but that one",
+				shape.Field(index).Name)
 		}
+		tags = append(tags, key)
 	}
 	return tags
 }
@@ -640,7 +652,7 @@ func messagesColumnTags() []string {
 // comparison against nothing. The plan's own row-count assertion catches only the third of those
 // and only when the count also changes.
 func TestMessagesCodecsAreEveryColumnTheCorpusPublishes(t *testing.T) {
-	tags := messagesColumnTags()
+	tags := messagesColumnTags(t)
 	if len(tags) != messagesFields {
 		t.Fatalf("messagesVector declares %d json keys and this family reads %d columns",
 			len(tags), messagesFields)
@@ -704,8 +716,13 @@ func TestMessagesCodecsReadTheColumnTheyAreNamedAfter(t *testing.T) {
 	filled := 0
 	for index := 0; index < shape.NumField(); index++ {
 		key, _, _ := strings.Cut(shape.Field(index).Tag.Get("json"), ",")
+		// fatal rather than skipped, for messagesColumnTags' reason: a field with no json key
+		// still decodes, under its go name, and a marker that leaves it empty would hand every
+		// codec reading it the empty string -- which reads here as a codec naming the wrong
+		// column rather than as a column this loop declined to fill.
 		if key == "" {
-			continue
+			t.Fatalf("messagesVector.%s carries no json key, so this marker would leave it empty and every codec reading it would answer the empty string",
+				shape.Field(index).Name)
 		}
 		value.Field(index).SetString(key)
 		filled++

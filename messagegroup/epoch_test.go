@@ -1404,7 +1404,10 @@ func epochOctetAnsweringMethodsIn(methods []reflect.Method) (answering []reflect
 // met yet instead of reporting clean over it.
 //
 // mls/GATES.md carries the rule this function is the fifth instance of, the query that finds the
-// next one, and the two narrowings in mls that the same query still reports open.
+// next one, and the index of every narrowing that query reaches. It carries NO open narrowing:
+// OPEN is a verdict in its vocabulary and it is RED, so a narrowing recorded there and not closed
+// fails the run. This comment used to send a reader to "the two narrowings in mls that the same
+// query still reports open", which the document has not carried since those two were closed.
 func epochSliceAnsweringAccessors(t *testing.T) []reflect.Method {
 	t.Helper()
 	accessors, excluded := epochOctetAnsweringMethodsIn(epochExportedMethodsOfTheProvisionalValue(t))

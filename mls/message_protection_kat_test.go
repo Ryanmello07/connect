@@ -399,12 +399,13 @@ func (self messageProtectionComparison) verdict() error {
 // version is what this file was written with and it is what the first run of it reported. The
 // base column exists precisely because a protected message CARRIES a raw value, so requiring it
 // is not a patch over the signature pair, it is the definition.
-func messageProtectionProtectedColumns() (public []string, private []string) {
+func messageProtectionProtectedColumns(t *testing.T) (public []string, private []string) {
+	t.Helper()
 	column := map[string]bool{}
-	for _, tag := range messageProtectionColumnTags() {
+	for _, tag := range messageProtectionColumnTags(t) {
 		column[tag] = true
 	}
-	for _, tag := range messageProtectionColumnTags() {
+	for _, tag := range messageProtectionColumnTags(t) {
 		if base, cut := strings.CutSuffix(tag, "_pub"); cut && column[base] {
 			public = append(public, tag)
 		}
@@ -421,14 +422,26 @@ func messageProtectionProtectedColumns() (public []string, private []string) {
 // Derived by reflection over the struct rather than listed, for guardrail 5's reason: a listed
 // class understates itself the moment a field lands beside the ones somebody remembered, and the
 // gate then reports full coverage of a corpus it covers less of than it did yesterday.
-func messageProtectionColumnTags() []string {
+//
+// AND AN UNTAGGED FIELD IS FATAL RATHER THAN SKIPPED, which is the repair of a narrowing this
+// package indexes in GATES.md. The skip read as harmless because the complement is EMPTY today --
+// every field of the struct carries a tag -- and an empty complement is the one GATES.md's own
+// table calls the dangerous case: it removes nothing now and begins removing real columns on the
+// commit that adds the first untagged field. encoding/json decodes such a field under its GO
+// NAME, so the column would decode perfectly well and this function, whose whole claim is "every
+// json key this struct decodes", would answer without it -- and every count derived from it would
+// be one short against a corpus that publishes the key.
+func messageProtectionColumnTags(t *testing.T) []string {
+	t.Helper()
 	tags := []string{}
 	shape := reflect.TypeOf(messageProtectionVector{})
 	for index := 0; index < shape.NumField(); index++ {
 		key, _, _ := strings.Cut(shape.Field(index).Tag.Get("json"), ",")
-		if key != "" {
-			tags = append(tags, key)
+		if key == "" {
+			t.Fatalf("messageProtectionVector.%s carries no json key, so it decodes under its go name and every class derived from this table would be one column short",
+				shape.Field(index).Name)
 		}
+		tags = append(tags, key)
 	}
 	return tags
 }
@@ -889,10 +902,10 @@ func TestMessageProtectionFamilyIsInstalled(t *testing.T) {
 // a byte exact re-seal on top of it. The struct is in turn held to the corpus by
 // TestMessageProtectionVectorDecodesEveryColumnTheCorpusPublishes.
 func TestMessageProtectionChecksAreEveryProtectedColumnTheCorpusPublishes(t *testing.T) {
-	public, private := messageProtectionProtectedColumns()
+	public, private := messageProtectionProtectedColumns(t)
 	if len(public) == 0 || len(private) == 0 {
 		t.Fatalf("%v holds %d public and %d private protected columns; this derivation read nothing",
-			messageProtectionColumnTags(), len(public), len(private))
+			messageProtectionColumnTags(t), len(public), len(private))
 	}
 	if len(public) != messageProtectionPublicColumns {
 		t.Fatalf("the corpus publishes the public columns %v and this family counts %d",
@@ -931,7 +944,7 @@ func TestMessageProtectionChecksAreEveryProtectedColumnTheCorpusPublishes(t *tes
 // rather than off the struct, so neither can be true and unnoticed.
 func TestMessageProtectionVectorDecodesEveryColumnTheCorpusPublishes(t *testing.T) {
 	declared := map[string]bool{}
-	for _, tag := range messageProtectionColumnTags() {
+	for _, tag := range messageProtectionColumnTags(t) {
 		declared[tag] = true
 	}
 	if len(declared) == 0 {
@@ -1647,7 +1660,7 @@ func TestVectorMessageProtectionGenerate(t *testing.T) {
 		if err := json.Unmarshal(body, &published); err != nil {
 			t.Fatalf("re-decode a generated case: %v", err)
 		}
-		for _, tag := range messageProtectionColumnTags() {
+		for _, tag := range messageProtectionColumnTags(t) {
 			raw, found := published[tag]
 			if !found {
 				t.Fatalf("a generated case at suite %#04x publishes no %s", vector.CipherSuite, tag)

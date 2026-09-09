@@ -57,7 +57,9 @@ import (
 //
 // This list is the SCOPE half of the rule GATES.md states: a gate that reads a set of
 // directories has to derive that set and print the ones it did not read. It was the fourth
-// of the five instances recorded there, and the derivation asserting it is directly below.
+// of the EIGHT instances recorded there -- the count moves as that file records another, and a
+// citation that names a total goes stale the round after it is written, which this one did --
+// and the derivation asserting it is directly below.
 var forbiddenScanRoots = []string{".", "../message", "../messagegroup"}
 
 // The directories this list must name, derived rather than read off it.
