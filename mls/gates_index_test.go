@@ -2,6 +2,7 @@ package mls
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/build"
@@ -61,13 +62,27 @@ import (
 //   - it OVER-reports the doors themselves in reflect's Value half, where a door is recognised
 //     by the arguments it takes and two element readings take the same ones: see
 //     gatesDeriveDoors, and the NOT-A-MEMBER verdict that exists for exactly this;
-//   - it UNDER-reports in THESE THREE PLACES, each of which wants a TYPE and each of which is
-//     DRIVEN through the control and asserted NOT found. A member reached through a parameter
-//     declared reflect.Value (nothing syntactic says that value came off a member set); a member
-//     held in a STRUCT FIELD whose type is declared in another declaration (no statement in the
-//     function binds it); and a predicate answering a DEFINED type whose underlying type is bool
-//     (a spelling comparison cannot tell `controlFlag` from any other named type). go/types and a
-//     full type-check of these packages would close each of them.
+//   - it UNDER-reports in THREE PLACES THAT WANT A TYPE, each DRIVEN through the control and
+//     asserted NOT found. A member reached through a parameter declared reflect.Value (nothing
+//     syntactic says that value came off a member set); a member held in a STRUCT FIELD whose
+//     type is declared in another declaration (no statement in the function binds it); and a
+//     predicate answering a DEFINED type whose underlying type is bool (a spelling comparison
+//     cannot tell `controlFlag` from any other named type). go/types and a full type-check of
+//     these packages would close each of them.
+//   - AND IT UNDER-REPORTS IN NINE PLACES THAT WANT NO TYPE AT ALL, WHICH IS THE NINTH INSTANCE,
+//     FILED AND NOT FIXED. Two lists, one per half of how a member is reached, and both are
+//     DRIVEN through the control and asserted NOT found beside the three above. The CONTAINER
+//     SHAPES: gatesAnswers and gatesDoorSet.declares read a descriptor bare or in a slice of
+//     them and in no other container, so on Go 1.26 the two ITERATOR doors of the reflect this
+//     file parses -- Type.Methods() answering iter.Seq[Method] and Type.Fields() answering
+//     iter.Seq[StructField] -- are not doors here and sit in the printed notDoors list, and a
+//     pointer, a map, a named slice type and a variadic fall out with them. The STATEMENT FORMS:
+//     gatesGather binds a member through an assignment, a range, a value specification and a
+//     field declaration, so a member bound by a TYPE ASSERTION or a TYPE SWITCH is invisible to
+//     every gate here. Each of the nine spells the descriptor outright, in a parameter, in an
+//     assertion or in a case clause, so go/types is not the remedy for any of them -- which is
+//     the third round running that the remedy this file named for what it cannot see would have
+//     found none of the next instance. GATES.md carries why the line stops here.
 //
 // THAT LAST LINE USED TO READ "in exactly three places, and all three want the same thing: a
 // TYPE", AND IT WAS THE EIGHTH INSTANCE'S COVER. Four narrowings over the fields a member
@@ -162,6 +177,13 @@ func (self gatesDoorSet) isAttribute(spelling string) bool {
 // everything else the descriptor sentence admits. Derived from that same sentence, so a helper
 // handed a slice of the OTHER descriptor reaches the same reading as one handed a slice of this
 // one; the fifth instance sat on exactly that cross-function edge, one door over.
+//
+// THE DESCRIPTOR IS DERIVED AND THE CONTAINER IT IS CARRIED IN IS A TWO-ENTRY LIST, `X` and
+// `[]X`, which is the ninth instance and the second of its two halves -- a parameter written
+// *reflect.Method, map[K]reflect.Method, [4]reflect.StructField, ...reflect.Method or a defined
+// slice type over one binds nothing here. It is stated rather than closed: see GATES.md, and the
+// nine shapes driven through the control in
+// TestTheGatesDerivationSeesANarrowingHoweverItsReceiverIsSpelled.
 func (self gatesDoorSet) declares(spelling string) (member bool, slice bool) {
 	for _, descriptor := range self.descriptors {
 		switch spelling {
@@ -205,6 +227,13 @@ func gatesDescriptorFields(structure *ast.StructType) (named string, typed strin
 	for _, field := range structure.Fields.List {
 		for _, name := range field.Names {
 			if !ast.IsExported(name.Name) {
+				// the complement of the exported-field narrowing, HANDED BACK rather than
+				// dropped here, because the disposition of it is a REFUSAL one level up: see
+				// gatesDeriveDoors, which fatals rather than continuing if this is ever
+				// non-empty. On Go 1.26 neither descriptor carries an unexported field, and an
+				// empty complement disposed of with `continue` is the one form GATES.md's own
+				// table forbids for that case -- it removes nothing today and begins removing
+				// real readings on the commit that lands the first one.
 				unexported = append(unexported, name.Name)
 				continue
 			}
@@ -239,6 +268,24 @@ func gatesFieldSpellings(of *ast.FieldList) []string {
 }
 
 // Whether a result list answers one of a set of types, in any position, bare or in a slice.
+//
+// AND "BARE OR IN A SLICE" IS A TWO-ENTRY LIST, WHICH IS THE NINTH INSTANCE OF THIS FILE'S OWN
+// DEFECT -- filed in GATES.md, driven through the control, and deliberately NOT fixed here. Every
+// derivation bottoms out in some literal; the questions that decide whether that is safe are
+// whether the literal sits where being wrong is visible and whether it fails closed and prints
+// its complement, and this one fails both: on Go 1.26 it removes four real doors of the reflect
+// parsed below, it is stated nowhere as a narrowing, and it has no complement of its own.
+//
+// WHY THE go/types HALF READS ONE CONTAINER MORE, AND WHY IT IS NOT CARRIED BACK HERE.
+// gatesAnswersObject strips a pointer as well, because go/types hands a member back as a
+// *types.Var or a *types.Func while reflect hands one back by value. Measured on this toolchain:
+// package reflect declares NO exported symbol answering *Method or *StructField, so stripping a
+// pointer here would change the door set by nothing at all. That is precisely the empty-complement
+// row of GATES.md's own table -- a narrowing that removes nothing today -- and lengthening this
+// list from two entries to three would leave the iterator, the map, the array, the variadic and
+// the named slice type outside it while making the sentence read MORE complete than it is. The
+// honest disposition is the whole list recorded as the ninth instance and neither half quietly
+// widened.
 func gatesAnswers(results *ast.FieldList, wanted map[string]bool) bool {
 	for _, spelling := range gatesFieldSpellings(results) {
 		if wanted[strings.TrimPrefix(spelling, "[]")] {
@@ -248,16 +295,37 @@ func gatesAnswers(results *ast.FieldList, wanted map[string]bool) bool {
 	return false
 }
 
-func gatesDeriveDoors() (gatesDoorSet, error) {
-	set := gatesDoorSet{doors: map[string]string{}}
+// errGatesUnexportedDescriptorField is the refusal the exported-field narrowing takes instead of
+// a `continue`. It exists as a value so the refusal can be OBSERVED by a test rather than only
+// believed: the complement it guards is empty on Go 1.26, so nothing in these trees would ever
+// drive it, and a fail-closed path nothing drives is a fail-closed path nobody has checked.
+var errGatesUnexportedDescriptorField = errors.New("a member descriptor of package reflect carries an unexported field, and this derivation reads only the exported ones")
+
+// The refusal itself, kept separate from the walk so it is reachable with a made-up complement.
+//
+// GATES.md's own table gives two remedies for a narrowing whose complement is empty -- delete it,
+// or make it a fail-closed refusal -- and names the third, a `continue`, as the one that reads as
+// harmless and is not. This narrowing removes a descriptor field no predicate in these trees can
+// spell, which on Go 1.26 is nothing at all, so the day reflect adds one this says so and stops.
+func gatesRefuseUnexportedDescriptorFields(descriptors []string, unexported []string) error {
+	if len(unexported) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%w: the %d member descriptor(s) %v carry %d unexported field(s) %v, and a predicate in these trees cannot decide by one; that narrowing is refused here rather than taken silently",
+		errGatesUnexportedDescriptorField, len(descriptors), descriptors, len(unexported), unexported)
+}
+
+// Package reflect's own source, parsed. Both readings of the door sentence ask the same files:
+// the one this derivation uses, and the one that measures what its container clause removes.
+func gatesReflectSource() (*token.FileSet, []*ast.File, error) {
 	root := build.Default.GOROOT
 	if root == "" {
-		return set, fmt.Errorf("the toolchain reports no GOROOT, so reflect's own source cannot be read")
+		return nil, nil, fmt.Errorf("the toolchain reports no GOROOT, so reflect's own source cannot be read")
 	}
 	directory := filepath.Join(root, "src", "reflect")
 	entries, err := os.ReadDir(directory)
 	if err != nil {
-		return set, fmt.Errorf("read %s: %w", directory, err)
+		return nil, nil, fmt.Errorf("read %s: %w", directory, err)
 	}
 	fileSet := token.NewFileSet()
 	files := []*ast.File{}
@@ -267,11 +335,11 @@ func gatesDeriveDoors() (gatesDoorSet, error) {
 		}
 		source, err := os.ReadFile(filepath.Join(directory, entry.Name()))
 		if err != nil {
-			return set, fmt.Errorf("read %s: %w", entry.Name(), err)
+			return nil, nil, fmt.Errorf("read %s: %w", entry.Name(), err)
 		}
 		parsed, err := parser.ParseFile(fileSet, entry.Name(), source, parser.SkipObjectResolution)
 		if err != nil {
-			return set, fmt.Errorf("parse %s: %w", entry.Name(), err)
+			return nil, nil, fmt.Errorf("parse %s: %w", entry.Name(), err)
 		}
 		if parsed.Name == nil || parsed.Name.Name != "reflect" {
 			continue
@@ -279,7 +347,40 @@ func gatesDeriveDoors() (gatesDoorSet, error) {
 		files = append(files, parsed)
 	}
 	if len(files) == 0 {
-		return set, fmt.Errorf("%s holds no source of package reflect", directory)
+		return nil, nil, fmt.Errorf("%s holds no source of package reflect", directory)
+	}
+	return fileSet, files, nil
+}
+
+// Every exported struct package reflect declares, with the fields the descriptor sentence found
+// in it. Shared for the same reason the parse is.
+func gatesReflectStructs(files []*ast.File) map[string]*ast.StructType {
+	declared := map[string]*ast.StructType{}
+	for _, file := range files {
+		for _, declaration := range file.Decls {
+			general, isGeneral := declaration.(*ast.GenDecl)
+			if !isGeneral || general.Tok != token.TYPE {
+				continue
+			}
+			for _, specification := range general.Specs {
+				typed, isType := specification.(*ast.TypeSpec)
+				if !isType || !ast.IsExported(typed.Name.Name) {
+					continue
+				}
+				if structure, isStruct := typed.Type.(*ast.StructType); isStruct {
+					declared[typed.Name.Name] = structure
+				}
+			}
+		}
+	}
+	return declared
+}
+
+func gatesDeriveDoors() (gatesDoorSet, error) {
+	set := gatesDoorSet{doors: map[string]string{}}
+	_, files, err := gatesReflectSource()
+	if err != nil {
+		return set, err
 	}
 
 	// the descriptors, what the sentence removed, and -- the eighth instance -- what the
@@ -292,35 +393,19 @@ func gatesDeriveDoors() (gatesDoorSet, error) {
 	carrying := map[string]bool{}
 	carried := map[string]bool{}
 	unexported := map[string]bool{}
-	for _, file := range files {
-		for _, declaration := range file.Decls {
-			general, isGeneral := declaration.(*ast.GenDecl)
-			if !isGeneral || general.Tok != token.TYPE {
-				continue
+	for name, structure := range gatesReflectStructs(files) {
+		if names, carries, fields, hidden, is := gatesDescriptorFields(structure); is {
+			descriptors[name] = true
+			naming[names] = true
+			carrying[carries] = true
+			for _, field := range fields {
+				carried[field] = true
 			}
-			for _, specification := range general.Specs {
-				typed, isType := specification.(*ast.TypeSpec)
-				if !isType || !ast.IsExported(typed.Name.Name) {
-					continue
-				}
-				structure, isStruct := typed.Type.(*ast.StructType)
-				if !isStruct {
-					continue
-				}
-				if names, carries, fields, hidden, is := gatesDescriptorFields(structure); is {
-					descriptors[typed.Name.Name] = true
-					naming[names] = true
-					carrying[carries] = true
-					for _, field := range fields {
-						carried[field] = true
-					}
-					for _, field := range hidden {
-						unexported[field] = true
-					}
-				} else {
-					rejected[typed.Name.Name] = true
-				}
+			for _, field := range hidden {
+				unexported[field] = true
 			}
+		} else {
+			rejected[name] = true
 		}
 	}
 	if len(descriptors) == 0 {
@@ -341,11 +426,23 @@ func gatesDeriveDoors() (gatesDoorSet, error) {
 	set.attributes = slices.Sorted(gatesKeysOf(carried))
 	set.attribute = carried
 	set.unexported = slices.Sorted(gatesKeysOf(unexported))
+	// AND THE EXPORTED-FIELD NARROWING FAILS CLOSED, which is the remedy GATES.md's own table
+	// names for an empty complement and the one this file was not taking. The reading above
+	// removes a descriptor field that no predicate outside reflect can spell; measured on Go
+	// 1.26 that removes NOTHING, and a narrowing that removes nothing today, disposed of with a
+	// `continue`, is the row that table calls the dangerous one. So the day reflect adds an
+	// unexported field to a member descriptor this derivation says so and stops, rather than
+	// quietly reading one fact fewer about every member. The three refusals above it -- no
+	// descriptor at all, two disagreeing name fields, no door -- are the same shape.
+	if err := gatesRefuseUnexportedDescriptorFields(slices.Sorted(gatesKeysOf(descriptors)), set.unexported); err != nil {
+		return set, err
+	}
 
 	// the doors: reflect's exported functions, and the method lists of its exported interfaces.
 	// `removed` is the complement, kept so it can be NAMED and not counted -- a class disposed of
-	// by a number is the first of the eight instances this file is about, and the door narrowing
-	// is a narrowing like any other.
+	// by a number is the COUNT instance this file records first, and the door narrowing is a
+	// narrowing like any other. (The shape, not the ordinal: a citation naming a total goes
+	// stale the round after it is written, which this file has now watched happen twice.)
 	arguments := map[string][]string{}
 	removed := map[string]bool{}
 	answersAValue := map[string]*ast.FuncType{}
@@ -427,6 +524,10 @@ func gatesDeriveDoors() (gatesDoorSet, error) {
 	set.notDoors = slices.Sorted(gatesKeysOf(removed))
 	return set, nil
 }
+
+// The one key under which this derivation counts rather than names -- see the reject closure in
+// gatesNarrowingsIn. It is spelled here so nothing can collide with it by accident.
+const gatesUnnamedRemovals = "(result positions reading no member at all)"
 
 // One narrowing: one predicate, in one function, in one test file.
 //
@@ -634,6 +735,14 @@ func gatesTypeSpelling(of ast.Expr) string {
 // Run to a fixed point rather than once, because `signature := method.Type` can be written
 // above the line that binds `method`, and a single pass would then miss every reading through
 // `signature` -- which is how proposal_list's narrowing is spelled.
+//
+// AND THE STATEMENT FORMS BELOW ARE A FOUR-ENTRY LIST, which is the ninth instance's other
+// family: an assignment, a range, a value specification and a field declaration bind a member,
+// and a TYPE ASSERTION and a TYPE SWITCH -- both of which spell the descriptor outright, exactly
+// as a parameter does -- bind nothing. The range case reads only the value, so a member arriving
+// as the KEY of a sequence is invisible too. Filed in GATES.md and driven through the control
+// rather than closed here; do not widen one of them without the sentence that says what the
+// whole class is.
 func gatesGather(scope ast.Node, known gatesFacts) {
 	ast.Inspect(scope, func(node ast.Node) bool {
 		switch statement := node.(type) {
@@ -867,7 +976,10 @@ func gatesReadings(of ast.Expr, known gatesFacts, into map[string]bool) {
 // Every narrowing in one parsed file. `answers` is the package-wide set of functions whose
 // result is a slice of members, so a class built in one file and narrowed in another is
 // reached; `doors` is the derived set of spellings that open onto a member.
-func gatesNarrowingsIn(fileSet *token.FileSet, parsed *ast.File, path string, answers map[string]bool, doors gatesDoorSet) []gatesNarrowing {
+// `undecided` is caller-owned and accumulated across files: it is the complement of the
+// predicate-result narrowing gatesRecordDecided performs, so that the one narrowing this
+// derivation makes over its own reading of a DECISION is named at run time like every other.
+func gatesNarrowingsIn(fileSet *token.FileSet, parsed *ast.File, path string, answers map[string]bool, doors gatesDoorSet, undecided map[string]bool) []gatesNarrowing {
 	found := []gatesNarrowing{}
 	for _, declaration := range parsed.Decls {
 		function, isFunction := declaration.(*ast.FuncDecl)
@@ -890,19 +1002,46 @@ func gatesNarrowingsIn(fileSet *token.FileSet, parsed *ast.File, path string, an
 		for pass := 0; pass < 4; pass++ {
 			gatesGather(function, known)
 		}
-		record := func(condition ast.Expr) {
-			if condition == nil {
-				return
-			}
+		// the reading one expression performs, shared by the recorder and by the complement
+		// below so the two cannot drift: a site is removed from the decision by exactly the
+		// test that would have admitted it.
+		reads := func(of ast.Expr) (map[string]bool, []gatesPredicate) {
 			readings := map[string]bool{}
-			gatesReadings(condition, known, readings)
+			gatesReadings(of, known, readings)
 			// and the same decision written in two statements instead of one
-			carried := gatesBoundPredicates(condition, known)
+			carried := gatesBoundPredicates(of, known)
 			for _, predicate := range carried {
 				for kind := range predicate.kinds {
 					readings[kind] = true
 				}
 			}
+			return readings, carried
+		}
+		// what the predicate-result narrowing removed, named. A function whose result DECIDES
+		// something about a member and is not spelled `bool` is not read as a decision here,
+		// and until this round nothing said so at run time -- the round that widened the arity
+		// closed the narrowing and left its print, which is the other half of the same rule.
+		// AND WHAT THIS NARROWING ITSELF REMOVES IS COUNTED RATHER THAN NAMED, said out loud
+		// because GATES.md's rule is to name and this does not. A result position that reads no
+		// member at all is every function in these trees, and printing that is printing the tree
+		// rather than a complement -- so the count is carried under one key and the reason is
+		// here. It is the one exclusion in this derivation whose members are not named, and it is
+		// the property itself: this file indexes narrowings over a reflected MEMBER set.
+		reject := func(spelling string, answer ast.Expr) {
+			if answer == nil {
+				return
+			}
+			if readings, _ := reads(answer); len(readings) == 0 {
+				undecided[gatesUnnamedRemovals] = true
+				return
+			}
+			undecided[path+" :: "+function.Name.Name+" :: answers "+spelling] = true
+		}
+		record := func(condition ast.Expr) {
+			if condition == nil {
+				return
+			}
+			readings, carried := reads(condition)
 			if len(readings) == 0 {
 				return
 			}
@@ -935,9 +1074,9 @@ func gatesNarrowingsIn(fileSet *token.FileSet, parsed *ast.File, path string, an
 					record(expression)
 				}
 			case *ast.FuncDecl:
-				gatesRecordDecided(statement.Type, statement.Body, record)
+				gatesRecordDecided(statement.Type, statement.Body, record, reject)
 			case *ast.FuncLit:
-				gatesRecordDecided(statement.Type, statement.Body, record)
+				gatesRecordDecided(statement.Type, statement.Body, record, reject)
 			}
 			return true
 		})
@@ -954,7 +1093,7 @@ func gatesNarrowingsIn(fileSet *token.FileSet, parsed *ast.File, path string, an
 // The bool is what keeps this from reporting every projection in these trees: a helper whose
 // result is a reflect.Kind, a []byte or a member is answering a question ABOUT a member, not
 // deciding whether the member is in a class.
-func gatesRecordDecided(signature *ast.FuncType, body *ast.BlockStmt, record func(ast.Expr)) {
+func gatesRecordDecided(signature *ast.FuncType, body *ast.BlockStmt, record func(ast.Expr), removed func(string, ast.Expr)) {
 	if body == nil || signature.Results == nil {
 		return
 	}
@@ -966,19 +1105,26 @@ func gatesRecordDecided(signature *ast.FuncType, body *ast.BlockStmt, record fun
 	// bool, and no such site exists in these trees today. Empty and unprinted is the case the
 	// table in GATES.md calls the dangerous one, because it begins removing real sites on the
 	// commit that adds the first helper of that shape.
+	// AND THE COMPLEMENT OF THAT NARROWING IS REPORTED RATHER THAN DROPPED, which is the half
+	// the round that widened this from "exactly one bool" left unclosed: the arity was fixed and
+	// the print was not, so a result position removed from the decision was removed in silence.
+	// `bool` is a SPELLING, and the one shape that reaches past it is a DEFINED type whose
+	// underlying type is bool -- this file's own third stated under-reach. So every non-bool
+	// result position is handed to `removed` together with the expression returned in it, and
+	// the caller, which is the half holding what a member is, names the ones that actually READ
+	// one. That is the difference between printing a complement and printing the tree.
+	spellings := []string{}
 	deciding := []bool{}
 	for _, result := range signature.Results.List {
 		repeated := len(result.Names)
 		if repeated == 0 {
 			repeated = 1
 		}
-		isBool := gatesTypeSpelling(result.Type) == "bool"
+		spelling := gatesTypeSpelling(result.Type)
 		for at := 0; at < repeated; at++ {
-			deciding = append(deciding, isBool)
+			spellings = append(spellings, spelling)
+			deciding = append(deciding, spelling == "bool")
 		}
-	}
-	if !slices.Contains(deciding, true) {
-		return
 	}
 	ast.Inspect(body, func(node ast.Node) bool {
 		switch statement := node.(type) {
@@ -995,7 +1141,9 @@ func gatesRecordDecided(signature *ast.FuncType, body *ast.BlockStmt, record fun
 			for at, answer := range statement.Results {
 				if deciding[at] {
 					record(answer)
+					continue
 				}
+				removed(spellings[at], answer)
 			}
 		}
 		return true
@@ -1016,7 +1164,7 @@ func gatesKeysOf[Value any](of map[string]Value) func(func(string) bool) {
 // relative to the module root.
 //
 // THE SCOPE IS NOT A LIST. It is forbiddenScanRoots, the set crypto_forbidden_test.go derives
-// from the module's own import graph and asserts -- the fourth of the eight instances, closed.
+// from the module's own import graph and asserts -- the DIRECTORY instance, closed.
 // Aliasing it rather than restating it is the whole point: a fourth package joins this gate's
 // scope on the commit that joins that one's.
 func gatesTestSources(t *testing.T) (paths []string, fileSet *token.FileSet, parsed map[string]*ast.File) {
@@ -1029,7 +1177,7 @@ func gatesTestSources(t *testing.T) (paths []string, fileSet *token.FileSet, par
 	parsed = map[string]*ast.File{}
 	perRoot := map[string]int{}
 	// the scope's own complement, kept so it can be NAMED rather than counted. A class disposed
-	// of by a number is the first of the eight instances this file is about, and the sentence
+	// of by a number is the COUNT instance this file records first, and the sentence
 	// "all of them production source" is a claim about members nobody could check off a count.
 	skipped := []string{}
 	for _, root := range forbiddenScanRoots {
@@ -1132,10 +1280,24 @@ func gatesReflectedNarrowings(t *testing.T) []gatesNarrowing {
 			}
 		}
 	}
+	undecided := map[string]bool{}
 	found := []gatesNarrowing{}
 	for _, path := range paths {
-		found = append(found, gatesNarrowingsIn(fileSet, parsed[path], path, answers, doors)...)
+		found = append(found, gatesNarrowingsIn(fileSet, parsed[path], path, answers, doors, undecided)...)
 	}
+	// AND THE COMPLEMENT OF THE DERIVATION'S READING OF A DECISION, which had no reporter at
+	// all until this round. `bool` is a spelling: a helper answering a DEFINED type whose
+	// underlying type is bool decides membership exactly as hard, and this derivation does not
+	// read it as the decision. These are the sites where that removal is not hypothetical --
+	// the result reads a member and is not spelled `bool` -- and naming them is what lets a
+	// reader ask of one whether it should have been read as a predicate.
+	named := slices.Sorted(gatesKeysOf(undecided))
+	unnamed := slices.Contains(named, gatesUnnamedRemovals)
+	named = slices.DeleteFunc(named, func(one string) bool { return one == gatesUnnamedRemovals })
+	t.Logf("decisions removed: %d result position(s) in these trees READ a member and are not spelled `bool`, so this derivation does not read them as the decision: %v",
+		len(named), named)
+	t.Logf("and the one exclusion of this derivation whose members are NOT named: result positions reading no member at all, present=%v over the %d key(s) undecided carries. They are every function in these trees, so naming them prints the tree rather than a complement -- and reading a member is the property this file indexes rather than a narrowing of it",
+		unnamed, len(undecided))
 	if len(found) == 0 {
 		t.Fatal("no narrowing over a reflected member set was derived from these trees; the document below claims a class and this read none of it, which is the vacuous reading every gate here is written to refuse")
 	}
@@ -1703,8 +1865,11 @@ func TestEveryComplementThisDerivationComputesIsPrintedByIt(t *testing.T) {
 			}
 			for _, argument := range call.Args {
 				ast.Inspect(argument, func(inner ast.Node) bool {
-					if read, isRead := inner.(*ast.SelectorExpr); isRead {
+					switch read := inner.(type) {
+					case *ast.SelectorExpr:
 						reported[read.Sel.Name] = true
+					case *ast.Ident:
+						reported[read.Name] = true
 					}
 					return true
 				})
@@ -1728,6 +1893,304 @@ func TestEveryComplementThisDerivationComputesIsPrintedByIt(t *testing.T) {
 	// them should have been held too.
 	t.Logf("and what this gate removes: %d field(s) of gatesDoorSet are not a set of spellings and are held by nothing here: %v",
 		len(otherwise), otherwise)
+
+	// AND THE COMPLEMENT THE SCAN HALF COMPUTES, held the same way -- because the half above
+	// only reaches the three narrowings this derivation makes BEFORE it reads a line of these
+	// trees, and gatesRecordDecided makes a fourth while reading them. That one had no reporter
+	// at all for two rounds: the round that widened it off "exactly one bool" closed the arity
+	// and left the print, which is one half of one rule closed and the other half not.
+	//
+	// The class is derived rather than named: an accumulator is a parameter the derivation only
+	// ever WRITES INTO, so the function it is passed to cannot be the thing that reads it out,
+	// and the only place left for it to be read is a reporter in the caller. Two proxies, said
+	// out loud the way the halves above say theirs: this decides that every function-typed
+	// parameter of the recorder is CALLED, and that the accumulator is NAMED in a reporter --
+	// not that what is called reports the removals, nor that what is printed IS them.
+	for _, declaration := range parsed.Decls {
+		function, isFunction := declaration.(*ast.FuncDecl)
+		if !isFunction || function.Body == nil || function.Name.Name != "gatesRecordDecided" {
+			continue
+		}
+		reporters, others := gatesReporterParameters(function)
+		if len(reporters) == 0 {
+			t.Error("gatesRecordDecided declares no function-typed parameter, so this half of the gate reads nothing and would report clean over a narrowing that hands its removals nowhere")
+		}
+		t.Logf("the recorder's reporters: %v, each required to be called; and what this reading removes: %v, which are not functions and cannot be a reporter",
+			reporters, others)
+		for _, parameter := range reporters {
+			called := false
+			ast.Inspect(function.Body, func(node ast.Node) bool {
+				call, isCall := node.(*ast.CallExpr)
+				if !isCall {
+					return true
+				}
+				if named, isIdent := gatesUnparen(call.Fun).(*ast.Ident); isIdent && named.Name == parameter {
+					called = true
+				}
+				return true
+			})
+			if !called {
+				t.Errorf("gatesRecordDecided declares the reporter %s and never calls it, so the narrowing it performs over which result positions decide would remove members in silence -- which is the rule this file publishes, broken by the file that publishes it",
+					parameter)
+			}
+		}
+	}
+	for _, declaration := range parsed.Decls {
+		function, isFunction := declaration.(*ast.FuncDecl)
+		if !isFunction || function.Body == nil || function.Name.Name != "gatesNarrowingsIn" {
+			continue
+		}
+		accumulators, read := gatesWriteOnlyParameters(function)
+		if len(accumulators) == 0 {
+			t.Error("gatesNarrowingsIn takes no accumulator this gate can read, so the complement the scan half computes is held by nothing here and deleting its print would leave every other gate in this file green")
+		}
+		for _, accumulator := range accumulators {
+			if !reported[accumulator] {
+				t.Errorf("gatesNarrowingsIn fills %s and nothing gatesReflectedNarrowings reports names it; an accumulator a derivation only writes into is read in a reporter or it is read nowhere",
+					accumulator)
+			}
+		}
+		t.Logf("and the complement the scan half computes, held by name: %v, filled by gatesNarrowingsIn and named in a reporter of gatesReflectedNarrowings; what this reading removes is %v, which the derivation READS as well as writes and so is held by what reads them rather than by a print",
+			accumulators, read)
+	}
+}
+
+// The parameters of one function that are themselves functions -- a reporter a narrowing hands
+// its removals to -- AND THE ONES THIS READING REMOVED, because a narrowing inside a gate that
+// checks narrowings is still a narrowing. Derived off the declaration so a second reporter added
+// in a later round is held on the commit that adds it.
+func gatesReporterParameters(function *ast.FuncDecl) (reporters []string, others []string) {
+	if function.Type.Params == nil {
+		return nil, nil
+	}
+	for _, parameter := range function.Type.Params.List {
+		_, isFunction := parameter.Type.(*ast.FuncType)
+		for _, name := range parameter.Names {
+			if name.Name == "_" {
+				continue
+			}
+			if isFunction {
+				reporters = append(reporters, name.Name)
+				continue
+			}
+			others = append(others, name.Name+" "+gatesTypeSpelling(parameter.Type))
+		}
+	}
+	return reporters, others
+}
+
+// The parameters one function only ever WRITES INTO -- every occurrence of the identifier is an
+// index expression on the left of an assignment. That is what an accumulator IS, said without
+// naming one: a value the callee fills and never reads, so whatever reads it out is somewhere
+// else, and for a complement the only somewhere else that satisfies this file's own rule is a
+// reporter.
+func gatesWriteOnlyParameters(function *ast.FuncDecl) (filled []string, read []string) {
+	if function.Type.Params == nil || function.Body == nil {
+		return nil, nil
+	}
+	candidates := map[string]bool{}
+	for _, parameter := range function.Type.Params.List {
+		for _, name := range parameter.Names {
+			if name.Name != "_" {
+				candidates[name.Name] = true
+			}
+		}
+	}
+	occurrences := map[string]int{}
+	writes := map[string]int{}
+	ast.Inspect(function.Body, func(node ast.Node) bool {
+		if assignment, isAssignment := node.(*ast.AssignStmt); isAssignment {
+			for _, side := range assignment.Lhs {
+				index, isIndex := gatesUnparen(side).(*ast.IndexExpr)
+				if !isIndex {
+					continue
+				}
+				if named, isIdent := gatesUnparen(index.X).(*ast.Ident); isIdent && candidates[named.Name] {
+					writes[named.Name] += 1
+				}
+			}
+		}
+		if named, isIdent := node.(*ast.Ident); isIdent && candidates[named.Name] {
+			occurrences[named.Name] += 1
+		}
+		return true
+	})
+	for name := range candidates {
+		if writes[name] > 0 && writes[name] == occurrences[name] {
+			filled = append(filled, name)
+			continue
+		}
+		read = append(read, name)
+	}
+	slices.Sort(filled)
+	slices.Sort(read)
+	return filled, read
+}
+
+// ---------------------------------------------------------------------------
+// the ninth instance, MEASURED rather than described
+// ---------------------------------------------------------------------------
+
+// gatesStatedDoors is the pair GATES.md publishes for the door sentence: how many spellings the
+// sentence admits WITH its container clause, and how many the same sentence admits without it.
+// The gap is the ninth instance's size, and publishing it as a fraction this file is held to is
+// the same device the recall fraction is: a number nobody measures is a claim.
+var gatesStatedDoors = regexp.MustCompile(`gates-doors:\s*(\d+)\s*/\s*(\d+)`)
+
+// The door sentence asked with NO container clause at all -- a member descriptor named anywhere
+// in the result type answers one -- so the size of the clause `X` or `[]X` can be read off the
+// difference rather than argued about.
+//
+// It deliberately over-reports, by matching the descriptor's name inside the rendered result
+// spelling: over-reporting makes the number this publishes LARGER, and larger is the safe
+// direction for a measurement whose whole job is to say how much a narrowing removes.
+func gatesDoorsWithoutTheContainerClause(files []*ast.File, descriptors []string) map[string][]string {
+	mentions := func(results *ast.FieldList) string {
+		if results == nil {
+			return ""
+		}
+		for _, spelling := range gatesFieldSpellings(results) {
+			for _, descriptor := range descriptors {
+				if strings.Contains(spelling, descriptor) {
+					return spelling
+				}
+			}
+		}
+		return ""
+	}
+	wide := map[string][]string{}
+	for _, file := range files {
+		for _, declaration := range file.Decls {
+			switch node := declaration.(type) {
+			case *ast.GenDecl:
+				if node.Tok != token.TYPE {
+					continue
+				}
+				for _, specification := range node.Specs {
+					typed, isType := specification.(*ast.TypeSpec)
+					if !isType || !ast.IsExported(typed.Name.Name) {
+						continue
+					}
+					declared, isInterface := typed.Type.(*ast.InterfaceType)
+					if !isInterface || declared.Methods == nil {
+						continue
+					}
+					for _, member := range declared.Methods.List {
+						signature, isFunction := member.Type.(*ast.FuncType)
+						if !isFunction {
+							continue
+						}
+						for _, name := range member.Names {
+							if !ast.IsExported(name.Name) {
+								continue
+							}
+							if answered := mentions(signature.Results); answered != "" {
+								wide[name.Name] = append(wide[name.Name], typed.Name.Name+"."+name.Name+" "+answered)
+							}
+						}
+					}
+				}
+			case *ast.FuncDecl:
+				if !ast.IsExported(node.Name.Name) {
+					continue
+				}
+				if answered := mentions(node.Type.Results); answered != "" {
+					on := "func"
+					if node.Recv != nil && len(node.Recv.List) > 0 {
+						on = gatesTypeSpelling(node.Recv.List[0].Type)
+					}
+					wide[node.Name.Name] = append(wide[node.Name.Name], on+"."+node.Name.Name+" "+answered)
+				}
+			}
+		}
+	}
+	return wide
+}
+
+// TestTheContainerClauseOnTheDoorSentenceIsANarrowingAndItsSizeIsMeasured is the ninth instance
+// made VISIBLE, and it is deliberately not the ninth instance CLOSED.
+//
+// The door sentence reads a descriptor bare or in a slice of them. That clause is two literals,
+// it was written into gatesAnswers and gatesDoorSet.declares under no sentence at all, and unlike
+// every other narrowing this derivation performs it printed no complement -- so the spellings it
+// removed sat in the 126-name notDoors list reading as ordinary non-doors, which is exactly why
+// nobody found it for a round. This gate does the one thing the criterion in GATES.md asks of a
+// literal that cannot be moved: it makes being wrong VISIBLE. It asks the same sentence without
+// the clause, names every spelling the clause removes, and holds GATES.md's published pair to the
+// measurement, so the day the toolchain moves the document goes red with the new list in hand.
+//
+// WHAT IT DOES NOT DO, and this is the whole of the decision recorded in GATES.md: it does not
+// widen the door set. A narrowing spelled `for member := range subject.Methods()` is still
+// invisible to every gate in this file, and a container this reading does not know still binds
+// nothing. Printing a complement is not the same as removing a narrowing, and pretending
+// otherwise is how a boundary comes to read as coverage.
+func TestTheContainerClauseOnTheDoorSentenceIsANarrowingAndItsSizeIsMeasured(t *testing.T) {
+	doors := gatesDoorsOf(t)
+	_, files, err := gatesReflectSource()
+	if err != nil {
+		t.Fatalf("read reflect's own source: %v", err)
+	}
+	wide := gatesDoorsWithoutTheContainerClause(files, doors.descriptors)
+	removed := []string{}
+	declarations := []string{}
+	for name, sites := range wide {
+		if doors.isDoor(name) {
+			continue
+		}
+		removed = append(removed, name)
+		declarations = append(declarations, sites...)
+	}
+	slices.Sort(removed)
+	slices.Sort(declarations)
+
+	// FIRST, that it IS a narrowing. If this ever came back empty the clause would be removing
+	// nothing on the toolchain in use, which is the OTHER dangerous reading in GATES.md's table
+	// and would want the clause deleted rather than measured.
+	if len(removed) == 0 {
+		t.Error("the container clause on the door sentence removes no spelling of reflect on this toolchain; a narrowing that removes nothing is the empty-complement row of GATES.md's own table, and it wants deleting or refusing rather than measuring")
+	}
+	t.Logf("the container clause removes %d spelling(s) of package reflect -- %v -- over %d exported declaration(s): %v. These are doors by the door sentence as GATES.md writes it and are not doors here, and every one of them sits in the notDoors list reading as an ordinary non-door. THIS IS THE NINTH INSTANCE, printed rather than closed",
+		len(removed), removed, len(declarations), declarations)
+
+	source, err := os.ReadFile(gatesDocumentPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", gatesDocumentPath, err)
+	}
+	stated := gatesStatedDoors.FindStringSubmatch(string(source))
+	if stated == nil {
+		t.Fatalf("%s states no gates-doors: <admitted>/<without the container clause>, so the size of the clause it now describes is a claim nobody measures -- which is the defect this whole file is about", gatesDocumentPath)
+	}
+	admitted, without := len(doors.doors), len(doors.doors)+len(removed)
+	if stated[1] != fmt.Sprint(admitted) || stated[2] != fmt.Sprint(without) {
+		t.Errorf("%s publishes gates-doors: %s/%s and the derivation measures %d/%d; the door sentence admits %d spellings with its container clause and %d without, the difference being %v. Update the document to the measurement",
+			gatesDocumentPath, stated[1], stated[2], admitted, without, admitted, without, removed)
+	}
+}
+
+// TestTheExportedFieldNarrowingRefusesRatherThanContinuing drives the refusal that replaced a
+// `continue`, because nothing in these trees can drive it: reflect.Method and reflect.StructField
+// are exported through and through, so the complement it guards is EMPTY and the refusal is
+// unreachable from the real toolchain. A fail-closed path nothing drives is a fail-closed path
+// nobody has checked, and this file has already shipped one of those.
+func TestTheExportedFieldNarrowingRefusesRatherThanContinuing(t *testing.T) {
+	if err := gatesRefuseUnexportedDescriptorFields([]string{"Method", "StructField"}, nil); err != nil {
+		t.Errorf("the exported-field narrowing refuses with an empty complement: %v -- it must refuse only when it removes something", err)
+	}
+	err := gatesRefuseUnexportedDescriptorFields([]string{"Method"}, []string{"hidden"})
+	if err == nil {
+		t.Fatal("a member descriptor carrying an unexported field is accepted; that narrowing then removes a reading in silence, which is the `continue` this refusal replaced and the one form GATES.md's own table forbids for an empty complement")
+	}
+	if !errors.Is(err, errGatesUnexportedDescriptorField) {
+		t.Errorf("the refusal answers %v, which is not %v; a sentinel is what lets a caller tell this refusal from a parse failure", err, errGatesUnexportedDescriptorField)
+	}
+	if !strings.Contains(err.Error(), "hidden") {
+		t.Errorf("the refusal answers %q and does not name the field it removed; a refusal that does not name its complement is the same silence one message over", err)
+	}
+	// and the reason it has to be driven here: the real complement is empty, so the real
+	// derivation never reaches this path.
+	if held := gatesDoorsOf(t).unexported; len(held) != 0 {
+		t.Logf("reflect now carries unexported descriptor field(s) %v, so the refusal above is reachable from the toolchain and this control has become redundant rather than necessary", held)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1965,6 +2428,13 @@ func gatesDeriveObjectDoors() (gatesObjectDoorSet, error) {
 
 // Whether a result list answers one of a set of named types, bare, behind a pointer, or in a
 // slice of either.
+//
+// THREE ENTRIES HERE AND TWO IN gatesAnswers, IN ONE COMMIT, WRITTEN BY ONE HAND IN ONE SITTING --
+// and that is the evidence GATES.md's stopping argument rests on. The difference is defensible
+// per library (go/types hands a member back as a pointer, reflect hands one back by value) and
+// neither list says it is a narrowing nor prints what it removed, which is the defect. See
+// gatesAnswers for why the pointer is not carried back and why doing so would make the sentence
+// read more complete rather than be more complete.
 func gatesAnswersObject(results *ast.FieldList, wanted map[string]bool) bool {
 	for _, spelling := range gatesFieldSpellings(results) {
 		bare := strings.TrimPrefix(strings.TrimPrefix(spelling, "[]"), "*")
@@ -2002,7 +2472,7 @@ func TestTheGoTypesRowsOfTheIndexAreACoincidenceOfSPELLINGAndTheCoincidenceIsMea
 	reflected := gatesDoorsOf(t)
 	objects, err := gatesObjectDoorsOnce()
 	if err != nil {
-		t.Fatalf("derive go/types' member doors: %v -- this gate measures the overlap between the two reflection libraries these trees use, and a boundary nobody measured is the defect GATES.md records eight of", err)
+		t.Fatalf("derive go/types' member doors: %v -- this gate measures the overlap between the two reflection libraries these trees use, and a boundary nobody measured is the defect GATES.md records instance after instance of", err)
 	}
 	if objects.descriptors != 0 {
 		t.Errorf("the member-descriptor sentence admits %d of package types' %d exported structs, so this index's doors are NOT reached there only by coincidence and GATES.md's paragraph about it is wrong",
@@ -2260,6 +2730,104 @@ func aPredicateAnsweringANamedBool(members []reflect.Method) controlFlag {
 	return false
 }
 
+// THE NINTH INSTANCE, DRIVEN AND NOT FIXED. Everything below narrows a reflected member set and
+// none of it is seen, and the two families are the two lists this derivation still bottoms out
+// in. It is recorded in GATES.md and asserted here rather than closed, because closing it is a
+// round and the line was stopped on evidence.
+//
+// FAMILY ONE, the CONTAINER SHAPES. A member is read bare or in a slice of descriptors and in
+// no other container, so an iterator door, a pointer, a map, a named slice type and a variadic
+// all fall out.
+// On Go 1.26 the first two functions here are real doors of the reflect this derivation parses:
+// Type.Methods() answers iter.Seq[Method] and Type.Fields() answers iter.Seq[StructField].
+func aMemberSetReachedThroughAnIteratorDoor(subject reflect.Type) []string {
+	kept := []string{}
+	for member := range subject.Methods() {
+		if strings.HasPrefix(member.Name, "Write") {
+			continue
+		}
+		kept = append(kept, member.Name)
+	}
+	return kept
+}
+
+func aFieldSetReachedThroughAnIteratorDoor(subject reflect.Type) []string {
+	kept := []string{}
+	for field := range subject.Fields() {
+		if field.Anonymous {
+			continue
+		}
+		kept = append(kept, field.Name)
+	}
+	return kept
+}
+
+func aMemberDeclaredBehindAPointer(member *reflect.Method) bool {
+	return strings.HasPrefix(member.Name, "Write")
+}
+
+func aMemberDeclaredInAMap(members map[string]reflect.Method) int {
+	kept := 0
+	for _, member := range members {
+		if strings.HasPrefix(member.Name, "Write") {
+			continue
+		}
+		kept += 1
+	}
+	return kept
+}
+
+type controlMembers []reflect.Method
+
+func aMemberDeclaredInANamedSliceType(members controlMembers) int {
+	kept := 0
+	for _, member := range members {
+		if strings.HasPrefix(member.Name, "Write") {
+			continue
+		}
+		kept += 1
+	}
+	return kept
+}
+
+func aMemberDeclaredVariadic(members ...reflect.Method) int {
+	kept := 0
+	for _, member := range members {
+		if strings.HasPrefix(member.Name, "Write") {
+			continue
+		}
+		kept += 1
+	}
+	return kept
+}
+
+// FAMILY TWO, the STATEMENT FORMS. A member is bound through an assignment, a range, a value
+// specification or a field declaration and through nothing else, so a type assertion and a type
+// switch bind nothing at all. Every one of these spells the descriptor outright, exactly as a
+// parameter does; none of them wants a type.
+func aMemberBoundByATypeAssertion(carried any) bool {
+	member := carried.(reflect.Method)
+	return strings.HasPrefix(member.Name, "Write")
+}
+
+func aMemberBoundByACommaOkTypeAssertion(carried any) bool {
+	if member, ok := carried.(reflect.StructField); ok && member.Anonymous {
+		return true
+	}
+	return false
+}
+
+func aMemberBoundByATypeSwitch(carried any) bool {
+	switch member := carried.(type) {
+	case reflect.StructField:
+		if member.Offset == 0 {
+			return false
+		}
+		return true
+	}
+	return false
+}
+
 func anAccumulatorOfMemberNamesIsNotAPredicate(members []reflect.Method) bool {
 	kept := []string{}
 	for _, member := range members {
@@ -2291,7 +2859,8 @@ func TestTheGatesDerivationSeesANarrowingHoweverItsReceiverIsSpelled(t *testing.
 		"throughABoundSignature":                   true,
 		"aFieldSetNarrowedThroughABoundDescriptor": true,
 	}
-	found := gatesNarrowingsIn(fileSet, parsed, "control.go", answers, gatesDoorsOf(t))
+	undecided := map[string]bool{}
+	found := gatesNarrowingsIn(fileSet, parsed, "control.go", answers, gatesDoorsOf(t), undecided)
 	seen := map[string]string{}
 	sites := map[string]int{}
 	for _, narrowing := range found {
@@ -2358,6 +2927,32 @@ func TestTheGatesDerivationSeesANarrowingHoweverItsReceiverIsSpelled(t *testing.
 		"aMemberReachedThroughADeclaredValue": "signature read off a parameter declared reflect.Value; nothing in the source says that value came off a member set",
 		"aMemberHeldInAStructField":           "member name read through a struct field whose type is declared in another declaration, so no statement in this function binds it",
 		"aPredicateAnsweringANamedBool":       "predicate answering a DEFINED type whose underlying type is bool, which a spelling comparison cannot tell from any other named type",
+		// AND THE NINTH, DRIVEN HERE AND NOT CLOSED. Two lists, one per half of how a member is
+		// reached. FAMILY ONE is the CONTAINER SHAPES: gatesAnswers and gatesDoorSet.declares
+		// read a descriptor bare or in a slice and in no other container, so on Go 1.26 the two
+		// ITERATOR doors of the reflect this derivation parses -- Type.Methods() answering
+		// iter.Seq[Method] and Type.Fields() answering iter.Seq[StructField] -- are not doors
+		// here, and both spellings sit in the printed notDoors list. The same two-entry list
+		// removes a pointer, a map, a named slice type and a variadic. FAMILY TWO is the
+		// STATEMENT FORMS: gatesGather binds a member through an assignment, a range, a value
+		// specification and a field declaration, so a type assertion and a type switch bind
+		// nothing. NONE OF THESE WANTS A TYPE -- the descriptor is spelled in the parameter, in
+		// the assertion or in the case clause -- which is why go/types is not the remedy here
+		// either, and it is the third round running that the remedy named for what this cannot
+		// see would have found none of the next instance.
+		//
+		// These entries are a BOUNDARY, not a wish: the day a round closes the ninth they go
+		// red, and the correct response is to move them to the list above rather than to delete
+		// them. A control that starts failing as a class widens is the control saying so.
+		"aMemberSetReachedThroughAnIteratorDoor": "name narrowing over a member set reached through an iterator door, which the two-entry container list `X` and `[]X` removes",
+		"aFieldSetReachedThroughAnIteratorDoor":  "attribute narrowing over a field set reached through an iterator door, removed by the same two-entry list",
+		"aMemberDeclaredBehindAPointer":          "name narrowing over a member declared *reflect.Method, which the reflect half does not strip although the go/types half strips exactly that",
+		"aMemberDeclaredInAMap":                  "name narrowing over members held in a map of descriptors",
+		"aMemberDeclaredInANamedSliceType":       "name narrowing over members held in a DEFINED slice type, whose spelling is the type name and not []reflect.Method",
+		"aMemberDeclaredVariadic":                "name narrowing over members taken variadically",
+		"aMemberBoundByATypeAssertion":           "name narrowing over a member bound by a type assertion, which no statement form gatesGather reads binds",
+		"aMemberBoundByACommaOkTypeAssertion":    "attribute narrowing over a member bound by a comma-ok type assertion",
+		"aMemberBoundByATypeSwitch":              "attribute narrowing over a member bound by a type switch, whose case clause spells the descriptor outright",
 	} {
 		if kind, sawIt := seen[function]; sawIt {
 			t.Errorf("the derivation reports %s as a %s narrowing over a reflected member set and it reads a %s",

@@ -3,13 +3,18 @@
 What this file is for: `mls`, `message` and `messagegroup` defend most of their properties with
 **gates** — a test that derives a class of things and then asserts something over every member. A
 gate is only ever as good as its class, and this project has now shipped the same class defect
-**eight times at eight altitudes**, each one green, each one found by a reviewer a round later at
+**nine times at nine altitudes**, each one green, each one found by a reviewer a round later at
 full cost.
 
-The sixth, the seventh and the eighth were all this file, each one inside the fix for the one
-before it. It is worth stating plainly, because it is the reason the file no longer looks the way
-it did — and because three rounds in a row is the argument for deciding a claim in a test rather
-than agreeing with it in prose:
+**The line stops at nine, and it stops on evidence rather than on exhaustion.** The ninth is
+recorded below and is NOT closed; [why the line stops here](#why-this-line-stops-here-and-the-criterion-that-replaces-the-slogan)
+is the section that has to be read before anybody opens a tenth round, because the argument for
+stopping is a measurement and not a mood.
+
+The sixth, the seventh, the eighth and the ninth were all this file, each one inside the fix for
+the one before it. It is worth stating plainly, because it is the reason the file no longer looks
+the way it did — and because four rounds in a row is the argument for deciding a claim in a test
+rather than agreeing with it in prose:
 
 > The artifact written to stop the fifth instance contained the defect. Its table opened
 > *"Every arity- or name-shaped narrowing over a reflected class"* and held **eight of the
@@ -37,17 +42,37 @@ than agreeing with it in prose:
 > byte-identical, and the recall fraction did not move. Worse, the boundary paragraph offered
 > `go/types` as the remedy for what this file cannot see, and **a go/types rebuild would have
 > caught none of the four**: a struct tag is a spelling the parse tree already holds.
+>
+> And the fix for THAT contained the NINTH, one shape over. The doors were derived and the
+> readings were derived, and the **container a member is carried through** was two literals, `X`
+> and `[]X`, written into `gatesAnswers` as `TrimPrefix(spelling, "[]")` and into
+> `gatesDoorSet.declares` as an exact match on `reflect.X` / `[]reflect.X`. On the toolchain in
+> this checkout that clause removes **two spellings — `Methods` and `Fields` — over the four
+> iterator doors Go 1.26 added to reflect's exported API**: `Type.Methods`, `Type.Fields`,
+> `Value.Methods` and `Value.Fields`. And a second family sits beside it: `gatesGather` binds a member
+> through four statement forms, so a member bound by a **type assertion** or a **type switch**
+> binds nothing at all. Six narrowings across the two families were planted and all seven gates
+> then in this file stayed green — **and, replanted after this round added two more, all nine do**.
+> **That one is filed and not fixed**, and the section that says why is the point of this document
+> now.
 
 So the table below is no longer written. It is **derived**, from the parse tree, by
 `gates_index_test.go`, and the two are required to be the same set in both directions. The query
 below is no longer trusted. It is **run**, and its recall against that derivation is measured on
 every test run and published here as a fraction this file is held to. The **doors** that derivation
 reads a member through are no longer named either: they are derived from reflect's own source, by
-the property that makes something a door, so a door Go adds in a later release joins this reading
-on the day the toolchain moves. And the **readings** off what a door hands back are no longer named
-either: the fields a member descriptor carries are found by the same sentence that admits the
-descriptor, so a field Go adds to `reflect.Method` or `reflect.StructField` joins this reading on
-the same day — and the ones this file does not read as a name or a type are printed on every run.
+the property that makes something a door. And the **readings** off what a door hands back are no
+longer named either: the fields a member descriptor carries are found by the same sentence that
+admits the descriptor, so a field Go adds to `reflect.Method` or `reflect.StructField` joins the
+reading on the same day — and the ones this file does not read as a name or a type are printed on
+every run.
+
+**What this paragraph used to claim next was that "a door Go adds in a later release joins this
+reading on the day the toolchain moves", and that sentence is measurably false on the toolchain in
+this checkout.** Go 1.26 added four iterator doors to reflect and none of them joined, because the
+derivation reads a descriptor bare or in a slice of them and an `iter.Seq[Method]` is neither. The
+sentence has been deleted rather than softened. That is the ninth instance, and it is the reason
+the next section exists.
 
 ---
 
@@ -83,7 +108,7 @@ is the sixth instance, and the tests named at the bottom of this file are it, cl
 
 ---
 
-## The eight, and what each narrowed by
+## The nine, and what each narrowed by
 
 1. **A class dispositioned by a COUNT instead of a grep.** The number of members stood in for the
    members. A count cannot have a complement, which is why nothing could be read off it.
@@ -142,6 +167,153 @@ is the sixth instance, and the tests named at the bottom of this file are it, cl
    The same round's self-check, run over its own diff, found one more of the shape one level down
    and closed it: the predicate class itself was narrowed by ARITY — "a function answering exactly
    one `bool`" — with an empty, unprinted complement.
+9. **This file a fourth time, inside the fix for the eighth, and the CONTAINER half — AND THIS
+   ONE IS FILED RATHER THAN CLOSED.** The doors were derived and the readings off a descriptor
+   were derived; the **shapes a member is carried through** were two literals, `X` and `[]X`.
+   `gatesAnswers` is `wanted[strings.TrimPrefix(spelling, "[]")]`, `gatesDoorSet.declares`
+   exact-matches `reflect.X` and `[]reflect.X`, and the door sentence in this file said only
+   *"or a slice of them"*. **Measured on the toolchain this gate runs on, by
+   `TestTheContainerClauseOnTheDoorSentenceIsANarrowingAndItsSizeIsMeasured`**, that clause
+   removes two spellings — `Methods` and `Fields` — over **six exported declarations**, four of
+   which are doors on reflect's exported API and are the four iterator doors Go 1.26 added:
+   `Type.Methods() iter.Seq[Method]`, `Type.Fields() iter.Seq[StructField]`,
+   `Value.Methods() iter.Seq2[Method, Value]` and `Value.Fields() iter.Seq2[StructField, Value]`.
+   (The other two are `*rtype.Methods` and `*rtype.Fields`, the unexported implementation of
+   `Type`.) Both spellings sit in the 126-name `notDoors` list this file prints, which is the only
+   place they appear and the one place nothing points at. The same two-entry list removes `*reflect.Method`,
+   `map[K]reflect.Method`, `[4]reflect.StructField`, `...reflect.Method` and a defined slice type
+   over one. **A second family sits one altitude over**: `gatesGather` binds a member through four
+   statement forms — `AssignStmt`, `RangeStmt`, `ValueSpec`, `Field` — so a member bound
+   by a **type assertion** or a **type switch** binds nothing, and the `RangeStmt` case reads only
+   the value and never the key. Six narrowings across the two families were planted in a real
+   `mls` `_test.go` and **all seven gates then in this file stayed green**, the derived class
+   byte-identical at 170 occurrences over 160 keys, while a `[]reflect.Method` control planted
+   beside them turned the index gate red immediately. **Replanted after this round, all NINE stay
+   green** — which is the measurement that says what the two gates added here did and did not do:
+   they make the narrowing visible, and they do not close it. **None of the nine wants a type**, so the `go/types` rebuild this
+   document has twice offered as the remedy for what it cannot see would find none of them —
+   the third round running that sentence has been wrong about the next instance.
+
+   All nine shapes are now DRIVEN through the control in
+   `TestTheGatesDerivationSeesANarrowingHoweverItsReceiverIsSpelled` and asserted **not found**,
+   beside the three under-reaches that do want a type. That is what filing it means here: the
+   boundary is a measurement that goes red on the day somebody widens the class, not a paragraph.
+   `OPEN` is red for a **row of the index** below, and this is not one of those — it is the
+   derivation's own boundary, stated and exercised.
+
+---
+
+## Why this line stops here, and the criterion that replaces the slogan
+
+**Nine rounds have been spent on one defect class**, and the class has not changed once: *a
+narrowing whose complement is unprinted, or whose justification names something that exists in the
+tree today.* Every instance was green when it shipped. Every one was found by the next reviewer,
+one round later, at full cost. And **the last five were each found inside the fix for the one
+before**:
+
+| # | the narrowing | half | found inside |
+|---|---|---|---|
+| 1 | a class dispositioned by a **count** rather than a grep | members | — |
+| 2 | a location query built from the **numbers** a ruling changed | scope | — |
+| 3 | a sweep built from the **construction** a finding was raised in | members | — |
+| 4 | a gate whose class was a **directory** | scope | — |
+| 5 | an accessor class narrowed by **arity** | members | the fix for the fourth |
+| 6 | this file's hand-written table, and a query keyed to `method.Name` | members | the fix for the fifth |
+| 7 | the derivation's **doors**, scoped to a reflected METHOD set | scope | the fix for the sixth |
+| 8 | the **readings** off a descriptor, left as `Name` and `Type` | members | the fix for the seventh |
+| 9 | the **container shapes** a member is carried through, `X` and `[]X` | members | the fix for the eighth |
+
+The obvious reading of that table is that it should be run a tenth time. **It should not, and the
+reason is in round eight's own commit.**
+
+### The two-list proof
+
+Round eight (`edb68e6`) closed the reading half and, in the same commit, added a second derivation
+one library over so the overlap with `go/types` could be measured: `gatesAnswersObject`, modelled
+on `gatesAnswers` and described in that commit's own text as *the same sentence one shape over*.
+
+```go
+// gatesAnswers   -- round seven, untouched by that commit
+if wanted[strings.TrimPrefix(spelling, "[]")] {
+
+// gatesAnswersObject -- added by that commit
+bare := strings.TrimPrefix(strings.TrimPrefix(spelling, "[]"), "*")
+```
+
+**Two containers, two different literal lists, in one commit, written by one agent in one sitting** —
+and the widening was not carried back. So the failure is not inattention and not inexperience; the
+same hand wrote both halves within minutes of each other, and neither half said it was narrowing
+anything.
+
+### What that actually demonstrates
+
+**Every derivation bottoms out in some literal.** There is no altitude at which the literal
+disappears; there is only a choice about where to put it, and each round of this line moved it
+one level down:
+
+- the table was a list of narrowings → replaced by a derivation over the parse tree, which
+  bottoms out in the literal door names `Method` and `MethodByName`;
+- the doors were a list → replaced by a derivation over reflect's own source, which bottoms out
+  in the literal field names `Name` and `Type`;
+- the readings were a list → replaced by a derivation over the descriptor, which bottoms out in
+  the literal containers `X` and `[]X`, and in the literal statement forms `AssignStmt`,
+  `RangeStmt`, `ValueSpec` and `Field`;
+- and the sentence that admits a descriptor bottoms out in `"Name"`, `"Type"` and `"string"` —
+  a literal this file already carries, already prints, and already fails closed on.
+
+Nine rounds is enough evidence to say that "keep going until nothing is a list" does not terminate.
+It is the wrong stopping condition, because the thing being chased is not a mistake anybody made.
+
+### So "derive from the property" is retired here
+
+That slogan was in this project's standing rules for **four of the first five failures and caught
+none of them**, and the reason is now clear: every one of those narrowings was written by somebody
+who believed they had derived from the property — and had, right down to the literal at the
+bottom. The slogan is not checkable. It cannot be applied to a diff and it cannot be applied to a
+gate, because it gives no test that a reader can fail.
+
+**What replaces it is two questions, and both are answerable by looking at the code:**
+
+> ### 1. Is the literal at a level where being wrong is VISIBLE?
+> ### 2. Does it FAIL CLOSED, and does it PRINT ITS COMPLEMENT?
+
+That is a bounded engineering criterion. It does not promise that no literal is wrong — it
+promises that a wrong one announces itself. Worked against this file's own literals:
+
+| the literal | visible? | fails closed? | prints its complement? | verdict |
+|---|---|---|---|---|
+| `"Name"` / `"Type"` / `"string"` in `gatesDescriptorFields` | yes — if reflect renames either field the sentence admits **no** descriptor | yes — `gatesDeriveDoors` returns an error and `gatesDoorsOf` fatals | yes — the exported structs it removed, on every run | **keep** |
+| the exported-field narrowing in `gatesDescriptorFields` | yes | **now yes** — an unexported field in a descriptor refuses rather than `continue`-ing | yes, and empty today, which is why the refusal was added | **keep** |
+| `"bool"` in `gatesRecordDecided` | yes | no, but it over-reports rather than under-reports at the class boundary | **now yes** — 43 result positions in these trees read a member and are not spelled `bool`, named on every run | **keep** |
+| `"[]"` in `gatesAnswers` — the DOOR reading | **was no**, the two spellings it removed read as ordinary non-doors inside a 126-name list; **now yes**, `TestTheContainerClauseOnTheDoorSentenceIsANarrowingAndItsSizeIsMeasured` asks the sentence both ways and holds the `gates-doors` pair | **no** — a container it does not know is simply not a door, silently | **was no; now yes** — two spellings over six declarations, named on every run | **the ninth, made visible** |
+| `reflect.X` / `[]reflect.X` in `declares` — the PARAMETER reading | **no** — a helper taking `*reflect.Method` binds nothing and nothing says so | **no** | **no**, and unlike the row above there is no enumerable universe of parameter spellings to print it against, which is why making this half visible is a round rather than a gate | **the ninth, still silent** |
+| the four statement forms in `gatesGather` | **no** | **no** | **no** | **the ninth, still silent** |
+
+The last three rows are exactly why the ninth is real and exactly why it is not urgent: it is the
+same class at the level this line has now reached, and the criterion says what to do about it
+without another round of the arms race. **What this round did is the first row's answer and not
+the other two's**: one literal was moved to where being wrong is visible, and the two that could
+not be were written down instead. **A tenth round would find a tenth literal. It always will. The
+question that decides whether that literal matters is in the three rows above.**
+
+### What a future pass should do instead of round ten
+
+1. **Do not open a round to make a list one entry longer.** Carrying the `*` from
+   `gatesAnswersObject` back into `gatesAnswers` is the tempting example, and it is measured:
+   package reflect declares **no exported symbol answering `*Method` or `*StructField`**, so that
+   widening changes the door set by nothing at all. It would turn a two-entry list into a
+   three-entry list, leave the iterator, the map, the array, the variadic and the named slice type
+   outside it, and make the sentence read **more** complete than it is. That is the empty-complement
+   row of the table above, which this file calls the dangerous one.
+2. **If the ninth is closed, close it as a class.** The sentence to write is "a member is read
+   through whatever container carries it, and every container this reading does not know is
+   printed" — which needs a complement to exist before the first line of it is written. The
+   nine control shapes in `TestTheGatesDerivationSeesANarrowingHoweverItsReceiverIsSpelled` are
+   the acceptance test, and they will go **red** when it works: move them to the seen half, do not
+   delete them.
+3. **Judge any new gate by the two questions, not by whether its class is derived.** A derived
+   class whose literal is invisible and silent is worth less than an enumerated one that refuses
+   and prints. That inversion is the whole of what nine rounds bought.
 
 ---
 
@@ -160,12 +332,47 @@ roots and derives, without naming any symbol of the tree:
 
 **"MEMBER SET", and the doors onto one are derived rather than named.** A door is any exported
 function or interface method of `reflect` that answers a **member descriptor** — a struct reflect
-exports that names one member of a type and carries that member's type — plus, in reflect's Value
-half, an exported method that answers a `Value` for the same arguments such a door takes. That
-sentence names no symbol of this tree and no symbol of reflect; run against Go 1.26 it admits ten
-spellings, two of which it over-reports and says so, and the whole set is printed on every run
-beside the exported structs the descriptor sentence removed. Naming the two method doors instead
-was the seventh instance.
+exports that names one member of a type and carries that member's type — **bare or in a slice of
+them** — plus, in reflect's Value half, an exported method that answers a `Value` for the same
+arguments such a door takes. That sentence names no symbol of this tree and no symbol of reflect.
+Naming the two method doors instead was the seventh instance.
+
+**AND "BARE OR IN A SLICE OF THEM" IS A NARROWING, WHICH IS THE NINTH INSTANCE — this paragraph
+did not carry that clause at all until this round, so the document stated a rule the code did not
+implement and stated it as though it were the whole class.** The clause is two literals, `X` and
+`[]X`; it is implemented as `strings.TrimPrefix(spelling, "[]")` in `gatesAnswers` and as an exact
+match on `reflect.X` / `[]reflect.X` in `gatesDoorSet.declares`; and unlike every other narrowing
+this file performs, **it had no complement of its own** — the door half has one now and the
+parameter half still does not. So the count has to be read as a count over a narrowed class rather
+than as a class:
+
+- **run against Go 1.26 the sentence WITH the container clause admits ten spellings**, two of which
+  it over-reports and says so, and the whole set is printed on every run beside the exported
+  structs the descriptor sentence removed;
+- **the same sentence WITHOUT the clause admits twelve** — the two further spellings being
+  `Methods` and `Fields`, over six exported declarations, of which four are doors on reflect's
+  exported API and are the four iterator doors Go 1.26 added: `Type.Methods() iter.Seq[Method]`,
+  `Type.Fields() iter.Seq[StructField]`, `Value.Methods() iter.Seq2[Method, Value]` and
+  `Value.Fields() iter.Seq2[StructField, Value]`;
+- and **until this round the two spellings the clause removes were printed only inside the
+  126-name `notDoors` list**, where they read as ordinary non-doors. That is the whole of why this
+  one was invisible for a round: the complement of the DOOR SENTENCE printed them, and the
+  complement of the CONTAINER CLAUSE — which is the narrowing that actually removed them — did not
+  exist. It exists now, and it is the line below.
+
+Ten is therefore the size of what this reading admits, not the size of what the sentence above
+describes, and **both halves of that are now a measurement rather than a claim**:
+
+**gates-doors: 10 / 12**
+
+`TestTheContainerClauseOnTheDoorSentenceIsANarrowingAndItsSizeIsMeasured` derives both readings
+off reflect's own source on every run, names every spelling the clause removes, and holds this
+pair to what it measured — so on the toolchain that adds the next container the document goes red
+with the new list already in hand. **That makes the ninth VISIBLE. It does not make it CLOSED**: a
+narrowing spelled `for member := range subject.Methods()` is still invisible to every gate here,
+and printing a complement is not the same as removing a narrowing. The gap is filed rather than
+closed: see
+[why this line stops here](#why-this-line-stops-here-and-the-criterion-that-replaces-the-slogan).
 
 **AND THE READINGS OFF WHAT A DOOR HANDS BACK ARE DERIVED TOO, which was the eighth instance.**
 A member descriptor does not carry two facts about a member, it carries eight; the field that NAMES
@@ -173,13 +380,20 @@ the member is read as a name narrowing, the field that carries its TYPE as a sha
 **every other exported field of a descriptor** is read as a narrowing over a fact the descriptor
 carries. Those fields are found by the same sentence that admits the descriptor rather than spelled
 here, the six that are neither the name nor the type are printed on every run, and a field Go adds
-to either descriptor joins the reading on the day the toolchain moves. Reading only the first two
+to either descriptor joins the reading on the day the toolchain moves — which is true of a FIELD
+and, as the ninth instance records, was not true of a DOOR. Reading only the first two
 left `field.Tag`, `field.PkgPath`, `field.Anonymous` and `member.Index` invisible to every gate in
 this file.
 
 The receiver can be spelled anything at all; a member reached through a door directly, through a
 `[]reflect.Method` or a `[]reflect.StructField` a helper was handed, or through a `reflect.Value`
-whose signature comes back from `Type()`, all reach the same reading. **And a predicate is a
+whose signature comes back from `Type()`, all reach the same reading. **The STATEMENT a member is
+bound by is a four-entry list, and that is the ninth instance's second family**: an assignment, a
+range, a value specification and a field declaration bind a member, so a member bound by a **type
+assertion** (`member := carried.(reflect.Method)`) or by a **type switch** is bound by nothing at
+all, and the range case reads only the value, never the key. Both spellings name the descriptor
+outright, exactly as a parameter does; neither wants a type. Driven through the control and
+asserted not found, and filed rather than closed. **And a predicate is a
 predicate however it is spelled**: the condition of an `if`, `for`, `switch` or `case`; an
 identifier bound to a member reading above the line that decides by it (`drop :=
 strings.HasPrefix(member.Name, "Gamma")` then `if drop`, or `key, _, _ :=
@@ -291,14 +505,56 @@ paragraph proposed would have found none of them — a struct tag is a selector 
 already holds. A count of what a derivation cannot see is a claim about the unseen, and this file
 has now been wrong about it twice.
 
+**AND ONE NARROWING IN THAT DERIVATION NOW REFUSES RATHER THAN CONTINUING.**
+`gatesDescriptorFields` reads only the EXPORTED fields of a member descriptor, because a predicate
+in these trees cannot spell an unexported one. Measured on Go 1.26 that removes **nothing** —
+`reflect.Method` and `reflect.StructField` are exported through and through — and a narrowing that
+removes nothing, disposed of with a `continue`, is the row the table above calls the dangerous one,
+sitting inside the file that publishes the table. `gatesDeriveDoors` now returns an error naming
+the fields instead, so the day reflect adds an unexported field to a descriptor this derivation
+says so and stops rather than quietly reading one fact fewer about every member. The complement is
+still printed on every run, and it is still `[]`.
+
 So what is written here is what is **driven through the control and asserted NOT found**, and
-nothing more: a member reached through a parameter declared `reflect.Value`; a member held in a
-struct FIELD whose type is declared in another declaration; and a predicate answering a DEFINED
-type whose underlying type is `bool`. Each of those three does want a type, and `go/types` would
-close each of them. **That is not the same as saying they are all that is missing**, and the reader
-who wants the next instance should look where this file has twice found it: at what the derivation
-reads its class THROUGH — the doors in the seventh round, the descriptor's own fields in the eighth
-— rather than at the class itself.
+nothing more. **Twelve shapes, in three groups**, every one of them written into
+`gatesControlSource` and asserted absent from the derivation's reading on every run:
+
+**Three that want a TYPE**, and `go/types` with a full type-check would close each of them:
+a member reached through a parameter declared `reflect.Value`; a member held in a struct FIELD
+whose type is declared in another declaration; and a predicate answering a DEFINED type whose
+underlying type is `bool`.
+
+**Six CONTAINER shapes — the ninth instance, filed and not fixed.** A member is read bare or in a
+slice of descriptors and in no other container, so all six of these bind nothing: a member set
+reached through an ITERATOR door (`for member := range subject.Methods()`, which on Go 1.26 is a
+real door of the reflect this gate parses) and the field twin of it; a member declared
+`*reflect.Method`; one held in a `map[K]reflect.Method`; one held in a DEFINED slice type over a
+descriptor; and one taken variadically.
+
+**Three STATEMENT forms — the ninth instance's other family.** A member bound by a type assertion,
+by a comma-ok type assertion, or by a type switch is bound by nothing, because the four statement
+forms that do bind one are an assignment, a range, a value specification and a field declaration.
+
+**None of the nine in the last two groups wants a type.** Each spells the descriptor outright — in
+a parameter, in an assertion, or in a case clause — so the `go/types` rebuild this paragraph
+proposed as the remedy for what it cannot see would find none of them either. **That is the third
+round running that the remedy named here would have missed the next instance**, and it is the
+reason the criterion this file is now held to is about literals and complements rather than about
+which library a derivation is built on.
+
+**And what is NOT here is as important as what is.** This list is what is asserted not found; it
+is **not** a proof that nothing else is missing, and this document no longer implies otherwise.
+Two things about it can be said honestly and are worth saying:
+
+- **it grows by measurement, not by inspiration.** Every entry arrived because somebody planted a
+  narrowing and watched the gates stay green. Nothing here was reasoned into existence, and a
+  future entry will arrive the same way;
+- **the entries a plant CAN reach are exactly the ones written down; the ones it cannot are not.**
+  A shape nobody thought to plant is invisible to this list in precisely the way a member nobody
+  thought to enumerate was invisible to the table this file replaced. The reader who wants the
+  next instance should look where this file has three times found it: at what the derivation
+  reads its class THROUGH — the doors in the seventh round, the descriptor's own fields in the
+  eighth, the container and the binding statement in the ninth — rather than at the class itself.
 
 Each row carries one verdict:
 
@@ -535,7 +791,7 @@ its own: it will also mis-resolve two production methods of different types that
 
 ## What holds this file to the tree
 
-Seven tests in `mls/gates_index_test.go`, and they are the whole reason this file is worth reading:
+Nine tests in `mls/gates_index_test.go`, and they are the whole reason this file is worth reading:
 
 - `TestTheGatesTableIsTheDerivedClassAndNotAListOfIt` — the index above equals the derived class in
   both directions, every row carries a verdict from the vocabulary, and an `OPEN` row is red.
@@ -584,13 +840,20 @@ Seven tests in `mls/gates_index_test.go`, and they are the whole reason this fil
   BESIDE another result. "A function answering exactly one `bool`" was an ARITY narrowing over the
   predicate class, which is the shape Q1 above calls always suspect, sitting inside the file that
   publishes the warning; its complement was unprinted and, probed, EMPTY, so nothing would have
-  gone red on the day the first `(bool, error)` predicate landed. Six it must not: a struct field spelled `name`, a directory entry's name, an
-  accumulator of member names consumed by `len()`, and **the three under-reaches this file
+  gone red on the day the first `(bool, error)` predicate landed. Fifteen it must not: a struct
+  field spelled `name`, a directory entry's name, an
+  accumulator of member names consumed by `len()`, and **the twelve under-reaches this file
   states** — a signature read off a parameter declared `reflect.Value`, a member held in a struct
   field declared elsewhere, and a predicate answering a defined type whose underlying type is
-  `bool`.
+  `bool` — **and the NINE the ninth instance added**: six container shapes (a member set reached
+  through an ITERATOR door and the field twin of it, a member declared `*reflect.Method`, one in a
+  `map[K]reflect.Method`, one in a defined slice type, one taken variadically) and three statement
+  forms (a type assertion, a comma-ok type assertion, a type switch). Those nine are the ninth
+  instance **driven rather than closed**, and they are written to go RED on the day a round widens
+  the class: the correct response to that failure is to move them to the seen half, never to
+  delete them. A control that starts failing as a class widens is the control saying so.
 
-  The last three are the difference between a boundary and a paragraph, and the boundary has now
+  The last twelve are the difference between a boundary and a paragraph, and the boundary has now
   been wrong twice while reading as complete. In the sixth round a predicate bound to a name was on
   neither of the two lines that claimed to say what could not be seen. In the seventh the paragraph
   said "exactly three, and all three want a TYPE" while four narrowings over a descriptor's own
@@ -609,6 +872,30 @@ Seven tests in `mls/gates_index_test.go`, and they are the whole reason this fil
   it decides that the field is named in a reporter's arguments, not that what is printed is the
   set — and what it does not read, the door map itself, is printed beside the complements it does.
 
+  **And a fourth narrowing, made while it reads these trees, is now held by the same test.**
+  `gatesRecordDecided` decides which RESULT POSITIONS of a function are the decision, and until
+  this round it took no reporter at all: the round that widened it off *"a function answering
+  exactly one `bool`"* closed the arity and left the print, which is one half of one rule closed
+  and the other half not. It now hands every non-`bool` result position to the caller, which names
+  the ones that actually READ a member — **43 of them in these trees today** — so the complement is
+  a set somebody can scan for the shape that reaches past a spelling, a DEFINED type whose
+  underlying type is `bool`. The class this test holds is derived, not named: an ACCUMULATOR is a
+  parameter the derivation only ever writes into, so the only place left for it to be read is a
+  reporter in the caller, and a second one added in a later round is held on the commit that adds
+  it. Two proxies, said out loud like the rest: it decides that every function-typed parameter of
+  the recorder is CALLED and that the accumulator is NAMED in a reporter — not that what is called
+  reports the removals, nor that what is printed IS them.
+
+- `TestTheContainerClauseOnTheDoorSentenceIsANarrowingAndItsSizeIsMeasured` — the ninth instance
+  made visible and deliberately not closed. The door sentence's container clause is asked with and
+  without, every spelling it removes is named at run time, and the `gates-doors` pair above is held
+  to the measurement. It goes red on the day the toolchain adds a container this reading does not
+  know, which is the one thing a literal that cannot be moved can still be made to do.
+- `TestTheExportedFieldNarrowingRefusesRatherThanContinuing` — the refusal that replaced a
+  `continue` in `gatesDescriptorFields`, DRIVEN. Nothing in these trees can drive it, because both
+  member descriptors are exported through and through and the complement it guards is empty, so it
+  is driven here with a made-up complement instead. A fail-closed path nothing exercises is a
+  fail-closed path nobody has checked, and this file has already shipped one of those.
 - `TestTheGoTypesRowsOfTheIndexAreACoincidenceOfSPELLINGAndTheCoincidenceIsMeasured` — the nine
   rows of the index that sit over a `go/types` member set are held to being a coincidence: the
   member-descriptor sentence admits nothing in `go/types`, the two spellings the two libraries

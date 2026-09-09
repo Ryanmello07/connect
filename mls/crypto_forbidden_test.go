@@ -56,10 +56,12 @@ import (
 // with it.
 //
 // This list is the SCOPE half of the rule GATES.md states: a gate that reads a set of
-// directories has to derive that set and print the ones it did not read. It was the fourth
-// of the EIGHT instances recorded there -- the count moves as that file records another, and a
-// citation that names a total goes stale the round after it is written, which this one did --
-// and the derivation asserting it is directly below.
+// directories has to derive that set and print the ones it did not read. It is the DIRECTORY
+// instance recorded there -- named by the SHAPE it had and not by its position in a list whose
+// length moves, because a citation that names a total goes stale the round after it is written,
+// and this one has now gone stale twice: it named a total, was rewritten to name a different
+// total in the same sentence that explains why totals go stale, and had to be rewritten again on
+// the commit that recorded the ninth. The derivation asserting this list is directly below.
 var forbiddenScanRoots = []string{".", "../message", "../messagegroup"}
 
 // The directories this list must name, derived rather than read off it.
