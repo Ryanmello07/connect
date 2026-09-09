@@ -9,7 +9,7 @@
 // adapter over it. Every KEY on that path is the real one.
 //
 // FOUR VALUES HERE ARE THE TEST'S AND NOT THE PRODUCT'S, named rather than left for a reader to
-// find: pq_secret, which task 13 produces and which the session takes as a required argument with
+// find: pq_secret, which NewPqSecret draws and which the session takes as a required argument with
 // no default -- absent rather than defaulted, which is the discipline this project's own rule
 // states; the state store, which is a map and persists nothing; the clock, which is a constant
 // because this package has no timing sensitive test and must not gain one; and the server nonce,
@@ -230,7 +230,7 @@ func testGroupId(name string) []byte {
 	return groupId
 }
 
-// The pq_secret every fixture supplies. Task 13 draws the real one; this is a constant so that a
+// The pq_secret every fixture supplies. NewPqSecret draws the real one; this is a constant so that a
 // case comparing two sessions is comparing the two sessions rather than two draws.
 //
 // It is NOT a default and it is not reachable from production: the constructor refuses an empty

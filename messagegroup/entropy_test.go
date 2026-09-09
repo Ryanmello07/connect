@@ -138,6 +138,11 @@ func entropyExpressionText(fileSet *token.FileSet, expr ast.Expr) string {
 // source, on a declaration that panics on one, has to fail, and it does, because the probe runs
 // the call.
 var entropyRefusalProbes = map[string]func(t *testing.T, random io.Reader) error{
+	"NewPqSecret": func(t *testing.T, random io.Reader) error {
+		t.Helper()
+		_, err := NewPqSecret(random)
+		return err
+	},
 	"XwingGenerateKey": func(t *testing.T, random io.Reader) error {
 		t.Helper()
 		_, err := XwingGenerateKey(random)

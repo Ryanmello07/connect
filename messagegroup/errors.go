@@ -207,8 +207,8 @@ var (
 	// session holds, so the alternative to this refusal is a record sealed under thirty two
 	// zeros.
 	ErrSessionClosed = errors.New("messagegroup: this group session is closed")
-	// Fires when a session is constructed or advanced with no pq_secret. Task 13 produces it
-	// and there is no default, which is the point: HKDF-Extract(mls_secret, 32 zero bytes)
+	// Fires when a session is constructed or advanced with no pq_secret. NewPqSecret in
+	// epoch.go draws one and there is no default, which is the point: HKDF-Extract(mls_secret, 32 zero bytes)
 	// produces a perfectly good storage root, both clients agree, every test passes, and the
 	// post quantum half of the design is silently gone. A missing key schedule fails closed
 	// and looks like what it is; a placeholder one fails open and looks like a working
@@ -263,4 +263,29 @@ var (
 	// and the two sentinels are what sdk matches on until it does. Wave 2's fan out is what
 	// returns it; nothing in wave 1 does.
 	ErrNoWrap = errors.New("messagegroup: no device wrap for this target at this epoch")
+)
+
+// ---------------------------------------------------------------------------
+// the provisional epoch state, spec A section 5.12 step 1 and guardrail G10
+// ---------------------------------------------------------------------------
+
+var (
+	// Fires when any accessor of a provisional epoch state is reached after its destructor has
+	// run. G10's whole sentence is "the provisional epoch state is a value that
+	// ClearPendingCommit destroys; there is no path that reads it afterwards", and a destroyed
+	// value that answered zeros rather than refusing would satisfy the letter of it while a
+	// caller sealed a record under thirty two zero octets -- which is a working record that no
+	// other member can open and which no round trip test can see.
+	ErrProvisionalEpochDestroyed = errors.New("messagegroup: this provisional epoch state has been destroyed and answers nothing")
+	// Fires when a provisional epoch state is built over a value that is not the thirty two
+	// octets its derivation produces. The four values of section 5.12 step 1 arrive from four
+	// different places -- an extraction, two expansions and a CSPRNG draw -- and a short one
+	// produces a MAC or a wrap that verifies against itself and against nothing else, so the
+	// width is settled once here rather than at whichever expansion happens to meet it first.
+	ErrProvisionalEpochValue = errors.New("messagegroup: a provisional epoch state was given a value that is not thirty two octets")
+	// Fires when the X-Wing wraps of a provisional epoch are installed twice, or installed
+	// empty. The set is write once because a second install over a live one drops the first
+	// fan out's wraps with nothing erasing them, and an epoch's wraps are exactly the material
+	// section 5.12 step 1 orders discarded together.
+	ErrProvisionalEpochWraps = errors.New("messagegroup: the X-Wing wraps of a provisional epoch are installed once")
 )

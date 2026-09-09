@@ -122,8 +122,9 @@ type GroupSession struct {
 
 // NewGroupSession opens a session over one group handle at the handle's current epoch.
 //
-// pqSecret is REQUIRED and has no default. It is task 13's to produce and it does not exist yet,
-// so wave 1's callers supply one -- which is the shape this project's own rule asks for: "a
+// pqSecret is REQUIRED and has no default. NewPqSecret in epoch.go is what draws it -- task 13
+// landed it, and this sentence used to say it did not exist -- and a caller that has one supplies
+// it here; which is the shape this project's own rule asks for: "a
 // missing key schedule fails closed and looks like what it is; a placeholder one fails open and
 // looks like a working messenger." A constructor that defaulted it to thirty two zeros would
 // produce a perfectly good storage root, both clients would agree, every test would pass, and the
@@ -164,7 +165,7 @@ func NewGroupSession(handle GroupHandle, pqSecret []byte, groupHandleKeyEpoch0 [
 		return nil, fmt.Errorf("%w: write_auth is a mac over it", ErrSessionServerNonce)
 	}
 	if len(pqSecret) == 0 {
-		return nil, fmt.Errorf("%w: task 13 produces it and there is no default", ErrNilPqSecret)
+		return nil, fmt.Errorf("%w: NewPqSecret draws one and there is no default", ErrNilPqSecret)
 	}
 	groupId := handle.GroupId()
 	if len(groupId) != len(([32]byte{})) {
@@ -331,7 +332,7 @@ func (self *GroupSession) AdvanceEpoch(pqSecret []byte) error {
 			return
 		}
 		if len(pqSecret) == 0 {
-			err = fmt.Errorf("%w: task 13 produces it and there is no default", ErrNilPqSecret)
+			err = fmt.Errorf("%w: NewPqSecret draws one and there is no default", ErrNilPqSecret)
 			return
 		}
 		// erased before it is overwritten, in this body, for installEpochOnLoop's reason.

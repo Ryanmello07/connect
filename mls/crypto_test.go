@@ -7823,6 +7823,7 @@ func TestEveryProviderConstructorHoldsTheSourceItWasGiven(t *testing.T) {
 // package, so there are three ways to fail and none of them is a stale label: a member with no
 // row, a row with no member, and a row naming a test that package does not declare.
 var entropyRefusalsHeldOutsideThisPackage = map[string]string{
+	"NewPqSecret":      "TestEveryEntropyTakingFunctionOfThisPackageRefusesANilSource",
 	"XwingGenerateKey": "TestEveryEntropyTakingFunctionOfThisPackageRefusesANilSource",
 	"XwingEncapsulate": "TestEveryEntropyTakingFunctionOfThisPackageRefusesANilSource",
 }
