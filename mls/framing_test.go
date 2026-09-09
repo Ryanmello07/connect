@@ -908,6 +908,16 @@ func TestSenderRoundTripEveryType(t *testing.T) {
 func TestTheSenderCodecWritesEveryFieldItsArmCarriesAndNoOther(t *testing.T) {
 	structType := reflect.TypeOf(Sender{})
 	observed := map[string]bool{}
+	// the complement of the sweep, printed rather than left to be read out of the constant. It
+	// is not skipped work: the discriminant is held to the goldens at the end of this test.
+	removed := []string{}
+	for i := 0; i < structType.NumField(); i += 1 {
+		if name := structType.Field(i).Name; name == senderDiscriminantField {
+			removed = append(removed, name)
+		}
+	}
+	t.Logf("%d field(s) of Sender removed from the variation sweep because they are the discriminant, which the golden assertion at the end of this test covers instead: %v",
+		len(removed), removed)
 	for _, senderType := range senderTypes(t) {
 		base, err := syntax.Marshal(testSenderOfType(senderType))
 		if err != nil {

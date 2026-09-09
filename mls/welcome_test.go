@@ -256,13 +256,17 @@ func TestTheGroupInfoSignatureCoversEveryFieldOfItsToBeSigned(t *testing.T) {
 	// structure that is not a field of the preimage is a field nobody's signature covers, and it
 	// would pass the whole sweep above because the sweep reads the preimage's fields
 	carried := []string{}
+	removed := []string{}
 	for i := 0; i < reflect.TypeOf(GroupInfo{}).NumField(); i++ {
 		name := reflect.TypeOf(GroupInfo{}).Field(i).Name
 		if name == "Signature" {
+			removed = append(removed, name)
 			continue
 		}
 		carried = append(carried, name)
 	}
+	t.Logf("%d field(s) of GroupInfo held to the preimage %v; %d removed because a signature does not cover itself: %v",
+		len(carried), carried, len(removed), removed)
 	signed := []string{}
 	for i := 0; i < reflect.TypeOf(GroupInfoTBS{}).NumField(); i++ {
 		signed = append(signed, reflect.TypeOf(GroupInfoTBS{}).Field(i).Name)

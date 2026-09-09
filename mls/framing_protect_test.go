@@ -4526,16 +4526,26 @@ func framedContentArmFields(t *testing.T) []string {
 		elsewhere[header.Field(index).Name] = true
 	}
 	arms := []string{}
+	removed := []string{}
 	shape := reflect.TypeOf(FramedContent{})
 	for index := 0; index < shape.NumField(); index++ {
 		if name := shape.Field(index).Name; !elsewhere[name] {
 			arms = append(arms, name)
+		} else {
+			removed = append(removed, name)
 		}
 	}
 	slices.Sort(arms)
+	slices.Sort(removed)
 	if len(arms) == 0 {
 		t.Fatal("the join of FramedContent against the cleartext header found no content arm at all, so the layout table below would be held to an empty class")
 	}
+	// the complement, named rather than counted. Everything here but Sender is derived from
+	// PrivateMessage's own fields; Sender is put out by hand because section 6.3.2 carries it in
+	// the ENCRYPTED SENDER DATA, and no type in this package holds that placement as a field
+	// this join could read off it.
+	t.Logf("%d content arms %v; %d field(s) of FramedContent removed because the private message carries them outside the content: %v",
+		len(arms), arms, len(removed), removed)
 	return arms
 }
 
@@ -4700,10 +4710,12 @@ func TestEveryRegisteredContentTypeEncodesToThePrivateMessageContentLayoutSectio
 	// selector, or a field this plaintext must not carry -- and there is no fourth kind, so a
 	// field added later cannot sit outside all three.
 	reassembled := []string{}
+	removed := []string{}
 	shape := reflect.TypeOf(FramedContent{})
 	for index := 0; index < shape.NumField(); index++ {
 		name := shape.Field(index).Name
 		if name == "ContentType" || slices.Contains(arms, name) {
+			removed = append(removed, name)
 			continue
 		}
 		reassembled = append(reassembled, name)
@@ -4711,6 +4723,8 @@ func TestEveryRegisteredContentTypeEncodesToThePrivateMessageContentLayoutSectio
 	if len(reassembled) == 0 {
 		t.Fatal("every field of FramedContent is an arm or the selector, so the absence sweep below moves nothing")
 	}
+	t.Logf("%d field(s) this plaintext must not carry %v; %d removed as the arm class or the selector: %v",
+		len(reassembled), reassembled, len(removed), removed)
 
 	padding := []byte{0x00, 0x00, 0x00, 0x00}
 	for _, contentType := range covered {
