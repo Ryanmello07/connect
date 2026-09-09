@@ -128,7 +128,11 @@ type GroupSession struct {
 // missing key schedule fails closed and looks like what it is; a placeholder one fails open and
 // looks like a working messenger." A constructor that defaulted it to thirty two zeros would
 // produce a perfectly good storage root, both clients would agree, every test would pass, and the
-// PQ half of the design would be silently gone.
+// PQ half of the design would be silently gone. Its WIDTH is refused here as well as its absence,
+// and separately, because until the review of task 13 this door checked only that the value was
+// non empty: MASTER section 7 fixes pq_secret[n] at thirty two octets, and a four octet one is the
+// ikm of a storage_root that is well formed, agreed by both clients and weaker than the document
+// specifies -- which no round trip in this package could ever tell you.
 //
 // groupHandleKeyEpoch0 IS group_handle_key -- HKDF-Expand(storage_root[0], "gh/v1", 32) -- and it
 // is PERSISTED state. A session opened at epoch 0 may leave it nil, because the current root IS
@@ -166,6 +170,10 @@ func NewGroupSession(handle GroupHandle, pqSecret []byte, groupHandleKeyEpoch0 [
 	}
 	if len(pqSecret) == 0 {
 		return nil, fmt.Errorf("%w: NewPqSecret draws one and there is no default", ErrNilPqSecret)
+	}
+	if len(pqSecret) != PqSecretBytes {
+		return nil, fmt.Errorf("%w: %d octets, and it is the ikm of every storage_root this session extracts",
+			ErrPqSecretLength, len(pqSecret))
 	}
 	groupId := handle.GroupId()
 	if len(groupId) != len(([32]byte{})) {
@@ -333,6 +341,11 @@ func (self *GroupSession) AdvanceEpoch(pqSecret []byte) error {
 		}
 		if len(pqSecret) == 0 {
 			err = fmt.Errorf("%w: NewPqSecret draws one and there is no default", ErrNilPqSecret)
+			return
+		}
+		if len(pqSecret) != PqSecretBytes {
+			err = fmt.Errorf("%w: %d octets, and it is the ikm of the storage_root of the epoch this session is moving into",
+				ErrPqSecretLength, len(pqSecret))
 			return
 		}
 		// erased before it is overwritten, in this body, for installEpochOnLoop's reason.

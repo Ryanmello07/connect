@@ -776,6 +776,109 @@ func TestTwoPqSecretDrawsFromTheProcessSourceDiffer(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// the width, which was defining its own correctness
+// ---------------------------------------------------------------------------
+
+// The width MASTER section 7 fixes for pq_secret[n], transcribed from the document rather than read
+// off the constant this file checks.
+//
+// It is spelled a second time for the reason epochEnvelopeExporterLabel is spelled a second time:
+// a rule that reads PqSecretBytes and then states every expectation in terms of PqSecretBytes
+// compares this package against itself and holds at any width at all. That was measured rather than
+// feared -- narrowing the constant to four octets left mls, mls/syntax, message and messagegroup
+// entirely green, because every width assertion in this file was written in terms of the constant it
+// was checking, and a four octet draw still extracts to a well formed storage_root that both clients
+// agree on.
+const masterSection7PqSecretOctets = 32
+
+// TestThePqSecretWidthIsTheOneMasterSectionSevenFixes pins the width from three sides, of which only
+// the first is a transcription.
+//
+// The DERIVED side is the one a second edit cannot move: section 5.12 step 1's four values are the
+// ikm and the outputs of this package's own key schedule, and HKDF-Extract's output width is a fact
+// about the hash rather than a constant anybody here declares. So the extraction is run and its
+// answer measured. A constant narrowed to four octets fails that comparison whatever else is edited
+// alongside it.
+//
+// The BEHAVIOURAL sides are what stop the transcription being satisfied vacuously in either
+// direction: the sampler must fill a source of exactly the document's width (so the draw cannot
+// grow) and must refuse one octet less (so it cannot shrink), and the constructor -- the door all
+// four values of step 1 arrive through -- is held the same way.
+func TestThePqSecretWidthIsTheOneMasterSectionSevenFixes(t *testing.T) {
+	if PqSecretBytes != masterSection7PqSecretOctets {
+		t.Errorf("PqSecretBytes is %d and MASTER section 7 fixes pq_secret[n] at %d octets. A shorter draw still extracts to a well formed storage_root, still round trips and still agrees between two clients, so nothing else in this tree can tell you",
+			PqSecretBytes, masterSection7PqSecretOctets)
+	}
+	// the derived side: what the extraction this value is the ikm of actually produces
+	extracted := StorageRoot(epochSecretFilled(0x01), epochSecretFilled(0x02))
+	if PqSecretBytes != len(extracted) {
+		t.Errorf("PqSecretBytes is %d and the extraction section 5.12 step 1's values feed and come out of produces %d octets. The width of these values is a property of the key schedule and not a number this package is free to choose",
+			PqSecretBytes, len(extracted))
+	}
+
+	source := make([]byte, masterSection7PqSecretOctets)
+	for i := range source {
+		source[i] = byte(0xc0 + i)
+	}
+	secret, err := NewPqSecret(bytes.NewReader(source))
+	if err != nil {
+		t.Fatalf("NewPqSecret over a source of MASTER section 7's own width: %v -- the draw is WIDER than the document's and takes more entropy than the specification gives it", err)
+	}
+	if !bytes.Equal(secret, source) {
+		t.Errorf("NewPqSecret over a %d octet source answered %d octets, %x", len(source), len(secret), secret)
+	}
+	if answered, err := NewPqSecret(bytes.NewReader(source[:masterSection7PqSecretOctets-1])); err == nil {
+		t.Errorf("NewPqSecret answered %x from a source one octet short of MASTER section 7's width, so the draw is NARROWER than the document's", answered)
+	}
+
+	// and the constructor's door, held the same two ways
+	engine := newTestEngine(t)
+	handle := engine.createGroup(t, "pq-secret-width")
+	full := func() []byte {
+		value := make([]byte, masterSection7PqSecretOctets)
+		for i := range value {
+			value[i] = 0x77
+		}
+		return value
+	}
+	if _, err := NewProvisionalEpoch(handle, 1, full(), full(), full(), full()); err != nil {
+		t.Errorf("NewProvisionalEpoch refused four values of MASTER section 7's own width: %v", err)
+	}
+	for _, wrong := range []int{masterSection7PqSecretOctets - 1, masterSection7PqSecretOctets + 1} {
+		if _, err := NewProvisionalEpoch(handle, 1, make([]byte, wrong), full(), full(), full()); !errors.Is(err, ErrProvisionalEpochValue) {
+			t.Errorf("NewProvisionalEpoch answered %v for a %d octet storage_root, want ErrProvisionalEpochValue: the four values of step 1 are %d octets each",
+				err, wrong, masterSection7PqSecretOctets)
+		}
+	}
+
+	// AND THE SESSION'S TWO DOORS, which is where a pq_secret reaches the seal path TODAY --
+	// NewProvisionalEpoch has no production caller until task 15, and the review that found this
+	// width unpinned named session.go's guard as the other half of the same gap: it checked that
+	// the value was non EMPTY and nothing else, so a four octet secret walked into
+	// StorageRoot(mls_secret, pq_secret) as the ikm and every test in this package stayed green.
+	// The property is one property -- pq_secret[n] is thirty two octets -- so its doors are held
+	// in one place rather than one case per file.
+	for _, wrong := range []int{masterSection7PqSecretOctets - 1, masterSection7PqSecretOctets + 1} {
+		if probe, err := buildProbeSession(make([]byte, wrong)); !errors.Is(err, ErrPqSecretLength) {
+			if probe != nil {
+				probe.session.Close()
+			}
+			t.Errorf("NewGroupSession answered %v for a %d octet pq_secret, want ErrPqSecretLength", err, wrong)
+		}
+	}
+	probe, err := buildProbeSession(testPqSecret())
+	if err != nil {
+		t.Fatalf("buildProbeSession: %v", err)
+	}
+	defer probe.session.Close()
+	for _, wrong := range []int{masterSection7PqSecretOctets - 1, masterSection7PqSecretOctets + 1} {
+		if err := probe.session.AdvanceEpoch(make([]byte, wrong)); !errors.Is(err, ErrPqSecretLength) {
+			t.Errorf("AdvanceEpoch answered %v for a %d octet pq_secret, want ErrPqSecretLength", err, wrong)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // the fixture the provisional epoch properties run over
 // ---------------------------------------------------------------------------
 
@@ -930,6 +1033,110 @@ func TestDestroyingAProvisionalEpochTwiceClearsOnce(t *testing.T) {
 	}
 }
 
+// A GroupHandle whose ClearPendingCommit records what the value said about itself and then fails.
+//
+// It embeds the real handle for the reason epochClearCountingHandle does, and it overrides the one
+// method the destructor calls out through, because what it is standing in for is not a stub group --
+// it is a group whose ClearPendingCommit did not return. engine.go's open item M1-43 contemplates
+// exactly that for a foreign GroupHandle, and it is the ONLY place the destructor can be interrupted:
+// zeroize is this package's own leaf and cannot fail, so a value that is already refusing when this
+// method runs is a value that is already refusing at every point after the destructor started.
+type epochPanickingClearHandle struct {
+	GroupHandle
+	value               *ProvisionalEpoch
+	saw                 bool
+	destroyedWhenCalled bool
+}
+
+func (self *epochPanickingClearHandle) ClearPendingCommit() {
+	self.saw = true
+	self.destroyedWhenCalled = self.value.Destroyed()
+	panic("this group handle failed inside the destructor")
+}
+
+// TestAProvisionalEpochIsAlreadyRefusingWhenItCallsIntoTheGroupHandle is the destructor's ordering,
+// which is fail closed and which nothing held.
+//
+// Destroy sets the flag BEFORE it erases anything and before it calls out of this package. Measured
+// before this case existed: moving that assignment to the end of the body passed the whole suite,
+// and a destructor ordered that way leaves a value that has been fully erased and is still
+// ANSWERING if the call out does not return -- so a caller seals under thirty two zero octets, which
+// is the failure ErrProvisionalEpochDestroyed's own doc comment names.
+func TestAProvisionalEpochIsAlreadyRefusingWhenItCallsIntoTheGroupHandle(t *testing.T) {
+	engine := newTestEngine(t)
+	handle := &epochPanickingClearHandle{GroupHandle: engine.createGroup(t, "destroy-fail-closed")}
+	value, err := NewProvisionalEpoch(handle, handle.Epoch()+1,
+		epochSecretFilled(0x11), epochSecretFilled(0x22), epochSecretFilled(0x33), epochSecretFilled(0x44))
+	if err != nil {
+		t.Fatalf("NewProvisionalEpoch: %v", err)
+	}
+	handle.value = value
+
+	recovered := func() (recovered any) {
+		defer func() {
+			recovered = recover()
+		}()
+		value.Destroy()
+		return nil
+	}()
+
+	if !handle.saw {
+		t.Fatal("the destructor never reached ClearPendingCommit, so this case observed nothing about the order it does things in")
+	}
+	if recovered == nil {
+		t.Fatal("the fixture handle did not fail, so this case observed nothing")
+	}
+	if !handle.destroyedWhenCalled {
+		t.Error("the provisional epoch was still answering when its destructor called out into the group handle. That call is the one place this destructor can be interrupted, and at the moment it runs the four secrets are already erased -- so a value still answering there hands a caller thirty two zero octets rather than a refusal")
+	}
+	for _, method := range epochSliceAnsweringAccessors(t) {
+		results := reflect.ValueOf(value).MethodByName(method.Name).Call(nil)
+		if err := epochErrorResultOf(results); !errors.Is(err, ErrProvisionalEpochDestroyed) {
+			t.Errorf("%s answered %v after a destructor that failed part way, want ErrProvisionalEpochDestroyed", method.Name, err)
+		}
+	}
+}
+
+// TestTheZeroValueOfAProvisionalEpochRefusesAndDestroysWithoutPanicking is the value nobody
+// constructed.
+//
+// NewProvisionalEpoch refuses a nil handle, so `var value ProvisionalEpoch` and a deferred Destroy
+// written above a construction that then failed are the two ways one of these exists, and both are
+// ordinary go. Before this case, the first answered a nil pq_secret and NO error -- a caller that
+// checked the error and sealed under what it was handed would seal under nothing -- and the second
+// took the process down on a nil GroupHandle inside the destructor, on the cleanup path of the
+// failure it was cleaning up.
+func TestTheZeroValueOfAProvisionalEpochRefusesAndDestroysWithoutPanicking(t *testing.T) {
+	value := &ProvisionalEpoch{}
+	for _, method := range epochSliceAnsweringAccessors(t) {
+		results := reflect.ValueOf(value).MethodByName(method.Name).Call(nil)
+		if err := epochErrorResultOf(results); !errors.Is(err, ErrProvisionalEpochDestroyed) {
+			t.Errorf("%s on a zero valued provisional epoch answered %v, want ErrProvisionalEpochDestroyed: it holds no epoch's secrets and a caller handed its zeros with no error beside them would seal under them",
+				method.Name, err)
+		}
+		for _, beside := range results {
+			if beside.Kind() == reflect.Slice && !beside.IsNil() {
+				t.Errorf("%s answered %d values from a zero valued provisional epoch", method.Name, beside.Len())
+			}
+		}
+	}
+
+	recovered := func() (recovered any) {
+		defer func() {
+			recovered = recover()
+		}()
+		value.Destroy()
+		return nil
+	}()
+	if recovered != nil {
+		t.Errorf("destroying a zero valued provisional epoch panicked with %v: a destructor is the one method a caller writes in a defer above the thing it destroys, so it must survive the value never having been made",
+			recovered)
+	}
+	if !value.Destroyed() {
+		t.Error("a destroyed zero value does not report itself destroyed, so task 15's readers would read it as live")
+	}
+}
+
 // The X-Wing wraps are installed once, and a second install is refused rather than dropping the
 // first set.
 //
@@ -999,22 +1206,112 @@ func epochExportedMethodsOfTheProvisionalValue(t *testing.T) []reflect.Method {
 	return methods
 }
 
-// Whether a method type answers an error, and whether it answers anything that is neither an error
-// nor a bool -- which is the shape half of property 4.
+// Whether a method type answers an error, and whether it answers anything that is not an error --
+// which is the shape half of property 4.
+//
+// THERE IS NO BOOL EXEMPTION HERE AND THERE USED TO BE, which is worth saying because the exemption
+// read as harmless and was not. It exempted every result whose Kind is Bool -- derived from the
+// INSTANCE, because Destroyed happens to return one -- while the sentence it was implementing is
+// "neither an error nor the destroyed flag". Under it, an exported PqSecretMatches([]byte) bool or a
+// WrapsInstalled() bool answered about a destroyed value's secret with no door to refuse through and
+// no gate said anything: measured, both passed the whole suite. The exemption is now derived from
+// the PROPERTY instead, by watching what a method answers, in epochIsTheDestroyedFlag below.
 func epochMethodResults(signature reflect.Type) (answersError bool, answersState bool) {
 	errorType := reflect.TypeOf((*error)(nil)).Elem()
 	for i := 0; i < signature.NumOut(); i += 1 {
-		out := signature.Out(i)
-		if out == errorType {
+		if signature.Out(i) == errorType {
 			answersError = true
-			continue
-		}
-		if out.Kind() == reflect.Bool {
 			continue
 		}
 		answersState = true
 	}
 	return answersError, answersState
+}
+
+// Whether one exported method IS the destroyed flag, decided by watching it rather than by its type
+// or by its name.
+//
+// This is the exemption property 4's shape half owes to exactly one method, derived from what that
+// method is FOR rather than from what the one method that exists today happens to return. The flag
+// answers G10's own question, so it takes nothing, answers one bool, and -- the half that makes it
+// the flag -- answers FALSE while the value is live and TRUE once the destructor has run. Nothing
+// else earns the exemption: a method taking an argument is answering a question about that argument
+// and not about the value's state, and a bool that reads true and then false is reporting some other
+// fact and owes a refusal like every other accessor.
+//
+// It holds Destroyed in BOTH directions as a side effect, which is the point rather than an
+// accident. Only one assertion in this file used to touch that method and it ran after Destroy, so a
+// body of `return true` passed the whole suite -- and task 15 property 6's derived reader class is
+// to be built on this flag, which makes a constant here a foundation rather than a wart.
+func epochIsTheDestroyedFlag(method reflect.Method, live *ProvisionalEpoch, destroyed *ProvisionalEpoch) bool {
+	if method.Type.NumIn() != 1 || method.Type.NumOut() != 1 || method.Type.Out(0).Kind() != reflect.Bool {
+		return false
+	}
+	before := reflect.ValueOf(live).MethodByName(method.Name).Call(nil)[0].Bool()
+	after := reflect.ValueOf(destroyed).MethodByName(method.Name).Call(nil)[0].Bool()
+	return !before && after
+}
+
+// Every exported accessor of the provisional value that answers octets, read off the type.
+//
+// The class is what makes the rules over it rules rather than lists: task 15's fan out will add
+// readers, and an accessor added for one of them is in the class on the commit that adds it. A
+// method that takes an argument is not an accessor -- InstallWraps is this type's writer -- and a
+// method answering no slice has no octets to hand back live or copied.
+func epochSliceAnsweringAccessors(t *testing.T) []reflect.Method {
+	t.Helper()
+	accessors := []reflect.Method{}
+	for _, method := range epochExportedMethodsOfTheProvisionalValue(t) {
+		if method.Type.NumIn() != 1 {
+			continue
+		}
+		for i := 0; i < method.Type.NumOut(); i += 1 {
+			if method.Type.Out(i).Kind() == reflect.Slice {
+				accessors = append(accessors, method)
+				break
+			}
+		}
+	}
+	if len(accessors) == 0 {
+		t.Fatal("no exported accessor of *ProvisionalEpoch answers a slice, so every rule below read an empty class and reported clean over it")
+	}
+	return accessors
+}
+
+// The octets one accessor answered, whatever shape it answered them in.
+//
+// A shape this cannot read is FATAL rather than skipped, because a rule that quietly ignores the one
+// accessor it does not recognise stops holding on the commit that adds it -- and the accessor a
+// future task adds is the one these rules exist for.
+func epochBytesAnsweredBy(t *testing.T, value *ProvisionalEpoch, method reflect.Method) [][]byte {
+	t.Helper()
+	results := reflect.ValueOf(value).MethodByName(method.Name).Call(nil)
+	if err := epochErrorResultOf(results); err != nil {
+		t.Fatalf("%s on a live provisional epoch: %v", method.Name, err)
+	}
+	errorType := reflect.TypeOf((*error)(nil)).Elem()
+	answered := [][]byte{}
+	for _, result := range results {
+		// the ERROR is skipped, and nothing else is skipped by its type. A reader that
+		// passed over every result whose Kind is not Slice would be the instance shaped
+		// exemption this file has already been caught by once: an accessor answering octets
+		// AND a counter would have the counter read by nothing and rowed by nothing.
+		if result.Type() == errorType {
+			continue
+		}
+		switch {
+		case result.Type().Elem().Kind() == reflect.Uint8:
+			answered = append(answered, result.Bytes())
+		case result.Type().Elem().Kind() == reflect.Slice && result.Type().Elem().Elem().Kind() == reflect.Uint8:
+			for i := 0; i < result.Len(); i += 1 {
+				answered = append(answered, result.Index(i).Bytes())
+			}
+		default:
+			t.Fatalf("%s answers %s, which this rule cannot read as octets and therefore holds nothing about",
+				method.Name, result.Type())
+		}
+	}
+	return answered
 }
 
 // The error among a call's results, or nil.
@@ -1043,6 +1340,10 @@ func epochErrorResultOf(results []reflect.Value) error {
 func TestEveryAccessorOfAProvisionalEpochRefusesOnceItHasBeenDestroyed(t *testing.T) {
 	fixture := newEpochProvisionalFixture(t, "refuse-after-destroy")
 	methods := epochExportedMethodsOfTheProvisionalValue(t)
+
+	if fixture.value.Destroyed() {
+		t.Fatal("a freshly constructed provisional epoch already reports itself destroyed, so the assertion at the end of this case says nothing about the destructor")
+	}
 
 	answered := 0
 	for i, method := range methods {
@@ -1097,8 +1398,14 @@ func TestEveryAccessorOfAProvisionalEpochRefusesOnceItHasBeenDestroyed(t *testin
 			if beside.Type() == errorType {
 				continue
 			}
-			if beside.Kind() == reflect.Slice && !beside.IsNil() {
-				t.Errorf("%s answered %d octets alongside its refusal", method.Name, beside.Len())
+			// the ZERO value of whatever it answers, rather than a nil SLICE. The
+			// narrower reading examined slice results only, so Epoch could hand back
+			// the live epoch beside its refusal and nothing noticed -- measured -- while
+			// the sentinel's own text is "has been destroyed and answers nothing". A
+			// number, a bool or a struct is a thing answered just as much as octets are.
+			if !beside.IsZero() {
+				t.Errorf("%s answered %v alongside its refusal, and ErrProvisionalEpochDestroyed's own text is that a destroyed value answers nothing",
+					method.Name, beside)
 			}
 		}
 	}
@@ -1116,11 +1423,172 @@ func TestEveryAccessorOfAProvisionalEpochRefusesOnceItHasBeenDestroyed(t *testin
 // nothing: a method answering anything that is neither an error nor the destroyed flag must answer
 // an error beside it.
 func TestNoExportedAccessorOfAProvisionalEpochAnswersStateWithoutARefusal(t *testing.T) {
+	live := newEpochProvisionalFixture(t, "shape-live")
+	gone := newEpochProvisionalFixture(t, "shape-destroyed")
+	gone.value.Destroy()
+
+	flags := []string{}
 	for _, method := range epochExportedMethodsOfTheProvisionalValue(t) {
 		answersError, answersState := epochMethodResults(method.Type)
+		if epochIsTheDestroyedFlag(method, live.value, gone.value) {
+			flags = append(flags, method.Name)
+			continue
+		}
 		if answersState && !answersError {
-			t.Errorf("%s answers state and no error, so it has no way to refuse once the destructor has run and G10's rule has no door to close on it",
+			t.Errorf("%s answers state and no error, so it has no way to refuse once the destructor has run and G10's rule has no door to close on it. The one method exempt from this is the destroyed flag itself, and it earns the exemption by reading false while the value is live and true once it has been destroyed -- which this one does not",
 				method.Name)
+		}
+	}
+	if len(flags) == 0 {
+		t.Error("no exported method of *ProvisionalEpoch reads false while the value is live and true once it has been destroyed, so G10's flag either does not exist or answers the same thing in both states. Task 15 property 6's derived reader class is to be held to that flag, and a constant is not a flag")
+	}
+	t.Logf("the destroyed flag is %v", flags)
+}
+
+// ---------------------------------------------------------------------------
+// property 4, ownership half: the answers are the LIVE octets
+// ---------------------------------------------------------------------------
+
+// TestEveryAccessorOfAProvisionalEpochHandsBackTheLiveSliceAndNotACopy holds the sentence the type's
+// own doc comment calls load-bearing, which nothing held before.
+//
+// "The accessors hand back the LIVE slice rather than a copy" is not a style note. Task 15's fan out
+// builds the device wraps out of these bytes, and if the accessor it reads them through hands back a
+// copy, that copy is a second home for pq_secret[n+1] in the committer's own frame that this
+// destructor never reaches -- so section 5.12 step 2's "MUST NOT be reused" becomes satisfiable
+// again by a caller that did nothing wrong. Measured before this case existed: four separate
+// mutations making PqSecret, StorageRoot, WriteKey, EphRoot and Wraps return copies each passed the
+// whole messagegroup suite.
+//
+// It is asserted two independent ways because either alone has a hole. The WRITE THROUGH says the
+// answer and the field are the same octets NOW; the ERASURE says an answer taken before the
+// destructor is dead after it, which is the property G10 actually promises and the one a future
+// accessor that copied on some paths and not others would fail. Both run over the derived class, so
+// an accessor added by task 15 is held without this case being edited.
+func TestEveryAccessorOfAProvisionalEpochHandsBackTheLiveSliceAndNotACopy(t *testing.T) {
+	fixture := newEpochProvisionalFixture(t, "accessors-hand-back-live")
+	accessors := epochSliceAnsweringAccessors(t)
+
+	// the write through: the next reader of the same door sees what the last one wrote
+	for _, method := range accessors {
+		answered := epochBytesAnsweredBy(t, fixture.value, method)
+		if len(answered) == 0 {
+			t.Fatalf("%s answered no octets at all on a live value, so nothing here reads anything", method.Name)
+		}
+		if len(answered[0]) == 0 {
+			t.Fatalf("%s answered an empty slice on a live value", method.Name)
+		}
+		answered[0][0] ^= 0xff
+		again := epochBytesAnsweredBy(t, fixture.value, method)
+		if len(again) != len(answered) {
+			t.Fatalf("%s answered %d values and then %d", method.Name, len(answered), len(again))
+		}
+		if !bytes.Equal(again[0], answered[0]) {
+			t.Errorf("a write through %s's answer is invisible to the next call of it -- it answered %x and now answers %x -- so it hands back a COPY. The destructor erases the fields, and a caller holding a copy holds an epoch's key material this type's whole promise says has stopped existing",
+				method.Name, answered[0], again[0])
+		}
+	}
+
+	// the erasure: what was handed out before the destructor is dead after it
+	held := map[string][][]byte{}
+	for _, method := range accessors {
+		answered := epochBytesAnsweredBy(t, fixture.value, method)
+		for i, one := range answered {
+			if bytes.Equal(one, make([]byte, len(one))) {
+				t.Fatalf("%s answered %d zero octets at position %d BEFORE the destructor ran, so the erasure check below would pass against any implementation at all",
+					method.Name, len(one), i)
+			}
+		}
+		held[method.Name] = answered
+	}
+
+	fixture.value.Destroy()
+
+	for _, name := range slices.Sorted(maps.Keys(held)) {
+		for i, one := range held[name] {
+			for at, octet := range one {
+				if octet == 0 {
+					continue
+				}
+				t.Errorf("the octets %s handed out before the destructor ran are still live afterwards -- position %d of its answer %d is %#02x -- so that accessor handed back a COPY. Task 15's fan out would hold pq_secret[n+1] in a buffer G10's destructor never sees",
+					name, at, i, octet)
+				break
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the constructor's four indistinguishable secrets
+// ---------------------------------------------------------------------------
+
+// Which value of section 5.12 step 1 each accessor answers, named by the fixture key the constructor
+// was handed it under.
+//
+// The CLASS is derived -- it is every exported accessor that answers octets, read off the type --
+// and only the ANSWERS are written down, which is the shape epochProvisionalFields pins the field
+// set with. An accessor with no row is a failure and a row with no accessor is a failure, so a
+// reader added by task 15 has to say which of step 1's values it is handing out.
+var epochAccessorAnswers = map[string][]string{
+	"StorageRoot": {"storage_root"},
+	"WriteKey":    {"write_key"},
+	"EphRoot":     {"eph_root"},
+	"PqSecret":    {"pq_secret"},
+	"Wraps":       {"the first wrap", "the second wrap"},
+}
+
+// TestEveryAccessorOfAProvisionalEpochAnswersTheValueItWasBuiltFrom closes the transposition.
+//
+// NewProvisionalEpoch takes four thirty two octet slices in a row, and to the compiler they are one
+// type repeated four times: a caller that passes eph_root where storage_root goes builds, runs, and
+// derives an entire epoch's class keys off the wrong root. Measured before this case existed: the
+// constructor could file storageRoot and ephRoot into each other's fields and the whole suite stayed
+// green, because exactly one place in this file compared an accessor's answer to a value handed in.
+//
+// The fixture's four fills are distinguishable, and that is checked here rather than assumed --
+// against four equal fills every row below is satisfied by every value and the case reports clean.
+func TestEveryAccessorOfAProvisionalEpochAnswersTheValueItWasBuiltFrom(t *testing.T) {
+	fixture := newEpochProvisionalFixture(t, "accessors-answer-their-own")
+	for _, one := range slices.Sorted(maps.Keys(fixture.aliases)) {
+		for _, other := range slices.Sorted(maps.Keys(fixture.aliases)) {
+			if one >= other {
+				continue
+			}
+			if bytes.Equal(fixture.aliases[one], fixture.aliases[other]) {
+				t.Fatalf("the fixture handed the same octets to %s and to %s, so a transposition between the two is unobservable and every row below passes vacuously",
+					one, other)
+			}
+		}
+	}
+
+	answered := []string{}
+	for _, method := range epochSliceAnsweringAccessors(t) {
+		rows, isRowed := epochAccessorAnswers[method.Name]
+		if !isRowed {
+			t.Errorf("%s answers octets and this rule carries no row saying WHICH of section 5.12 step 1's values they are, so a constructor filing it under the wrong field would answer here unchallenged",
+				method.Name)
+			continue
+		}
+		answered = append(answered, method.Name)
+		got := epochBytesAnsweredBy(t, fixture.value, method)
+		if len(got) != len(rows) {
+			t.Errorf("%s answered %d values and its row names %d", method.Name, len(got), len(rows))
+			continue
+		}
+		for i, want := range rows {
+			expected, isHeld := fixture.aliases[want]
+			if !isHeld {
+				t.Fatalf("this rule's row for %s names %q and the fixture handed the constructor no such value", method.Name, want)
+			}
+			if !bytes.Equal(got[i], expected) {
+				t.Errorf("%s answered %x at position %d and the fixture handed %s = %x in: the four values of step 1 are one type repeated four times, so a transposition between two of them is a program that builds and a key schedule that is somebody else's",
+					method.Name, got[i], i, want, expected)
+			}
+		}
+	}
+	for _, name := range slices.Sorted(maps.Keys(epochAccessorAnswers)) {
+		if !slices.Contains(answered, name) {
+			t.Errorf("this rule carries a row for %s and *ProvisionalEpoch has no such octet answering accessor, so the pin describes a surface that no longer exists", name)
 		}
 	}
 }

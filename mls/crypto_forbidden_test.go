@@ -56,6 +56,196 @@ import (
 // with it.
 var forbiddenScanRoots = []string{".", "../message", "../messagegroup"}
 
+// The directories this list must name, derived rather than read off it.
+//
+// R5, and it is the half this list was failing: the class these guardrails cover was a written
+// list of three directories, so a FOURTH package of this module doing cryptography was invisible
+// to every gate that aliases it -- an entropy taking function there, or a direct crypto/hkdf call,
+// would have been scanned by nothing and reported clean by everything.
+//
+// The property, said as a property: a package is in scope when it does CRYPTOGRAPHY and is
+// CONNECTED to the packages URmessage is built from. Both halves are read off the source. "Does
+// cryptography" is an import of crypto, crypto/... or golang.org/x/crypto/... in production
+// source, which is derived off the import path rather than off a list of primitive names -- the
+// same reading the ban lists below use one layer down. "Connected" is the undirected component of
+// this package in the module's own import graph, so a sibling that imports one of these, or that
+// one of these imports, joins on the commit that adds the edge and not on the commit somebody
+// remembers to widen a list.
+//
+// It is measured over the whole module and the answer today is exactly the three roots above.
+// mls/syntax is in the component and is NOT in the class, because it imports no crypto at all --
+// it is a codec -- and on the day it imports one it becomes a scan root here rather than a hole.
+// The module's root package, blocker and extender all do cryptography and are NOT in the
+// component: they are the legacy side this file's header already excludes, and the edge that would
+// bring them in is the one connect/layering_test.go refuses.
+//
+// The list is kept as a LIST because twenty odd gates alias it and a value computed at init that
+// came back short would narrow every one of them in silence, which is this tree's most expensive
+// failure mode. So the class is derived and only the answer is written down, and the two are
+// required to be equal in both directions: a root in the class and not in the list fails here, and
+// so does a root in the list that the class does not contain.
+func cryptographicUrmessageDirectories(t *testing.T) []string {
+	t.Helper()
+	const moduleRoot = ".."
+	modulePath := ""
+	goMod, err := os.ReadFile(filepath.Join(moduleRoot, "go.mod"))
+	if err != nil {
+		t.Fatalf("read the module's go.mod: %v -- this rule walks the module and cannot say where it starts", err)
+	}
+	for _, line := range strings.Split(string(goMod), "\n") {
+		if after, found := strings.CutPrefix(strings.TrimSpace(line), "module "); found {
+			modulePath = strings.TrimSpace(after)
+			break
+		}
+	}
+	if modulePath == "" {
+		t.Fatal("go.mod declares no module path, so every in module import below would resolve to nothing and the component would be this package alone")
+	}
+	rootPath, err := filepath.Abs(moduleRoot)
+	if err != nil {
+		t.Fatalf("resolve the module root: %v", err)
+	}
+	ownPath, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatalf("resolve this package: %v", err)
+	}
+	ownKey, err := filepath.Rel(rootPath, ownPath)
+	if err != nil {
+		t.Fatalf("place this package inside the module: %v", err)
+	}
+	ownKey = filepath.ToSlash(ownKey)
+
+	holdsSource := map[string]bool{}
+	doesCrypto := map[string]bool{}
+	edges := map[string][]string{}
+	fileSet := token.NewFileSet()
+	frontier := []string{moduleRoot}
+	for 0 < len(frontier) {
+		dir := frontier[len(frontier)-1]
+		frontier = frontier[:len(frontier)-1]
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatalf("read %s: %v", dir, err)
+		}
+		relative, err := filepath.Rel(moduleRoot, dir)
+		if err != nil {
+			t.Fatalf("place %s inside the module: %v", dir, err)
+		}
+		key := filepath.ToSlash(relative)
+		for _, entry := range entries {
+			name := entry.Name()
+			if entry.IsDir() {
+				// testdata is skipped for the reason forbiddenControlRoot exists: the
+				// fixtures under it commit every banned act on purpose, and they are
+				// unbuildable by the go tool, so they are not packages of this module.
+				if strings.HasPrefix(name, ".") || name == "testdata" || name == "vendor" {
+					continue
+				}
+				frontier = append(frontier, filepath.Join(dir, name))
+				continue
+			}
+			if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+				continue
+			}
+			parsed, err := parser.ParseFile(fileSet, filepath.Join(dir, name), nil,
+				parser.ImportsOnly|parser.SkipObjectResolution)
+			if err != nil {
+				t.Fatalf("parse %s: %v", filepath.Join(dir, name), err)
+			}
+			holdsSource[key] = true
+			for _, spec := range parsed.Imports {
+				imported := strings.Trim(spec.Path.Value, `"`)
+				if imported == "crypto" || strings.HasPrefix(imported, "crypto/") ||
+					strings.HasPrefix(imported, "golang.org/x/crypto/") {
+					doesCrypto[key] = true
+				}
+				if sibling, found := strings.CutPrefix(imported, modulePath); found {
+					sibling = strings.TrimPrefix(sibling, "/")
+					if sibling == "" {
+						sibling = "."
+					}
+					edges[key] = append(edges[key], sibling)
+					edges[sibling] = append(edges[sibling], key)
+				}
+			}
+		}
+	}
+	// three floors, because a walk that read nothing answers what a clean module answers
+	if !holdsSource["."] {
+		t.Fatal("the walk found no production source in the module's own root package, so it did not reach the top of the module and the component below is whatever it happened to see")
+	}
+	if !holdsSource[ownKey] {
+		t.Fatalf("the walk found no production source in %s, which is the package it is running in", ownKey)
+	}
+	if !doesCrypto[ownKey] {
+		t.Fatalf("%s reads as importing no crypto package at all, so the class this rule derives cannot contain the package whose guardrails it is checking", ownKey)
+	}
+
+	component := map[string]bool{ownKey: true}
+	reach := []string{ownKey}
+	for 0 < len(reach) {
+		at := reach[len(reach)-1]
+		reach = reach[:len(reach)-1]
+		for _, next := range edges[at] {
+			if component[next] || !holdsSource[next] {
+				continue
+			}
+			component[next] = true
+			reach = append(reach, next)
+		}
+	}
+	class := []string{}
+	outside := []string{}
+	for key := range component {
+		if doesCrypto[key] {
+			class = append(class, key)
+			continue
+		}
+		outside = append(outside, key)
+	}
+	slices.Sort(class)
+	slices.Sort(outside)
+	if len(class) < 2 {
+		t.Fatalf("this reading finds %v and nothing else, so it has stopped seeing the module's import graph: connect/message and connect/messagegroup are two packages this one is connected to and both do cryptography", class)
+	}
+	t.Logf("%d packages walked, component %d, cryptographic %v, connected and not cryptographic %v",
+		len(holdsSource), len(component), class, outside)
+	return class
+}
+
+// TestTheScanRootsAreEveryCryptographicPackageConnectedToThisOne is R5 over this file's own scope.
+//
+// A gate that derives its class and then walks an enumerated scope is not a derived gate, and that
+// is what the three roots above were until this case existed. What is asserted is equality in both
+// directions with a class read off the module: a fourth package of this module that does
+// cryptography and shares an import edge with these fails here on the commit that adds it, and a
+// root left in the list after its package stopped qualifying fails here too.
+func TestTheScanRootsAreEveryCryptographicPackageConnectedToThisOne(t *testing.T) {
+	derived := cryptographicUrmessageDirectories(t)
+
+	ownPath, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatalf("resolve this package: %v", err)
+	}
+	rootPath, err := filepath.Abs("..")
+	if err != nil {
+		t.Fatalf("resolve the module root: %v", err)
+	}
+	ownKey, err := filepath.Rel(rootPath, ownPath)
+	if err != nil {
+		t.Fatalf("place this package inside the module: %v", err)
+	}
+	declared := []string{}
+	for _, root := range forbiddenScanRoots {
+		declared = append(declared, filepath.ToSlash(filepath.Clean(filepath.Join(filepath.ToSlash(ownKey), root))))
+	}
+	slices.Sort(declared)
+	if !slices.Equal(derived, declared) {
+		t.Errorf("forbiddenScanRoots names %v and the cryptographic packages this one is connected to are %v. Every gate in this package that aliases that list reads exactly the directories it names, so a package in the class and not in the list is a package no guardrail in this tree scans: a direct crypto/hkdf call there is guardrail 1 gone, and an entropy taking function there is the nil source substitution p5 shipped twice",
+			declared, derived)
+	}
+}
+
 // The fixture tree the positive controls scan. It sits under testdata on purpose, which
 // is what makes it unreachable from the roots above and unbuildable by the go tool.
 const forbiddenControlRoot = "testdata/forbidden"

@@ -108,6 +108,16 @@ func NewPqSecret(random io.Reader) ([]byte, error) {
 // arrays live after Destroy had run, which is a destructor that destroys a duplicate. For the same
 // reason the accessors hand back the LIVE slice rather than a copy: task 15's fan out builds the
 // device wraps out of these bytes, and the whole of G10 is that those bytes stop existing together.
+// That sentence is HELD and is not a comment -- epoch_test.go's
+// TestEveryAccessorOfAProvisionalEpochHandsBackTheLiveSliceAndNotACopy derives the class of slice
+// answering accessors off the type and requires each one's answer to be dead after Destroy, because
+// an accessor that copied would hand task 15 a buffer this destructor never reaches and section
+// 5.12 step 2's "MUST NOT be reused" would be quietly satisfiable again.
+//
+// THE ZERO VALUE IS NOT ONE OF THESE. NewProvisionalEpoch is the only thing that makes one, and a
+// value that did not come from it holds no handle: every accessor refuses it for that reason rather
+// than answering the zeros it happens to hold, and Destroy is a no-op on it rather than a nil
+// dereference on the caller's cleanup path.
 //
 // It is NOT safe for concurrent use and is not meant to be. A commit is built on one goroutine --
 // GroupSession's, per spec A section 3.6 -- and a lock here would buy nothing except the appearance
@@ -199,32 +209,32 @@ func NewProvisionalEpoch(handle GroupHandle, epoch uint64,
 
 // Epoch is n+1, the epoch this state was built for.
 func (self *ProvisionalEpoch) Epoch() (uint64, error) {
-	if self.destroyed {
-		return 0, self.refuse("epoch")
+	if err := self.unusable("epoch"); err != nil {
+		return 0, err
 	}
 	return self.epoch, nil
 }
 
 // StorageRoot is storage_root[n+1], live rather than copied.
 func (self *ProvisionalEpoch) StorageRoot() ([]byte, error) {
-	if self.destroyed {
-		return nil, self.refuse("storage_root")
+	if err := self.unusable("storage_root"); err != nil {
+		return nil, err
 	}
 	return self.storageRoot, nil
 }
 
 // WriteKey is write_key[n+1], live rather than copied.
 func (self *ProvisionalEpoch) WriteKey() ([]byte, error) {
-	if self.destroyed {
-		return nil, self.refuse("write_key")
+	if err := self.unusable("write_key"); err != nil {
+		return nil, err
 	}
 	return self.writeKey, nil
 }
 
 // EphRoot is eph_root[n+1], live rather than copied.
 func (self *ProvisionalEpoch) EphRoot() ([]byte, error) {
-	if self.destroyed {
-		return nil, self.refuse("eph_root")
+	if err := self.unusable("eph_root"); err != nil {
+		return nil, err
 	}
 	return self.ephRoot, nil
 }
@@ -235,16 +245,16 @@ func (self *ProvisionalEpoch) EphRoot() ([]byte, error) {
 // lost commit in so many words, and the refusal below is what leaves a retry loop that tried to
 // unable to: after Destroy there is no value to reuse and no door to ask for one through.
 func (self *ProvisionalEpoch) PqSecret() ([]byte, error) {
-	if self.destroyed {
-		return nil, self.refuse("pq_secret")
+	if err := self.unusable("pq_secret"); err != nil {
+		return nil, err
 	}
 	return self.pqSecret, nil
 }
 
 // Wraps is every X-Wing wrap built for this unborn epoch so far.
 func (self *ProvisionalEpoch) Wraps() ([][]byte, error) {
-	if self.destroyed {
-		return nil, self.refuse("the X-Wing wraps")
+	if err := self.unusable("the X-Wing wraps"); err != nil {
+		return nil, err
 	}
 	return self.wraps, nil
 }
@@ -268,8 +278,8 @@ func (self *ProvisionalEpoch) Wraps() ([][]byte, error) {
 // The slices are taken by reference and not copied, for the reason the constructor takes the four
 // secrets that way.
 func (self *ProvisionalEpoch) InstallWraps(wraps [][]byte) error {
-	if self.destroyed {
-		return self.refuse("the X-Wing wraps")
+	if err := self.unusable("the X-Wing wraps"); err != nil {
+		return err
 	}
 	if len(wraps) == 0 {
 		return fmt.Errorf("%w: an empty set is not an install", ErrProvisionalEpochWraps)
@@ -298,7 +308,18 @@ func (self *ProvisionalEpoch) Destroyed() bool {
 // the call site because a caller that has to remember two erasures will one day make one.
 //
 // It is idempotent: a second call is the same state as the first and must not clear a commit the
-// group staged AFTER this state was destroyed, which is exactly what step 5's retry stages.
+// group staged AFTER this state was destroyed, which is exactly what step 5's retry stages. It is
+// also safe on the zero value, which has no handle to clear a commit on: a destructor is the one
+// method a caller writes in a defer before the thing it destroys exists, so a destructor that
+// panicked there would take the process down on the cleanup path of a failure it was cleaning up.
+//
+// The flag is set BEFORE anything else happens here, which is fail closed. What HOLDS that
+// ordering is one observation and it is worth saying which: the only point this body can be
+// interrupted at is the call out to foreign code at the end of it, since zeroize is this package's
+// own leaf and cannot fail, and by then all four secrets are already zeros -- so
+// epoch_test.go's TestAProvisionalEpochIsAlreadyRefusingWhenItCallsIntoTheGroupHandle fails a
+// handle that finds this value still answering. Moving the assignment between two zeroize calls is
+// not observable from anywhere and is not claimed to be.
 //
 // The noinline directive is this package's erase helper class, reached through the hand off to
 // zeroize: the stores it makes are into arrays that outlive this call, and a compiler that inlined
@@ -322,7 +343,31 @@ func (self *ProvisionalEpoch) Destroy() {
 	self.ephRoot = nil
 	self.pqSecret = nil
 	self.wraps = nil
-	self.handle.ClearPendingCommit()
+	if self.handle != nil {
+		self.handle.ClearPendingCommit()
+	}
+}
+
+// unusable is the one door check every accessor above runs, and it answers two conditions rather
+// than one because both of them are "this value has nothing to tell you".
+//
+// The first is G10's: the destructor has run. The second is the ZERO VALUE, and it is here because
+// the alternative was worse than it looks. NewProvisionalEpoch refuses a nil handle, so a value
+// holding none was never constructed -- `var value ProvisionalEpoch`, or a deferred Destroy written
+// above a construction that then failed -- and every field of it is the zero one. Without this
+// check PqSecret on such a value answers a nil secret and NO error, which is precisely the shape
+// ErrProvisionalEpochDestroyed's own doc comment names: a caller that seals under the zeros it was
+// handed rather than stopping at a refusal. One sentinel covers both because a caller's question is
+// the same in both cases and it matches it with one errors.Is.
+func (self *ProvisionalEpoch) unusable(what string) error {
+	if self.handle == nil {
+		return fmt.Errorf("%w: %s of a zero valued provisional epoch, which NewProvisionalEpoch did not make",
+			ErrProvisionalEpochDestroyed, what)
+	}
+	if self.destroyed {
+		return self.refuse(what)
+	}
+	return nil
 }
 
 // refuse is G10's typed refusal, with the field named so a caller reading a log knows which door it

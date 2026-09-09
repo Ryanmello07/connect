@@ -214,6 +214,15 @@ var (
 	// and looks like what it is; a placeholder one fails open and looks like a working
 	// messenger.
 	ErrNilPqSecret = errors.New("messagegroup: a group session requires a pq_secret and there is no default")
+
+	// A pq_secret of the wrong WIDTH, which is a different mistake from having none and is
+	// answered separately so a caller can tell "I passed nothing" from "I passed the wrong
+	// thing". It is here because the session was the one door this value reaches the seal path
+	// through that checked only that it was non empty: MASTER section 7 fixes pq_secret[n] at
+	// thirty two octets, a four octet one extracts to a well formed storage_root that both
+	// clients agree on, and every test in this package stayed green over it.
+	ErrPqSecretLength = errors.New("messagegroup: a pq_secret is not the thirty two octets MASTER section 7 fixes")
+
 	// Fires when a session is opened at an epoch after zero with no epoch zero group handle
 	// key. group_handle_key is fixed at group creation and is PERSISTED state; a constructor
 	// that recomputed it from the current epoch would give every epoch a different
