@@ -891,6 +891,7 @@ func TestTheTwoTranscriptHashesAreNotSubstitutable(t *testing.T) {
 func trRecordLayerCodecMethods(t *testing.T) []string {
 	t.Helper()
 	found := []string{}
+	notRecordLayer := []string{}
 	for _, of := range []reflect.Type{
 		reflect.TypeOf((*syntax.Writer)(nil)),
 		reflect.TypeOf((*syntax.Reader)(nil)),
@@ -898,6 +899,8 @@ func trRecordLayerCodecMethods(t *testing.T) []string {
 		for i := 0; i < of.NumMethod(); i++ {
 			if name := of.Method(i).Name; strings.HasSuffix(name, "LP") {
 				found = append(found, name)
+			} else {
+				notRecordLayer = append(notRecordLayer, of.Elem().Name()+"."+name)
 			}
 		}
 	}
@@ -906,6 +909,16 @@ func trRecordLayerCodecMethods(t *testing.T) []string {
 	if len(found) == 0 {
 		t.Fatalf("no LP suffixed method was read off syntax.Writer or syntax.Reader, so the gate below forbids nothing")
 	}
+	// and the COMPLEMENT is printed. This is a name test over a reflected method set, the shape
+	// GATES.md indexes, and until now it removed twenty-odd methods without naming one of them.
+	// The sentence that puts them out is the naming rule encode.go states: LP(x) is the master
+	// protocol design notation for a fixed 32 bit big endian length, so a method carrying the
+	// suffix is a record layer entry point and one without it is not.
+	if len(notRecordLayer) == 0 {
+		t.Fatalf("every method of syntax.Writer and syntax.Reader carries the LP suffix, so this name test removes nothing")
+	}
+	t.Logf("the record layer entry points are %v; the %d methods of syntax.Writer and syntax.Reader this suffix removes, none of which is a fixed 32 bit length prefixed entry point, are %v",
+		found, len(notRecordLayer), notRecordLayer)
 	return found
 }
 

@@ -283,8 +283,7 @@ func TestEveryPerTypeViewOfAProposalListIsItsCommitOrderFiltered(t *testing.T) {
 				proposalTypeName(carries), method.Name)
 			continue
 		}
-		answered := reflect.ValueOf(list).MethodByName(method.Name).Call(nil)[0].
-			Interface().([]CachedProposal)
+		answered := proposalListViewAnswer(t, list, method.Name)
 		got := []LeafIndex{}
 		for _, entry := range answered {
 			if entry.Proposal.ProposalType != carries {

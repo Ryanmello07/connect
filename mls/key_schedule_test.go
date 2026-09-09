@@ -3262,6 +3262,11 @@ func bytesTheGroupHandsOut(t *testing.T, at string, group *Group) []exposedSlice
 		t.Fatalf("%s: no exported method of *Group was read as an eraser, and Close is one; the signature filter is matching nothing and this sweep is reading a closed group",
 			at)
 	}
+	// and it is PRINTED as well as counted. A non-empty check says the exclusion fired; it
+	// does not say WHAT it removed, and a member that quietly joined the removed set is
+	// exactly the fault GATES.md indexes this line for.
+	t.Logf("%s: the %d exported methods of *Group this sweep removes, because they take nothing and answer only errors and so hand nothing out, are %v",
+		at, len(skipped), skipped)
 	for _, one := range exposed {
 		if !bytes.Equal(one.bytes, one.taken) {
 			t.Fatalf("%s: %s changed after this sweep read it, so what it collected is not what those methods answered and every comparison over it runs against the rewrite",
@@ -9494,12 +9499,14 @@ var scheduleMethodsThatStillAnswerAfterAnErase = map[string]string{
 func TestAnErasedScheduleRefusesRatherThanAnsweringFromZeros(t *testing.T) {
 	scheduleType := reflect.TypeOf(&KeySchedule{})
 	class := []string{}
+	erasers := []string{}
 	for i := range scheduleType.NumMethod() {
 		method := scheduleType.Method(i)
 		// an eraser answers nothing over a live epoch either, so there is no refusal for it
 		// to make and nothing for the live control to observe. Told apart by the shape, which
 		// is the same rule hasSomewhereToPutASecret states for the source.
 		if method.Type.NumOut() == 0 {
+			erasers = append(erasers, method.Name)
 			continue
 		}
 		class = append(class, method.Name)
@@ -9508,6 +9515,15 @@ func TestAnErasedScheduleRefusesRatherThanAnsweringFromZeros(t *testing.T) {
 		t.Fatalf("this gate reads %d exported methods of *KeySchedule (%v) and the type declares four accessors at least, so it is not reading what it claims to",
 			len(class), class)
 	}
+	// and the COMPLEMENT is printed. An arity-shaped exclusion whose removed members nobody
+	// names is the shape GATES.md indexes this line for, and empty here would mean the filter
+	// matched none of the erasers this type declares -- which is a class one member too wide
+	// reporting a clean bill over a method that has no refusal to make.
+	if len(erasers) == 0 {
+		t.Fatal("no exported method of *KeySchedule answers nothing, and Zeroize is one; this exclusion removed nothing, so it is not reading the type it claims to")
+	}
+	t.Logf("the class this gate holds to a refusal is %v; the %d methods it removes, because they answer nothing at all and so have no refusal to observe, are %v",
+		class, len(erasers), erasers)
 	for name := range scheduleMethodsThatStillAnswerAfterAnErase {
 		if !slices.Contains(class, name) {
 			t.Errorf("scheduleMethodsThatStillAnswerAfterAnErase excuses %s, which is not an exported method of *KeySchedule that answers anything",

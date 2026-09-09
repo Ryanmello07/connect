@@ -527,12 +527,38 @@ func TestNewKeyPackageKeepsTheSigningSeedOffTheWireAndBesideItsOwnLeaf(t *testin
 func mlsEncodingEmitters(t *testing.T) map[string]bool {
 	t.Helper()
 	emitters := map[string]bool{}
+	// PRINT THE COMPLEMENT, AND PROVE THE SENTENCE THAT DESCRIBES IT. This name test removes
+	// four methods of *syntax.Writer -- Bytes, Err, Len and MaxVectorLength -- and until now it
+	// removed them in silence, which is the shape GATES.md indexes: a name-shaped narrowing over
+	// a class the compiler can describe, with a complement nobody had read. The sentence that
+	// puts them out is "they take nothing and answer the writer accumulated state; an emitter
+	// puts something INTO it", and that sentence is a SHAPE, so it is read off the type
+	// independently below and the two readings are required to agree. A Write-named method
+	// taking no argument, or an emitter named anything else, is fatal here rather than joining
+	// or leaving this class unremarked.
 	writer := reflect.TypeOf(&syntax.Writer{})
+	namedWrite, takesSomething, notEmitters := []string{}, []string{}, []string{}
 	for i := 0; i < writer.NumMethod(); i++ {
-		if name := writer.Method(i).Name; strings.HasPrefix(name, "Write") {
-			emitters[name] = true
+		method := writer.Method(i)
+		if strings.HasPrefix(method.Name, "Write") {
+			namedWrite = append(namedWrite, method.Name)
+			emitters[method.Name] = true
+		} else {
+			notEmitters = append(notEmitters, method.Name+" "+method.Type.String())
+		}
+		if method.Type.NumIn() > 1 {
+			takesSomething = append(takesSomething, method.Name)
 		}
 	}
+	if !slices.Equal(namedWrite, takesSomething) {
+		t.Fatalf("the Write-named methods of *syntax.Writer are %v and the ones that take something to write are %v; this name test is only the property while those two are the same set",
+			namedWrite, takesSomething)
+	}
+	if len(notEmitters) == 0 {
+		t.Fatal("every method of *syntax.Writer is named Write<something>, so this name test removes nothing and its complement cannot be read")
+	}
+	t.Logf("%d emitters read off *syntax.Writer; the %d methods this name removes, each of which takes nothing and answers the writer own state: %v",
+		len(namedWrite), len(notEmitters), notEmitters)
 	marshaler := reflect.TypeOf((*syntax.Marshaler)(nil)).Elem()
 	for i := 0; i < marshaler.NumMethod(); i++ {
 		emitters[marshaler.Method(i).Name] = true

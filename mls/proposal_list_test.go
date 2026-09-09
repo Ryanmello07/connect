@@ -1680,11 +1680,27 @@ func proposalListViewMethods(t *testing.T) []reflect.Method {
 	entries := reflect.TypeOf([]CachedProposal{})
 	listType := reflect.TypeOf(&ProposalList{})
 	found := []reflect.Method{}
+	removed := []string{}
 	for i := 0; i < listType.NumMethod(); i += 1 {
 		method := listType.Method(i)
 		signature := method.Type
-		// one receiver and nothing else in, one []CachedProposal out
-		if signature.NumIn() != 1 || signature.NumOut() != 1 || signature.Out(0) != entries {
+		// THE READING IS OFF THE RESULTS, in whatever position they sit and whatever else sits
+		// beside them. This used to open with signature.NumIn() != 1 || signature.NumOut() != 1,
+		// and measured at 81b97ca the complement of those two clauses was EMPTY -- Refs, Len,
+		// PathRequired and Extensions are all removed by the result TYPE test, which is the
+		// property. An arity clause whose complement is empty removes nothing today and starts
+		// removing real members the day one appears: a view answering ([]CachedProposal, error)
+		// once a filter can fail, or a Filtered(ProposalType) []CachedProposal, would have left
+		// this class in silence, and every rule stated over it would have gone on reporting a
+		// clean bill over a class one member short.
+		answersEntries := false
+		for at := 0; at < signature.NumOut(); at += 1 {
+			if signature.Out(at) == entries {
+				answersEntries = true
+			}
+		}
+		if !answersEntries {
+			removed = append(removed, method.Name+" "+signature.String())
 			continue
 		}
 		if method.Name == commitOrder {
@@ -1697,18 +1713,51 @@ func proposalListViewMethods(t *testing.T) []reflect.Method {
 		t.Fatalf("*ProposalList answers no %s, so the one exclusion this class makes excludes nothing",
 			commitOrder)
 	}
+	if len(removed) == 0 {
+		t.Fatal("every exported method of *ProposalList answers cached proposals, so the result reading removes nothing and this class is the method set under another name")
+	}
+	t.Logf("%d per-type views; %s is removed by name because it answers the commit order rather than a view of it, and the %d exported methods removed because no result of theirs is a []CachedProposal are %v",
+		len(found), commitOrder, len(removed), removed)
 	return found
+}
+
+// proposalListViewAnswer reads one view, driven with the zero value of each of its arguments.
+//
+// It is a DRIVER and not a filter, which is the distinction the arity clause above got wrong. A
+// view that takes a filter is in the class the moment it is declared, and it arrives HERE rather
+// than dropping out of the sweep: a member the zero row cannot get a view out of turns these
+// rules red, which is a demand for a row to be written here and not a silent narrowing.
+func proposalListViewAnswer(t *testing.T, list *ProposalList, view string) []CachedProposal {
+	t.Helper()
+	bound := reflect.ValueOf(list).MethodByName(view)
+	if !bound.IsValid() {
+		t.Fatalf("*ProposalList answers no %s", view)
+	}
+	arguments := []reflect.Value{}
+	for at := 0; at < bound.Type().NumIn(); at += 1 {
+		arguments = append(arguments, reflect.Zero(bound.Type().In(at)))
+	}
+	answered := [][]CachedProposal{}
+	for _, result := range bound.Call(arguments) {
+		if failure, isError := result.Interface().(error); isError && failure != nil {
+			t.Fatalf("the %s view driven with the zero value of each argument: %v -- a view that needs a row rather than a zero is a row to write here",
+				view, failure)
+		}
+		if entries, isView := result.Interface().([]CachedProposal); isView {
+			answered = append(answered, entries)
+		}
+	}
+	if len(answered) != 1 {
+		t.Fatalf("the %s view answers %d slices of cached proposals and a view answers one", view, len(answered))
+	}
+	return answered[0]
 }
 
 // proposalListBucketLength reads one per-type view of a list by the name of the method that
 // answers it.
 func proposalListBucketLength(t *testing.T, list *ProposalList, bucket string) int {
 	t.Helper()
-	method := reflect.ValueOf(list).MethodByName(bucket)
-	if !method.IsValid() {
-		t.Fatalf("*ProposalList answers no %s", bucket)
-	}
-	return method.Call(nil)[0].Len()
+	return len(proposalListViewAnswer(t, list, bucket))
 }
 
 // TestEveryProposalTypeTheV1ProfileAcceptsLandsInAViewOfItsOwn holds the profile table to the

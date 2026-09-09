@@ -1665,10 +1665,13 @@ func TestTheGenerateDirectionSharesNoCodePathWithVerify(t *testing.T) {
 // hit fourteen times.
 func TestNoVectorRunnerCanSkip(t *testing.T) {
 	skips := map[string]bool{}
+	notSkips := []string{}
 	reported := reflect.TypeOf((*testing.T)(nil))
 	for index := 0; index < reported.NumMethod(); index++ {
 		if name := reported.Method(index).Name; strings.HasPrefix(name, "Skip") {
 			skips[name] = true
+		} else {
+			notSkips = append(notSkips, name)
 		}
 	}
 	for _, required := range []string{"Skip", "Skipf", "SkipNow"} {
@@ -1679,6 +1682,16 @@ func TestNoVectorRunnerCanSkip(t *testing.T) {
 	if skips["Fatal"] || skips["Fatalf"] {
 		t.Fatalf("the derived skip class %v holds a fatal, so it is matching more than skips", slices.Sorted(maps.Keys(skips)))
 	}
+	// and the COMPLEMENT is printed rather than left to be assumed harmless. The property is
+	// "a member of *testing.T that abandons a test without leaving a verdict", and nothing in
+	// the list below does that -- a sentence about the removed members that a reader can check,
+	// rather than an exclusion nobody sees. Empty here would mean the name test removed nothing,
+	// which is a reflection that read the wrong type.
+	if len(notSkips) == 0 {
+		t.Fatal("every method of *testing.T is named Skip<something>, so this name test removed nothing and the class below is the whole method set")
+	}
+	t.Logf("the derived skip class is %v; the %d methods of *testing.T it removes, none of which abandons a test without a verdict, are %v",
+		slices.Sorted(maps.Keys(skips)), len(notSkips), notSkips)
 
 	flags := func(source string) []string {
 		fileSet := token.NewFileSet()

@@ -1962,28 +1962,57 @@ func capabilityPredicates(t *testing.T) []capabilityPredicate {
 	capabilitiesType := reflect.TypeOf(Capabilities{})
 	pointerType := reflect.TypeOf(&Capabilities{})
 	pairs := []capabilityPredicate{}
+	selected := map[string]bool{}
 	for i := 0; i < capabilitiesType.NumField(); i++ {
 		field := capabilitiesType.Field(i)
 		registry := field.Type.Elem()
 		predicates := []reflect.Method{}
 		for m := 0; m < pointerType.NumMethod(); m++ {
 			method := pointerType.Method(m)
-			if !strings.HasPrefix(method.Name, "Supports") || method.Type.NumIn() != 2 {
+			// THE SHAPE IS THE WHOLE TEST, and the name test that used to open this loop is
+			// gone. It read !strings.HasPrefix(method.Name, "Supports") over a class the
+			// compiler already describes, and measured at 81b97ca its complement was EMPTY:
+			// MarshalMLS takes a *syntax.Writer, UnmarshalMLS a *syntax.Reader, and Supports a
+			// *RequiredCapabilities answering an error, so all three were already removed by
+			// the two clauses below. A narrowing whose complement is empty removes nothing
+			// today and begins removing real members on the commit that adds the first one of
+			// the shape it excludes -- here a predicate named Accepts or Knows, which would
+			// have been unjudged while the one-field-one-predicate fatal below read clean.
+			if method.Type.NumIn() != 2 || method.Type.In(1) != registry {
 				continue
 			}
-			if method.Type.In(1) == registry && method.Type.NumOut() == 1 && method.Type.Out(0).Kind() == reflect.Bool {
-				predicates = append(predicates, method)
+			if method.Type.NumOut() != 1 || method.Type.Out(0).Kind() != reflect.Bool {
+				continue
 			}
+			predicates = append(predicates, method)
 		}
 		if len(predicates) != 1 {
-			t.Fatalf("Capabilities.%s is a slice of %s and %d Supports predicates take that type (%v); one field, one predicate",
-				field.Name, registry.Name(), len(predicates), predicates)
+			t.Fatalf("Capabilities.%s is a slice of %s and %d methods take one %s and answer one bool (%v); one field, one predicate",
+				field.Name, registry.Name(), len(predicates), registry.Name(), predicates)
 		}
+		selected[predicates[0].Name] = true
 		pairs = append(pairs, capabilityPredicate{field: field.Name, registry: registry, predicate: predicates[0]})
 	}
 	if len(pairs) != capabilitiesType.NumField() {
 		t.Fatalf("%d of Capabilities' %d fields were paired with a predicate", len(pairs), capabilitiesType.NumField())
 	}
+	// AND THE COMPLEMENT IS PRINTED, which is the operational half of the rule GATES.md
+	// states: a gate that narrows names, at run time, every member it removed and the
+	// predicate it removed them by. Empty here would mean every exported method of the type is
+	// a registry predicate, which is not a pairing at all but the method set under another name.
+	removed := []string{}
+	for m := 0; m < pointerType.NumMethod(); m++ {
+		method := pointerType.Method(m)
+		if selected[method.Name] {
+			continue
+		}
+		removed = append(removed, method.Name+" "+method.Type.String())
+	}
+	if len(removed) == 0 {
+		t.Fatal("every exported method of *Capabilities was paired with a field as its predicate, so the shape test above removes nothing and this class is the method set under another name")
+	}
+	t.Logf("%d (field, predicate) pairs; the %d exported methods of *Capabilities this shape removes, none of which takes one registry code point and answers one bool: %v",
+		len(pairs), len(removed), removed)
 	return pairs
 }
 
