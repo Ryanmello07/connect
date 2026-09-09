@@ -5458,8 +5458,21 @@ func TestEveryConstructionHandedAProviderReadsKdfNhFromIt(t *testing.T) {
 // worth of secrets the group believes are gone.
 //
 // The class is read off the type rather than named: every exported method of *KeySchedule
-// that takes no argument and answers a pointer, so an accessor added later joins by
-// existing. Three things are asserted, because each is satisfiable by a different wrong
+// with a POINTER among its results, so an accessor added later joins by existing.
+//
+// It used to read "takes no argument, answers exactly one result, and that result is a
+// pointer", which is the same narrowing-by-arity the provisional epoch's accessor class in
+// connect/messagegroup was found carrying on 2026-09-09 -- a class derived from the
+// PROPERTY and then narrowed by the shape its members happen to have. Measured at 81b97ca
+// the complement of that narrowing was EMPTY: no method this type declares was removed by
+// it, which is what a filter written for the members that exist looks like from outside. A
+// Secrets-shaped accessor taking an epoch, or answering (*scheduleSecrets, error), would
+// have dropped out of this gate on the commit that added it and taken the schedule's own
+// storage with it. An argument-taking member is now REFUSED rather than skipped, every
+// pointer among a method's results is a row rather than only the first, and the complement
+// is printed. GATES.md carries the rule and the query.
+//
+// Three things are asserted, because each is satisfiable by a different wrong
 // implementation — two calls answer the same pointer, a write through it is visible to the
 // next call, and two schedules answer different pointers, which is what separates "into the
 // schedule's own storage" from "into a package level singleton".
@@ -5469,34 +5482,56 @@ func TestEveryAccessorAnsweringAPointerAnswersIntoTheSchedulesOwnStorage(t *test
 		t.Fatalf("the corpus answered for %d epochs and the last assertion here needs two schedules", len(epochs))
 	}
 	answered := []string{}
+	excluded := []string{}
 	scheduleType := reflect.TypeOf((*KeySchedule)(nil))
 	for i := range scheduleType.NumMethod() {
 		method := scheduleType.Method(i)
-		if method.Type.NumIn() != 1 || method.Type.NumOut() != 1 || method.Type.Out(0).Kind() != reflect.Pointer {
+		pointers := []int{}
+		for at := range method.Type.NumOut() {
+			if method.Type.Out(at).Kind() == reflect.Pointer {
+				pointers = append(pointers, at)
+			}
+		}
+		if len(pointers) == 0 {
+			excluded = append(excluded, method.Name+" "+method.Type.String())
 			continue
 		}
-		answered = append(answered, method.Name)
-		pointerOf := func(schedule *KeySchedule) uintptr {
-			return method.Func.Call([]reflect.Value{reflect.ValueOf(schedule)})[0].Pointer()
-		}
-		schedule := epochs[0].schedule(t)
-		first, second := pointerOf(schedule), pointerOf(schedule)
-		if first == 0 {
-			t.Errorf("(*KeySchedule).%s answered nil, so this row observed nothing", method.Name)
+		// an argument-taking member is REFUSED and not skipped, which is the difference
+		// between a gate that narrows and a gate that fails closed: this one cannot drive
+		// it, and a method that hands out the schedule's own storage must not leave the
+		// class by growing a parameter
+		if method.Type.NumIn() != 1 {
+			t.Errorf("(*KeySchedule).%s answers a pointer and takes %d arguments, so this gate cannot drive it; give it a row rather than letting a method that hands out the schedule's own storage fall outside this class",
+				method.Name, method.Type.NumIn()-1)
 			continue
 		}
-		if first != second {
-			t.Errorf("(*KeySchedule).%s answered a different address on each call, so it is handing back a copy rather than the schedule's own storage; an erase that nils the fields would leave that copy holding live keys",
-				method.Name)
-		}
-		if other := pointerOf(epochs[1].schedule(t)); other == first {
-			t.Errorf("(*KeySchedule).%s answered the same address for two different schedules, so it is not answering into either one's own storage",
-				method.Name)
+		for _, at := range pointers {
+			where := fmt.Sprintf("(*KeySchedule).%s result %d", method.Name, at)
+			answered = append(answered, where)
+			pointerOf := func(schedule *KeySchedule) uintptr {
+				return method.Func.Call([]reflect.Value{reflect.ValueOf(schedule)})[at].Pointer()
+			}
+			schedule := epochs[0].schedule(t)
+			first, second := pointerOf(schedule), pointerOf(schedule)
+			if first == 0 {
+				t.Errorf("%s answered nil, so this row observed nothing", where)
+				continue
+			}
+			if first != second {
+				t.Errorf("%s answered a different address on each call, so it is handing back a copy rather than the schedule's own storage; an erase that nils the fields would leave that copy holding live keys",
+					where)
+			}
+			if other := pointerOf(epochs[1].schedule(t)); other == first {
+				t.Errorf("%s answered the same address for two different schedules, so it is not answering into either one's own storage",
+					where)
+			}
 		}
 	}
 	if len(answered) == 0 {
 		t.Fatal("no exported method of *KeySchedule answers a pointer, so this gate swept nothing; Secrets() is one")
 	}
+	t.Logf("the pointer answering class of *KeySchedule is %v; excluded because no result of theirs is a pointer: %v",
+		answered, excluded)
 
 	// and the write through, which is the property the aliasing exists for. Reflection can
 	// say two calls agree on an address; only a write says the address is the storage the

@@ -54,6 +54,10 @@ import (
 // read no production file of. The hkdf and .ECDH( confinements are the half that would go
 // quiet. Five other gates alias this value rather than restating it, so they gained the root
 // with it.
+//
+// This list is the SCOPE half of the rule GATES.md states: a gate that reads a set of
+// directories has to derive that set and print the ones it did not read. It was the fourth
+// of the five instances recorded there, and the derivation asserting it is directly below.
 var forbiddenScanRoots = []string{".", "../message", "../messagegroup"}
 
 // The directories this list must name, derived rather than read off it.

@@ -963,6 +963,29 @@ func newEpochProvisionalFixture(t *testing.T, name string) *epochProvisionalFixt
 	}
 }
 
+// A LIVE provisional epoch whose four secrets and wrap are the octets the destructor leaves behind.
+//
+// It exists for the destroyed flag's exemption and for nothing else. Destroy changes two things
+// about a value at once -- it sets the flag and it zeroizes -- so a value that is live and already
+// holds zeros is the one probe that tells those two apart, and a bool that reads the secrets rather
+// than the flag answers TRUE here while the value is still live.
+//
+// The handle is a real group, for the reason epochClearCountingHandle gives.
+func newEpochProvisionalOfErasedOctets(t *testing.T, name string) *ProvisionalEpoch {
+	t.Helper()
+	handle := newTestEngine(t).createGroup(t, name)
+	value, err := NewProvisionalEpoch(handle, handle.Epoch()+1,
+		make([]byte, PqSecretBytes), make([]byte, PqSecretBytes),
+		make([]byte, PqSecretBytes), make([]byte, PqSecretBytes))
+	if err != nil {
+		t.Fatalf("NewProvisionalEpoch: %v", err)
+	}
+	if err := value.InstallWraps([][]byte{make([]byte, PqSecretBytes)}); err != nil {
+		t.Fatalf("InstallWraps: %v", err)
+	}
+	return value
+}
+
 // ---------------------------------------------------------------------------
 // property 3: the provisional value is destroyed as ONE THING
 // ---------------------------------------------------------------------------
@@ -1090,7 +1113,8 @@ func TestAProvisionalEpochIsAlreadyRefusingWhenItCallsIntoTheGroupHandle(t *test
 		t.Error("the provisional epoch was still answering when its destructor called out into the group handle. That call is the one place this destructor can be interrupted, and at the moment it runs the four secrets are already erased -- so a value still answering there hands a caller thirty two zero octets rather than a refusal")
 	}
 	for _, method := range epochSliceAnsweringAccessors(t) {
-		results := reflect.ValueOf(value).MethodByName(method.Name).Call(nil)
+		bound := reflect.ValueOf(value).MethodByName(method.Name)
+		results := bound.Call(epochZeroArgumentsFor(bound))
 		if err := epochErrorResultOf(results); !errors.Is(err, ErrProvisionalEpochDestroyed) {
 			t.Errorf("%s answered %v after a destructor that failed part way, want ErrProvisionalEpochDestroyed", method.Name, err)
 		}
@@ -1109,7 +1133,8 @@ func TestAProvisionalEpochIsAlreadyRefusingWhenItCallsIntoTheGroupHandle(t *test
 func TestTheZeroValueOfAProvisionalEpochRefusesAndDestroysWithoutPanicking(t *testing.T) {
 	value := &ProvisionalEpoch{}
 	for _, method := range epochSliceAnsweringAccessors(t) {
-		results := reflect.ValueOf(value).MethodByName(method.Name).Call(nil)
+		bound := reflect.ValueOf(value).MethodByName(method.Name)
+		results := bound.Call(epochZeroArgumentsFor(bound))
 		if err := epochErrorResultOf(results); !errors.Is(err, ErrProvisionalEpochDestroyed) {
 			t.Errorf("%s on a zero valued provisional epoch answered %v, want ErrProvisionalEpochDestroyed: it holds no epoch's secrets and a caller handed its zeros with no error beside them would seal under them",
 				method.Name, err)
@@ -1243,49 +1268,190 @@ func epochMethodResults(signature reflect.Type) (answersError bool, answersState
 // accident. Only one assertion in this file used to touch that method and it ran after Destroy, so a
 // body of `return true` passed the whole suite -- and task 15 property 6's derived reader class is
 // to be built on this flag, which makes a constant here a foundation rather than a wart.
-func epochIsTheDestroyedFlag(method reflect.Method, live *ProvisionalEpoch, destroyed *ProvisionalEpoch) bool {
+//
+// IT WATCHES A SET OF VALUES AND NOT ONE OF EACH, AND THE SET IS WHAT MAKES THE EXEMPTION THE
+// PROPERTY. Watching one live value and one destroyed one asks "does this bool differ between these
+// two values", and the destructor changes two things about a value at once: it sets the flag AND it
+// leaves the four secrets as zero octets. So a predicate reading the CONTENT rather than the
+// lifecycle satisfies that reading too -- the 2026-09-09 verification planted
+// PqSecretLeadsWithAZero and reproduced it, exempt from the shape rule and answering a bit OF the
+// secret on a live value. The flag reports the DESTRUCTOR, so it must read false on every live
+// value whatever the value holds, and the live set therefore includes one whose secrets are already
+// the octets the destructor leaves. Any predicate reading erasedness rather than the flag reads
+// true there and is refused the exemption.
+func epochIsTheDestroyedFlag(method reflect.Method, live []reflect.Value, destroyed []reflect.Value) bool {
 	if method.Type.NumIn() != 1 || method.Type.NumOut() != 1 || method.Type.Out(0).Kind() != reflect.Bool {
 		return false
 	}
-	before := reflect.ValueOf(live).MethodByName(method.Name).Call(nil)[0].Bool()
-	after := reflect.ValueOf(destroyed).MethodByName(method.Name).Call(nil)[0].Bool()
-	return !before && after
+	// an empty side would make this vacuous in one direction, which is the shape the whole file
+	// fatals on rather than reports clean over
+	if len(live) == 0 || len(destroyed) == 0 {
+		return false
+	}
+	for _, one := range live {
+		if one.MethodByName(method.Name).Call(nil)[0].Bool() {
+			return false
+		}
+	}
+	for _, one := range destroyed {
+		if !one.MethodByName(method.Name).Call(nil)[0].Bool() {
+			return false
+		}
+	}
+	return true
 }
 
-// Every exported accessor of the provisional value that answers octets, read off the type.
+// Whether a value of this type could be a place an epoch's octets come back out through.
 //
-// The class is what makes the rules over it rules rather than lists: task 15's fan out will add
-// readers, and an accessor added for one of them is in the class on the commit that adds it. A
-// method that takes an argument is not an accessor -- InstallWraps is this type's writer -- and a
-// method answering no slice has no octets to hand back live or copied.
-func epochSliceAnsweringAccessors(t *testing.T) []reflect.Method {
-	t.Helper()
-	accessors := []reflect.Method{}
-	for _, method := range epochExportedMethodsOfTheProvisionalValue(t) {
-		if method.Type.NumIn() != 1 {
-			continue
+// It is a WALK DOWN the type rather than a test of its outermost Kind, because "the shape the five
+// accessors happen to have today" is the instance and "can carry an octet" is the property. []byte
+// and [][]byte are what this type answers now; a [32]byte, a *[]byte, a struct holding a wrap, a
+// map of them and a string are each a place pq_secret could leave through, and every one of them is
+// outside a Kind == reflect.Slice reading.
+//
+// An INTERFACE or a FUNC answers yes rather than being followed, which is the fail closed
+// direction: what a value of either carries is not decidable from the type, and a class that
+// guessed no would exclude the shape a leak is easiest to hide in. error is removed by the caller
+// before this is asked, because every accessor here answers one.
+//
+// THE COMPLEMENT IS STATED RATHER THAN LEFT TO BE INFERRED. A bool, a rune, an int and a uint64 are
+// answered no. They are not octet sequences, and the two rules that hold them are the ones that do
+// not care what shape state is in: property 4's shape half wants an error beside anything that is
+// not the destroyed flag, and its behavioural half wants the ZERO value of whatever it is beside
+// the refusal. A uint64 packing eight octets of pq_secret is therefore held there and not here --
+// it cannot be answered by a destroyed value at all, and it can never BE the live storage, which is
+// the only thing this class's two rules are about.
+func epochTypeCarriesOctets(carrier reflect.Type, seen map[reflect.Type]bool) bool {
+	// a type reached twice on one walk is a cycle rather than an octet, and a struct holding
+	// itself would otherwise recur until the stack ended
+	if seen[carrier] {
+		return false
+	}
+	seen[carrier] = true
+	switch carrier.Kind() {
+	case reflect.Uint8, reflect.String, reflect.Interface, reflect.Func, reflect.UnsafePointer:
+		return true
+	case reflect.Slice, reflect.Array, reflect.Pointer, reflect.Chan:
+		return epochTypeCarriesOctets(carrier.Elem(), seen)
+	case reflect.Map:
+		return epochTypeCarriesOctets(carrier.Key(), seen) || epochTypeCarriesOctets(carrier.Elem(), seen)
+	case reflect.Struct:
+		for i := 0; i < carrier.NumField(); i += 1 {
+			if epochTypeCarriesOctets(carrier.Field(i).Type, seen) {
+				return true
+			}
 		}
+		return false
+	default:
+		return false
+	}
+}
+
+// The octet answering members of a method set, and -- said out loud -- the ones that are not.
+//
+// It takes the methods rather than reading *ProvisionalEpoch itself so that the derivation can be
+// proved against a shape this type does not have yet, which is the only way the narrowing below
+// could have been observed at the commit that wrote it.
+// TestTheOctetAnsweringClassIsReadOffResultsAndNotArity is that proof.
+func epochOctetAnsweringMethodsIn(methods []reflect.Method) (answering []reflect.Method, excluded []string) {
+	errorType := reflect.TypeOf((*error)(nil)).Elem()
+	for _, method := range methods {
+		carries := false
 		for i := 0; i < method.Type.NumOut(); i += 1 {
-			if method.Type.Out(i).Kind() == reflect.Slice {
-				accessors = append(accessors, method)
+			if method.Type.Out(i) == errorType {
+				continue
+			}
+			if epochTypeCarriesOctets(method.Type.Out(i), map[reflect.Type]bool{}) {
+				carries = true
 				break
 			}
 		}
+		if carries {
+			answering = append(answering, method)
+			continue
+		}
+		excluded = append(excluded, method.Name+" "+method.Type.String())
 	}
+	return answering, excluded
+}
+
+// Every exported method of the provisional value that can hand this value's octets back, read off
+// the type.
+//
+// The class is what makes the rules over it rules rather than lists: task 15's fan out will add
+// readers, and an accessor added for one of them is in the class on the commit that adds it.
+//
+// IT NARROWS BY THE PROPERTY AND NOT BY THE ARITY, AND THAT SENTENCE IS THIS FUNCTION'S WHOLE
+// HISTORY. It used to open with a skip of every method whose NumIn is not one, and it argued that
+// exclusion in its own comment from the one argument-taking method that exists: "a method that
+// takes an argument is not an accessor -- InstallWraps is this type's writer". That is derived from
+// the INSTANCE. The property these rules defend is "an exported method that can hand back this
+// value's live octets", and a method that takes an argument can do exactly that: a
+// PqSecretFor(purpose string) ([]byte, error) answering a copy of self.pqSecret was planted, passed
+// the whole suite, and escaped both halves of the ownership rule and every transposition row.
+//
+// MEASURED AT 81b97ca, THAT NARROWING'S COMPLEMENT WAS EMPTY. InstallWraps answers only an error,
+// so the result reading already removed it and the arity line removed nothing at all -- a filter
+// written for members that do not exist, which would have begun removing real ones on the commit
+// that added the first argument-taking accessor. An exclusion whose complement is empty and an
+// exclusion whose complement is one named method are two different defects that look identical from
+// outside, and neither is visible unless the complement is PRINTED. This one prints it.
+//
+// So the reading is off the RESULTS, in whatever shape they are answered, and an argument-taking
+// member is DRIVEN with the zero value of each argument rather than skipped -- the same driver the
+// refusal half already uses. A member the zero row cannot get octets out of is FATAL in
+// epochBytesAnsweredBy rather than passed over, so this class fails closed on the shape it has not
+// met yet instead of reporting clean over it.
+//
+// mls/GATES.md carries the rule this function is the fifth instance of, the query that finds the
+// next one, and the two narrowings in mls that the same query still reports open.
+func epochSliceAnsweringAccessors(t *testing.T) []reflect.Method {
+	t.Helper()
+	accessors, excluded := epochOctetAnsweringMethodsIn(epochExportedMethodsOfTheProvisionalValue(t))
 	if len(accessors) == 0 {
-		t.Fatal("no exported accessor of *ProvisionalEpoch answers a slice, so every rule below read an empty class and reported clean over it")
+		t.Fatal("no exported method of *ProvisionalEpoch answers anything that can carry an octet, so every rule below read an empty class and reported clean over it")
 	}
+	names := []string{}
+	for _, method := range accessors {
+		names = append(names, method.Name)
+	}
+	t.Logf("the octet answering class of *ProvisionalEpoch is %v; excluded because no result of theirs can carry an octet: %v",
+		names, excluded)
 	return accessors
+}
+
+// The arguments this class is driven with: the zero value of each.
+//
+// It is a DRIVER and not a filter, which is the distinction the arity narrowing above got wrong. A
+// member the zero row cannot get octets out of turns the rules red in epochBytesAnsweredBy rather
+// than dropping out of the class, so an accessor whose argument means something has to be given a
+// row here rather than quietly ceasing to be swept. It is the same construction
+// TestEveryAccessorOfAProvisionalEpochRefusesOnceItHasBeenDestroyed already drives its own half
+// with, which is where the shape of it comes from.
+func epochZeroArgumentsFor(bound reflect.Value) []reflect.Value {
+	arguments := []reflect.Value{}
+	for i := 0; i < bound.Type().NumIn(); i += 1 {
+		arguments = append(arguments, reflect.Zero(bound.Type().In(i)))
+	}
+	return arguments
 }
 
 // The octets one accessor answered, whatever shape it answered them in.
 //
 // A shape this cannot read is FATAL rather than skipped, because a rule that quietly ignores the one
 // accessor it does not recognise stops holding on the commit that adds it -- and the accessor a
-// future task adds is the one these rules exist for.
+// future task adds is the one these rules exist for. That fatal is now the whole of the class's
+// fail closed door: epochSliceAnsweringAccessors admits an argument-taking member, and a member
+// answering octets in a shape nothing here has met, and both arrive at this fatal rather than at a
+// skip inside the derivation.
+//
+// The member is driven with the ZERO value of each of its arguments. A member for which that row is
+// the wrong one refuses, or answers nothing, and both land on a fatal here -- which is a demand for
+// a row rather than a silent narrowing of the class.
 func epochBytesAnsweredBy(t *testing.T, value *ProvisionalEpoch, method reflect.Method) [][]byte {
 	t.Helper()
-	results := reflect.ValueOf(value).MethodByName(method.Name).Call(nil)
+	bound := reflect.ValueOf(value).MethodByName(method.Name)
+	results := bound.Call(epochZeroArgumentsFor(bound))
 	if err := epochErrorResultOf(results); err != nil {
 		t.Fatalf("%s on a live provisional epoch: %v", method.Name, err)
 	}
@@ -1299,10 +1465,14 @@ func epochBytesAnsweredBy(t *testing.T, value *ProvisionalEpoch, method reflect.
 		if result.Type() == errorType {
 			continue
 		}
+		// the Kind is read BEFORE Elem is asked for, because Elem panics on a uint64 and a
+		// panic is not a reading. The class above admits any shape that can carry an octet, so
+		// what arrives here is wider than the two shapes this rule knows how to read.
 		switch {
-		case result.Type().Elem().Kind() == reflect.Uint8:
+		case result.Kind() == reflect.Slice && result.Type().Elem().Kind() == reflect.Uint8:
 			answered = append(answered, result.Bytes())
-		case result.Type().Elem().Kind() == reflect.Slice && result.Type().Elem().Elem().Kind() == reflect.Uint8:
+		case result.Kind() == reflect.Slice && result.Type().Elem().Kind() == reflect.Slice &&
+			result.Type().Elem().Elem().Kind() == reflect.Uint8:
 			for i := 0; i < result.Len(); i += 1 {
 				answered = append(answered, result.Index(i).Bytes())
 			}
@@ -1426,11 +1596,43 @@ func TestNoExportedAccessorOfAProvisionalEpochAnswersStateWithoutARefusal(t *tes
 	live := newEpochProvisionalFixture(t, "shape-live")
 	gone := newEpochProvisionalFixture(t, "shape-destroyed")
 	gone.value.Destroy()
+	// the second live value holds the octets the DESTRUCTOR leaves, so an exemption granted to a
+	// predicate reading erasedness rather than the flag is refused here
+	erased := newEpochProvisionalOfErasedOctets(t, "shape-live-erased-octets")
+	goneErased := newEpochProvisionalOfErasedOctets(t, "shape-destroyed-erased-octets")
+	goneErased.Destroy()
+	liveValues := []reflect.Value{reflect.ValueOf(live.value), reflect.ValueOf(erased)}
+	destroyedValues := []reflect.Value{reflect.ValueOf(gone.value), reflect.ValueOf(goneErased)}
+
+	// and the live set SPANS the octets the destructor leaves, checked rather than assumed. It
+	// is the same reading TestEveryAccessorOfAProvisionalEpochAnswersTheValueItWasBuiltFrom
+	// makes of its own fixture: without a live value already holding zeros, the exemption below
+	// is decided by one value's content, and every predicate that reads the SECRETS rather than
+	// the flag reads false-then-true and is exempted. Measured: with this probe out of the set
+	// and nothing else changed, an exported PqSecretLeadsWithAZero() bool passes this case.
+	spanning := []string{}
+	for at, one := range liveValues {
+		value := one.Interface().(*ProvisionalEpoch)
+		erasedOctets := true
+		for _, method := range epochSliceAnsweringAccessors(t) {
+			for _, octets := range epochBytesAnsweredBy(t, value, method) {
+				if len(octets) == 0 || !bytes.Equal(octets, make([]byte, len(octets))) {
+					erasedOctets = false
+				}
+			}
+		}
+		if erasedOctets {
+			spanning = append(spanning, fmt.Sprintf("live value %d", at))
+		}
+	}
+	if len(spanning) == 0 {
+		t.Fatal("no LIVE value in this case's probe set holds the octets the destructor leaves, so the exemption below cannot tell a bool that reports the destructor from a bool that reports the secrets being zero. A predicate reading a bit of pq_secret is exempted by any set that does not span erased content, and it then answers about a destroyed value with no door to refuse through")
+	}
 
 	flags := []string{}
 	for _, method := range epochExportedMethodsOfTheProvisionalValue(t) {
 		answersError, answersState := epochMethodResults(method.Type)
-		if epochIsTheDestroyedFlag(method, live.value, gone.value) {
+		if epochIsTheDestroyedFlag(method, liveValues, destroyedValues) {
 			flags = append(flags, method.Name)
 			continue
 		}
@@ -1443,6 +1645,194 @@ func TestNoExportedAccessorOfAProvisionalEpochAnswersStateWithoutARefusal(t *tes
 		t.Error("no exported method of *ProvisionalEpoch reads false while the value is live and true once it has been destroyed, so G10's flag either does not exist or answers the same thing in both states. Task 15 property 6's derived reader class is to be held to that flag, and a constant is not a flag")
 	}
 	t.Logf("the destroyed flag is %v", flags)
+}
+
+// ---------------------------------------------------------------------------
+// the two classes above, proved on shapes this type does not have yet
+// ---------------------------------------------------------------------------
+
+// A method set *ProvisionalEpoch does not have, so the octet answering class can be proved against
+// the shape it will meet next rather than only against the five accessors that exist.
+//
+// THE HOLE THIS CONTROL CLOSES IS INVISIBLE FROM THE REAL TYPE, which is why the arity narrowing
+// survived five reviews and a verification: the type declares exactly one argument-taking method
+// and it answers no octets, so the narrowing removed nothing and every rule over it stayed green
+// whichever way it was written. A class with no member of the shape it excludes is a class nothing
+// can measure, and the answer to that is a shape, not another reading of the same five methods.
+//
+// Five members, each deciding one reading. An accessor that takes an argument and hands octets back;
+// an accessor answering octets in an ARRAY, which a Kind == reflect.Slice reading cannot see; a
+// writer that takes an argument and answers only an error, which is out on its results and needs no
+// arity rule to exclude it; and two methods answering state no octet can hide in.
+//
+// THE TWO STATE MEMBERS ARE NAMED ProbeEpoch AND ProbeDestroyed RATHER THAN Epoch AND Destroyed,
+// which is not cosmetic and is not this control being tuned. keysource_test.go's
+// TestNothingOnTheReproductionsSideOfTheComparisonComesFromTheModule resolves the edges of this
+// package's TEST source by bare name and cannot see a receiver, so a test-only method sharing a name
+// with a production one makes a selector that used to dangle resolve into somebody else's closure --
+// measured: with these named Epoch and Destroyed, that gate reports its exclusion as swallowing
+// scope, over an edge that is a name collision and nothing else. Renaming them costs this control
+// nothing, because both classes here are decided by results and by behaviour and neither reads a
+// name.
+type epochArgumentTakingProbe struct {
+	pqSecret []byte
+}
+
+func (self *epochArgumentTakingProbe) PqSecretFor(purpose string) ([]byte, error) {
+	return self.pqSecret, nil
+}
+
+func (self *epochArgumentTakingProbe) Fingerprint() ([32]byte, error) {
+	return [32]byte{}, nil
+}
+
+func (self *epochArgumentTakingProbe) InstallSomething(wraps [][]byte) error {
+	return nil
+}
+
+func (self *epochArgumentTakingProbe) ProbeEpoch() (uint64, error) {
+	return 0, nil
+}
+
+func (self *epochArgumentTakingProbe) ProbeDestroyed() bool {
+	return false
+}
+
+// TestTheOctetAnsweringClassIsReadOffResultsAndNotArity is the fifth instance of this project's
+// oldest defect, held.
+//
+// The defect is deriving a class from the INSTANCE rather than from the PROPERTY, and this is it one
+// layer inside the fix for the fourth: epochSliceAnsweringAccessors excluded every method whose
+// NumIn is not one and argued that exclusion from the one method that takes an argument today. The
+// property is "an exported method that can hand back this value's live octets" and an argument
+// takes nothing away from it.
+//
+// BOTH DIRECTIONS ARE ASSERTED, because a class that admitted everything would satisfy the first
+// half and hold nothing: the two members that answer octets are in, the three that cannot are out
+// by name, and the real type's own class and complement are pinned beside them so that an accessor
+// added by task 15 lands in one of the two lists on the commit that adds it rather than silently
+// outside both.
+func TestTheOctetAnsweringClassIsReadOffResultsAndNotArity(t *testing.T) {
+	probe := reflect.TypeOf(&epochArgumentTakingProbe{})
+	methods := []reflect.Method{}
+	for i := 0; i < probe.NumMethod(); i += 1 {
+		methods = append(methods, probe.Method(i))
+	}
+	if len(methods) != 5 {
+		t.Fatalf("the control declares %d exported methods and this case decides five readings", len(methods))
+	}
+
+	answering, excluded := epochOctetAnsweringMethodsIn(methods)
+	if want := []string{"Fingerprint", "PqSecretFor"}; !slices.Equal(epochNamesOf(answering), want) {
+		t.Errorf("the octet answering class of the control is %v, want %v: PqSecretFor takes an argument and hands octets back, and Fingerprint answers them in an array, so a class narrowed by arity or by the outermost Kind loses one of the two",
+			epochNamesOf(answering), want)
+	}
+	if want := []string{"InstallSomething", "ProbeDestroyed", "ProbeEpoch"}; !slices.Equal(epochExcludedNamesOf(excluded), want) {
+		t.Errorf("the control's complement is %v, want %v: a class that admitted these would put a bool and a uint64 through a rule that reads octets out of them",
+			epochExcludedNamesOf(excluded), want)
+	}
+
+	// and the real type, whose class and complement are the numbers the narrowing was measured
+	// by: the arity line it used to open with excluded NOTHING here, which is what an exclusion
+	// written for members that do not exist looks like from the outside
+	real, realExcluded := epochOctetAnsweringMethodsIn(epochExportedMethodsOfTheProvisionalValue(t))
+	if want := []string{"EphRoot", "PqSecret", "StorageRoot", "Wraps", "WriteKey"}; !slices.Equal(epochNamesOf(real), want) {
+		t.Errorf("the octet answering class of *ProvisionalEpoch is %v, want %v; if task 15 added an accessor, give it a row in epochAccessorAnswers and name it here",
+			epochNamesOf(real), want)
+	}
+	if want := []string{"Destroy", "Destroyed", "Epoch", "InstallWraps"}; !slices.Equal(epochExcludedNamesOf(realExcluded), want) {
+		t.Errorf("the complement of that class is %v, want %v; every member of it is a method no octet can be answered through, and the two rules that hold them are property 4's other halves",
+			epochExcludedNamesOf(realExcluded), want)
+	}
+}
+
+// The names of a class, sorted, so a failure reads as a set rather than as reflection order.
+func epochNamesOf(methods []reflect.Method) []string {
+	names := []string{}
+	for _, method := range methods {
+		names = append(names, method.Name)
+	}
+	slices.Sort(names)
+	return names
+}
+
+// The names of a complement, which carries each member's signature beside it.
+func epochExcludedNamesOf(excluded []string) []string {
+	names := []string{}
+	for _, one := range excluded {
+		names = append(names, one[:strings.Index(one, " ")])
+	}
+	slices.Sort(names)
+	return names
+}
+
+// A bool answering type carrying the exact accessor the 2026-09-09 verification planted against the
+// destroyed flag's exemption, and reproduced.
+//
+// It is a control and not a stub: the flag's exemption cannot be measured on *ProvisionalEpoch,
+// because the only bool that type declares IS the flag, so a reading that exempted every bool and a
+// reading that exempted the flag agree on every member the real type has.
+//
+// Its flag is ProbeDestroyed rather than Destroyed for the reason epochArgumentTakingProbe's members
+// are renamed, and the rename also says something worth having said: epochIsTheDestroyedFlag decides
+// by WATCHING and not by name, so the control it is proved against must not be recognisable by one.
+type epochFlagProbe struct {
+	pqSecret  []byte
+	destroyed bool
+}
+
+func (self *epochFlagProbe) ProbeDestroyed() bool {
+	return self.destroyed
+}
+
+// The leak, written as the verification wrote it. It reads false while the secret does not lead
+// with a zero octet and true once the destructor has dropped the slice, so an exemption watching one
+// live value and one destroyed one admits it -- and what it answers on a live value is a bit OF the
+// secret rather than a fact about the value's lifecycle.
+func (self *epochFlagProbe) PqSecretLeadsWithAZero() bool {
+	return len(self.pqSecret) == 0 || self.pqSecret[0] == 0x00
+}
+
+// TestTheDestroyedFlagExemptionReadsTheLifecycleAndNotTheSecret closes verify2's LOW.
+//
+// The exemption is the one door property 4's shape half leaves open, so what earns it decides what
+// can answer about a destroyed value with no refusal. Watching one live value and one destroyed one
+// asks whether a bool DIFFERS between two values, and the destructor changes two things at once --
+// the flag, and the four secrets, which become zeros. The live set therefore holds a value whose
+// secrets are already zeros.
+//
+// THE THIRD ASSERTION IS WHAT STOPS THIS CASE PASSING VACUOUSLY. Against the non-zero live value
+// alone the leak IS exempted, so the case fails if the probe set stops spanning the erased content
+// -- which is the edit that would put the hole back.
+func TestTheDestroyedFlagExemptionReadsTheLifecycleAndNotTheSecret(t *testing.T) {
+	live := []reflect.Value{
+		reflect.ValueOf(&epochFlagProbe{pqSecret: epochSecretFilled(0x44)}),
+		reflect.ValueOf(&epochFlagProbe{pqSecret: make([]byte, PqSecretBytes)}),
+	}
+	destroyed := []reflect.Value{
+		reflect.ValueOf(&epochFlagProbe{destroyed: true}),
+		reflect.ValueOf(&epochFlagProbe{destroyed: true}),
+	}
+	probe := reflect.TypeOf(&epochFlagProbe{})
+
+	flag, declared := probe.MethodByName("ProbeDestroyed")
+	if !declared {
+		t.Fatal("the control declares no ProbeDestroyed, so this case decided nothing")
+	}
+	if !epochIsTheDestroyedFlag(flag, live, destroyed) {
+		t.Error("the control's own destroyed flag is not recognised as one, so the exemption has been narrowed until it exempts nothing and the real flag would fail property 4's shape half")
+	}
+
+	leak, declared := probe.MethodByName("PqSecretLeadsWithAZero")
+	if !declared {
+		t.Fatal("the control declares no PqSecretLeadsWithAZero, so this case decided nothing")
+	}
+	if epochIsTheDestroyedFlag(leak, live, destroyed) {
+		t.Error("a bool answering a bit OF pq_secret is exempted from property 4's shape half, so it may answer about a destroyed value with no door to refuse through. The flag reports the DESTRUCTOR, and a predicate that reads the secrets rather than the flag reads true on a live value that already holds zeros")
+	}
+	if !epochIsTheDestroyedFlag(leak, live[:1], destroyed) {
+		t.Error("the leak is refused the exemption even against a live set that does not span the erased content, so the assertion above passes for some other reason and this case observes nothing about the probe set")
+	}
 }
 
 // ---------------------------------------------------------------------------
