@@ -3,9 +3,11 @@ package connect
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"runtime"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -19,6 +21,110 @@ import (
 
 type trackedTunDialConn struct {
 	closed atomic.Bool
+}
+
+// uncomparableTunTestContext catches interface equality on arbitrary Context
+// implementations; its slice deliberately makes the dynamic value uncomparable.
+type uncomparableTunTestContext struct {
+	context.Context
+	marker []byte
+}
+
+func TestTunDialCtxJoinsCallerAndLifecycleCancellation(t *testing.T) {
+	tunCtx, tunCancel := context.WithCancel(context.Background())
+	tun := &Tun{ctx: tunCtx}
+
+	callerCtx, callerCancel := context.WithCancel(context.Background())
+	linkedCtx, cleanup := tun.dialCtx(callerCtx)
+	callerCancel()
+	select {
+	case <-linkedCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("caller cancellation did not reach linked dial context")
+	}
+	cleanup()
+
+	callerCtx, callerCancel = context.WithCancel(context.Background())
+	linkedCtx, cleanup = tun.dialCtx(callerCtx)
+	cleanup()
+	if !errors.Is(linkedCtx.Err(), context.Canceled) {
+		t.Fatalf("cleanup left linked dial context active: %v", linkedCtx.Err())
+	}
+	if callerCtx.Err() != nil {
+		t.Fatalf("cleanup canceled caller context: %v", callerCtx.Err())
+	}
+	callerCancel()
+
+	callerCtx, callerCancel = context.WithCancel(context.Background())
+	linkedCtx, cleanup = tun.dialCtx(callerCtx)
+	tunCancel()
+	select {
+	case <-linkedCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("tun lifecycle cancellation did not reach linked dial context")
+	}
+	cleanup()
+	callerCancel()
+}
+
+func TestTunDialCtxHandlesAlreadyCanceledAndSharedContexts(t *testing.T) {
+	tunCtx, tunCancel := context.WithCancel(context.Background())
+	defer tunCancel()
+	tun := &Tun{ctx: tunCtx}
+
+	canceledCtx, canceledCtxCancel := context.WithCancel(context.Background())
+	canceledCtxCancel()
+	linkedCtx, cleanup := tun.dialCtx(canceledCtx)
+	defer cleanup()
+	if !errors.Is(linkedCtx.Err(), context.Canceled) {
+		t.Fatalf("already-canceled caller returned active dial context: %v", linkedCtx.Err())
+	}
+
+	sharedCtx, sharedCleanup := tun.dialCtx(tunCtx)
+	sharedCleanup()
+	if tunCtx.Err() != nil {
+		t.Fatalf("shared-context cleanup canceled tun lifecycle: %v", tunCtx.Err())
+	}
+	if !errors.Is(sharedCtx.Err(), context.Canceled) {
+		t.Fatalf("shared-context cleanup left derived dial active: %v", sharedCtx.Err())
+	}
+
+	uncomparableCtx := uncomparableTunTestContext{Context: context.Background(), marker: []byte{1}}
+	uncomparableTun := &Tun{ctx: uncomparableCtx}
+	uncomparableLinkedCtx, uncomparableCleanup := uncomparableTun.dialCtx(uncomparableCtx)
+	uncomparableCleanup()
+	if !errors.Is(uncomparableLinkedCtx.Err(), context.Canceled) {
+		t.Fatalf("uncomparable context cleanup left derived dial active: %v", uncomparableLinkedCtx.Err())
+	}
+}
+
+func TestTunDialCtxDoesNotParkOneGoroutinePerLiveCaller(t *testing.T) {
+	tunCtx, tunCancel := context.WithCancel(context.Background())
+	defer tunCancel()
+	tun := &Tun{ctx: tunCtx}
+	baselineGoroutines := runtime.NumGoroutine()
+	const callerCount = 256
+	callerCancels := make([]context.CancelFunc, 0, callerCount)
+	cleanups := make([]context.CancelFunc, 0, callerCount)
+	for range callerCount {
+		callerCtx, callerCancel := context.WithCancel(context.Background())
+		linkedCtx, cleanup := tun.dialCtx(callerCtx)
+		if linkedCtx.Err() != nil {
+			t.Fatalf("live caller produced canceled dial context: %v", linkedCtx.Err())
+		}
+		callerCancels = append(callerCancels, callerCancel)
+		cleanups = append(cleanups, cleanup)
+	}
+	runtime.Gosched()
+	if delta := runtime.NumGoroutine() - baselineGoroutines; 16 < delta {
+		t.Fatalf("%d live dial contexts parked %d goroutines", callerCount, delta)
+	}
+	for _, cleanup := range cleanups {
+		cleanup()
+	}
+	for _, callerCancel := range callerCancels {
+		callerCancel()
+	}
 }
 
 // newTunTcpInboundTestPacket builds the minimum packet shape needed to test
@@ -78,6 +184,125 @@ func TestTunTcpInboundShardHandoffCadenceIsBounded(t *testing.T) {
 	}
 	if shard.packetCount != 0 || shard.endpointCount != 1 {
 		t.Fatalf("handoff state packet_count=%d endpoint_count=%d, want 0 and 1", shard.packetCount, shard.endpointCount)
+	}
+}
+
+// A small origin response often consists of one returned TCP packet. Raw Write
+// must complete its gVisor handoff before it returns: a shared deferred worker
+// can be blocked by unrelated traffic and leave the H1/TLS ACK tail stranded.
+// One P prevents an asynchronous handoff from running between Write's return
+// and this assertion, making the old deferred-worker failure deterministic.
+func TestTunWriteCompletesFiniteTcpInboundHandoffBeforeReturn(t *testing.T) {
+	previousProcs := runtime.GOMAXPROCS(1)
+	runtime.LockOSThread()
+	defer func() {
+		runtime.UnlockOSThread()
+		runtime.GOMAXPROCS(previousProcs)
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tun, err := CreateTunWithDefaults(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tun.Close()
+
+	packet := newTunTcpInboundTestPacket(40000, 443)
+	_, shardIndex, ok := tcpInboundFlow(packet)
+	if !ok {
+		t.Fatal("test packet was not classified as TCP")
+	}
+	if _, err := tun.Write(packet); err != nil {
+		t.Fatalf("write finite TCP return: %v", err)
+	}
+
+	shard := &tun.tcpInboundShards[shardIndex]
+	shard.writeLock.Lock()
+	packetCount := shard.packetCount
+	endpointCount := shard.endpointCount
+	shard.writeLock.Unlock()
+	if packetCount != 1 || endpointCount != 0 {
+		t.Fatalf(
+			"Write returned before finite TCP handoff: packet_count=%d endpoint_count=%d, want 1/0",
+			packetCount,
+			endpointCount,
+		)
+	}
+}
+
+// Immediate endpoint handoff must not erase the bounded scheduler-yield
+// cadence shared by consecutive one-packet callbacks on the same flow.
+func TestTunWriteRetainsTcpInboundYieldCadence(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tun, err := CreateTunWithDefaults(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tun.Close()
+
+	packet := newTunTcpInboundTestPacket(40000, 443)
+	_, shardIndex, ok := tcpInboundFlow(packet)
+	if !ok {
+		t.Fatal("test packet was not classified as TCP")
+	}
+	for packetIndex := 1; packetIndex <= tunTcpInboundBurstPacketCount; packetIndex += 1 {
+		if _, err := tun.Write(packet); err != nil {
+			t.Fatalf("write packet %d: %v", packetIndex, err)
+		}
+		shard := &tun.tcpInboundShards[shardIndex]
+		shard.writeLock.Lock()
+		packetCount := shard.packetCount
+		endpointCount := shard.endpointCount
+		shard.writeLock.Unlock()
+		wantPacketCount := uint32(packetIndex % tunTcpInboundBurstPacketCount)
+		if packetCount != wantPacketCount || endpointCount != 0 {
+			t.Fatalf(
+				"packet %d cadence/handoff=%d/%d, want %d/0",
+				packetIndex,
+				packetCount,
+				endpointCount,
+				wantPacketCount,
+			)
+		}
+	}
+}
+
+// WriteBatch may touch several TCP endpoints and end below the mid-batch
+// cadence on every one. Its return is the lossless boundary: no touched shard
+// may retain state that assumes another callback will arrive to wake it.
+func TestTunWriteBatchFinishesEveryTcpInboundHandoff(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tun, err := CreateTunWithDefaults(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tun.Close()
+
+	packets := [][]byte{
+		newTunTcpInboundTestPacket(40000, 443),
+		newTunTcpInboundTestPacket(40001, 443),
+		newTunTcpInboundTestPacket(40002, 443),
+	}
+	if _, err := tun.WriteBatch(packets); err != nil {
+		t.Fatalf("write finite TCP return batch: %v", err)
+	}
+	for shardIndex := range tun.tcpInboundShards {
+		shard := &tun.tcpInboundShards[shardIndex]
+		shard.writeLock.Lock()
+		packetCount := shard.packetCount
+		endpointCount := shard.endpointCount
+		shard.writeLock.Unlock()
+		if packetCount != 0 || endpointCount != 0 {
+			t.Fatalf(
+				"batch left shard %d unsynchronized: packet_count=%d endpoint_count=%d",
+				shardIndex,
+				packetCount,
+				endpointCount,
+			)
+		}
 	}
 }
 
@@ -615,10 +840,10 @@ func bridgeTunBatch(ctx context.Context, dst *Tun, src *Tun) {
 // head-of-line-blocks the tun receive loop (e.g. holding a lock across a blocking
 // enqueue) collapses this number.
 func TestTunTCPThroughput(t *testing.T) {
-	// generous overall cap: the transfer is measured several times (below), and
-	// each run's stalls are independently bounded by per-chunk 55s deadlines.
-	// The cap only backstops a true hang; slow-but-progressing runs on a
-	// loaded -race host stay inside it.
+	// Generous overall cap: the transfer is measured several times (below), and
+	// each read/write phase is independently bounded by a 55s progress window.
+	// Every operation is also capped by this absolute deadline, so a loaded host
+	// may slow an attempt but cannot extend the complete test past the cap.
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
 	defer cancel()
 
@@ -667,6 +892,10 @@ func TestTunTCPThroughput(t *testing.T) {
 	// throughputRuns independent attempts, so one slow or broken attempt is
 	// ridden out instead of failing the test early.
 	runTransfer := func() (mibs float64, runErr error) {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+
 		// a panic in the gvisor stack under load fails only this attempt.
 		defer func() {
 			if r := recover(); r != nil {
@@ -696,17 +925,15 @@ func TestTunTCPThroughput(t *testing.T) {
 				return
 			}
 			defer conn.Close()
-			// drain exactly totalBytes, so neither side needs a half-close.
-			// The deadline is refreshed per bounded step so it bounds a
-			// stall in the stack, not the whole transfer: under -race plus
-			// host load the full stream legitimately outlasts any single
-			// fixed deadline while still making progress.
+			// Drain exactly totalBytes, so neither side needs a half-close.
+			// Each bounded read gets a fresh progress window without exceeding
+			// the test's absolute deadline.
 			received := int64(0)
+			readBuffer := make([]byte, 1024*1024)
 			for received < totalBytes {
-				_ = conn.SetReadDeadline(time.Now().Add(55 * time.Second))
 				step := min(totalBytes-received, int64(1024*1024))
-				n, err := io.CopyN(io.Discard, conn, step)
-				received += n
+				n, err := readFullWithProgressDeadline(ctx, conn, readBuffer[:int(step)], 55*time.Second)
+				received += int64(n)
 				if err != nil {
 					recvErr <- err
 					return
@@ -730,14 +957,12 @@ func TestTunTCPThroughput(t *testing.T) {
 			if remaining := totalBytes - written; remaining < int64(len(chunk)) {
 				chunk = payload[:remaining]
 			}
-			// per-chunk deadline: bounds a stalled pipe without capping the
-			// whole transfer's wall clock (see the receiver note above)
-			_ = conn.SetWriteDeadline(time.Now().Add(55 * time.Second))
-			n, err := conn.Write(chunk)
-			if err != nil {
+			// Each chunk gets a progress window capped by the absolute test
+			// deadline; the helper checks cancellation before any socket write.
+			if err := writeConnPhaseWithDeadline(ctx, conn, chunk, 55*time.Second); err != nil {
 				return 0, fmt.Errorf("write through tun after %d bytes: %w", written, err)
 			}
-			written += int64(n)
+			written += int64(len(chunk))
 		}
 
 		select {
@@ -760,6 +985,9 @@ func TestTunTCPThroughput(t *testing.T) {
 	best := 0.0
 	failures := 0
 	for i := range throughputRuns {
+		if err := ctx.Err(); err != nil {
+			t.Fatalf("throughput deadline before run %d/%d: %v", i+1, throughputRuns, err)
+		}
 		mibs, err := runTransfer()
 		if err != nil {
 			failures++

@@ -45,7 +45,39 @@ servers:
 security:
   - BearerAuth: []
 
+tags:
+  - name: onboarding
+    description: |
+      The new-user onboarding program (mmm/onboarding/PLAN.md): the welcome
+      offer, the campaign landing and feedback links, and the sign-up
+      preferences the campaign honors.
+  - name: analytics
+    description: |
+      Product events and experiment results behind the onboarding
+      optimization loop: the closed client event schema, the experiment
+      registry and the aggregated results the analysis script reads.
+  - name: subscription
+    description: Pro subscriptions, prices and the store purchase paths.
+
 paths:
+  /clock:
+    get:
+      description: |
+        Get the cumulative destination-reported bytes for contracts finalized
+        on or after the start of subnet block 9.
+        The counter advances when contracts reach a final outcome and is
+        intended for public clients polling every 1-5 seconds.
+      operationId: Clock
+      security: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ClockResult"
+        "503":
+          description: The clock has not completed its initial block-9 backfill.
+
   /stats/last-90:
     get:
       description: |
@@ -158,6 +190,46 @@ paths:
               schema:
                 $ref: "#/components/schemas/LeaderboardResult"
 
+  /stats/points-leaderboard:
+    post:
+      description: |
+        Page the all-time points leaderboard. Every network with points is
+        ranked on three dimensions (total points, finalized epochs with points
+        = "blocks", current streak of consecutive finalized epochs with points)
+        with competition ranks (1, 2, 2, 4), and every ranked network is
+        listed: the pages form one continuous list. A row carries the network
+        name only when that network turned on
+        /network/points-ranking-visibility (its "show my network name"
+        switch); otherwise the row is anonymous. The emoji tag (/network/emoji)
+        shows on every row that set one.
+        Each sort has its own tie-break order, every key descending, then the
+        network id ascending so the order is total: `points` = (points,
+        streak, blocks), `blocks` = (blocks, streak, points), `streak` =
+        (streak, blocks, points). The pages come in exactly that order, and a
+        rank is shared only by networks whose three values all tie.
+        Pages use a keyset cursor pinned to a ranking snapshot (rebuilt when an
+        epoch finalizes, when a payout plan commits, and hourly); a cursor
+        whose snapshot was pruned returns `restart: true` and the client
+        reloads from the top. No authentication is required; with a bearer
+        token the response also carries `me`, the caller's own row with its
+        network name for the caller's own card, whether or not it opted in.
+        In the list itself the caller's row is anonymous like everyone
+        else's until it opts in: the caller sees what everyone sees, and the
+        apps only highlight that row.
+      operationId: Stats Points Leaderboard
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PointsLeaderboardArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PointsLeaderboardResult"
+
   /auth/login:
     post:
       description: |
@@ -167,6 +239,12 @@ paths:
         - phone number
         - Apple JWT
         - Google JWT
+        - a wallet (`wallet_auth`): a Solana or Bittensor signature over the
+          single-use challenge from /auth/wallet-challenge. A bound wallet
+          returns `network.by_jwt`; an unbound wallet echoes `wallet_auth`
+          and the client continues to /auth/network-create with a fresh
+          challenge.
+        - a seedphrase
       operationId: Auth Login
       security: []
       requestBody:
@@ -181,6 +259,37 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AuthLoginResult"
+
+  /auth/wallet-challenge:
+    post:
+      description: |
+        Issue a single-use wallet sign-in challenge. The wallet signs the
+        returned `message_template` byte for byte; the signature is then
+        submitted as `wallet_auth` to /auth/login, /auth/network-create or
+        /auth/add-auth, each of which consumes one challenge. The message is
+        exactly three LF-separated lines: `Sign in to URnetwork`,
+        `Challenge: <challenge>` and `Timestamp: <unix seconds>`; the server
+        rejects any other text (`400 invalid message format`), a challenge
+        that is unknown, expired (5 minutes), already used, issued for another
+        blockchain or address, or whose timestamp differs from the issued one.
+        Bittensor (TAO) wallets sign with sr25519 in the `substrate` context;
+        both the raw text and the polkadot-js `<Bytes>…</Bytes>`-wrapped form
+        of the signature verify, and the unwrapped text is what the client
+        submits. Rate limited per client address. See server/BITTENSOR-LOGIN.md.
+      operationId: Auth Wallet Challenge
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AuthWalletChallengeArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthWalletChallengeResult"
 
   /auth/login-with-password:
     post:
@@ -318,10 +427,12 @@ paths:
 
   /auth/network-create:
     post:
+      tags: [onboarding]
+      summary: Create a network
       description: |
         Create a new network.
         A user authority can be associated with at most one network.
-      operationId: Auth Network Create
+      operationId: authNetworkCreate
       security: []
       requestBody:
         required: true
@@ -331,10 +442,13 @@ paths:
               $ref: "#/components/schemas/NetworkCreateArgs"
       responses:
         "200":
+          description: The created network, or the verification/pending state.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/NetworkCreateResult"
+        "400":
+          description: The request was malformed, the network name is taken, or the referral code is invalid.
 
   /auth/network-delete:
     post:
@@ -376,6 +490,159 @@ paths:
               schema:
                 $ref: "#/components/schemas/AuthCodeCreateResult"
 
+  /auth/apple/callback:
+    post:
+      tags: [auth]
+      summary: Sign in with Apple return for android, windows and linux
+      description: |
+        Apple has no SDK for android, windows or linux, so those apps open
+        Apple's authorize page in the system browser (a Custom Tab on android)
+        with `client_id` = the Apple Services ID, `redirect_uri` = this
+        endpoint, `response_type=code id_token`, `response_mode=form_post`,
+        `scope=name email`, and a fresh `state` and `nonce` per attempt. Apple
+        posts the result here as a form, and this endpoint answers `302` to the
+        app's own scheme so the browser hands control back to the app:
+
+            <scheme>://oauth/apple?state=…&id_token=…&code=…&user=…
+            <scheme>://oauth/apple?state=…&error=…
+
+        `user` is the JSON name/email Apple sends with the first authorization
+        only. Nothing is stored or verified here: the app checks that `state`
+        is the attempt it started and that the identity token's `nonce` claim
+        is the one it minted, then signs in with the token through
+        `POST /auth/login` (`auth_jwt_type: apple`), which verifies the
+        signature and the audience.
+
+        `state` is opaque except for one optional claim: when it is the
+        base64url encoding of a JSON object with a `platform` key, that key
+        picks the scheme (`android` → `ur://`, `windows` and `linux` →
+        `urnetwork://`); without it the android scheme is used. `GET` with the
+        same parameters as a query behaves the same way (manual testing).
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [state]
+              properties:
+                state:
+                  type: string
+                  description: The attempt's state, echoed by Apple untouched.
+                code:
+                  type: string
+                  description: Apple's authorization code (unused by the apps, passed through).
+                id_token:
+                  type: string
+                  description: Apple's identity token (a JWT carrying the attempt's nonce).
+                user:
+                  type: string
+                  description: JSON with the user's name and email, first authorization only.
+                error:
+                  type: string
+                  description: Apple's error, e.g. `user_cancelled_authorize`.
+      responses:
+        '302':
+          description: Redirect to the app's `<scheme>://oauth/apple?…` return url.
+          headers:
+            Location:
+              schema:
+                type: string
+              example: 'ur://oauth/apple?state=eyJwbGF0Zm9ybSI6ImFuZHJvaWQiLCJ0b2tlbiI6IjEyMyJ9&id_token=eyJ...'
+        '400':
+          description: No `state` in the form, or a body over 64 KiB.
+    get:
+      tags: [auth]
+      summary: Sign in with Apple return (query form, for manual testing)
+      parameters:
+        - in: query
+          name: state
+          required: true
+          schema:
+            type: string
+        - in: query
+          name: id_token
+          schema:
+            type: string
+        - in: query
+          name: code
+          schema:
+            type: string
+        - in: query
+          name: user
+          schema:
+            type: string
+        - in: query
+          name: error
+          schema:
+            type: string
+      responses:
+        '302':
+          description: Redirect to the app's `<scheme>://oauth/apple?…` return url.
+        '400':
+          description: No `state`.
+  /auth/google/callback:
+    get:
+      tags: [auth]
+      summary: Sign in with Google return for windows and linux
+      description: |
+        Windows and Linux have no native Google sign-in, so those apps open
+        Google's authorize page in the system browser with `client_id` = the
+        ur.io web sign-in client, `redirect_uri` = this endpoint,
+        `response_type=code`, `scope=openid email profile`,
+        `prompt=select_account`, and a fresh `state` and `nonce` per attempt
+        (android signs in with play services and ur.io in the page; neither
+        uses this). Google redirects the browser here with the authorization
+        code; this endpoint exchanges it at Google's token endpoint with the
+        web client's secret (vault `google.yml` `sign_in_oauth`) and answers
+        `302` to the app's own scheme so the browser hands control back to
+        the app:
+
+            <scheme>://oauth/google?state=…&id_token=…
+            <scheme>://oauth/google?state=…&error=…
+
+        Nothing is stored. The app checks that `state` is the attempt it
+        started and that the identity token's `nonce` claim is the one it
+        minted, then signs in with the token through `POST /auth/login`
+        (`auth_jwt_type: google`), which verifies the signature and the
+        audience.
+
+        `state` is opaque except for the optional `platform` claim shared
+        with the Apple callback: base64url JSON with a `platform` key picks
+        the scheme (`android` → `ur://`, `windows` and `linux` →
+        `urnetwork://`); without it the android scheme is used. Google's own
+        `error` (e.g. `access_denied`) is passed through; a failed exchange
+        or a missing client configuration comes back as `error` too
+        (`not_configured` when the vault has no `sign_in_oauth`).
+      parameters:
+        - in: query
+          name: state
+          required: true
+          schema:
+            type: string
+          description: The attempt's state, echoed by Google untouched.
+        - in: query
+          name: code
+          schema:
+            type: string
+          description: Google's authorization code, exchanged here for the identity token.
+        - in: query
+          name: error
+          schema:
+            type: string
+          description: Google's error, e.g. `access_denied`.
+      responses:
+        '302':
+          description: Redirect to the app's `<scheme>://oauth/google?…` return url.
+          headers:
+            Location:
+              schema:
+                type: string
+              example: 'urnetwork://oauth/google?state=eyJwbGF0Zm9ybSI6IndpbmRvd3MiLCJ0b2tlbiI6IjEyMyJ9&id_token=eyJ...'
+        '400':
+          description: No `state`.
+        '405':
+          description: Not a `GET`.
   /auth/code-login:
     post:
       description: |
@@ -402,7 +669,10 @@ paths:
     post:
       description: |
         Add an authentication method (email/phone + password, SSO, or wallet)
-        to the calling user. Subject to the account action rate limit.
+        to the calling user. A wallet (`wallet_auth`, Solana or Bittensor)
+        must sign the single-use challenge from /auth/wallet-challenge, the
+        same proof as wallet login; one wallet address binds to one user.
+        Subject to the account action rate limit.
       operationId: Auth Add Auth
       security:
         - BearerAuth: []
@@ -472,13 +742,15 @@ paths:
 
   /network/auth-client:
     post:
+      tags: [onboarding]
+      summary: Authenticate a client on the network
       description: |
         Gain permission to use the `connect` protocol as the requested clientId,
         or assign a new clientId.
         Each network can have at most 128 clientIds.
         Above that number, new clientId requests will error until one or more
         existing clientIds are removed.
-      operationId: Auth Network Client
+      operationId: authNetworkClient
       security:
         - BearerAuth: []
       requestBody:
@@ -489,10 +761,13 @@ paths:
               $ref: "#/components/schemas/AuthNetworkClientArgs"
       responses:
         "200":
+          description: The client credentials.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/AuthNetworkClientResult"
+        "401":
+          description: Missing or invalid bearer token.
 
   /network/remove-client:
     post:
@@ -517,7 +792,11 @@ paths:
   /network/clients:
     get:
       description: |
-        Get the latest status of all clients on this network.
+        Get the latest status of the network's devices: every top-level
+        client (no source_client_id) that is not a hosted proxy device, with
+        no provide-mode qualification. Child clients are never listed, and
+        neither are the network's cloud proxy devices (the "resident proxy"
+        clients the proxy host runs), which `/network/proxies` lists instead.
 
         Includes:
 
@@ -526,7 +805,27 @@ paths:
         - Connections, which are transports from the client to the platform.
         Note there can be multiple active connections for a single client.
         - Provide status
+
+        `proxy_client` is never present on this list.
       operationId: Network Clients
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetworkClientsResult"
+
+  /network/proxies:
+    get:
+      description: |
+        The network's cloud proxy devices: the clients that carry a hosted
+        proxy device (created with `proxy_config` on `/network/auth-client`),
+        each with its `proxy_client` credentials (proxy URLs, auth token,
+        WireGuard details). Same row shape as `/network/clients` otherwise:
+        resident status, connections, provide status.
+      operationId: Network Proxies
       security:
         - BearerAuth: []
       responses:
@@ -708,7 +1007,11 @@ paths:
   /network/ranking:
     get:
       description: |
-        Get leaderboard ranking of current network
+        Get leaderboard ranking of current network. Besides the data
+        leaderboard rank, the result carries the network's points leaderboard
+        settings (`points_leaderboard_public`, `emoji_tag`) and its points
+        ranks (`rank_points`, `rank_blocks`, `rank_streak`; 0 until the
+        network has points and a ranking snapshot exists).
       operationId: Network Get Ranking
       security:
         - BearerAuth: []
@@ -739,6 +1042,53 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SetNetworkRankingVisibilityResult"
+
+  /network/points-ranking-visibility:
+    post:
+      description: |
+        Turn the network's name on or off on the points leaderboard. Every
+        network with points is ranked and listed either way; this switch only
+        decides whether its row shows the network name or "Anonymous". The
+        emoji tag (/network/emoji) shows on the row regardless.
+      operationId: Network Points Ranking Visibility
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetNetworkPointsRankingVisibilityArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SetNetworkPointsRankingVisibilityResult"
+
+  /network/emoji:
+    post:
+      description: |
+        Set the network's emoji tag: 1 to 6 emoji (each grapheme cluster must
+        be a single emoji: pictographs with skin tones, ZWJ sequences, keycaps,
+        flags). Letters, digits and punctuation are rejected with the message
+        "Use 1 to 6 emoji.". An empty string clears the tag. The tag is shown
+        on the points leaderboard row and in the network's own header.
+      operationId: Network Set Emoji Tag
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetNetworkEmojiTagArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SetNetworkEmojiTagResult"
 
   /network/block-location:
     post:
@@ -918,9 +1268,63 @@ paths:
 
   /subscription/balance:
     get:
+      tags: [subscription]
+      summary: Subscription status, balance and the onboarding plan data
       description: |
-        Get the current subscription status and transfer balance.
-      operationId: Subscription Balance
+        Get the current subscription status and transfer balance. This is also
+        the PLAN response of the onboarding program: it carries the caller's
+        regional `price_tier`, the welcome `onboarding_offer` (null when none
+        was issued) and the `experiments` assignments per surface.
+
+        Regional pricing rule (mmm/onboarding/PLAN.md): the tier is resolved,
+        in order, from `storefront_country` (the store's storefront country,
+        sent by the Apple and Google apps), the Stripe customer's billing
+        country when a customer exists, else the client IP as a DISPLAY
+        ESTIMATE (`price_tier.estimate: true`). The store charges its own
+        storefront's price; the Stripe tier actually charged is finalized from
+        the card's billing country once the payment method is attached, before
+        the trial ends. The regional price is tied to the storefront/billing
+        country, never to a VPN exit.
+      operationId: subscriptionBalance
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: storefront_country
+          in: query
+          required: false
+          description: |
+            ISO 3166-1 alpha-2 (or alpha-3) storefront country of the app's
+            store (StoreKit `Storefront.countryCode`, Play billing region).
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The balance, subscription and onboarding plan data.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubscriptionBalanceResult"
+
+  /subscription/details:
+    get:
+      description: |
+        The "Manage subscription" screen: every store currently billing the
+        caller's network, one entry per store, with the window it bought
+        (`end_time` is the expiry, or the next renewal date when the store
+        renews), the store's auto-renew state and the control that stops it.
+
+        `auto_renew` is true/false when the store answered and null when the
+        store lookup failed (best-effort, ~5 s per store; the entry still
+        carries the window from our own records). `can_cancel` is true only
+        for Stripe, which /subscription/cancel acts on; Apple and Google
+        entries carry the store's own subscriptions page in `manage_url` (a
+        subscription is cancelled where it is billed); a Solana entry is a
+        one-time USDC payment that never renews. `has_stripe_customer` gates
+        the Stripe billing portal (/stripe/customer-portal errors without one).
+
+        The result is cached per network for 60 seconds; cancel and resume
+        invalidate it.
+      operationId: Subscription Details
       security:
         - BearerAuth: []
       responses:
@@ -928,7 +1332,53 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/SubscriptionBalanceResult"
+                $ref: "#/components/schemas/SubscriptionDetailsResult"
+
+  /subscription/cancel:
+    post:
+      description: |
+        Stop the Stripe subscription billing the caller's network at the end of
+        the paid period (`cancel_at_period_end`); the customer keeps Pro until
+        `end_time`. Only `store` "stripe" (the default) is acted on: the other
+        stores answer with `error.message` and, for Apple/Google, the store's
+        subscriptions page in `manage_url`. Idempotent: an already-cancelling
+        subscription is not written again.
+      operationId: Subscription Cancel
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SubscriptionCancelArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubscriptionCancelResult"
+
+  /subscription/resume:
+    post:
+      description: |
+        Undo /subscription/cancel while the paid period is still running: the
+        Stripe subscription renews again. Same request and result shapes.
+      operationId: Subscription Resume
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SubscriptionCancelArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubscriptionCancelResult"
 
   /subscription/check-balance-code:
     post:
@@ -1641,6 +2091,29 @@ paths:
               schema:
                 $ref: "#/components/schemas/NetworkBalanceCodesResult"
 
+  /account/epochs:
+    get:
+      description: |
+        The caller network's finalized epochs, newest first: the points earned
+        inside each epoch's wall-clock window and the network's share of the
+        operator pool in basis points (0 when no coldkey was attached, i.e.
+        points only). `limit` defaults to 26 and is capped at 104.
+      operationId: Account Epochs
+      security:
+        - BearerAuth: []
+      parameters:
+        - in: query
+          name: limit
+          required: false
+          schema:
+            type: integer
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccountEpochsResult"
+
   /account/referral-code:
     get:
       description: |
@@ -1657,10 +2130,14 @@ paths:
 
   /referral-code/validate:
     post:
-      description: Validate the referral code.
+      description: |
+        Validate a referral (bonus) code: whether it exists and whether it has
+        been used up. The sign-up screens call this before an account exists,
+        so no authentication is required; a bearer token, if sent, is ignored.
+        Checks are budgeted per caller address (60 per 10 minutes) and across
+        all callers; over budget the response is 429 with a Retry-After header.
       operationId: Validate Referral Code
-      security:
-        - BearerAuth: []
+      security: []
       requestBody:
         required: true
         content:
@@ -1673,6 +2150,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ValidateReferralCodeResult"
+        "429":
+          description: Too many referral code checks from this address; retry after the Retry-After seconds.
 
   /account/referral-network:
     get:
@@ -1738,9 +2217,11 @@ paths:
 
   /solana/payment-intent:
     post:
+      tags: [subscription]
+      summary: Create a Solana Pay intent for Pro
       description: |
         When paying for a subscription with Solana, we track the order through this intent.
-      operationId: Solana Payment Intent
+      operationId: solanaPaymentIntent
       security:
         - BearerAuth: []
       requestBody:
@@ -1751,10 +2232,13 @@ paths:
               $ref: "#/components/schemas/SolanaPaymentIntentArgs"
       responses:
         "200":
+          description: The quoted intent.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/SolanaPaymentIntentResult"
+        "401":
+          description: Missing or invalid bearer token.
 
   /stripe/payment-intent:
     post:
@@ -1797,6 +2281,125 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/StripeCreateCustomerPortalResult"
+
+  /pay/data/checkout:
+    post:
+      description: |
+        Buy a data pack with a card without signing in (the ur.io buy-data
+        page). Starts a hosted Stripe checkout and returns the url to send the
+        customer to. To pay with USDC on Solana use /pay/data/solana-intent.
+
+        With `network_name`, the data is applied to that network by the payment
+        webhook as soon as the payment confirms, and the customer is emailed a
+        note that the data is on the network (the code is included, already
+        applied). The name is matched case-insensitively and exactly; an unknown
+        name returns `error.message` "No network named <name>".
+
+        Without `network_name`, the customer receives a data code by email, as
+        before. Stripe collects the email on its checkout page when `email` is
+        not given.
+
+        The success url is the configured checkout success url plus
+        `item=<item_id>` and, when applying to a network, `network=<name>`.
+        Unauthenticated, per-ip rate limited. Errors are returned as
+        `error.message` with a 200.
+      operationId: Pay Data Checkout
+      security: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PayDataCheckoutArgs"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PayDataCheckoutResult"
+
+  /pay/data/network-lookup:
+    post:
+      description: |
+        Whether a network with exactly this name exists, for the buy-data page.
+        Matched the same way /pay/data/checkout resolves `network_name`
+        (case-insensitive, exact). Unlike /auth/network-check, which is a sign-up
+        similarity check, a name within a few characters of an existing one is
+        NOT reported as existing. Returns only the canonical name, no id.
+        Unauthenticated, per-ip rate limited.
+      operationId: Pay Data Network Lookup
+      security: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PayDataNetworkLookupArgs"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PayDataNetworkLookupResult"
+
+  /pay/data/solana-intent:
+    post:
+      description: |
+        Buy a data pack with USDC on Solana, without signing in or giving an
+        email: the data goes straight to the network named by `network_name`
+        (matched like /pay/data/network-lookup). Records the payment intent and
+        returns the exact `amount_usd` to send in USDC. The client generates
+        `reference` (a Solana Pay reference: a fresh base58 public key) and
+        either opens a Solana Pay url carrying it, or shows the buyer the
+        receiving address, the amount and `memo` (which is the reference) to
+        send by hand from any wallet or exchange. The Helius webhook
+        (/pay/solana) matches the transfer by the reference among the
+        transaction's account keys OR by the memo text, then lands the data on
+        the network (data only, valid for one year, no Pro) and emails the
+        network's admin when their login is an email.
+
+        The intent expires after 24 hours (`expires_at`); a payment that arrives
+        late still credits as long as the intent has not been swept. A reused
+        reference, an unknown item or an unknown network return `error.message`
+        with a 200. Unauthenticated, per-ip rate limited.
+      operationId: Pay Data Solana Intent
+      security: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PayDataSolanaIntentArgs"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PayDataSolanaIntentResult"
+
+  /pay/data/solana-status:
+    post:
+      description: |
+        The state of a data pack payment started with /pay/data/solana-intent,
+        for the buy-data page to poll while it waits: `pending` until the USDC
+        transfer is credited, `paid` once the data is on the network, `expired`
+        when the intent passed `expires_at` unpaid, `unknown` for a reference
+        that is not a data pack intent (plan intents made by a signed-in wallet
+        are not reported here). Unauthenticated, per-ip rate limited.
+      operationId: Pay Data Solana Status
+      security: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PayDataSolanaStatusArgs"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PayDataSolanaStatusResult"
 
   /stripe/create-checkout-session:
     post:
@@ -1880,9 +2483,15 @@ paths:
   /sn/wallet:
     post:
       description: |
-        Set the caller network's subnet coldkey - the ss58 address that pool
-        payouts for this network are claimable by. This wallet is deliberately
-        separate from the account payout wallet.
+        Attach the caller's subnet coldkey - the ss58 address that pool payouts
+        are claimable by. Proof of key possession is required: `message` is the
+        single-use challenge issued by POST /auth/wallet-challenge for
+        blockchain TAO and `signature` is the coldkey's sr25519 signature over
+        it. `client_id` scopes the wallet to one provider client (a
+        client-scoped JWT selects its own client). Banned addresses are
+        rejected. Not retroactive: the wallet applies from the next committed
+        epoch's leaf set. This wallet is deliberately separate from the
+        account payout wallet.
       operationId: Sn Set Wallet
       security:
         - BearerAuth: []
@@ -1898,6 +2507,92 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SnSetWalletResult"
+    get:
+      description: |
+        The coldkeys attached inside the caller's network: the network-level
+        wallet (no `client_id`) and every provider client's wallet. `wallet` is
+        the session's effective wallet (the client-scoped wallet for a client
+        session when set, else the network wallet); absent when none is
+        attached. An empty `wallets` list is not an error.
+      operationId: Sn Get Wallet
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnGetWalletResult"
+
+  /sn/wallet/validate:
+    post:
+      description: |
+        Checks an address before it is attached: ss58 syntax with the Bittensor
+        prefix, the operator ban list, and whether the account exists on the
+        subtensor chain. When the chain cannot be reached the result reports
+        `exists_on_chain: true` with a message, so an outage never blocks a
+        user. No authentication; chain lookups are rate limited per source
+        address.
+      operationId: Sn Validate Wallet
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SnValidateWalletArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnValidateWalletResult"
+
+  /sn/head:
+    get:
+      description: |
+        The caller network's standing for a head mining spot (Top 200,
+        WHITEPAPER 8.4). `score` is the server's estimate of split-adjusted
+        distinct routable egress-IP breadth from the live trail egress index,
+        `floor` the score of the last network inside `cutoff` (0 while fewer
+        networks score), `rank_estimate` 1-based (0 without a score).
+        `bound`/`hotkey`/`uid` reflect an active head binding. `source` is
+        "server" until validators publish consensus scores on chain; a chain
+        outage degrades to the estimate, never an error.
+      operationId: Sn Head
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnHeadResult"
+
+  /sn/head/binding:
+    post:
+      description: |
+        Store a device's consent for a fleet binding (WHITEPAPER 11.4): the
+        canonical binding payload and the client's Ed25519 signature over its
+        keccak256 digest, optionally with the head hotkey's sr25519 signature.
+        When both signatures verify the response carries the
+        `bindFleetMember` calldata for the operator to submit from their own
+        key. The server never submits on chain.
+      operationId: Sn Head Binding
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SnHeadBindingArgs"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnHeadBindingResult"
 
   /sn/pool/claim:
     get:
@@ -1936,6 +2631,680 @@ paths:
               schema:
                 $ref: "#/components/schemas/SnEpochResult"
 
+  # ----- onboarding program (mmm/onboarding/PLAN.md) -----
+
+  /onboarding/offer/issue:
+    post:
+      tags: [onboarding]
+      summary: Issue the welcome offer
+      description: |
+        Issue the caller's welcome offer: 25% off the first year of Pro (3
+        months free), valid `validity_days` (5) from issue, stacked on the
+        14-day trial, redeemable on every store. Issued ONCE per network:
+        the call is idempotent and returns the existing offer in whatever
+        state it is in (`created: false`); an expired offer is never
+        re-issued. Call it the moment the offer surface renders (the intro
+        plan step), so the deadline is real.
+
+        Refused with `error` when the onboarding config is absent, or when
+        the caller is in the `holdout` variant of the in-app offer
+        experiment (`experiments["offer.in_app"]`): those networks show the
+        regular plan picker and reach the offer by email instead.
+
+        Budgeted per caller address (30 per 10 minutes): over budget the
+        response is 429 with a Retry-After header.
+      operationId: onboardingOfferIssue
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OnboardingOfferIssueArgs"
+            examples:
+              introStep:
+                summary: The intro plan step renders
+                value:
+                  surface: intro_step
+                  storefront_country: US
+      responses:
+        "200":
+          description: The caller's offer, created now or already issued.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OnboardingOfferIssueResult"
+              examples:
+                created:
+                  summary: Issued by this call
+                  value:
+                    created: true
+                    offer:
+                      issued_at: "2026-09-09T16:00:00Z"
+                      expires_at: "2026-09-14T16:00:00Z"
+                      percent_off: 25
+                      months_free: 3
+                      first_year_usd: 30
+                      regular_year_usd: 40
+                      tier: standard
+                      currency: USD
+                      state: active
+                      apple_offer_code: ONBOARD25
+                      play_offer_tag: onboarding25
+                      stripe_coupon_id: onboarding25
+                      redeemed_at: null
+                      store: null
+                holdout:
+                  summary: Refused for the in-app holdout
+                  value:
+                    created: false
+                    offer: null
+                    error:
+                      message: holdout
+        "401":
+          description: Missing or invalid bearer token.
+        "429":
+          description: Too many requests from this address.
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying.
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RateLimitedError"
+
+  /client/events:
+    post:
+      tags: [analytics]
+      summary: Store a batch of product events
+      description: |
+        Store a batch of product events (at most 200 per call) against the
+        CLOSED event schema (see ClientEvent). The network id comes from the
+        bearer token only; `country_tier`, path, experiment and variant are
+        stamped by the server. Unknown event names, unknown prop keys,
+        missing required props and ill-typed values are refused PER EVENT in
+        `rejected` (the rest of the batch is stored); a rejection is final,
+        the client must not resend that event. No free text is stored except
+        `feedback.submitted.text`, which is redacted (emails, phone numbers,
+        IP addresses) before storage.
+
+        Clients batch every 30 s or on background, drop an event after three
+        failed calls, and never send more than 200 per call (a larger batch
+        is a 400). Budgeted per caller address (120 calls per 10 minutes):
+        over budget the response is 429 with a Retry-After header.
+      operationId: clientEventsSend
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ClientEventsSendArgs"
+            examples:
+              batch:
+                summary: An offer exposure and a purchase start
+                value:
+                  events:
+                    - name: offer.screen.shown
+                      at: "2026-09-09T16:00:03Z"
+                      platform: android
+                      app_version: 2026.9.9
+                      locale: en-US
+                      session: 3f9c1a
+                      props:
+                        surface: intro_step
+                        experiment: offer_screen
+                        variant: control
+                        tier: standard
+                        price_shown: 29.99
+                        currency: USD
+                        expires_in_s: 431997
+                    - name: purchase.started
+                      at: "2026-09-09T16:00:41Z"
+                      platform: android
+                      app_version: 2026.9.9
+                      locale: en-US
+                      session: 3f9c1a
+                      props:
+                        store: play
+                        product: supporter-yearly
+                        plan: yearly
+                        trial: true
+                        price: 29.99
+                        currency: USD
+      responses:
+        "200":
+          description: Per-event acceptance for the batch.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ClientEventsSendResult"
+              examples:
+                partial:
+                  summary: One event refused
+                  value:
+                    accepted: 1
+                    rejected:
+                      - index: 1
+                        message: "props.plan: unknown value"
+        "400":
+          description: More than 200 events in the batch, or a malformed body.
+        "401":
+          description: Missing or invalid bearer token.
+        "429":
+          description: Too many event calls from this address.
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying.
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RateLimitedError"
+
+  /onboarding/click:
+    post:
+      tags: [onboarding, analytics]
+      summary: Record a campaign landing click
+      description: |
+        Record a campaign landing-page click. Every onboarding email link is
+        `https://ur.io/o/<step>?t=<token>`; the landing page posts the token
+        here, which writes the server-side `landing.clicked` attribution
+        event and answers with the in-app destination to route to
+        (`onboarding/connect`, `onboarding/widgets`, `onboarding/offer`,
+        `onboarding/feedback`). An app open (`/network/auth-client`) within
+        48 h of the click is attributed to it as `app.opened`.
+
+        No authentication: the signed token is the credential, and the
+        response carries nothing about the network. An expired token still
+        returns `step` and `destination` (with `ok: false`,
+        `error: expired`) so the page can route without attributing; an
+        invalid token returns `ok: false`, `error: invalid`. Budgeted per
+        caller address (60 per 10 minutes) -> 429 with Retry-After.
+      operationId: onboardingClick
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OnboardingClickArgs"
+            examples:
+              click:
+                value:
+                  token: eyJzIjoiZTFfY29ubmVjdCIsIm4iOi4uLn0.sig
+      responses:
+        "200":
+          description: The step the link belongs to and where to route.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OnboardingClickResult"
+              examples:
+                attributed:
+                  value:
+                    ok: true
+                    step: e1_connect
+                    destination: onboarding/connect
+                expired:
+                  value:
+                    ok: false
+                    step: e1_connect
+                    destination: onboarding/connect
+                    error: expired
+        "429":
+          description: Too many requests from this address.
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying.
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RateLimitedError"
+
+  /onboarding/feedback/{token}:
+    get:
+      tags: [onboarding]
+      summary: Resolve a feedback link token
+      description: |
+        Resolve a feedback link token (`https://ur.io/f/<token>?r=n` or
+        `?why=n`) to the rating or reason the one-tap email button stood
+        for, so the in-app feedback screen opens pre-filled. The token
+        carries the step and may carry the rating/reason; `r` (1-5) and
+        `why` (a reason token) override when present. The app then submits
+        the actual feedback through `/feedback/send-feedback` and reports
+        `feedback.submitted` through `/client/events`.
+
+        No authentication: the signed token is the credential. Budgeted per
+        caller address (60 per 10 minutes) -> 429 with Retry-After.
+      operationId: onboardingFeedbackToken
+      security: []
+      parameters:
+        - name: token
+          in: path
+          required: true
+          description: The signed feedback token from the email link.
+          schema:
+            type: string
+        - name: r
+          in: query
+          required: false
+          description: Rating 1-5 from the tapped button.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 5
+        - name: why
+          in: query
+          required: false
+          description: Reason token from the tapped button.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The pre-fill for the feedback screen.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OnboardingFeedbackTokenResult"
+              examples:
+                rating:
+                  value:
+                    ok: true
+                    step: e4_feedback
+                    rating: 4
+                    reason: ""
+                reason:
+                  value:
+                    ok: true
+                    step: e4_feedback
+                    rating: 0
+                    reason: did_not_work
+        "429":
+          description: Too many requests from this address.
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying.
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RateLimitedError"
+
+  /subscription/stripe/payment-sheet:
+    post:
+      tags: [subscription, onboarding]
+      summary: Prepare an inline Stripe payment sheet
+      description: |
+        Prepare an inline Stripe PaymentSheet purchase of Pro (the non-Play
+        Android flavors, Windows and Linux; never the play flavor or
+        iOS/macOS). The server creates or reuses the Stripe customer
+        (metadata `network_id`) and the subscription at the caller's
+        regional tier price: the yearly plan with the 14-day trial and, when
+        the caller's welcome offer is redeemable, the 25% coupon applied
+        server-side; the monthly plan without a trial. The sheet confirms
+        the returned intent: a SetupIntent for the yearly plan
+        (`intent_type: setup`, `setup_intent_client_secret`) or the first
+        invoice's PaymentIntent for the monthly plan (`intent_type: payment`,
+        `payment_intent_client_secret`). Configure the sheet with
+        `customer_id`, `ephemeral_key_secret` and `publishable_key`; pass the
+        Stripe API version the mobile SDK requires as `stripe_version`.
+
+        The trial is credited only once the card is attached
+        (`setup_intent.succeeded`); an abandoned sheet leaves nothing behind.
+        The charged tier is finalized from the card's billing country before
+        the trial ends and the tier is recorded on the subscription.
+        Calling again replaces a pending, unfinished sheet.
+      operationId: stripePaymentSheet
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StripePaymentSheetArgs"
+            examples:
+              yearly:
+                value:
+                  plan: yearly
+                  stripe_version: "2024-06-20"
+      responses:
+        "200":
+          description: The intent, customer and key material for the sheet.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StripePaymentSheetResult"
+              examples:
+                yearlyWithOffer:
+                  value:
+                    customer_id: cus_123
+                    ephemeral_key_secret: ek_test_123
+                    setup_intent_client_secret: seti_123_secret_456
+                    intent_type: setup
+                    subscription_id: sub_123
+                    publishable_key: pk_test_123
+                    tier: standard
+                    currency: USD
+                    plan: yearly
+                    amount_first_period_usd: 30
+                    regular_period_usd: 40
+                    trial_days: 14
+                    trial_end_at: "2026-09-23T16:00:00Z"
+                    offer_applied: true
+                    error: null
+        "401":
+          description: Missing or invalid bearer token.
+        "429":
+          description: Too many requests from this address.
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying.
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RateLimitedError"
+
+  /subscription/stripe/prices:
+    get:
+      tags: [subscription, onboarding]
+      summary: Stripe prices for the caller's tier
+      description: |
+        The Stripe price ids (and USD amounts) of the caller's regional tier,
+        the publishable key, and the welcome-offer coupon id when the
+        caller's offer is redeemable -- for clients that build their own
+        Stripe flow (the Windows/Linux Payment Element).
+      operationId: stripePrices
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: storefront_country
+          in: query
+          required: false
+          description: ISO 3166-1 alpha-2 storefront country, when the app knows it.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The tier's price ids and key material.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StripePricesResult"
+              examples:
+                standard:
+                  value:
+                    tier: standard
+                    currency: USD
+                    yearly_price_id: price_yearly_standard
+                    monthly_price_id: price_monthly_standard
+                    yearly_usd: 40
+                    monthly_usd: 5
+                    publishable_key: pk_test_123
+                    onboarding_coupon_id: onboarding25
+                    offer_eligible: true
+                    error: null
+        "401":
+          description: Missing or invalid bearer token.
+
+  # ----- optimization loop results (mmm/onboarding/PLAN.md, implemented by S3) -----
+
+  /admin/onboarding/results:
+    get:
+      tags: [analytics]
+      summary: Aggregated onboarding experiment results
+      description: |
+        The nightly aggregate the analysis script (mmm/onboarding/analyze.mjs)
+        reads: `onboarding_results_daily`, recomputed at 02:00 UTC by the
+        `OnboardingResultsRollup` task for the last `onboarding.results.rollup_days`
+        cohort days (config/main/onboarding.yml). One row per cohort day
+        (the network's sign-up day, UTC), experiment, variant, surface,
+        platform, price tier and path. Counts are networks, never events.
+
+        Exposure is the registry assignment (hash of network id and
+        experiment id), so holdout rows exist without any stamped event; for
+        the email sequence it is the variant the campaign row was served, and
+        only networks with an email address are exposed to an email
+        experiment. The pseudo-experiment `_all` (variant `all`, surface
+        `all`) counts every network of the cohort so the funnel per platform,
+        tier and path is readable without an experiment.
+
+        Column definitions, measured from each network's cohort time:
+        `sent`, `delivered`, `opened`, `clicked`, `unsubscribe`, `complaint` =
+        at least one `email.*` event of that name, any step;
+        `landing_clicked` = a `landing.clicked`; `app_open_48h` = an
+        `app.opened` (the auth-client attribution within 48 h of a landing
+        click); `connect_7d` = a connection day or `connect.first` within 7
+        days; `widget_7d` = `widget.added` within 7 days; `feedback_7d` =
+        `feedback.submitted` or an account feedback within 7 days;
+        `pro_start_14d` = a `purchase.completed` or the first subscription
+        renewal (trial included) within 14 days; `trial_to_paid_35d` =
+        `trial.converted` within 35 days; `refund_60d` = a `refund` within
+        60 days; `retention_d7` = a connection on day 6 or 7;
+        `retention_d30` = a connection on day 28, 29 or 30. A window that has
+        not matured reports 0: read `matured_days` (the cohort's age at
+        `computed_at`) to tell "not yet" from "did not".
+
+        Volume floor: rows with fewer than `onboarding.results.min_exposures`
+        exposures (default 10) are suppressed, and no identifier of any kind
+        is returned. Ordered by the dimension tuple; keyset paged by
+        `cursor`.
+
+        Auth: `Authorization: Bearer <token>` where the token is listed in
+        vault `onboarding.yml` under `onboarding.admin_bearers` (compared in
+        constant time). A missing or unknown token is 401; a network JWT is
+        403. Without the vault entry the endpoint is closed.
+      operationId: adminOnboardingResults
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: experiment
+          in: query
+          required: true
+          description: The experiment id from the registry.
+          schema:
+            type: string
+        - name: from
+          in: query
+          required: true
+          description: First cohort day, inclusive (YYYY-MM-DD).
+          schema:
+            type: string
+            format: date
+        - name: to
+          in: query
+          required: true
+          description: Last cohort day, inclusive (YYYY-MM-DD).
+          schema:
+            type: string
+            format: date
+        - name: surface
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: platform
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/EventPlatform"
+        - name: tier
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/PriceTierName"
+        - name: path
+          in: query
+          required: false
+          description: The campaign path, A (saw the in-app offer) or B.
+          schema:
+            type: string
+            enum: [A, B]
+        - name: cursor
+          in: query
+          required: false
+          description: The `next_cursor` of the previous page.
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          description: Rows per page, 1-1000 (default 500).
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: A page of aggregated rows.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OnboardingResultsPage"
+              examples:
+                page:
+                  value:
+                    rows:
+                      - cohort_day: "2026-09-15"
+                        experiment: e1_subject_2026w38
+                        variant: control
+                        surface: email.e1
+                        platform: android
+                        tier: standard
+                        path: A
+                        exposures: 412
+                        sent: 412
+                        delivered: 401
+                        opened: 190
+                        clicked: 31
+                        landing_clicked: 31
+                        app_open_48h: 24
+                        connect_7d: 19
+                        widget_7d: 6
+                        feedback_7d: 9
+                        pro_start_14d: 5
+                        trial_to_paid_35d: 3
+                        refund_60d: 0
+                        retention_d7: 41
+                        retention_d30: 22
+                        unsubscribe: 1
+                        complaint: 0
+                        matured_days: 61
+                        computed_at: "2026-11-16T02:00:12Z"
+                    next_cursor: null
+                    min_exposures: 10
+        "400":
+          description: Missing experiment, a date not YYYY-MM-DD, `to` before `from`, or an invalid cursor.
+        "401":
+          description: Missing or invalid bearer token.
+        "403":
+          description: The token is a network token, not an admin bearer.
+
+  /admin/onboarding/experiments:
+    get:
+      tags: [analytics]
+      summary: The experiment registry as loaded
+      description: |
+        The onboarding experiment registry (config/main/onboarding.yml
+        `onboarding.experiments`) as the server loaded it, so the analysis
+        script judges results against the same allocation, primary metric,
+        guardrails and minimum exposures the server applied, plus each
+        experiment's live variant states from the pause overlay
+        (`network_onboarding_experiment_state`: a variant the nightly
+        guardrail check or `bringyourctl onboarding experiments --pause`
+        paused is served as `control` until resumed) and the results
+        configuration (`min_exposures`, `rollup_days`, `guardrail_days`).
+        Same auth as /admin/onboarding/results.
+      operationId: adminOnboardingExperiments
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: The loaded registry.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OnboardingExperimentsResult"
+              examples:
+                registry:
+                  value:
+                    experiments:
+                      - id: offer_screen
+                        surface: offer.in_app
+                        status: running
+                        start: "2026-09-15"
+                        stop: "2026-10-27"
+                        allocation:
+                          control: 80
+                          holdout: 20
+                        variants:
+                          control: {}
+                          holdout: {}
+                        primary_metric: pro_start_14d
+                        secondary: [trial_to_paid_35d, refund_rate]
+                        guardrails:
+                          refund_rate: 0.06
+                        min_exposures: 3000
+        "401":
+          description: Missing or invalid bearer token.
+        "403":
+          description: The token is not an admin token.
+
+  /updates/brevo:
+    post:
+      tags: [analytics]
+      summary: Brevo transactional webhook
+      description: |
+        The Brevo transactional-email webhook. Brevo is registered
+        (idempotently, by the server when `onboarding.enabled` is on) to
+        post one event per delivery step; the request is authenticated by a
+        bearer token from the account's `webhook_bearers` list, not by a
+        network token. `unsubscribe` turns the account's product-updates
+        preference off (the existing behavior); for the onboarding campaign
+        the remaining events are recorded as server-written
+        `email.delivered|opened|clicked|bounced|complained|unsubscribed`
+        events against the network, with the campaign step taken from the
+        message's tag (`onboarding`, `<step>`, `<variant>`) or the
+        `X-Mailin-custom` header, so `e1_connect` clicks and `e4b_offer`
+        complaints land on the right step. A hard bounce or a complaint
+        exits the network from the sequence.
+      operationId: brevoWebhook
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BrevoWebhookArgs"
+            examples:
+              click:
+                value:
+                  event: click
+                  email: person@example.com
+                  message-id: "<202609091600.123@smtp-relay.mailin.fr>"
+                  tags: [onboarding, e1_connect, control]
+                  link: https://ur.io/o/e1_connect?t=...
+                  date: "2026-09-10 09:12:01"
+      responses:
+        "200":
+          description: Acknowledged.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BrevoWebhookResult"
+        "401":
+          description: The bearer is not one of the account's webhook bearers.
+
 components:
   securitySchemes:
     BearerAuth:
@@ -1944,6 +3313,28 @@ components:
       description: URnetwork JWT
 
   schemas:
+    ClockResult:
+      type: object
+      required:
+        - total_transfer_byte_count
+        - since_block
+        - since_time
+      properties:
+        total_transfer_byte_count:
+          type: string
+          pattern: "^[0-9]+$"
+          description: |
+            Base-10 destination-reported bytes for contracts finalized since
+            since_block. This is a string so clients do not lose integer
+            precision as the lifetime total grows.
+        since_block:
+          type: integer
+          description: First subnet block included in the counter.
+        since_time:
+          type: string
+          format: date-time
+          description: UTC start time of since_block.
+
     ProvideMode:
       type: integer
       oneOf:
@@ -2108,13 +3499,19 @@ components:
           description: email or phone number
           type: string
         auth_allowed:
+          description: The sign-in methods on file for this user authority
           type: array
           items:
             type: string
             enum:
               - password
+              - email
+              - phone
               - apple
               - google
+              - solana
+              - bittensor
+              - seedphrase
         error:
           type: object
           properties:
@@ -2277,6 +3674,15 @@ components:
         balance_code:
           type: string
           description: Optional balance code to add transfer balance to the new network.
+        product_updates:
+          type: boolean
+          description: |
+            The sign-up form's "Periodic product updates" line. Absent = true
+            (the line ships ticked). false turns the product-updates
+            preference off from the first moment: no onboarding campaign mail
+            is ever sent. Honored on every create path, including sign-ups
+            that complete through /auth/verify. The server records a
+            `signup.optout_changed` event with the value.
 
     NetworkCreateResult:
       type: object
@@ -2387,6 +3793,19 @@ components:
           type: string
         device_spec:
           description: If this is a new device, sets the device spec.
+          type: string
+        time_zone:
+          description: |
+            Optional. The device's IANA time zone (e.g. America/Chicago), used
+            only to place the onboarding campaign's emails in the user's local
+            day (08:00-21:00 local); never stored on the client. Every app
+            sends it on each auth-client call; the latest wins.
+          type: string
+        locale:
+          description: |
+            Optional. The device's BCP 47 locale ("de-DE"). Selects the onboarding
+            campaign's template language, falling back to English. Same rules as
+            time_zone.
           type: string
         roles:
           description: Optional. |
@@ -3152,6 +4571,1000 @@ components:
           type: integer
         update_time:
           type: string
+        price_tier:
+          $ref: "#/components/schemas/PriceTier"
+        onboarding_offer:
+          description: The caller's welcome offer; null when none was issued.
+          oneOf:
+            - $ref: "#/components/schemas/OnboardingOffer"
+            - type: "null"
+        experiments:
+          type: object
+          description: |
+            The caller's variant per experiment surface, keyed by surface
+            (`offer.in_app`, `email.sequence`, `offer.intro_step`,
+            `offer.final_screen`, `offer.email`, `offer.account`,
+            `email.<step>`, `cadence`). Only running experiments appear. A
+            network keeps its variant for the life of an experiment
+            (hash(network_id, experiment_id), server-side). The variant
+            `holdout` on `offer.in_app` means: show the regular plan picker,
+            no offer screen, do not issue the offer in-app. Stamp the
+            surface's experiment_id/variant on `offer.screen.shown`.
+          additionalProperties:
+            $ref: "#/components/schemas/ExperimentAssignment"
+
+    PriceTier:
+      type: object
+      description: |
+        A regional price tier of Pro (config/all/pro.yml pro.price_tiers):
+        `standard` ($40/year, $5/month) for the developed-country list,
+        `regional` ($4/year, $0.50/month) everywhere else. Prices are USD;
+        the store or Stripe shows the local-currency figure. The 14-day
+        trial and the welcome offer apply on every tier.
+      properties:
+        name:
+          type: string
+          enum:
+            - standard
+            - regional
+        yearly_usd:
+          type: number
+        monthly_usd:
+          type: number
+        currency:
+          type: string
+          description: always USD
+        source:
+          type: string
+          description: how the country was resolved
+          enum:
+            - storefront
+            - billing
+            - ip
+            - default
+        estimate:
+          type: boolean
+          description: true when the tier is a display estimate (ip or default)
+
+    OnboardingOffer:
+      type: object
+      description: |
+        The welcome offer: `percent_off` (25) off the first year of Pro,
+        `months_free` (3) in the store copy, valid until `expires_at`.
+        `first_year_usd` / `regular_year_usd` are for the caller's current
+        tier ($30 / $40 standard, $3 / $4 regional; the store products show
+        $29.99 / $39.99). Redemption handles per store: the App Store offer
+        code (`apple_offer_code`, one-time from the batch or the custom
+        code), the Play offer tag (`play_offer_tag`, on the yearly base
+        plan's discounted first-cycle offer) and the Stripe coupon
+        (`stripe_coupon_id`, applied server-side by the checkout and the
+        payment sheet); Solana quotes the offer price for plan
+        `yearly_onboarding`. Every purchase path stamps `redeemed_at` and
+        `store` on the first redemption.
+      properties:
+        issued_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        percent_off:
+          type: integer
+        months_free:
+          type: integer
+        first_year_usd:
+          type: number
+        regular_year_usd:
+          type: number
+        tier:
+          type: string
+        currency:
+          type: string
+        state:
+          type: string
+          enum:
+            - active
+            - redeemed
+            - expired
+        apple_offer_code:
+          type: string
+        play_offer_tag:
+          type: string
+        stripe_coupon_id:
+          type: string
+        redeemed_at:
+          description: When the offer was first redeemed; null until then.
+          oneOf:
+            - type: string
+              format: date-time
+            - type: "null"
+        store:
+          description: The store of the first redemption; null until then.
+          oneOf:
+            - $ref: "#/components/schemas/EventStore"
+            - type: "null"
+
+    ExperimentAssignment:
+      type: object
+      description: The caller's variant on one experiment surface.
+      properties:
+        experiment_id:
+          type: string
+        variant:
+          type: string
+          description: a registry variant name; `holdout` means show nothing
+
+    OnboardingOfferIssueArgs:
+      type: object
+      properties:
+        surface:
+          $ref: "#/components/schemas/OfferSurface"
+        storefront_country:
+          type: string
+          description: ISO 3166-1 storefront country, when the app knows it
+
+    OfferSurface:
+      type: string
+      description: Where the offer is shown.
+      enum:
+        - intro_step
+        - final_screen
+        - email_link
+        - account
+
+    OfferDeclineControl:
+      type: string
+      enum:
+        - free_plan_link
+        - back
+        - system_dismiss
+
+    OfferPlan:
+      type: string
+      enum:
+        - yearly
+        - monthly
+
+    EventStore:
+      type: string
+      enum:
+        - apple
+        - play
+        - stripe
+        - solana
+
+    EventPlatform:
+      type: string
+      enum:
+        - ios
+        - macos
+        - android
+        - web
+        - windows
+        - linux
+
+    PriceTierName:
+      type: string
+      enum:
+        - standard
+        - regional
+
+    RateLimitedError:
+      type: object
+      description: The body of a 429 response.
+      properties:
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+            retry_after_seconds:
+              type: integer
+
+    OnboardingOfferIssueResult:
+      type: object
+      properties:
+        offer:
+          description: The offer; null when refused.
+          oneOf:
+            - $ref: "#/components/schemas/OnboardingOffer"
+            - type: "null"
+        created:
+          type: boolean
+          description: true for the call that issued the offer
+        error:
+          oneOf:
+            - $ref: "#/components/schemas/ErrorMessage"
+            - type: "null"
+
+    ErrorMessage:
+      type: object
+      properties:
+        message:
+          type: string
+
+    ClientEvent:
+      description: |
+        One product event. The schema is CLOSED: `name` selects exactly one
+        of the variants below and `props` may carry only that variant's
+        keys (`additionalProperties: false`). A token is [A-Za-z0-9_.:+-],
+        at most 64 characters. Server-written names (landing.clicked,
+        app.opened, email.*, trial.*, refund, retention.*) are refused from
+        clients.
+      oneOf:
+        - $ref: "#/components/schemas/ClientEventOnboardingStepShown"
+        - $ref: "#/components/schemas/ClientEventOnboardingStepCompleted"
+        - $ref: "#/components/schemas/ClientEventOnboardingStepSkipped"
+        - $ref: "#/components/schemas/ClientEventOfferScreenShown"
+        - $ref: "#/components/schemas/ClientEventOfferCardTapped"
+        - $ref: "#/components/schemas/ClientEventOfferCtaTapped"
+        - $ref: "#/components/schemas/ClientEventOfferDeclined"
+        - $ref: "#/components/schemas/ClientEventPurchaseStarted"
+        - $ref: "#/components/schemas/ClientEventPurchaseCompleted"
+        - $ref: "#/components/schemas/ClientEventPurchaseCancelled"
+        - $ref: "#/components/schemas/ClientEventPurchaseFailed"
+        - $ref: "#/components/schemas/ClientEventConnectFirst"
+        - $ref: "#/components/schemas/ClientEventWidgetAdded"
+        - $ref: "#/components/schemas/ClientEventFeedbackSubmitted"
+        - $ref: "#/components/schemas/ClientEventSignupOptoutChanged"
+      discriminator:
+        propertyName: name
+        mapping:
+          onboarding.step.shown: "#/components/schemas/ClientEventOnboardingStepShown"
+          onboarding.step.completed: "#/components/schemas/ClientEventOnboardingStepCompleted"
+          onboarding.step.skipped: "#/components/schemas/ClientEventOnboardingStepSkipped"
+          offer.screen.shown: "#/components/schemas/ClientEventOfferScreenShown"
+          offer.card.tapped: "#/components/schemas/ClientEventOfferCardTapped"
+          offer.cta.tapped: "#/components/schemas/ClientEventOfferCtaTapped"
+          offer.declined: "#/components/schemas/ClientEventOfferDeclined"
+          purchase.started: "#/components/schemas/ClientEventPurchaseStarted"
+          purchase.completed: "#/components/schemas/ClientEventPurchaseCompleted"
+          purchase.cancelled: "#/components/schemas/ClientEventPurchaseCancelled"
+          purchase.failed: "#/components/schemas/ClientEventPurchaseFailed"
+          connect.first: "#/components/schemas/ClientEventConnectFirst"
+          widget.added: "#/components/schemas/ClientEventWidgetAdded"
+          feedback.submitted: "#/components/schemas/ClientEventFeedbackSubmitted"
+          signup.optout_changed: "#/components/schemas/ClientEventSignupOptoutChanged"
+
+    ClientEventBase:
+      type: object
+      description: The fields every client event carries.
+      required: [name]
+      properties:
+        name:
+          type: string
+        at:
+          type: string
+          format: date-time
+          description: the client's event time (RFC 3339); missing = now; clamped to [now - 30 d, now]
+        platform:
+          $ref: "#/components/schemas/EventPlatform"
+        app_version:
+          $ref: "#/components/schemas/EventToken"
+        locale:
+          type: string
+          maxLength: 32
+          description: a locale token (e.g. pt-BR)
+        session:
+          $ref: "#/components/schemas/EventToken"
+          description: an opaque per-app-session token
+        props:
+          type: object
+
+    EventToken:
+      type: string
+      pattern: "^[A-Za-z0-9_.:+-]{1,64}$"
+
+    CurrencyCode:
+      type: string
+      pattern: "^[A-Z]{3}$"
+
+    ClientEventOnboardingStepShown:
+      allOf:
+        - $ref: "#/components/schemas/ClientEventBase"
+        - type: object
+          description: An onboarding step was shown, completed or skipped.
+          properties:
+            name:
+              type: string
+              const: onboarding.step.shown
+            props:
+              type: object
+              additionalProperties: false
+              required: [step]
+              properties:
+                step:
+                  $ref: "#/components/schemas/EventToken"
+                index:
+                  type: integer
+                elapsed_ms:
+                  type: integer
+
+    ClientEventOnboardingStepCompleted:
+      allOf:
+        - $ref: "#/components/schemas/ClientEventBase"
+        - type: object
+          description: An onboarding step was shown, completed or skipped.
+          properties:
+            name:
+              type: string
+              const: onboarding.step.completed
+            props:
+              type: object
+              additionalProperties: false
+              required: [step]
+              properties:
+                step:
+                  $ref: "#/components/schemas/EventToken"
+                index:
+                  type: integer
+                elapsed_ms:
+                  type: integer
+
+    ClientEventOnboardingStepSkipped:
+      allOf:
+        - $ref: "#/components/schemas/ClientEventBase"
+        - type: object
+          description: An onboarding step was shown, completed or skipped.
+          properties:
+            name:
+              type: string
+              const: onboarding.step.skipped
+            props:
+              type: object
+              additionalProperties: false
+              required: [step]
+              properties:
+                step:
+                  $ref: "#/components/schemas/EventToken"
+                index:
+                  type: integer
+                elapsed_ms:
+                  type: integer
+
+    ClientEventOfferScreenShown:
+      allOf:
+        - $ref: "#/components/schemas/ClientEventBase"
+        - type: object
+          description: The welcome offer was shown on a surface.
+          properties:
+            name:
+              type: string
+              const: offer.screen.shown
+            props:
+              type: object
+              additionalProperties: false
+              required: [surface]
+              properties:
+                surface:
+                  $ref: "#/components/schemas/OfferSurface"
+                experiment:
+                  $ref: "#/components/schemas/EventToken"
+                variant:
+                  $ref: "#/components/schemas/EventToken"
+                tier:
+                  $ref: "#/components/schemas/PriceTierName"
+                price_shown:
+                  type: number
+                currency:
+                  $ref: "#/components/schemas/CurrencyCode"
+                expires_in_s:
+                  type: integer
+
+    ClientEventOfferCardTapped:
+      allOf:
+        - $ref: "#/components/schemas/ClientEventBase"
+        - type: object
+          description: A plan card on the offer screen was tapped.
+          properties:
+            name:
+              type: string
+              const: offer.card.tapped
+            props:
+              type: object
+              additionalProperties: false
+              required: [plan]
+              properties:
+                plan:
+                  $ref: "#/components/schemas/OfferPlan"
+
+    ClientEventOfferCtaTapped:
+      allOf:
+        - $ref: "#/components/schemas/ClientEventBase"
+        - type: object
+          description: The offer screen's primary button was tapped.
+          properties:
+            name:
+              type: string
+              const: offer.cta.tapped
+            props:
+              type: object
+              additionalProperties: false
+              required: [plan, store]
+              properties:
+                plan:
+                  $ref: "#/components/schemas/OfferPlan"
+                store:
+                  $ref: "#/components/schemas/EventStore"
+
+    ClientEventOfferDeclined:
+      allOf:
+        - $ref: "#/components/schemas/ClientEventBase"
+        - type: object
+          description: The offer screen was left without a purchase.
+          properties:
+            name:
+              type: string
+              const: offer.declined
+            props:
+              type: object
+              additionalProperties: false
+              required: [control]
+              properties:
+                control:
+                  $ref: "#/components/schemas/OfferDeclineControl"
+                elapsed_ms:
+                  type: integer
+
+    ClientEventPurchaseStarted:
+      allOf:
+        - $ref: "#/components/schemas/ClientEventBase"
+        - type: object
+          description: A purchase started, completed or was cancelled.
+          properties:
+            name:
+              type: string
+              const: purchase.started
+            props:
+              type: object
+              additionalProperties: false
+              required: [store]
+              properties:
+                store:
+                  $ref: "#/components/schemas/EventStore"
+                product:
+                  $ref: "#/components/schemas/EventToken"
+                plan:
+                  $ref: "#/components/schemas/OfferPlan"
+                trial:
+                  type: boolean
+                price:
+                  type: number
+                currency:
+                  $ref: "#/components/schemas/CurrencyCode"
+
+    ClientEventPurchaseCompleted:
+      allOf:
+        - $ref: "#/components/schemas/ClientEventBase"
+        - type: object
+          description: A purchase started, completed or was cancelled.
+          properties:
+            name:
+              type: string
+              const: purchase.completed
+            props:
+              type: object
+              additionalProperties: false
+              required: [store]
+              properties:
+                store:
+                  $ref: "#/components/schemas/EventStore"
+                product:
+                  $ref: "#/components/schemas/EventToken"
+                plan:
+                  $ref: "#/components/schemas/OfferPlan"
+                trial:
+                  type: boolean
+                price:
+                  type: number
+                currency:
+                  $ref: "#/components/schemas/CurrencyCode"
+
+    ClientEventPurchaseCancelled:
+      allOf:
+        - $ref: "#/components/schemas/ClientEventBase"
+        - type: object
+          description: A purchase started, completed or was cancelled.
+          properties:
+            name:
+              type: string
+              const: purchase.cancelled
+            props:
+              type: object
+              additionalProperties: false
+              required: [store]
+              properties:
+                store:
+                  $ref: "#/components/schemas/EventStore"
+                product:
+                  $ref: "#/components/schemas/EventToken"
+                plan:
+                  $ref: "#/components/schemas/OfferPlan"
+                trial:
+                  type: boolean
+                price:
+                  type: number
+                currency:
+                  $ref: "#/components/schemas/CurrencyCode"
+
+    ClientEventPurchaseFailed:
+      allOf:
+        - $ref: "#/components/schemas/ClientEventBase"
+        - type: object
+          description: A purchase failed.
+          properties:
+            name:
+              type: string
+              const: purchase.failed
+            props:
+              type: object
+              additionalProperties: false
+              required: [store]
+              properties:
+                store:
+                  $ref: "#/components/schemas/EventStore"
+                product:
+                  $ref: "#/components/schemas/EventToken"
+                plan:
+                  $ref: "#/components/schemas/OfferPlan"
+                trial:
+                  type: boolean
+                price:
+                  type: number
+                currency:
+                  $ref: "#/components/schemas/CurrencyCode"
+                error_class:
+                  $ref: "#/components/schemas/EventToken"
+
+    ClientEventConnectFirst:
+      allOf:
+        - $ref: "#/components/schemas/ClientEventBase"
+        - type: object
+          description: The network's first successful connection (once per network; resends are deduplicated).
+          properties:
+            name:
+              type: string
+              const: connect.first
+            props:
+              type: object
+              additionalProperties: false
+              properties: {}
+
+    ClientEventWidgetAdded:
+      allOf:
+        - $ref: "#/components/schemas/ClientEventBase"
+        - type: object
+          description: A widget, tile or control was added.
+          properties:
+            name:
+              type: string
+              const: widget.added
+            props:
+              type: object
+              additionalProperties: false
+              required: [kind]
+              properties:
+                kind:
+                  $ref: "#/components/schemas/EventToken"
+
+    ClientEventFeedbackSubmitted:
+      allOf:
+        - $ref: "#/components/schemas/ClientEventBase"
+        - type: object
+          description: In-app feedback was submitted.
+          properties:
+            name:
+              type: string
+              const: feedback.submitted
+            props:
+              type: object
+              additionalProperties: false
+              properties:
+                rating:
+                  type: integer
+                  minimum: 1
+                  maximum: 5
+                reason:
+                  $ref: "#/components/schemas/EventToken"
+                has_text:
+                  type: boolean
+                text:
+                  type: string
+                  maxLength: 2000
+                  description: free text, redacted (emails, phone numbers, IP addresses) before storage
+
+    ClientEventSignupOptoutChanged:
+      allOf:
+        - $ref: "#/components/schemas/ClientEventBase"
+        - type: object
+          description: The sign-up form's product-updates line was changed.
+          properties:
+            name:
+              type: string
+              const: signup.optout_changed
+            props:
+              type: object
+              additionalProperties: false
+              required: [product_updates]
+              properties:
+                product_updates:
+                  type: boolean
+
+    ClientEventsSendArgs:
+      type: object
+      properties:
+        events:
+          type: array
+          maxItems: 200
+          items:
+            $ref: "#/components/schemas/ClientEvent"
+
+    ClientEventsSendResult:
+      type: object
+      properties:
+        accepted:
+          type: integer
+          description: events stored (or deduplicated)
+        rejected:
+          type: array
+          description: schema refusals by batch index; final, do not resend
+          items:
+            type: object
+            properties:
+              index:
+                type: integer
+              message:
+                type: string
+
+    OnboardingClickArgs:
+      type: object
+      properties:
+        token:
+          type: string
+
+    OnboardingClickResult:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        step:
+          type: string
+          description: the campaign step the link belongs to (e.g. e1_connect)
+        destination:
+          type: string
+          description: the in-app destination to route to
+          enum:
+            - onboarding/connect
+            - onboarding/widgets
+            - onboarding/offer
+            - onboarding/feedback
+        error:
+          type: string
+          enum:
+            - invalid
+            - expired
+
+    OnboardingFeedbackTokenResult:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        step:
+          type: string
+        rating:
+          type: integer
+          description: 1-5, 0 when the link carried none
+        reason:
+          type: string
+        error:
+          type: string
+          enum:
+            - invalid
+            - expired
+
+    StripePaymentSheetArgs:
+      type: object
+      required: [plan]
+      properties:
+        plan:
+          $ref: "#/components/schemas/OfferPlan"
+        storefront_country:
+          type: string
+        stripe_version:
+          type: string
+          description: the Stripe API version the mobile SDK requires for its ephemeral key
+
+    StripePaymentSheetResult:
+      type: object
+      properties:
+        customer_id:
+          type: string
+        ephemeral_key_secret:
+          type: string
+        setup_intent_client_secret:
+          type: string
+          description: set for intent_type setup (the yearly plan with its trial)
+        payment_intent_client_secret:
+          type: string
+          description: set for intent_type payment (the monthly plan, no trial)
+        intent_type:
+          type: string
+          enum:
+            - setup
+            - payment
+        subscription_id:
+          type: string
+        publishable_key:
+          type: string
+        tier:
+          type: string
+        currency:
+          type: string
+        plan:
+          type: string
+        amount_first_period_usd:
+          type: number
+          description: the first period's price, with the welcome offer applied when eligible
+        regular_period_usd:
+          type: number
+        trial_days:
+          type: integer
+        trial_end_at:
+          type: string
+          format: date-time
+        offer_applied:
+          type: boolean
+        error:
+          oneOf:
+            - $ref: "#/components/schemas/ErrorMessage"
+            - type: "null"
+
+    StripePricesResult:
+      type: object
+      properties:
+        tier:
+          type: string
+        currency:
+          type: string
+        yearly_price_id:
+          type: string
+        monthly_price_id:
+          type: string
+        yearly_usd:
+          type: number
+        monthly_usd:
+          type: number
+        publishable_key:
+          type: string
+        onboarding_coupon_id:
+          type: string
+          description: the welcome-offer coupon, when the caller's offer is redeemable (yearly only)
+        offer_eligible:
+          type: boolean
+        error:
+          oneOf:
+            - $ref: "#/components/schemas/ErrorMessage"
+            - type: "null"
+
+    OnboardingResultsRow:
+      type: object
+      description: |
+        One aggregated row of the onboarding results. Counts are networks,
+        not events; the fixed-window outcomes are measured from each
+        network's cohort time (see GET /admin/onboarding/results for every
+        column's definition).
+      properties:
+        cohort_day:
+          type: string
+          format: date
+        experiment:
+          type: string
+        variant:
+          type: string
+        surface:
+          type: string
+        platform:
+          type: string
+          description: An EventPlatform, or `unknown` when the sign-up did not say.
+        tier:
+          type: string
+          description: A PriceTierName, or `unknown` when the sign-up country is unknown.
+        path:
+          type: string
+          description: The campaign path A or B, or `unknown`.
+        exposures:
+          type: integer
+        sent:
+          type: integer
+        delivered:
+          type: integer
+        opened:
+          type: integer
+        clicked:
+          type: integer
+        landing_clicked:
+          type: integer
+        app_open_48h:
+          type: integer
+        connect_7d:
+          type: integer
+        widget_7d:
+          type: integer
+        feedback_7d:
+          type: integer
+        pro_start_14d:
+          type: integer
+        trial_to_paid_35d:
+          type: integer
+        refund_60d:
+          type: integer
+        retention_d7:
+          type: integer
+        retention_d30:
+          type: integer
+        unsubscribe:
+          type: integer
+        complaint:
+          type: integer
+        matured_days:
+          type: integer
+          description: The cohort's age in whole days at `computed_at`; a window longer than this has not been measured yet.
+        computed_at:
+          type: string
+          format: date-time
+
+    OnboardingResultsPage:
+      type: object
+      properties:
+        rows:
+          type: array
+          items:
+            $ref: "#/components/schemas/OnboardingResultsRow"
+        next_cursor:
+          description: The cursor for the next page; null on the last page.
+          type: [string, "null"]
+        min_exposures:
+          type: integer
+          description: The volume floor applied to this page.
+
+    OnboardingExperiment:
+      type: object
+      description: One registry entry (config/main/onboarding.yml onboarding.experiments).
+      properties:
+        id:
+          type: string
+        surface:
+          type: string
+          description: email.<step> | offer.in_app | offer.email | cadence
+        status:
+          type: string
+          enum: [draft, running, paused, done]
+        start:
+          type: string
+          format: date
+        stop:
+          type: string
+          format: date
+        allocation:
+          type: object
+          description: percent per variant name, by hash(network_id, id)
+          additionalProperties:
+            type: number
+        variants:
+          type: object
+          description: per variant, the Brevo template name or the store copy key set and layout id
+          additionalProperties:
+            type: object
+        primary_metric:
+          type: string
+        secondary:
+          type: array
+          items:
+            type: string
+        guardrails:
+          type: object
+          additionalProperties:
+            type: number
+        min_exposures:
+          type: integer
+        active:
+          type: boolean
+          description: Whether the experiment assigns right now (status running, within start/stop).
+        variant_states:
+          type: array
+          description: The pause overlay rows of this experiment (empty when nothing was ever paused).
+          items:
+            $ref: "#/components/schemas/OnboardingExperimentVariantState"
+
+    OnboardingExperimentVariantState:
+      type: object
+      properties:
+        experiment_id:
+          type: string
+        variant:
+          type: string
+        status:
+          type: string
+          enum: [paused, running]
+          description: paused = served as control; running = resumed.
+        reason:
+          type: string
+        updated_at:
+          type: string
+          format: date-time
+
+    OnboardingExperimentsResult:
+      type: object
+      properties:
+        experiments:
+          type: array
+          items:
+            $ref: "#/components/schemas/OnboardingExperiment"
+        results:
+          type: object
+          description: The results configuration the rollup and the results endpoint apply.
+          properties:
+            min_exposures:
+              type: integer
+            rollup_days:
+              type: integer
+            guardrail_days:
+              type: integer
+
+    BrevoWebhookArgs:
+      type: object
+      description: |
+        A Brevo transactional webhook event (https://developers.brevo.com/docs/transactional-webhooks).
+        Only the fields the server reads are listed; Brevo sends more.
+      required: [event, email]
+      properties:
+        event:
+          type: string
+          enum:
+            - request
+            - delivered
+            - opened
+            - uniqueOpened
+            - click
+            - hardBounce
+            - softBounce
+            - blocked
+            - spam
+            - complaint
+            - unsubscribed
+            - unsubscribe
+            - invalid
+            - deferred
+            - error
+        email:
+          type: string
+        message-id:
+          type: string
+        tags:
+          type: array
+          description: the send's tags; the campaign sends carry [onboarding, <step>, <variant>]
+          items:
+            type: string
+        tag:
+          type: string
+          description: Brevo's legacy form of the tags, a JSON-encoded array in a string
+        template_id:
+          type: integer
+        X-Mailin-custom:
+          type: string
+          description: the campaign sets this header to the step name on every send
+        link:
+          type: string
+          description: the clicked URL (click events)
+        date:
+          type: string
+        ts_event:
+          type: integer
+          description: unix seconds of the event
+
+    BrevoWebhookResult:
+      type: object
+      properties: {}
 
     StatsProvidersArgs:
       type: object
@@ -3844,6 +6257,20 @@ components:
           type: string
         total_referrals:
           type: integer
+        max_referrals:
+          description: |
+            Referrals a network is paid for (pro.yml referral.max_referrals).
+            0 when the server has no pro.yml (uncapped); clients treat 0 as unknown.
+          type: integer
+        bonus_per_referral_bytes:
+          description: Bytes granted to the referrer per referral, per bonus period. 0 when unknown.
+          type: integer
+        referred_bonus_bytes:
+          description: Bytes granted to the referred network, per bonus period. 0 when unknown.
+          type: integer
+        bonus_period_seconds:
+          description: The bonus grant period in seconds (24h = 86400). 0 when unknown.
+          type: integer
 
     TransferStatsResult:
       type: object
@@ -3882,7 +6309,16 @@ components:
       type: object
       properties:
         auth_type:
+          description: The sign-in method to remove; the last remaining method cannot be removed
           type: string
+          enum:
+            - email
+            - phone
+            - apple
+            - google
+            - solana
+            - bittensor
+            - seedphrase
     RemoveAuthResult:
       type: object
       properties:
@@ -3928,21 +6364,58 @@ components:
           properties:
             message:
               type: string
+    AuthWalletChallengeArgs:
+      type: object
+      properties:
+        blockchain:
+          description: solana (default) or tao/bittensor; case-insensitive
+          type: string
+          enum:
+            - solana
+            - tao
+            - bittensor
+        wallet_address:
+          description: Optional. Solana base58 public key or Bittensor ss58 address; when given, the challenge is bound to it.
+          type: string
+    AuthWalletChallengeResult:
+      type: object
+      properties:
+        challenge:
+          description: 32 random bytes, base64url; embedded in message_template
+          type: string
+        timestamp:
+          description: unix seconds the challenge was issued; embedded in message_template
+          type: integer
+        expires_in:
+          description: seconds until the challenge expires (300)
+          type: integer
+        message_template:
+          description: "The exact text to sign: `Sign in to URnetwork\nChallenge: <challenge>\nTimestamp: <timestamp>`"
+          type: string
+        error:
+          type: object
+          properties:
+            message:
+              type: string
     WalletAuthArgs:
       type: object
       properties:
         wallet_address:
-          description: The user's wallet address
+          description: Solana base58 public key, or Bittensor ss58 address (prefix 42, checksum verified)
           type: string
         wallet_message:
-          description: The signed message
+          description: The message_template issued by /auth/wallet-challenge, unmodified (no `<Bytes>` wrapper, LF line endings)
           type: string
         wallet_signature:
+          description: "Solana: base64 ed25519 signature over the message. Bittensor: hex of the 64-byte sr25519 signature (with or without 0x) made in the `substrate` signing context, over the raw or `<Bytes>`-wrapped message"
           type: string
         blockchain:
+          description: solana (default) or tao/bittensor; case-insensitive
           type: string
           enum:
             - solana
+            - tao
+            - bittensor
 
     AccountPoint:
       type: object
@@ -4013,6 +6486,12 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/LeaderboardEarner"
+        rank:
+          description: The caller network's leaderboard position (1 = top earner); 0 when the network has no ranked payouts.
+          type: integer
+        total:
+          description: The number of ranked networks.
+          type: integer
         error:
           type: object
           properties:
@@ -4030,6 +6509,24 @@ components:
         leaderboard_public:
           description: Whether your network is publicly visibile on the leaderboard
           type: boolean
+        points_leaderboard_public:
+          description: Whether the network is listed on the points leaderboard
+          type: boolean
+        emoji_tag:
+          description: The network's emoji tag (1 to 6 emoji), absent when unset
+          type: string
+        rank_points:
+          description: Competition rank by total points, 0 when unranked
+          type: integer
+          format: int64
+        rank_blocks:
+          description: Competition rank by finalized epochs with points, 0 when unranked
+          type: integer
+          format: int64
+        rank_streak:
+          description: Competition rank by current streak, 0 when unranked
+          type: integer
+          format: int64
 
     NetworkRankingResult:
       type: object
@@ -4052,6 +6549,178 @@ components:
     SetNetworkRankingVisibilityResult:
       type: object
       properties:
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    SetNetworkPointsRankingVisibilityArgs:
+      type: object
+      required:
+        - public
+      properties:
+        public:
+          description: true to list the network on the points leaderboard
+          type: boolean
+
+    SetNetworkPointsRankingVisibilityResult:
+      type: object
+      properties:
+        points_leaderboard_public:
+          type: boolean
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    SetNetworkEmojiTagArgs:
+      type: object
+      required:
+        - emoji_tag
+      properties:
+        emoji_tag:
+          description: 1 to 6 emoji; an empty string clears the tag
+          type: string
+          example: "🐬🔥"
+
+    SetNetworkEmojiTagResult:
+      type: object
+      properties:
+        emoji_tag:
+          description: The stored (NFC-normalized) tag, empty when cleared
+          type: string
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+              example: Use 1 to 6 emoji.
+
+    PointsLeaderboardArgs:
+      type: object
+      properties:
+        sort:
+          description: The dimension to page by
+          type: string
+          enum: [points, blocks, streak]
+          default: points
+        cursor:
+          description: |
+            Continues a previous page in either direction: a `next_cursor`
+            opens the page after it, a `prev_cursor` the page before it.
+            Omit for the first page. A cursor is opaque and pins the snapshot
+            and the sort; `restart: true` means its snapshot is gone.
+          type: string
+        seek_rank:
+          description: |
+            Jumps to a position: the page starts at the row whose `position`
+            in this sort's total order equals `seek_rank` (1-based, clamped to
+            [1, total_ranked]). Used without a cursor; the response then
+            carries both `prev_cursor` and `next_cursor` so the jumped-to
+            window pages in both directions. `total_ranked` from any previous
+            response is the client's denominator when it turns a scroll
+            position into a rank.
+          type: integer
+          format: int64
+          minimum: 1
+        limit:
+          description: Page size, default 50, max 200
+          type: integer
+
+    PointsLeaderboardRow:
+      type: object
+      properties:
+        network_id:
+          type: string
+        network_name:
+          description: Present only when the network turned on points_leaderboard_public (/network/points-ranking-visibility)
+          type: string
+        emoji_tag:
+          description: The network's emoji tag, absent when unset; shown whether or not the name is
+          type: string
+        anonymous:
+          description: true when the network name is hidden; the row is listed either way
+          type: boolean
+        contains_profanity:
+          description: The public name contains profanity (apps may mask it)
+          type: boolean
+        total_points:
+          description: All-time points
+          type: number
+          format: double
+        blocks_with_points:
+          description: Finalized epochs in which the network earned points
+          type: integer
+        streak:
+          description: Consecutive finalized epochs with points ending at the latest finalized epoch
+          type: integer
+        longest_streak:
+          description: The best streak ever (informational, never ranked)
+          type: integer
+        rank_points:
+          type: integer
+          format: int64
+        rank_blocks:
+          type: integer
+          format: int64
+        rank_streak:
+          type: integer
+          format: int64
+        position:
+          description: |
+            The row's 1-based place in the requested sort's total order.
+            Ranks tie (competition ranks), positions never do: this is the
+            `seek_rank` coordinate and the key a client keeps its loaded
+            window by.
+          type: integer
+          format: int64
+          minimum: 1
+
+    PointsLeaderboardMe:
+      allOf:
+        - $ref: "#/components/schemas/PointsLeaderboardRow"
+        - type: object
+          properties:
+            points_leaderboard_public:
+              type: boolean
+            ranked:
+              description: false when the network has no points yet
+              type: boolean
+
+    PointsLeaderboardResult:
+      type: object
+      properties:
+        rows:
+          type: array
+          items:
+            $ref: "#/components/schemas/PointsLeaderboardRow"
+        next_cursor:
+          description: Pages forward from this page's last row; absent on the last page
+          type: string
+        prev_cursor:
+          description: |
+            Pages backward from this page's first row; null when the page
+            starts at position 1. Present on every page reached by a cursor or
+            a `seek_rank`.
+          type: [string, "null"]
+        restart:
+          description: The cursor's snapshot is gone; reload from the top
+          type: boolean
+        total_ranked:
+          description: Networks ranked in the snapshot; every one of them is listed across the pages
+          type: integer
+          format: int64
+        snapshot_time:
+          type: string
+          format: date-time
+        latest_epoch:
+          description: The latest finalized epoch the snapshot counts
+          type: integer
+          format: int64
+        me:
+          $ref: "#/components/schemas/PointsLeaderboardMe"
         error:
           type: object
           properties:
@@ -4306,16 +6975,42 @@ components:
         reference:
           description: A unique reference string to identify the payment intent added to the Solana transaction
           type: string
+        plan:
+          type: string
+          description: |
+            The plan. The PRICE is quoted by the server from the caller's
+            regional tier. `yearly_onboarding` is the welcome offer (the
+            tier's yearly price less 25%, crediting a year plus the 14-day
+            trial) and is refused unless the caller's offer is redeemable.
+          enum:
+            - yearly
+            - monthly
+            - yearly_onboarding
+        storefront_country:
+          type: string
+          description: ISO 3166-1 storefront country, when the app knows it (Solana keeps the estimate otherwise)
 
     SolanaPaymentIntentResult:
       type: object
       properties:
+        amount_usd:
+          type: number
+          description: the price the server quoted; the client must pay exactly this
+        tier:
+          type: string
+        plan:
+          type: string
+        regular_amount_usd:
+          type: number
+          description: the plan's regular price (the full-year price for yearly_onboarding)
+        offer_applied:
+          type: boolean
+        currency:
+          type: string
         error:
-          type: object
-          nullable: true
-          properties:
-            message:
-              type: string
+          oneOf:
+            - $ref: "#/components/schemas/ErrorMessage"
+            - type: "null"
 
     ValidateReferralCodeArgs:
       type: object
@@ -4617,12 +7312,235 @@ components:
         - coldkey_ss58
       properties:
         coldkey_ss58:
-          description: The subnet coldkey as an ss58 address.
+          description: The subnet coldkey as an ss58 address (Bittensor prefix 42).
+          type: string
+        client_id:
+          description: uuid of the provider client the wallet is attached to. Defaults to the session client for a client-scoped JWT; must belong to the caller's network.
+          type: string
+        signature:
+          description: The coldkey's sr25519 signature (hex) over `message`. Required for app callers.
+          type: string
+        message:
+          description: The exact single-use challenge text issued by POST /auth/wallet-challenge for blockchain TAO and this address.
           type: string
 
     SnSetWalletResult:
       type: object
       properties:
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    SnWallet:
+      type: object
+      properties:
+        coldkey_ss58:
+          type: string
+        client_id:
+          description: uuid of the provider client; absent for the network-level wallet.
+          type: string
+        set_at_millis:
+          description: Unix time in milliseconds the wallet was set.
+          type: integer
+
+    SnGetWalletResult:
+      type: object
+      properties:
+        wallet:
+          $ref: "#/components/schemas/SnWallet"
+        wallets:
+          type: array
+          items:
+            $ref: "#/components/schemas/SnWallet"
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    SnValidateWalletArgs:
+      type: object
+      required:
+        - address
+      properties:
+        address:
+          description: The ss58 address to check.
+          type: string
+
+    SnValidateWalletResult:
+      type: object
+      properties:
+        valid_syntax:
+          description: The address decodes as ss58 with the Bittensor prefix.
+          type: boolean
+        exists_on_chain:
+          description: The account exists on the subtensor chain (true when the chain could not be reached; see message).
+          type: boolean
+        banned:
+          description: The address is on the operator ban list and must not be attached.
+          type: boolean
+        message:
+          type: string
+
+    AccountEpoch:
+      type: object
+      properties:
+        epoch:
+          type: integer
+        start_millis:
+          description: Epoch window start, unix milliseconds.
+          type: integer
+        end_millis:
+          description: Epoch window end, unix milliseconds.
+          type: integer
+        points:
+          description: Points earned inside the window.
+          type: number
+          format: double
+        share_bps:
+          description: The network's share of the operator pool in basis points; 0 when no coldkey was attached.
+          type: integer
+
+    AccountEpochsResult:
+      type: object
+      properties:
+        epochs:
+          type: array
+          items:
+            $ref: "#/components/schemas/AccountEpoch"
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    SnHeadResult:
+      type: object
+      properties:
+        eligible:
+          description: The estimate places the network inside the cutoff.
+          type: boolean
+        score:
+          description: Split-adjusted distinct routable egress-IP breadth (server estimate).
+          type: number
+          format: double
+        floor:
+          description: Score of the last network inside the cutoff; 0 while fewer networks score.
+          type: number
+          format: double
+        rank_estimate:
+          description: 1-based estimated rank; 0 without a score.
+          type: integer
+        cutoff:
+          description: Head-tier size (200).
+          type: integer
+        bound:
+          description: An active head binding exists for one of the network's clients.
+          type: boolean
+        hotkey:
+          description: The bound head hotkey as ss58; absent when not bound.
+          type: string
+        uid:
+          description: The bound uid; 0 when not bound.
+          type: integer
+        rank:
+          description: The bound network's estimated rank; 0 when not bound.
+          type: integer
+        epoch:
+          description: The current contract epoch.
+          type: integer
+        netuid:
+          type: integer
+        source:
+          description: '"server" (estimate) or "chain" (validator consensus).'
+          type: string
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    SnFleetBinding:
+      type: object
+      description: |
+        protocol.FleetBinding on the wire: 32-byte values as 0x-hex, the
+        hotkey as ss58 or 0x-hex, the client id as its uuid. The digest is
+        keccak256(domain "urnetwork/fleet-binding/v1" + fields).
+      properties:
+        chain_id:
+          type: integer
+        netuid:
+          type: integer
+        coordinator:
+          description: 0x-hex coordinator contract address.
+          type: string
+        fleet_id:
+          type: string
+        hotkey:
+          type: string
+        client_id:
+          description: uuid
+          type: string
+        client_key:
+          description: 0x-hex 32-byte client Ed25519 public key.
+          type: string
+        generation:
+          type: integer
+        valid_from_epoch:
+          type: integer
+        valid_to_epoch:
+          type: integer
+        commitment_hash:
+          type: string
+
+    SnHeadBindingArgs:
+      type: object
+      required:
+        - binding
+        - client_signature
+      properties:
+        binding:
+          $ref: "#/components/schemas/SnFleetBinding"
+        client_signature:
+          description: The device's Ed25519 signature (hex) over the binding digest; `signature` is accepted as an alias.
+          type: string
+        signature:
+          type: string
+        hotkey_signature:
+          description: The head hotkey's sr25519 signature (hex) over the same digest; optional, required for calldata.
+          type: string
+        hotkey:
+          description: Optional override of the binding's hotkey (ss58 or 0x-hex).
+          type: string
+
+    SnHeadBindingResult:
+      type: object
+      properties:
+        digest:
+          description: 0x-hex keccak256 binding digest.
+          type: string
+        client_signature_valid:
+          type: boolean
+        hotkey_signature_valid:
+          type: boolean
+        ready:
+          description: Both signatures verified and calldata is present.
+          type: boolean
+        calldata:
+          description: 0x-hex `bindFleetMember` calldata for the operator to submit.
+          type: string
+        to:
+          description: The coordinator contract address to send the calldata to.
+          type: string
+        data:
+          description: Same as calldata.
+          type: string
+        contract_address:
+          type: string
+        chain_id:
+          type: integer
         error:
           type: object
           properties:
@@ -4690,6 +7608,17 @@ components:
           type: integer
         contract_address:
           description: 0x-hex EVM address of the subnet contract.
+          type: string
+        settlement_vault_address:
+          description: 0x-hex EVM address of the settlement vault claims are sent to; absent when unset.
+          type: string
+        no_id:
+          description: The operator id (decimal string); absent when unset.
+          type: string
+        netuid:
+          type: integer
+        rpc_url:
+          description: Public subtensor EVM JSON-RPC url for clients; absent when unset.
           type: string
 
     RefreshTokenResult:
@@ -4925,11 +7854,141 @@ components:
             message:
               type: string
 
+    PayDataCheckoutArgs:
+      type: object
+      required:
+        - item_id
+        - provider
+      properties:
+        item_id:
+          type: string
+          enum: [data_1tib, data_10tib]
+        provider:
+          type: string
+          enum: [stripe]
+          description: the hosted checkout; empty means stripe
+        network_name:
+          type: string
+          description: the network that receives the data; omit to receive a code by email
+        email:
+          type: string
+          description: where the code (or the applied note) is sent; Stripe collects it at checkout when omitted
+    PayDataCheckoutResult:
+      type: object
+      properties:
+        url:
+          type: string
+          description: the hosted checkout url to send the customer to
+        provider:
+          type: string
+          enum: [stripe]
+        network_id:
+          type: string
+          format: uuid
+          description: the resolved network when network_name was given
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+    PayDataNetworkLookupArgs:
+      type: object
+      required:
+        - network_name
+      properties:
+        network_name:
+          type: string
+    PayDataNetworkLookupResult:
+      type: object
+      required:
+        - exists
+      properties:
+        exists:
+          type: boolean
+        network_name:
+          type: string
+          description: the name as stored, when it exists
+    PayDataSolanaIntentArgs:
+      type: object
+      required:
+        - item_id
+        - network_name
+        - reference
+      properties:
+        item_id:
+          type: string
+          enum: [data_1tib, data_10tib]
+        network_name:
+          type: string
+          description: the network that receives the data
+        reference:
+          type: string
+          description: |
+            the Solana Pay reference the client generated (a fresh base58 public
+            key); it doubles as the transfer memo for a payment sent by hand
+    PayDataSolanaIntentResult:
+      type: object
+      properties:
+        amount_usd:
+          type: number
+          description: the exact amount to send, in USDC
+        reference:
+          type: string
+        memo:
+          type: string
+          description: the transfer memo for a payment sent by hand (the reference)
+        expires_at:
+          type: string
+          format: date-time
+        network_name:
+          type: string
+          description: the resolved network name, as stored
+        network_id:
+          type: string
+          format: uuid
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+    PayDataSolanaStatusArgs:
+      type: object
+      required:
+        - reference
+      properties:
+        reference:
+          type: string
+    PayDataSolanaStatusResult:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          enum: [pending, paid, expired, unknown]
+        item_id:
+          type: string
+          enum: [data_1tib, data_10tib]
+        network_name:
+          type: string
+        amount_usd:
+          type: number
+        expires_at:
+          type: string
+          format: date-time
     StripeCreateCheckoutSessionArgs:
       type: object
       properties:
         item_id:
           type: string
+        storefront_country:
+          type: string
+          description: |
+            ISO 3166-1 storefront country, when the caller knows it. The Pro
+            items are priced at the caller's regional tier and, when the
+            welcome offer is redeemable (yearly only), the 25% coupon is
+            applied server-side; the charged tier is finalized from the
+            card's billing country once attached.
         ui_mode:
           type: string
           description: |
@@ -4956,6 +8015,79 @@ components:
         session_id:
           type: string
           description: both modes; the caller can reconcile the purchase with this
+        error:
+          type: object
+          properties:
+            message:
+              type: string
+
+    SubscriptionDetailsResult:
+      type: object
+      properties:
+        subscriptions:
+          type: array
+          description: One entry per store billing the network, ordered by store.
+          items:
+            type: object
+            properties:
+              store:
+                type: string
+                description: stripe | apple | google | solana | manual | x402 | "" (unknown)
+              plan:
+                type: string
+                description: The wire plan value ("supporter"); shown as Pro.
+              cadence:
+                type: string
+                description: yearly | monthly | "" when unknown.
+              start_time:
+                type: string
+                description: datetime, the start of the active window
+              end_time:
+                type: string
+                description: datetime, the expiry or the next renewal date
+              auto_renew:
+                type: boolean
+                nullable: true
+                description: The store will bill again at end_time; null when the store lookup failed.
+              cancel_at_period_end:
+                type: boolean
+                description: The store lets the paid period run out and will not bill again.
+              can_cancel:
+                type: boolean
+                description: POST /subscription/cancel acts on this entry (Stripe only).
+              manage_url:
+                type: string
+                description: The store's own subscriptions page (Apple, Google), else empty.
+              transaction_id:
+                type: string
+                description: The store handle for support; invoice id, original transaction id, purchase token or payment reference.
+        has_stripe_customer:
+          type: boolean
+          description: A Stripe customer exists for the network; gate for /stripe/customer-portal.
+        update_time:
+          type: string
+          description: datetime
+
+    SubscriptionCancelArgs:
+      type: object
+      properties:
+        store:
+          type: string
+          description: The store to act on. "stripe" (default) is the only store the server can cancel.
+
+    SubscriptionCancelResult:
+      type: object
+      properties:
+        store:
+          type: string
+        end_time:
+          type: string
+          description: datetime, the end of the paid period (Pro is kept until then)
+        auto_renew:
+          type: boolean
+        manage_url:
+          type: string
+          description: For a store the server cannot act on, where the customer cancels.
         error:
           type: object
           properties:

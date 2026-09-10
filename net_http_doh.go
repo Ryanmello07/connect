@@ -14,6 +14,7 @@ import (
 	"net/http/httptrace"
 	"net/netip"
 	"net/url"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -305,6 +306,17 @@ type DnsResolverSettings struct {
 	TlsConfig *tls.Config `json:"-"`
 }
 
+// configureDohHttp2Transport applies DoH's keepalive policy and the same
+// socket-progress invariant as the native net/http HTTP/2 clients.
+func configureDohHttp2Transport(h2tr *http2.Transport, settings *DohSettings) {
+	h2tr.ReadIdleTimeout = 30 * time.Second
+	h2tr.PingTimeout = 15 * time.Second
+	// Context cancellation cannot interrupt an HTTP/2 flow-control or reset
+	// write already holding the connection write mutex. Give the socket write
+	// its own progress bound, as the ordinary API transports do.
+	h2tr.WriteByteTimeout = settings.ConnectTimeout
+}
+
 // httpClientWithDialer builds a DoH HTTP client over the given dialer. Remote DoH
 // uses the tun dialer (settings.DialContext); local DoH uses the host dialer.
 // sessionCache holds TLS session tickets so a re-dial resumes instead of paying a
@@ -344,8 +356,7 @@ func httpClientWithDialer(settings *DohSettings, dialContext DialContextFunction
 	if err != nil {
 		panic(err)
 	}
-	h2tr.ReadIdleTimeout = 30 * time.Second
-	h2tr.PingTimeout = 15 * time.Second
+	configureDohHttp2Transport(h2tr, settings)
 	httpClient := &http.Client{
 		Timeout:   settings.RequestTimeout,
 		Transport: tr,
@@ -1533,6 +1544,20 @@ func dohRouteForConn(conn net.Conn) *DohRoute {
 		return nil
 	}
 	addrPort := func(addr net.Addr) (netip.AddrPort, bool) {
+		// httptrace may report a live wrapper whose address is temporarily nil
+		// while an HTTP/2 connection is being retired. Route observation is
+		// diagnostic only; an absent endpoint must not panic and abort the DoH
+		// result path.
+		if addr == nil {
+			return netip.AddrPort{}, false
+		}
+		addrValue := reflect.ValueOf(addr)
+		switch addrValue.Kind() {
+		case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+			if addrValue.IsNil() {
+				return netip.AddrPort{}, false
+			}
+		}
 		if tcpAddr, ok := addr.(*net.TCPAddr); ok {
 			ip, found := netip.AddrFromSlice(tcpAddr.IP)
 			if !found || tcpAddr.Port < 0 || 65535 < tcpAddr.Port {
@@ -1609,7 +1634,7 @@ func (self *dohClient) queryWireRawDetailedWithRoute(ctx context.Context, dohUrl
 		}
 		return nil, nil, fmt.Errorf("request %s: %w", dohUrl, err)
 	}
-	defer response.Body.Close()
+	defer releaseHttpResponseBody(ctx, response)
 	if response.StatusCode != http.StatusOK {
 		return nil, nil, fmt.Errorf("request %s: HTTP status %s", dohUrl, response.Status)
 	}

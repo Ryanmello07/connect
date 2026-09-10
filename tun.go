@@ -456,7 +456,9 @@ func (self *Tun) advanceTcpInboundShardWithLock(shard *tunTcpInboundShard, endpo
 
 // synchronizeTcpInboundProcessorsWithLock performs gVisor's documented user
 // unlock handoff for every endpoint touched in the burst. The shard write lock
-// remains held so the next burst cannot overtake the handoff.
+// remains held so the next burst cannot overtake the handoff. Endpoint state
+// is cleared independently from packetCount: individual finite callbacks must
+// retain their shared cadence until one of them performs the scheduler yield.
 func (self *Tun) synchronizeTcpInboundProcessorsWithLock(shard *tunTcpInboundShard) {
 	for endpointIndex := 0; endpointIndex < shard.endpointCount; endpointIndex += 1 {
 		endpointId := shard.endpointIds[endpointIndex]
@@ -472,10 +474,6 @@ func (self *Tun) synchronizeTcpInboundProcessorsWithLock(shard *tunTcpInboundSha
 		}
 	}
 	shard.endpointCount = 0
-	// UnlockUser requeues protocol work but does not run it synchronously.
-	// Yield once while this shard remains gated so the awakened worker cannot
-	// be starved by an immediately reacquired producer lock.
-	runtime.Gosched()
 }
 
 // tunLinkEndpoint converts channel.Endpoint's silent bounded-queue drop into
@@ -870,9 +868,40 @@ func (self *Tun) WriteBatch(packets [][]byte) (int, error) {
 			// bounded endpoint array cannot overflow mid-batch
 			self.gro.Flush()
 			self.synchronizeTcpInboundProcessorsWithLock(shard)
+			// UnlockUser requeues protocol work but does not run it
+			// synchronously. Yield while the shard remains gated so a new
+			// producer cannot immediately overtake the awakened worker.
+			runtime.Gosched()
 		}
 	}
 	self.gro.Flush()
+
+	// A finite response commonly ends with fewer than the 16 packets that
+	// trigger the mid-batch cadence above. gVisor can have queued one of those
+	// packets while a syscall owned the endpoint; without this final
+	// LockUser/UnlockUser handoff there may be no later packet to wake its TCP
+	// processor. The provider NAT has already consumed the upstream bytes, so
+	// that missed tail is permanent rather than recoverable by retransmission.
+	finalHandoff := false
+	for shardIndex, locked := range lockedShards {
+		if !locked {
+			continue
+		}
+		shard := &self.tcpInboundShards[shardIndex]
+		if shard.endpointCount == 0 {
+			shard.packetCount = 0
+			continue
+		}
+		self.synchronizeTcpInboundProcessorsWithLock(shard)
+		shard.packetCount = 0
+		finalHandoff = true
+	}
+	if finalHandoff {
+		// UnlockUser queues processors asynchronously. Yield once for the whole
+		// finite batch while every touched shard remains gated so the awakened
+		// workers cannot be overtaken by the next producer callback.
+		runtime.Gosched()
+	}
 
 	return total, nil
 }
@@ -889,11 +918,11 @@ func (self *Tun) write(packet []byte, onRelease func()) (int, error) {
 
 	endpointId, shardIndex, tcpInbound := tcpInboundFlow(packet)
 	var tcpInboundShard *tunTcpInboundShard
-	synchronize := false
+	yieldProcessor := false
 	if tcpInbound {
 		tcpInboundShard = &self.tcpInboundShards[shardIndex]
 		tcpInboundShard.writeLock.Lock()
-		synchronize = self.advanceTcpInboundShardWithLock(tcpInboundShard, endpointId)
+		yieldProcessor = self.advanceTcpInboundShardWithLock(tcpInboundShard, endpointId)
 	}
 
 	// copy the packet
@@ -911,8 +940,13 @@ func (self *Tun) write(packet []byte, onRelease func()) (int, error) {
 		self.ep.InjectInbound(header.IPv4ProtocolNumber, pkb)
 		pkb.DecRef()
 		if tcpInbound {
-			if synchronize {
-				self.synchronizeTcpInboundProcessorsWithLock(tcpInboundShard)
+			// A one-packet callback is itself a complete finite burst. Complete
+			// gVisor's user-unlock handoff before returning: deferred execution
+			// can strand a short H1/TLS response behind an unrelated shard or a
+			// worker scheduling delay, and the provider NAT cannot retransmit it.
+			self.synchronizeTcpInboundProcessorsWithLock(tcpInboundShard)
+			if yieldProcessor {
+				runtime.Gosched()
 			}
 			tcpInboundShard.writeLock.Unlock()
 		}
@@ -940,19 +974,19 @@ func (self *Tun) convertToFullAddr(endpoint netip.AddrPort) (tcpip.FullAddress, 
 	}, protoNumber
 }
 
-func (self *Tun) dialCtx(ctx context.Context) context.Context {
-	if ctx == self.ctx {
-		return ctx
-	}
+// dialCtx joins one call's cancellation to the tun lifecycle without parking
+// a goroutine for every unresolved dial. The returned cleanup owns both the
+// callback registration and derived context and must be called by the caller.
+func (self *Tun) dialCtx(ctx context.Context) (context.Context, context.CancelFunc) {
 	dialCtx, dialCancel := context.WithCancel(self.ctx)
-	go func() {
-		defer dialCancel()
-		select {
-		case <-ctx.Done():
-		case <-self.ctx.Done():
-		}
-	}()
-	return dialCtx
+	stopCallerCancel := context.AfterFunc(ctx, dialCancel)
+	if ctx.Err() != nil {
+		dialCancel()
+	}
+	return dialCtx, func() {
+		stopCallerCancel()
+		dialCancel()
+	}
 }
 
 func (self *Tun) ListenTCP(addr *net.TCPAddr) (*gonet.TCPListener, error) {
@@ -1165,7 +1199,8 @@ func (self *Tun) dialContext(ctx context.Context, network string, address string
 			return nil, syscall.EAFNOSUPPORT
 		}
 	}
-	dialCtx := self.dialCtx(ctx)
+	dialCtx, dialCtxCancel := self.dialCtx(ctx)
+	defer dialCtxCancel()
 
 	var addrs []netip.Addr
 	if parsedAddrErr == nil {

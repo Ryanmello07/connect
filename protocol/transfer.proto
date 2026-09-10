@@ -343,6 +343,12 @@ message CreateContract {
     optional bool force_stream = 7;
     // see stream version reference at top
     optional uint32 stream_version = 8;
+
+    // Fixed sender-side ContractKey sequence lane that requested this
+    // contract. This is diagnostic capability metadata only: it does not
+    // select or alter a route, contract, or encryption session. Presence
+    // proves the sender can report the lane; absence remains unknown.
+    optional SequenceRole sender_role = 9;
 }
 // the creator knows all the hops on the stream from the enumerated linpaths
 // when evaluating the completed contracts, the send and receive count involving the source_id
@@ -355,6 +361,11 @@ enum ContractError {
     Setup = 2;
     Trust = 3;
     Invalid = 4;
+    // The requested destination is no longer a reliable route. Unlike an
+    // account or authorization error, this is actionable by a multi-client:
+    // retire the exact window client that produced the result and choose a
+    // replacement.
+    Reliability = 5;
 }
 
 
@@ -508,16 +519,20 @@ enum EncryptedControlType {
     EncryptedControlIdentityProof = 2;
     // Undecryptable-wrap feedback (changes 2026-08): the receiver of a wrapped
     // frame that no local session/epoch can open sends this (no payload,
-    // rate-limited) back to the sealer. `session_role` is the NACKING
+    // rate-limited) back to the sealer. `session_role` is the nacking
     // session's role per the envelope convention, so the sealer routes it to
     // its complement (client) session; `epoch_id` is the epoch the nacking
-    // side can currently read, unset when it has none (e.g. a process restart
-    // that lost the responder session).
+    // side can currently read or is actively establishing, unset when it has
+    // neither (e.g. a process restart that lost the responder session). The
+    // establishing case distinguishes the ordinary window where the TLS
+    // initiator seals first from genuine state loss: destroying the healthy
+    // initiator epoch there puts its replacement ClientHello behind the
+    // dropped application's receive-sequence gap.
     //
-    // The sealer acts ONLY when the nacked epoch differs from its own
-    // established epoch — a nack echoing its current epoch means the peer can
-    // read it (the failed unwrap was corruption in flight), and is ignored.
-    // On genuine desync the sealer DEMOTES the dead epochs (the peer provably
+    // The sealer acts only when `epoch_id` is unset. A real epoch means the
+    // peer can read that generation or is already converging onto one the
+    // initiator minted, so moving the target with another restart is wrong.
+    // On genuine desync the sealer demotes the dead epochs (the peer provably
     // cannot read them) and re-handshakes; each mode's own contract then
     // recovers the flow: Opportunistic resends re-wrap as plaintext (its
     // fail-open baseline; a forged nack can force this rate-limited window,

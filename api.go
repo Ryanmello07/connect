@@ -364,6 +364,7 @@ type FindProviders2Args struct {
 	ExcludeClientIds    []Id            `json:"exclude_client_ids"`
 	ExcludeDestinations [][]Id          `json:"exclude_destinations,omitempty"`
 	RankMode            string          `json:"rank_mode"`
+	ForceMinimum        bool            `json:"force_minimum,omitempty"`
 }
 
 type FindProviders2Result struct {
@@ -376,6 +377,12 @@ type FindProvidersProvider struct {
 	HasEstimatedBytesPerSecond bool      `json:"has_estimated_bytes_per_second"`
 	Tier                       int       `json:"tier"`
 	IntermediaryIds            []Id      `json:"intermediary_ids,omitempty"`
+	// NetworkOnly is true when this provider is available through the caller's
+	// own network relationship rather than as a public exit.
+	NetworkOnly bool `json:"network_only,omitempty"`
+	// ReputationFailedNames comes from low-rate external probes. Values are
+	// opaque domain/vendor labels; the tunnel does not infer them from TLS.
+	ReputationFailedNames string `json:"reputation_failed_names,omitempty"`
 	// Location is the provider's location. nil when the server does not know
 	// it (or an older server).
 	Location *ProviderLocation `json:"location,omitempty"`
@@ -420,7 +427,8 @@ type ConnectControlArgs struct {
 }
 
 type ConnectControlResult struct {
-	Pack string `json:"pack"`
+	Pack  string               `json:"pack"`
+	Error *ConnectControlError `json:"error"`
 }
 
 type ConnectControlError struct {

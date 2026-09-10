@@ -164,35 +164,38 @@ func TestSynWaitExceededIsPerExit(t *testing.T) {
 	update := &multiClientChannelUpdate{}
 	exitA := &multiClientChannel{}
 	exitB := &multiClientChannel{}
+	tcpPath := udpTestPath(4)
+	tcpPath.Protocol = IpProtocolTcp
+	tcpPath.Syn = true
 	// wide enough that a scheduler or GC stall between two adjacent calls
 	// cannot age the clock past the bound and fail the "does not trip"
 	// assertions spuriously on a loaded runner
 	timeout := 250 * time.Millisecond
 
 	// first syn arms the clock, nothing trips
-	if update.synWaitExceeded(exitA, timeout) {
+	if update.synWaitExceeded(exitA, tcpPath, timeout) {
 		t.Fatal("first syn tripped the clock")
 	}
 	// a retransmit inside the window does not trip
-	if update.synWaitExceeded(exitA, timeout) {
+	if update.synWaitExceeded(exitA, tcpPath, timeout) {
 		t.Fatal("retransmit inside the window tripped the clock")
 	}
 
 	time.Sleep(timeout + 50*time.Millisecond)
 
 	// moving to a new exit must restart the wait, not inherit the old one
-	if update.synWaitExceeded(exitB, timeout) {
+	if update.synWaitExceeded(exitB, tcpPath, timeout) {
 		t.Fatal("a fresh exit inherited the previous exit's wait")
 	}
 
 	time.Sleep(timeout + 50*time.Millisecond)
 
 	// the same exit past the timeout trips
-	if !update.synWaitExceeded(exitB, timeout) {
+	if !update.synWaitExceeded(exitB, tcpPath, timeout) {
 		t.Fatal("an aged wait on the same exit did not trip")
 	}
 	// and tripping restarts the clock rather than firing on every retransmit
-	if update.synWaitExceeded(exitB, timeout) {
+	if update.synWaitExceeded(exitB, tcpPath, timeout) {
 		t.Fatal("the clock did not restart after tripping")
 	}
 }
@@ -1204,17 +1207,28 @@ func TestBlackholeGateUsesLoadScaledDestinations(t *testing.T) {
 	}
 }
 
+// readSource normalizes line endings, because functionBody delimits a body with
+// a bare "\n}\n" and git checks these files out with CRLF wherever core.autocrlf
+// is on, which is the default on Windows. Without this the delimiter matches
+// nothing, functionBody hands back the whole rest of the file, and every anchor
+// built on strings.Contains passes against text from somewhere else entirely.
+// The six anchors written as strings.Count fail loudly in that state; the
+// eighty-odd written as strings.Contains do not, so the failure is silent
+// exactly where the protection matters most.
 func readSource(name string) (string, error) {
 	b, err := os.ReadFile(name)
 	if err != nil {
 		return "", err
 	}
-	return string(b), nil
+	return strings.ReplaceAll(string(b), "\r\n", "\n"), nil
 }
 
 // functionBody returns the source between a function's signature and the
 // closing brace at column 0. Good enough for asserting a call site exists,
-// which is all it is used for.
+// which is all it is used for. A missing terminator reports false rather than
+// returning the rest of the file: an anchor that silently widens to the whole
+// file still passes, and a passing anchor that proves nothing is worse than no
+// anchor, because it is indistinguishable from a real one.
 func functionBody(source string, signature string) (string, bool) {
 	start := strings.Index(source, signature)
 	if start < 0 {
@@ -1224,5 +1238,5 @@ func functionBody(source string, signature string) (string, bool) {
 	if end := strings.Index(rest, "\n}\n"); 0 <= end {
 		return rest[:end], true
 	}
-	return rest, true
+	return "", false
 }

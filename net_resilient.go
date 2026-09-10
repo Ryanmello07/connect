@@ -91,37 +91,62 @@ func newResilientDialTlsContext(
 			panic(err)
 		}
 
-		// fmt.Printf("Extender client 1\n")
+		// the handshake half of the dial, split out so the address-family
+		// fallback can own the connection between the connect and the
+		// handshake -- it has to read the family off it before a failed
+		// handshake takes it away.
+		handshake := func(ctx context.Context, conn net.Conn) (net.Conn, error) {
+			rconn := NewResilientTlsConn(conn, fragment, reorder)
 
-		conn, err := connectSettings.DialContext(ctx, "tcp", addr)
-		if err != nil {
-			return nil, err
+			// copy and extend
+			tlsConfig := baseTlsConfig.Clone()
+			tlsConfig.ServerName = host
+			tlsConn := tls.Client(rconn, tlsConfig)
+
+			var err error
+			func() {
+				tlsCtx, tlsCancel := context.WithTimeout(ctx, connectSettings.TlsTimeout)
+				defer tlsCancel()
+				err = tlsConn.HandshakeContext(tlsCtx)
+			}()
+			if err != nil {
+				tlsConn.Close()
+				return nil, err
+			}
+			// once the stream is established, no longer need the resilient features
+			if err := offResilientTlsConn(ctx, rconn, connectSettings.ConnectTimeout); err != nil {
+				tlsConn.Close()
+				return nil, err
+			}
+
+			return tlsConn, nil
 		}
 
-		rconn := NewResilientTlsConn(conn, fragment, reorder)
-
-		// copy and extend
-		tlsConfig := baseTlsConfig.Clone()
-		tlsConfig.ServerName = host
-		tlsConn := tls.Client(rconn, tlsConfig)
-
-		func() {
-			tlsCtx, tlsCancel := context.WithTimeout(ctx, connectSettings.TlsTimeout)
-			defer tlsCancel()
-			err = tlsConn.HandshakeContext(tlsCtx)
-		}()
-		if err != nil {
-			tlsConn.Close()
-			return nil, err
-		}
-		// once the stream is established, no longer need the resilient features
-		if err := rconn.Off(); err != nil {
-			tlsConn.Close()
-			return nil, err
-		}
-
-		return tlsConn, nil
+		// The resilient dialers need the family fallback as much as the normal
+		// one does, and wiring it into newNormalDialTlsContext alone is the
+		// wrong half to have. Api posts do not race the dialers: they go
+		// through HttpSerial -> serialEval, which sorts the dialers it has
+		// already seen succeed by priority, and "fragment" is priority 0 while
+		// "normal" is 25 -- so once a launch is warm, the fragment dialer is
+		// the FIRST one every serial post tries. Before that it is one of the
+		// dialers the parallel hello runs. Either way a post over a
+		// blackholed ipv6 path stalled here, in a dialer with no timeout
+		// classification and no strike, until serialEval's whole budget was
+		// gone -- the exact stall this feature exists to remove, and with
+		// nothing recorded to show for it.
+		return dialControlTlsWithFamilyFallback(
+			ctx, connectSettings, "tcp", addr, connectSettings.DialContext, handshake)
 	}
+}
+
+// offResilientTlsConn bounds the partial-record drain that Off may perform.
+// The completed TLS handshake's context cannot interrupt that raw Write.
+func offResilientTlsConn(
+	ctx context.Context,
+	rconn *ResilientTlsConn,
+	phaseTimeout time.Duration,
+) error {
+	return withConnWritePhaseDeadline(ctx, rconn, phaseTimeout, rconn.Off)
 }
 
 // adapts techniques to overcome adversarial networks
@@ -310,12 +335,11 @@ func (self *ResilientTlsConn) Write(b []byte) (int, error) {
 							if self.fragment && self.reorder {
 								tcpConn.SetNoDelay(true)
 
-								f, err := tcpConn.File()
+								fd, closeFd, err := duplicateSocketHandle(tcpConn)
 								if err != nil {
 									return 0, err
 								}
-								fd := SocketHandle(f.Fd())
-								defer f.Close()
+								defer closeFd()
 
 								nativeTtl := GetSocketTtl(fd)
 								if nativeTtl <= 0 {
@@ -329,8 +353,7 @@ func (self *ResilientTlsConn) Write(b []byte) (int, error) {
 									continue
 								}
 								// restore the TTL on every exit after this point,
-								// including fragment-write failures; defer LIFO
-								// runs it before f.Close() closes the dup'd fd.
+								// including fragment-write failures.
 								// Best effort: a defer has nobody to report to
 								defer func() { _ = self.applyTtl(fd, nativeTtl) }()
 
@@ -395,12 +418,11 @@ func (self *ResilientTlsConn) Write(b []byte) (int, error) {
 
 								tcpConn.SetNoDelay(true)
 
-								f, err := tcpConn.File()
+								fd, closeFd, err := duplicateSocketHandle(tcpConn)
 								if err != nil {
 									return 0, err
 								}
-								fd := SocketHandle(f.Fd())
-								defer f.Close()
+								defer closeFd()
 
 								nativeTtl := GetSocketTtl(fd)
 								if nativeTtl <= 0 {
@@ -412,8 +434,7 @@ func (self *ResilientTlsConn) Write(b []byte) (int, error) {
 									continue
 								}
 								// restore the TTL on every exit after this point,
-								// including block-write failures; defer LIFO
-								// runs it before f.Close() closes the dup'd fd.
+								// including block-write failures.
 								// Best effort: a defer has nobody to report to
 								defer func() { _ = self.applyTtl(fd, nativeTtl) }()
 

@@ -1,7 +1,7 @@
 # Low-bar network delivery plan
 
 Status: living implementation plan
-Last updated: 2026-08-21
+Last updated: 2026-09-04
 
 ## Outcome
 
@@ -40,6 +40,24 @@ result is cold or warmed. Append results; do not replace an unfavorable run.
 Lock release thresholds after the Phase 1 baseline so they cannot be moved to
 fit a candidate.
 
+## Physical Android device allowlist
+
+LOWBAR physical validation uses exactly these two devices:
+
+| Role | Serial | Model |
+|---|---|---|
+| `device-a` | `3B161FDJG001KT` | Pixel 8 Pro |
+| `device-b` | `R5CX21FY6ND` | Galaxy S24 Ultra |
+
+Preflight must find both serials in `adb devices -l` with state `device` and no
+other serial. Drivers receive the serial explicitly; missing, unauthorized, or
+offline devices invalidate the physical block rather than being substituted.
+Public notes use the opaque roles, while the private run manifest keeps serials
+for identity and reproducibility.
+
+Verified 2026-09-04 with `adb devices -l`: exactly these two serials were
+attached and online; no third device was admitted to the performance cohort.
+
 ## Decisions
 
 1. **Transfer owns end-to-end tunnel delivery.** Every tunneled TCP Pack uses a
@@ -65,11 +83,17 @@ fit a candidate.
    multiple lossy DATAGRAMs. Transfer sequencing and ACKs do not change with
    the carrier lane. Explicit two-fragment controls remain available for
    compatibility tests and measurement, not production selection.
-5. **Receive never waits for admission.** The invariant in
-   [CODESTYLE.md](./CODESTYLE.md#receive-callbacks-must-not-block) applies to the
-   shared Client receive pump, every callback handoff, and each carrier/socket
-   reader handing data to a bounded route queue. A full destination is dropped
-   and counted immediately. Sender-side backpressure may block.
+5. **Receive admission follows the exact physical lane.** Shared callbacks and
+   true datagram readers remain bounded, zero-wait, and counted on refusal. An
+   H1, QUIC-stream, SCTP, or framed internal-TCP reader retains only its one
+   already-read complete message while waiting for fixed queue capacity or
+   lifecycle cancellation; dropping there manufactures loss above a reliable
+   carrier. The final Client-to-Pack handoff uses the same exact lane metadata:
+   reliable lanes wait within unchanged count/byte budgets, while H3 DATAGRAM,
+   outer DNS datagrams, and native P2P datagrams never wait. A shared server
+   callback that cannot propagate reliable backpressure retires its generation
+   instead of silently skipping a frame. See
+   [CODESTYLE.md](./CODESTYLE.md#receive-callbacks-and-reliable-carrier-backpressure).
 6. **Preserve security and routing policy.** Transport changes do not weaken
    encryption, CFAA policy, SMTP policy, kill-switch behavior, provider
    eligibility, or route authentication.
@@ -193,19 +217,18 @@ Current code facts:
   configured memory ceiling. Active data lanes pin their negotiating lane-0
   lifetime; losing that base sequence clears capability and cancels its data
   lanes rather than silently continuing with stale negotiation.
-- Every P2P data-plane mode publishes unreliable delivery semantics to
-  Transfer. Fast RTP/SRTP can lose below Transfer, while legacy SCTP still ends
-  at the same bounded, nonblocking application handoff; a live carrier in
-  either mode is not proof of end-to-end delivery. Transfer therefore retains
-  ACK recovery and limits one destination to 255 unacknowledged messages and a
-  240-KiB data flight. The carrier readers enqueue without waiting into a
-  256-message / 256-KiB queue; the remaining 16 KiB is carrier-specific reserve
-  for cumulative ACK, compact-recovery, contract, and probe traffic.
-  That count includes the item held by the one owned worker that may wait on
-  RouteManager. The shared Client ReceiveSequence handoff independently admits
-  256 messages with a hard 256-KiB retained-Transfer-byte ceiling. Matching the
-  count headroom removes avoidable small-packet drops without increasing the
-  prior byte budget or violating `receiveBuffer.Pack(..., 0)`.
+- P2P publishes its physical lanes separately. Legacy SCTP is reliable and
+  propagates fixed-capacity backpressure from its dedicated reader; native
+  RTP/SRTP is unreliable and enters the existing zero-wait 256-message /
+  256-KiB queue. Auto send policy activates the bounded unreliable Transfer
+  flight only while the native fast path can be selected; LegacyOnly does not
+  pay that flight limit. Transfer ACK recovery remains end-to-end on both
+  lanes because route replacement can invalidate carrier-local delivery. The
+  native data flight remains 240 KiB, leaving 16 KiB inside the unchanged queue
+  ceiling for cumulative ACK, compact-recovery, contract, and probe traffic.
+  Exact receive-lane metadata follows the selected route into the shared Client
+  Pack admission, so SCTP waits within the existing 256-message / 256-KiB
+  retained-Transfer ceiling and native datagrams remain zero-wait.
 - Transfer queues are sized in bytes, but at a 64 kbit/s uplink even 1 MiB is
   more than two minutes of serialization. A memory-safe queue can still be a
   catastrophic latency queue.
@@ -1020,13 +1043,464 @@ the iOS Network Extension's native footprint, GOGC-10 behavior, memory-pressure
 callback timing, or jetsam boundary. The active H3 breach is a measured failure
 of a hard 28-MiB-at-all-times interpretation and remains a physical-iOS gate.
 
+### 2026-08-23 zandroid follow-up: a 20-MiB steady target
+
+This pass lowered the proposed iOS-proxy goal from 28 MiB to a steady 20 MiB
+and used the connected Pixel 8 Pro (Android 17/API 37) as `zandroid`. Android
+was adeb792799e2, Connect was c1d9ab4, and SDK was f9652cb. The ordinary build
+kept the 32-MiB Go soft limit, 20-MiB `DeviceLocal` target, and Go's production
+524,288-byte heap-profile rate. A second private process used a 65,536-byte
+rate only to rank allocation stacks. Device/client identities, credentials,
+addresses, DNS answers, and signed traffic URLs were not retained in this
+document. The phone was USB-powered at 100%, cellular signal level 0 was
+available but the measured underlay was Wi-Fi, and every OS sample reported
+thermal status 0. This remains memory evidence, not battery or physical-iOS
+evidence.
+
+The 20-MiB signal is `MemoryStats.TotalRuntimeByteCount`, exactly Go runtime
+total mapped memory minus heap pages released to the OS. It is neither Android
+whole-process PSS nor an estimate of an iOS Network Extension's total native
+footprint. The debug/instrumentation process reached 450,220 KiB whole-app PSS
+and contained large Java, code, graphics, and test-runner components, so PSS is
+not used for this cross-platform Go-runtime target. "Steady" also cannot mean
+"at every instant": live packet work alone exceeded 20 MiB during fast.com.
+Active peak and post-traffic recovery need separate gates.
+
+The production-rate process remained alive for 1,551.6 seconds. Auto used H1
+according to exact SDK carrier deltas. Five uncached Wikipedia navigations and
+five streamed 1-MiB Cloudflare downloads completed; their medians were 476.7
+ms and 1.02 Mbit/s. A 60-second fast.com session also completed and moved about
+40.4 MiB through H1 according to SDK counters. All 593 external traffic
+collector samples were eligible Wi-Fi-plus-VPN, IPv4-only, and thermal-zero
+samples. Functional success therefore did not hide the memory miss.
+
+The production-rate timeline was:
+
+| Point | Go runtime | Live heap | Pool state | Topology | 20-MiB result |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Cold, aged and disconnected | 15.19 MiB | 3.78 MiB | 1.00 MiB returned | 0 exits / 57 goroutines | Pass |
+| Auto connect completion | 20.23 MiB | 6.78 MiB | 0.99 MiB returned | 5 exits / 254 goroutines | Fail by 0.23 MiB |
+| Auto, about 90 seconds idle | 22.76 MiB | about 7.1 MiB | 1.00 MiB returned | 8--9 exits / about 300 goroutines | Fail |
+| Auto, later pre-traffic plateau | 25.06 MiB median, 25.55 MiB peak | about 7.4 MiB | 1.00 MiB returned | 8 exits / 283 median goroutines | Fail |
+| fast.com/recovery sampled peak | 35.83 MiB | 20.76 MiB | 4,764 objects outstanding at peak | 10--12 exits / 402 peak goroutines | Active failure; no crash |
+| Just before automatic trim | 34.44 MiB | 18.42 MiB | 9.28 MiB returned | 11 exits / 344 goroutines | Fail |
+| Immediately after automatic trim | 24.22 MiB | 7.21 MiB | rebuilt to 1.00 MiB returned | topology unchanged | Fail, but 10.22 MiB lower |
+| About five minutes after fast.com | 26.15 MiB | about 8.17 MiB | 1.00 MiB returned | 10 exits | Fail after rebound |
+
+The 32-MiB soft limit induced severe collection pressure rather than enforcing
+a hard footprint. Across fast.com and recovery the process advanced roughly
+5,100 GC cycles; phase rates reached about 23.6 collections/second during the
+transfer and 10.4/second during recovery. Live buffers could not be reclaimed,
+and the heap goal repeatedly collapsed close to the live set. Pools prevented
+some allocation but could not make 4,764 owned objects disappear.
+
+The automatic pool rebuild was effective but late. It ran 192 seconds after
+fast.com, not after the configured 60 seconds. There were 13 post-transfer
+one-second packet-stat epochs of at least 4 KiB; the last occurred exactly 60
+seconds before the rebuild. Multi-exit H1 health/control traffic is included
+in the aggregate remote counters and therefore repeatedly reset the global
+user-quiet timer. The code behaved as written, but the activity signal is too
+broad for a steady-footprint policy.
+
+Matched pressure points in the same long-lived production process separated
+warm retention from the connected live floor:
+
+| Mode | Explicit `TrimMemory` (warm pool) | Explicit `FreeMemory` (no returned pool/caches) | Live heap after full pressure | Live exits |
+| --- | ---: | ---: | ---: | ---: |
+| Disconnected | 20.63 MiB | 19.06 MiB | 3.91 MiB | 0 |
+| H3 | 23.62 MiB | 21.68 MiB | 5.80 MiB | 1 |
+| H1 | 24.76 MiB | 22.40 MiB | 6.23 MiB | 8 |
+
+The nominal 1-MiB warm packet set costs more than one MiB of runtime at these
+floors because reachable slices can pin allocator spans and because
+`FreeMemory` also sheds resolver, connection, and affinity caches. The observed
+warm-to-full-pressure differences were 1.57--2.36 MiB. Conversely, reducing
+H1 from eight exits to the one-exit H3 topology changed the pressure floor by
+only about 0.72 MiB. Exit count matters, but mostly through goroutine/control
+churn and delayed reclaim; topology reduction alone is not a 2--3-MiB fix.
+
+Allocator history remains after reachable objects drain. From the cold state
+to the long-run disconnected pressure floor, stack in-use rose from about 1.28
+to 2.41 MiB and GC metadata from about 3.30 to 4.03 MiB even though goroutines
+returned to 57 and live heap was only 3.91 MiB. The fast.com process had peaked
+at 402 goroutines. Packet concurrency, goroutine fan-out, and stack depth thus
+raise the later runtime floor; optimizing only the final object graph misses
+this high-water effect.
+
+The private 64-KiB profiles are ranking evidence, not byte-exact accounting.
+The pressure profile sampled 6.18 MiB of live allocations while runtime gauges
+reported a larger total that also includes stacks, allocator/GC metadata, and
+released-versus-retained spans. Sampling variance is especially high for
+small objects. Still, the repeated leading sites were useful:
+
+- a returned 1-MiB message-pool set sampled as about 1.40 MiB before pressure
+  and disappeared from the full-pressure profile;
+- `newContractStatusCallbackWorker` sampled about 0.77 MiB after pressure;
+- gomobile `seq.ToRefNum` tables sampled about 0.53--0.69 MiB, attributable in
+  different profiles to `ExitList_Get` and the one-second transport/status
+  object getters;
+- H1 WebSocket batch buffers, `bufio` readers/writers, HPACK state, decoded-pack
+  owners, RTT windows, location/grid projections, JSON type metadata, and TLS
+  state each appeared in the roughly 0.1--0.4-MiB sampled tier; and
+- cumulative allocation ranked the SDK I/O loop, IP packet grouping, remote
+  packet-group sends, pool misses, TLS record encryption, decoded-pack owners,
+  timers, and send scheduling as the main burst/churn paths.
+
+The gomobile result is partly an observer effect. `ToRefNum` grows global Go
+reference maps when object graphs cross into Java; deleting entries does not
+necessarily shrink their map buckets. Calling exits, throughput lists,
+transport distributions, packet-stat objects, and transport status every
+second therefore perturbs the exact heap being measured. The retained
+0.53--0.69-MiB samples are not all product steady state. A 20-MiB release gate
+needs Go-side or primitive-only sampling and should project topology no more
+often than every 15--30 seconds.
+
+One final A/B measured Go heap profiling itself. Merely calling
+`SetMemoryProfileRate(0)` from Android application startup was too late: the Go
+runtime already held 1,447,889 bytes of profiling buckets. Removing the SDK
+helper was also insufficient because gomobile links a Go shared library and
+retains `runtime.memProfileInternal`. A controlled build with profiling
+disabled at native-runtime initialization reduced profiling buckets to 5,649
+bytes. At the same approximately seven-second ready point, runtime fell from
+13,146,376 to 11,419,664 bytes, a 1.65-MiB reduction. No such build change was
+retained; the ordinary SDK artifact was rebuilt after the experiment.
+
+The native-profile-off process then showed both the opportunity and its limit:
+
+| State | Runtime result with native profiling disabled |
+| --- | ---: |
+| Cold ready, first sample / short ready-phase median | 10.92 / 13.74 MiB |
+| Auto connect-completion median | 19.05 MiB |
+| Auto early-idle median / p95 | 21.10 / 21.42 MiB |
+| Auto after `TrimMemory`, nine exits and 1-MiB warm pool | 20.58 MiB |
+| Auto after `FreeMemory`, eight exits | 19.20 MiB immediate; 20.42 MiB about 75 seconds later |
+| H3 one-exit idle median / p95 | 19.38 / 19.55 MiB |
+| H3 one-exit full-pressure floor | 18.84 MiB |
+
+This was a focused hypothesis test, not a matched full fast.com rerun, so its
+numbers must not be subtracted mechanically from the longer production
+history. It does establish that a connected sub-20-MiB state is technically
+reachable, that one-exit H3 can hold it for a minute, and that profiler removal
+alone does not keep multi-exit Auto below 20 MiB after normal repopulation.
+
+The ranked plan to make 20 MiB a repeatable steady state is:
+
+1. **Make the gate non-observing and explicit.** Add a bounded Go-side sampler
+   that records primitive memory/pool/topology counters and exports one batch
+   after the interval. Stop constructing bound exit/status/list objects every
+   second. Gate a production build on five fresh-process repetitions with
+   `TotalRuntimeByteCount` p50 and p95 at or below 20 MiB after five connected
+   quiet minutes. Report cold, one-minute, five-minute, and fifteen-minute
+   values separately. Keep fast.com active peak and recovery time as separate
+   gates; do not hide a peak failure in a steady average.
+2. **Fix mobile quiet detection and reclaim.** Drive the quiet timer from user
+   TUN payload activity, or explicitly exclude/tag carrier health, probe, and
+   status traffic. When pool outstanding ownership is drained and runtime is
+   above target, use a short 10--15-second high-water debounce followed by one
+   full shed/collection per quiet epoch; do not wait for a control-silent
+   minute. Measure a 256- or 512-KiB mobile warm packet set versus the current
+   1 MiB. Full shedding and a smaller warm set are needed because pool-only
+   trim left 20.58 MiB even in the profiling-off process. Never collect while
+   buffers are in flight, and add rate/cooldown counters so this cannot become
+   a battery-expensive periodic GC.
+3. **Disable heap profiling before the release mobile Go runtime starts.** A
+   diagnostic library should retain `WriteHeapProfile` and selectable sampling;
+   Android/iOS release libraries should start with `memprofilerate=0`. Android
+   application callbacks are too late because `go.Seq` loads `libgojni.so` in
+   its static initializer, so this needs a controlled gomobile loader/runtime
+   build rather than an `Application.onCreate` call. Re-measure binary startup,
+   crash diagnostics, and the physical iOS extension before adopting it. The
+   measured steady benefit was about 1.1 MiB in early Auto and 1.65 MiB at the
+   matched cold point, not the full 1.45-MiB bucket counter in every state.
+4. **Reduce the connected live/control set.** Add a mobile-low-memory
+   `MultiClient` profile and A/B the quality window at three instead of six,
+   speed at one with a hard cap of one or two, and standing reserve only when
+   measured quality requires it. Coalesce contract status through one worker
+   per window/device and size its latest-value queue to live contracts rather
+   than the transfer sequence buffer. Right-size H1 WebSocket/bufio/HPACK
+   buffers and share only immutable TLS/root state. The 0.72-MiB H1-versus-H3
+   pressure difference means window reduction must be justified by lower
+   control traffic, goroutines, and allocation rate as well as direct bytes.
+5. **Lower burst high-water instead of deleting useful pools.** Bound H1/H3
+   send/receive flight and packet-group fan-out so fast.com cannot create 4,764
+   simultaneous pool owners or a 402-goroutine stack high-water. Preserve
+   bounded reuse for active traffic, then reclaim returned objects. Track quiet
+   GC cadence with a provisional goal of at most one collection/minute and no
+   forced collection outside a recorded reclaim event.
+
+The warm-set/reclaim policy must remain mobile-specific. Do not shrink global
+Connect pool capacity or apply mobile forced-reclaim timing to `server/connect`
+or `server/proxy`; any shared-pool implementation change must rerun their
+performance suites and `server/connect/perfvar`. For mobile acceptance, repeat
+Wikipedia, the streamed 1-MiB object, and fast.com on Auto/H1/H3, verify exact
+carrier bytes and no latency/goodput regression, then use the physical iOS
+Network Extension footprint and jetsam behavior as the actual release gate.
+
+### 2026-08-23 20-MiB plan implementation and zandroid validation
+
+All five implementation items above are now present in the candidate source,
+with mobile policy isolated from server defaults:
+
+- a 64-record, 15-second Go sampler records primitive runtime, pool, topology,
+  flow, transport-budget, reclaim, and host-supplied physical-footprint values;
+  its record and complete `DeviceLocal.memorySample` paths allocate zero in
+  tests. Android drains batches without constructing gomobile exit/status/list
+  graphs at one hertz;
+- mobile high-water reclaim uses TUN payload quiet rather than carrier-control
+  silence, a 15-second debounce, at most 16 outstanding pool objects, a
+  one-minute cooldown, full cache/pool shedding, and a 256-KiB packet warm set.
+  Runtime and iOS `phys_footprint` threshold crossings can arm a quiet epoch;
+  material above-target drops can request a later cooldown-bounded pass, while
+  an immaterial floor cannot create a forced-GC loop;
+- Android, Apple, and the reduced iOS-extension release libraries set
+  `memprofilerate=0` at Go runtime link initialization. A private build can
+  select a positive rate through the same build input, and a build-policy test
+  checks the actual runtime value. Android now uses the iOS extension's
+  `GOGC=10` pacing as well; the previous Android-only value of 50 concealed
+  allocator float in the surrogate measurement;
+- the <=20-MiB mobile profile fixes Auto quality/speed windows at 3/1, disables
+  standing reserve, and makes the hard max a strict admission ceiling without
+  destroying existing flows. Contract status now has one live-contract-sized
+  coalescer per window instead of one packet-sequence-sized worker per exit;
+  mobile HTTP, WebSocket, HPACK, and HTTP/2 receive state is explicitly bounded;
+  and
+- every mobile send, receive, forward, contract, and unreliable-flight
+  sequence is capped at 16 messages. Packet grouping is capped at 16 packets /
+  24 KiB and shared transfer queues retain byte ceilings. A mobile-only sampled
+  admission gate rejects and returns a complete native ingress batch when the
+  process has at least 512 outstanding packet roots, then resamples on every
+  ingress call until the pressure drains. Inactive mobile TCP flow state is
+  reaped after three minutes instead of the desktop ten-minute default.
+  Server/default sequence sizes, admission behavior, GC pacing, pool warm set,
+  and reclaim timing are unchanged.
+
+The physical run used the one attached `zandroid` Pixel 8 Pro (Android 17/API
+37), a main-environment Github Debug app, the 32-MiB Go soft limit and 20-MiB
+device target, and native heap profiling disabled. Credentials and the
+temporary acceptance client stayed private; the client was released after the
+run. The long-lived process alternated Wi-Fi Auto, cellular explicit H1, and
+Wi-Fi explicit H3. Wikipedia, a real streamed Cloudflare 1-MiB object, and
+fast.com completed in every measured transport cell. Exact carrier counters
+recorded 25.40 MiB H1 ingress and 8.69 MiB H3 ingress over the session. Android
+whole-app PSS is intentionally excluded from the Go target.
+
+The artifact used for this long session contained the sampler, native profile
+policy, 15-second reclaim, 256-KiB warm set, queue/group bounds, and initial 3/1
+window settings. It preceded the final strict-admission and 16-message tuning,
+which were added from the observed overshoot and active-flight counts:
+
+| Phase | Go runtime p50 / p95 / max | Live heap max | Pool ownership | Topology / result |
+| --- | ---: | ---: | ---: | --- |
+| Fresh Auto, 5.5 quiet min (22 samples) | 17.34 / 17.67 / 17.78 MiB | 5.07 MiB | 234 outstanding max | quality 3, speed 1; steady 20-MiB pass |
+| Auto fast.com | 22.96 / 27.97 / 27.97 MiB | 12.38 MiB | 2,074 outstanding max | active peak below 28 MiB in sampled Auto interval |
+| Auto after first reclaim (28 samples) | 20.91 / 21.73 / 21.90 MiB | 6.50 MiB after drain | <=9 outstanding | quality grew to 5; steady miss that produced strict admission |
+| Cellular H1 fast.com | 28.65 / 29.25 / 29.25 MiB | 12.80 MiB | 1,921 outstanding max | functional H1; active 28-MiB failure |
+| Wi-Fi H3 fast.com | 30.36 / 30.56 / 31.92 MiB | 15.43 MiB | 2,757 outstanding max | 9.1 MiB H3 ingress; active 28-MiB failure |
+| H3 after reclaim | 22.83 / 23.90 / 24.15 MiB | about 7 MiB after drain | <=19 outstanding | returned pool about 0.25 MiB; long-process recovery still above 20 MiB |
+
+The >28-MiB samples are attributable, not an unidentified leak. They coincide
+with 1,921--2,757 borrowed packet objects and 12.8--15.4 MiB live heap during
+fast.com. After Chrome stopped, outstanding ownership fell to control-scale
+counts; reclaim dropped H1 from 30.85 to 23.22 MiB and H3 from 31.85 to 21.70
+MiB while preserving the 13.17-MiB future pool capacity. Repeated cooldown
+passes were material only while allocator state drained. This evidence selected
+the final 16-message sequence/flight ceiling. The first rebuilt artifact proved
+that strict window admission held quality at three but also showed 2,488 packet
+roots and a 30.31-MiB Auto peak: per-flow caps alone do not bound aggregate
+ownership across the native ingress, receive, and transfer pipeline. That
+failure produced the sampled 512-root pressure gate rather than another global
+pool-size reduction.
+
+Two final-source follow-ups used the same Pixel and real sites. The first kept
+Android's old `GOGC=50` solely to isolate the packet-pressure and three-minute
+flow policies. The second changed only Android pacing to the iOS value of 10:
+
+| Rebuilt artifact / phase | Samples | Go runtime p50 / p95 / max | Ownership / reclaim | Result |
+| --- | ---: | ---: | ---: | --- |
+| pressure guard, Auto fast.com | 8 | 22.31 / 23.62 / 23.62 MiB | 1,474 roots max; 1,914 cumulative pressure drops by recovery | no >28-MiB sample; prior 30.31-MiB failure closed |
+| pressure guard, Auto post-reclaim steady | 19 | 19.79 / 20.13 / 20.13 MiB | one forced reclaim; flows 41 -> 8 | 20-MiB p95 miss by 0.13 MiB |
+| pressure guard, H3 fast.com | 8 | 25.38 / 26.53 / 26.53 MiB | 1,117 roots max; 1,630 additional pressure drops | no >28-MiB sample; functional H3 carried 5.70 MiB ingress |
+| pressure guard, late H3 recovery | 11 | 21.00 / 21.45 / 21.45 MiB | returned pool about 0.25 MiB; flows fell to 7 | remaining floor was live/allocator state, not retained buffers |
+| final iOS-paced Auto fast.com | 7 | 21.08 / 21.13 / 21.13 MiB | 1,453 roots max; 1,227 pressure drops | zero >28-MiB samples |
+| final iOS-paced five-minute recovery | 22 | 17.76 / 17.88 / 17.88 MiB | one reclaim; flows 49 -> 3 | steady 20-MiB p50/p95 pass |
+| final iOS-paced cellular H1 real-site traffic | 14 | 19.69 / 19.89 / 19.89 MiB | 1,130 roots max; 1,865 pressure drops | active 20-MiB p50/p95 pass; zero >28-MiB samples |
+| final iOS-paced cellular H1 post-reclaim | 7 | 17.38 / 17.57 / 17.57 MiB | returned pool <=0.26 MiB; flows 21 -> 1 | steady 20-MiB p50/p95 pass |
+
+The complete pressure-guard session recorded 60 samples, zero over 28 MiB, a
+26.53-MiB whole-session peak, 3,544 pressure-rejected ingress packets, and no
+process termination. The counter is deliberate overload loss, not corruption
+or a leaked return: batch rejection returns every pooled owner immediately and
+TCP provides retransmission/backpressure. Because the snapshot is sampled and
+already-admitted remote work drains asynchronously, 512 is the trigger rather
+than a claim that observed process-wide ownership can never exceed 512.
+
+The exact final artifact was `m20-iospace-20260823`: 32-MiB Go soft limit,
+20-MiB device target, `GOGC=10`, and `memprofilerate=0`. Its 31 samples had no
+28-MiB breach and a 21.13-MiB whole-session peak. The reclaim changed the
+runtime from 21.56 to 16.56 MiB; the next five connected minutes remained at
+17.76-MiB p50 / 17.88-MiB p95 / 17.88-MiB max while the pool retained at most
+about 0.57 MiB and flow count drained to three. H1 carried 4.84 MiB of ingress.
+The final detailed snapshot recorded 0.375 seconds of cumulative GC pause over
+470 seconds of process lifetime (about 0.08%); the denser iOS pacing therefore
+closed the heap-float gap without a material pause-time tax in this run.
+Wikipedia, the Cloudflare object, and fast.com all generated real tunneled
+traffic, and the process finished cleanly. The temporary client was released
+and private credentials were removed from the device.
+
+The same exact artifact then ran in a fresh process with Wi-Fi disabled and the
+cellular underlay proven before explicit H1 traffic. Wikipedia, the Cloudflare
+object, and fast.com completed while H1 recorded 5.48 MiB ingress. The 14-sample
+traffic interval stayed at 19.69-MiB p50 / 19.89-MiB p95 and max despite 1,865
+pressure rejections. The whole process peaked at 20.34 MiB during the short
+pre-reclaim recovery interval, never approached 28 MiB, and did not terminate.
+One reclaim changed 20.34 MiB to 17.10 MiB; the following seven samples were
+17.38-MiB p50 / 17.57-MiB p95 with returned buffers at or below 0.26 MiB and
+flows draining from 21 to one. Cumulative GC pause was 0.439 seconds over 378
+seconds (about 0.12%). The acceptance client was released, private credential
+files were deleted, and Wi-Fi was restored after the run.
+
+The message-pool changes were also isolated against the exact parent revision
+with five 300-ms benchmark repetitions on Apple M4 Pro / Go 1.26.7:
+
+| Server package | Time geomean change | B/op change | allocs/op change |
+| --- | ---: | ---: | ---: |
+| `server/connect` | -0.79% | +0.00% | unchanged |
+| `server/connect/perfvar` link primitives | +0.25% | +0.00% | unchanged |
+| `server/proxy` | +0.01% | +0.00% | unchanged |
+
+No server reclaim tuning is warranted from these results. The mobile caller
+uses the parameterized 256-KiB warm/reclaim API; existing server callers retain
+the 1-MiB wrapper and do not start the mobile trimmer. Five samples do not
+provide a 95% confidence interval, so the small time movements are treated as
+noise while the exact allocation equality is the useful guard.
+
+Only one Android device was attached during this follow-up, so a new same-LAN
+P2P role pair could not run. The 2026-08-21 bidirectional two-device P2P result
+remains the current physical P2P evidence. No iOS device was attached, and
+Android does not publish the extension's `TASK_VM_INFO.phys_footprint`; the new
+allocation-free iOS recorder and pressure trigger are implemented and tested,
+but an actual Network Extension footprint/termination run remains the release
+gate. A 20-MiB Go steady result on Android is not proof of a 20-MiB iOS process
+footprint.
+
+### 2026-08-24 24-MiB performance rebalance
+
+The 20-MiB profile met its memory target, but a matched fresh-process Wi-Fi
+Auto pass on the same attached `zandroid` exposed an unacceptable real-site
+cost. The exact `m20-iospace-20260823` artifact loaded Wikipedia in a 3,967.8-ms
+median, with 1,575.2-ms median document TTFB and 2,359.23-ms median per-page
+request p95. A streamed Cloudflare 1-MiB object took 33.279 seconds at 0.25
+Mbit/s median; the direct control completed in 0.412 seconds at 20.37 Mbit/s.
+The page phase never reached the 512-root pressure gate, so its latency was not
+caused by packet rejection. The transfer phase did accumulate 1,135 pressure
+drops and 72 collections, showing that the 20-MiB combination was also too
+aggressive under bulk traffic.
+
+The accepted profile treats 24 MiB as the mobile Go-runtime steady target and
+keeps 28 MiB as a separate active diagnostic failure threshold. It spends the
+additional room narrowly:
+
+- mobile Android/iOS defaults and Android's explicit per-device target are 24
+  MiB; desktop/server retains its established 20-MiB default;
+- Auto quality/speed windows are fixed at 4/1 rather than 3/1, giving route
+  selection one additional quality candidate without restoring the much
+  larger desktop live set;
+- Android and iOS use `GOGC=25`, midway between the slow 10 setting and the
+  unsafe 50 experiment, and keep `memprofilerate=0` plus the 32-MiB soft limit;
+- the post-reclaim packet warm set is 512 KiB rather than 256 KiB, avoiding a
+  completely cold allocation wave while leaving the pool capacity unchanged;
+  and
+- the measured H3-safe 16-message sequence/unreliable-flight ceiling,
+  16-packet/24-KiB group ceiling, 512-root aggregate pressure gate, and
+  three-minute flow retirement remain unchanged.
+
+The physical A/B rejected every apparently faster configuration that weakened
+the H3 safety margin. These are threshold experiments, not directly comparable
+latency samples: live network conditions and process ages differed.
+
+| Candidate | Queue / aggregate policy | Explicit-H3 runtime max | Decision |
+| --- | --- | ---: | --- |
+| `GOGC=50`, 32-message/group, 768-root gate | both per-flow and process-wide admission widened | 28.41 MiB | reject: crossed 28 MiB |
+| `GOGC=50`, 32-message/group, 512-root gate | restored aggregate gate only | 29.30 MiB | reject: already-admitted per-flow work still crossed 28 MiB |
+| `GOGC=50`, 16-message, 16-packet/24-KiB group, 512-root gate | restored all packet safety ceilings | 29.95 MiB | reject: GC heap float alone remained unsafe |
+| `GOGC=25`, unchanged H3-safe ceilings | final `m24-route-gc25-safe-20260824` profile | 24.73 MiB whole-session; 24.03 MiB under sustained H3 traffic | accept on Android surrogate |
+
+The final artifact used a fresh authenticated process, Chrome's cache-disabled
+benchmark path, real Wikipedia/Cloudflare/fast.com traffic, the 32-MiB Go soft
+limit, and production `memprofilerate=0`. Against the exact 20-MiB baseline,
+the observed performance was:
+
+| Workload | 20-MiB profile | Accepted 24-MiB profile | Observed change |
+| --- | ---: | ---: | ---: |
+| Wikipedia load, 7 runs | 3,967.8 ms median | 745.0 ms median | 81.2% lower |
+| Wikipedia document TTFB | 1,575.2 ms median | 248.1 ms median | 84.3% lower |
+| Wikipedia request p95 per page | 2,359.23 ms median | 294.58 ms median | 87.5% lower |
+| Cloudflare streamed 1 MiB, 5 runs | 33.279 s / 0.25 Mbit/s median | 3.892 s / 2.16 Mbit/s median | 88.3% less time / 8.64x goodput |
+
+This live-route result demonstrates that the severe regression is removable;
+it is not a confidence interval or proof that every gain comes from one knob.
+The accepted `GOGC=25` Wikipedia median was slower than the rejected
+`GOGC=50` candidate's 519.9 ms, which is the expected safety/performance trade.
+Two newly-created DevTools targets closed their websocket during the explicit
+H3 phase; the retained existing-target attempt completed in 2.624 seconds.
+Those two harness-visible failures remain recorded rather than being converted
+into successes.
+
+Memory telemetry for the accepted run separated active high-water from steady
+recovery:
+
+| Phase | Samples | Go runtime p50 / p95 / max | Live/pool ownership | Result |
+| --- | ---: | ---: | ---: | --- |
+| Auto fast.com | 7 | 20.65 / 20.92 / 20.92 MiB | 8.22-MiB live heap; 1,248 roots max | below both targets |
+| Explicit H3 page | 5 | 22.66 / 23.19 / 23.19 MiB | returned pool <=2.73 MiB | below both targets |
+| Explicit H3 fast.com | 8 | 23.86 / 24.03 / 24.03 MiB | 10.08-MiB live heap; 1,152 roots max | active headroom retained |
+| H3 recovery, including drain | 25 / 360 s | 20.20 / 24.61 / 24.73 MiB | first 105 s include in-flight drain | below 28-MiB active guard |
+| H3 recovery after reclaim | 18 | 20.12 / 20.52 / 20.52 MiB | reclaim 24.12 -> 19.53 MiB; warm pool about 0.5 MiB | steady 24-MiB pass |
+
+The final summary contained 59 samples, zero 28-MiB breaches, a 24.73-MiB
+runtime peak, 10.33-MiB live-heap peak, 1,289 maximum outstanding pooled
+objects, and 5,512 cumulative overload drops. Exact carrier counters recorded
+16.75 MiB H1 and 6.32 MiB H3 ingress. One quiet reclaim fired 105 seconds after
+the H3 traffic phase and flows drained from 45 to six. Cumulative GC pause was
+0.953 seconds over the 887.7-second process (about 0.11%). The instrumentation
+finished successfully, the temporary client was released, and credentials
+were removed from the device.
+
+Server isolation used an exact same-session A/B rather than the misleading
+prior-day comparison. Server `1806bbc9` and every non-SDK dependency were held
+fixed; SDK `49f756f` was compared with only this patch. Every benchmark ran for
+300 ms with `-benchmem`, `GOMAXPROCS=10`, and six repetitions per side in
+baseline/candidate/candidate/baseline order over three cycles:
+
+| Server package | Time geomean change | Allocation result |
+| --- | ---: | --- |
+| `server/connect` | -0.05% | B/op +0.01%; allocs/op unchanged |
+| `server/connect/perfvar` | -0.17% | B/op and allocs/op unchanged |
+| `server/proxy` | +0.05% | every B/op and allocs/op result unchanged |
+
+No individual timing comparison was significant. This rejects a server
+performance regression and confirms that the mobile/default split leaves
+Linux at `GOGC=100`, its previous 20-MiB device default, the 1-MiB server warm
+wrapper, and no mobile packet gate/reclaimer. The broad server short-suite
+attempt remained environment-blocked by missing `WARP_ENV` and vault `pg.yml`,
+matching its documented fixture limitation; the benchmark and focused policy
+processes passed.
+
+Only one Android remained attached, so this pass could not create a new P2P
+pair; the successful 2026-08-21 bidirectional same-LAN result remains the
+current evidence. The 24-MiB result is still a Go-runtime Android surrogate,
+not proof that an iOS Network Extension remains below its `phys_footprint` or
+jetsam limit. A physical iOS run remains the release gate.
+
 ### Provisional release gates
 
 Freeze exact gates after Phase 1 measures variance. Until then, the target is:
 
 - zero packet corruption, policy bypass, encryption downgrade, sequence/lane
   cross-talk, unbounded allocation, or IPv6 advertisement;
-- no shared receive handoff waits for queue space or worker exit;
+- no shared callback or unreliable physical lane waits for queue space or
+  worker exit; every reliable-lane wait owns at most its one already-read frame,
+  stays inside unchanged fixed queue/byte budgets, and ends on cancellation;
 - sparse interactive p95 at least 20% below current H1/H3 on mobile-poor and no
   more than 10% above direct when direct completes;
 - loaded interactive p95 at least 25% below the better current tunnel mode;
@@ -1046,17 +1520,22 @@ the tunnel's completion as an infinite percentage win.
 
 ### Phase 0 — correctness and observability
 
-- [x] Enforce zero-timeout Pack admission in the shared Client receive pump.
+- [x] Carry exact receive-lane reliability through RouteManager and make the
+  shared Client Pack handoff wait only for H1, H3/DNS QUIC stream, SCTP, and
+  framed reliable routes. H3 DATAGRAM and native P2P remain zero-timeout.
 - [x] Enforce zero-timeout inbound ACK admission.
 - [x] Drop rather than wait on receive-generation replacement when admission is
   nonblocking.
 - [x] Count Pack/byte and ACK handoff drops and add deterministic regressions.
 - [x] Expose Pack/byte and ACK handoff drops through the lock-free
   `Client.ReceiveStats()` snapshot.
-- [x] Make H1, H3, H3Dns, H3DnsPump, legacy P2P, and fast P2P carrier-reader
-  route admission zero-wait; count mode-specific refused messages and bytes.
-- [x] Make connect-server socket/exchange receive handoffs zero-wait and expose
-  bounded-label refusal counters.
+- [x] Make H1, H3/H3Dns/H3DnsPump QUIC stream, and legacy SCTP readers preserve
+  fixed-capacity backpressure to cancellation. Publish hybrid H3 and production
+  P2P receive lanes as distinct immutable routes; keep H3/DNS DATAGRAM and
+  native P2P carrier-reader admission zero-wait with exact refusal counters.
+- [x] Make reliable connect-server socket/exchange readers wait for their fixed
+  handoff or cancellation. When a shared resident callback cannot wait, retire
+  that generation on refusal rather than continuing past an invisible frame.
 - [x] Move resident control throttling and forward construction/storage checks
   out of Client callbacks. Control remains ordered; forwards use bounded
   destination-stable worker shards. Reliable-control overflow retires the
@@ -1074,11 +1553,11 @@ the tunnel's completion as an infinite percentage win.
 - [x] Give every retained IPv4 fragment group a fresh nonzero wire identity
   before asynchronous routing. This preserves two interleaved gVisor ID-zero
   datagrams across parallel H3 lanes without relaxing the fragment budgets.
-- [x] Match unreliable P2P flight and zero-wait receive handoffs by message
-  count while retaining independent 256-KiB byte ceilings. All P2P modes remain
-  Transfer-ACKed and are bounded as unreliable through their final handoff; a
-  240-KiB carrier-specific flight leaves 16 KiB inside the unchanged queue
-  ceiling for untracked control.
+- [x] Match native-P2P unreliable flight and zero-wait receive handoffs by
+  message count while retaining independent 256-KiB byte ceilings. Legacy SCTP
+  now publishes reliable receive semantics and waits only on its fixed route;
+  a 240-KiB native carrier flight leaves 16 KiB inside the unchanged queue
+  ceiling for untracked control. Both modes remain Transfer-ACKed.
 - [x] Complete the adjacent receive-callback audit. The shared Client pump,
   exact-delivery and encryption fixtures, control-sync collector, mux and
   multi-client provider echoes, contention benchmarks, WebRTC signal/data,
@@ -1622,6 +2101,9 @@ timeouts, following `CODESTYLE.md`.
 | 2026-08-21 | Automatic clear/collect/rewarm dropped 10.22/7.22 MiB of returned buffers and restored the H3 processes to 24.39/23.19 MiB. After bidirectional P2P and disconnect they held 23.86/23.58 MiB for five minutes with about 1 MiB returned; each automatic trim count stayed one. | Retain a one-shot 60-second mobile quiet timer, a 4-KiB activity epoch, and a 1-MiB material-rebuild threshold. Preserve explicit pressure semantics, pool capacity, and all outstanding buffers. Do not force GC repeatedly for background trickle or trivial free-list refill. |
 | 2026-08-21 | The allocation profile also found non-packet garbage: one-second status observation built full TLS defaults and reparsed pinned roots (about 9 MiB cumulative), while hot reliability reads projected another roughly 3.5 MiB. | Construct Auto eligibility from modes plus budget only, share immutable parsed roots while keeping per-config session caches isolated, and reuse each client's immutable reliability projection. Pools are for reusable mutable buffers; avoid or share immutable configuration instead. |
 | 2026-08-21 | On the rebuilt physical artifact, matched disconnected allocation-byte rates fell 53.4% and 47.6%, GC cadence fell about 36%, and the tail ended at 21.82/21.74 MiB. Galaxy's allocations-per-second did not fall even though its allocated bytes did, showing the remaining objects are smaller. | Retain the allocation-avoidance changes and report byte churn, object churn, GC, and resident memory independently. Do not infer all-allocation improvement from fewer bytes or use pooling to hide avoidable immutable objects. |
+| 2026-08-27 | Six Bloomberg media Fetch retries after an HTTP 403 all reused one established Chrome H2/TLS connection (`connectionId` 8895). A later top-level 403 used a new H2 connection (9547), but Chrome did not retry it. Connect received ordinary encrypted return traffic in both cases. | HTTP retry is not transport retry. No provider-selection policy can reroute requests multiplexed on an existing H2 connection, and the TLS-blind tunnel must not classify ciphertext as a 403. Anti-bias can act only when Chrome opens a fresh TCP/TLS tuple. |
+| 2026-08-27 | Hard IP/domain affinity let a long-lived page connection bypass the provider race for every later connection in its group. Even a low-rate completed media sample could be hidden by a healthy live page donor. | Ordinary fresh-flow inheritance is now default-off. Exact established tuples remain fixed and explicit app/host pins remain strict; ordinary new flows reach the health/performance-weighted race. The legacy hard-affinity switch remains for A/B, while bounded IP/domain groups remain measurement keys. |
+| 2026-08-27 | With hard DNS affinity disabled, retaining hour-long name/address-to-channel maps serves no production placement decision and can keep provider channel graphs reachable. | Do not populate DNS-exit hint maps while ordinary fresh-flow affinity is off. A runtime legacy enable learns from subsequent answers; explicit pins retain stable egress through their own affinity groups. |
 
 ## Results log
 
@@ -1743,6 +2225,45 @@ timeouts, following `CODESTYLE.md`.
 | 2026-08-21 | Allocation attribution and idle-pool rebuild | Private 64-KiB and production-rate heap profiles; allocator/pool/GC telemetry; manual clear/collect/rewarm; automatic quiet recovery after explicit H3 and bidirectional P2P | The manual A/B reduced 34.53/35.05 MiB to 24.01/26.90 MiB. Production H3 peaked at 51.70/31.95 MiB, then one automatic material rebuild per device restored 24.39/23.19 MiB; a disconnected five-minute tail ended at 23.86/23.58 MiB without another forced collection. Profiles identify live packet work at the active peak, returned pools after the burst, and avoidable status/reliability configuration churn. |
 | 2026-08-21 | Final memory implementation gates | Connect and SDK `go test ./... -short -count=1 -timeout=10m`; both `go vet ./...`; focused trim/idle/status/TLS/reliability selections five times under `-race`; Android Github Debug app/test assembly and unit tests; collector Node suite | Pass. Connect main completed in 199.890 s and SDK in 97.001 s; both vet runs were clean. The race selections preserve pool capacity and outstanding ownership, keep aggregate pool telemetry allocation-free, coalesce activity correctly, skip forced GC for trivial refill, avoid full TLS construction in status polling, share only immutable roots, and allocate zero objects for cached reliability reads. Android assembly/unit tests passed and all 10 collector tests passed. |
 | 2026-08-21 | Rebuilt post-allocation-fix Android artifact | Pixel cellular explicit H3 at signal level 0 and Galaxy Wi-Fi explicit H3; 405 eligible route samples per device; Wikipedia, Cloudflare 1 MiB, fast.com, idle rebuild, and 370-second disconnected tail | After one retained fresh-install VPN-authorization timeout per device, unchanged code connected both TUNs in under nine seconds and completed all 18 measured browser actions. Sampler peaks were 31.42/30.78 MiB, so active/post-burst 28 MiB still fails. One automatic rebuild restored 23.39/22.95 MiB and the tail ended at 21.82/21.74 MiB. Allocation-byte rate fell 53.4%/47.6% and GC cadence about 36% versus the matched prior tail; no extra forced GC, trim, exit, crash, or low-memory process death occurred. |
+| 2026-08-23 | 20-MiB source and regression gates | Full Connect and SDK package suites; final Connect/SDK focused race selections; SDK iOS-extension build and linked runtime-policy check; Android Github Debug AAR/app/instrumentation assembly, unit tests, and 10 collector tests | Pass. Connect's full suite completed in 444.586 s and its final short suite in 199.909 s; the final SDK full suite passed, including three measured provider-load repetitions at a 30.4--30.5-MiB host-process peak. New tests cover pool root/share/final-return ownership and zero allocation, bounded grouping, strict window admission, callback coalescing, mobile-only pressure admission and ownership returns, sampler/reclaim/physical-footprint transitions, nested-settings ownership, exact Android/iOS `GOGC=10`, desktop defaults, and linked `memprofilerate=0`. The final Android build and both test tiers passed. |
+| 2026-08-23 | Exact iOS-paced Android physical surrogate | Fresh Wi-Fi Auto and cellular H1 processes on `zandroid`, 32-MiB Go soft limit, 20-MiB target, `GOGC=10`, `memprofilerate=0`; Wikipedia, Cloudflare 1 MiB, and fast.com | Wi-Fi active traffic was 21.08/21.13-MiB p50/p95 and five-minute steady recovery was 17.76/17.88 MiB. Cellular H1 active traffic was 19.69/19.89 MiB and post-reclaim steady recovery was 17.38/17.57 MiB. Neither process exceeded 28 MiB or terminated; one reclaim per process returned the pool to a small reuse floor. Temporary clients were released and credentials removed. Only one Android was attached, so fresh P2P could not replace the successful 2026-08-21 bidirectional evidence; physical iOS remains required. |
+| 2026-08-23 | Server isolation after mobile pool/pressure work | Five serial 300-ms `-benchmem` repetitions of every benchmark in `server/connect`, its PERFVAR link primitives, and `server/proxy`, exact Connect parent versus candidate | Time geomeans changed -0.79%, +0.25%, and +0.01%; allocation geomeans and every individual proxy allocation result were unchanged. Server keeps the 1-MiB warm wrapper and has no mobile pressure/reclaim path. The canonical DB-backed PERFVAR attempt was retained as blocked after Redis `10.211.55.5:6379` returned `host is down`; its focused non-DB comparison passed three normal repetitions and once under `-race`. |
+| 2026-08-24 | 24-MiB mobile performance rebalance on `zandroid` | Exact 20-MiB baseline plus three rejected 24-MiB candidates and final `m24-route-gc25-safe-20260824`; Wikipedia, Cloudflare 1 MiB, fast.com, explicit-H3 stress, and six-minute recovery | The accepted profile uses quality/speed 4/1, `GOGC=25`, and a 512-KiB warm set while retaining the 16-message, 16-packet/24-KiB, and 512-root H3 safety ceilings. Wikipedia median load fell 81.2% and Cloudflare median goodput rose 8.64x versus the exact 20-MiB run. The final 59-sample session peaked at 24.73 MiB with zero 28-MiB breaches; post-reclaim steady p50/p95 were 20.12/20.52 MiB. `GOGC=50` and both widened-queue candidates were rejected at 28.41--29.95 MiB under explicit H3. |
+| 2026-08-24 | Exact server isolation for the 24-MiB SDK patch | Six order-balanced 300-ms `-benchmem` repetitions per side across every benchmark in `server/connect`, `server/connect/perfvar`, and `server/proxy`; SDK `49f756f` versus only the candidate patch | Time geomeans changed -0.05%, -0.17%, and +0.05%; no individual timing result was significant. Allocation geomeans were unchanged except +0.01% B/op in Connect, and alloc counts were identical. Linux retains `GOGC=100`, the 20-MiB default device budget, 1-MiB server warm wrapper, and no mobile gate/reclaimer. |
+| 2026-08-24 | H1 sequence-depth and ACK-path isolation on one attached Android surrogate | Explicit H1/provider-off runs at global depth 32 and 64; receive-only 128/256 KiB; send+receive 128; H1 receive 64 with quick Transfer ACK, ACK-root reserve/suffix rescue, and zero/1-ms Pack handoff; Wikipedia, Cloudflare 1 MiB, fast.com, and Direct brackets | Depth 64 was the page-performance knee: global median Wikipedia load improved 543.7 to 457.6 ms versus depth 32 and stayed below 24 MiB, while depth 128 crossed about 25.05 MiB under repeated traffic and collapsed. Carrier attribution then observed a 64-message/~98-KiB Pack HWM and 2,280 Pack handoff drops but zero ACK-handoff drops. A 1-ms H1-only reliable-carrier wait reduced page/Cloudflare Pack loss from 82 to one; H3/unknown and ACK admission remain zero-wait. Send, ACK, forward, contract, and control counts remain 16; H1 receive is 64 with the same 128-KiB encoded-byte cap. |
+| 2026-08-24 | Retained H1 64/1-ms physical result and 24-MiB memory gate | `h1-rx64-ackscan-wait1ms-20260824`; seven cache-disabled Wikipedia navigations, three Cloudflare 1 MiB transfers, fresh/hot canonical fast.com, 1-Hz memory/pressure/recovery telemetry | Wikipedia median load/request-to-first-byte/TTFB/request-p95 were 521.5/203.2/210.9/227.43 ms, with all seven warm loads at 483--537 ms. Cloudflare median was 1.58 Mbit/s; fast.com displayed 1.2 then 0.94 Mbit/s. Page/Cloudflare peak runtime was 18.63 MiB and the full session peak was 21.80 MiB; 19 samples had zero 28-MiB breaches. Only one Pack handoff dropped before fast.com, and two of three bounded waits succeeded. This fixes the internal H1 receive-collapse mode and page tails, but does not recover 40 Mbit/s. |
+| 2026-08-24 | Rejected pure-TCP-ACK Transfer-NoAck diagnostic | `h1-rx64-acknoack-group-20260824`; same physical H1 client plus an H1-only NoAck arm for ACK-only inner TCP packets, followed by Direct Wi-Fi bracket | Cloudflare median remained 1.65 Mbit/s and Wikipedia median load/TTFB regressed to 1,032/311 ms even though timeout resends fell to 21 during that phase. Fresh canonical fast.com displayed 0.64 Mbit/s; a hot overlapping reload failed near 80 s. Hot runtime peaked at 27.79 MiB with 4,951 pressure drops. Direct Cloudflare then measured 38.87, 80.04, 92.28, and 90.01 Mbit/s (middle-pair median 85.03), proving underlay headroom. The NoAck arm was removed because it did not improve performance and breaks end-to-end commit across carrier replacement. Two query-cachebuster fast.com 404 attempts were harness-invalid and excluded. Temporary clients and credential material were removed. |
+| 2026-08-24 | Contract-safe provider-return H1 grouping and ACK-amplification benchmark | Provider drains remain logical groups of 16 frames / 24 KiB; selected H1 sequences use 16 frames / 3 KiB per Pack while H3/mixed remain two frames / one MTU. Seven 500-ms `GOMAXPROCS=10` Transfer-boundary samples compare old singleton groups with one 16-packet full-MTU group. | Median 16-packet formation fell from 25,579 to 9,105 ns (2.81x throughput); wire Packs 16 to 8; allocations 147 to 51 (-65.3%); allocated bytes 19,440 to 4,024 (-79.3%). Tests cover no-contract and contract-bearing drains, 16/16/1 fairness chunks, partial admission, retry/lane identity, exact ownership/completion, route-generation pinning, the first group on a new H1 sequence, and H1/H3 bounds. Sparse singleton returns retain their raw path. This is local boundary evidence pending provider deployment, not a physical throughput claim. |
+| 2026-08-24 | Current shared-code server performance and PERFVAR fixture status | Five 300-ms `-benchmem` repetitions of every benchmark in `server/connect`, `server/connect/perfvar`, and `server/proxy`; DB-backed H1 download campaign attempt; broad PERFVAR short attempt | All 185 benchmark samples passed: Connect 72.736 s, PERFVAR link primitives 4.303 s, proxy 9.073 s. Versus the preceding exact-candidate cohort, time geomeans changed -0.14%, +0.57%, and +0.92%; PERFVAR/proxy allocations were identical and Connect mean bytes/op changed about +0.01%. The full-TUN attempt remains infrastructure-blocked by the configured Redis endpoint reporting `host is down`; the broad short tier also requires absent local vault/DB resources. No server reclaim override is warranted, and no end-to-end throughput claim is made from benchmark-only success. |
+| 2026-08-24 | Final H1 ACK/grouping source gates | Connect `go test ./... -short -count=1 -timeout=10m`; SDK equivalent; 18 Connect and 20 SDK affected tests three times under `-race`; Android local AAR plus Github Debug app/instrumentation and unit tests; physical collector parser suite | Pass. Connect's main package took about 200 s after replacing an obsolete all-carrier zero-timeout source assertion with the exact H1-1-ms/H3-zero/ACK-zero policy; SDK completed in 97.659 s. Both focused race selections passed. The provider grouping and permanent benchmark compile/run cleanly. The first Android AAR attempt hit a transient gomobile temporary-module error before app compilation; the unchanged rerun built the AAR, app, instrumentation, and unit tests in 59 s. All 10 privacy/eligibility collector tests passed. `git diff --check` is clean. |
+| 2026-08-24 | Exact-byte ACK-root and small-pool physical isolation | `h1-ack-smallpool-20260824` on the attached Android surrogate: explicit H1/provider off, 256-byte pool class, 1-MiB base packet gate and 2-MiB ACK-only ceiling; adjacent diagnostic raised only the ACK ceiling to 3 MiB | The accepted ten-run Cloudflare distribution was 1.20--2.90 Mbit/s with a 1.695-Mbit/s median. Seven Wikipedia runs had 363.9/119.2/142.4/177.77-ms median load/request-to-first-byte/TTFB/request-p95. Runtime peaked at 22.19 MiB with zero >28-MiB samples. The 3-MiB arm removed ACK drops but lowered median speed to 0.92 Mbit/s and raised Pack drops 47 -> 79, so it was reverted. Exact byte accounting and the 2-MiB ACK ceiling remain overload protection, not a 40-Mbit/s solution. |
+| 2026-08-24 | Provider pure-ACK and H1 ready-drain host performance | Seven two-second provider-download samples before/after direct established pure-ACK application; adjacent client H1/TLS ready-drain samples at 16/32 messages; full current `server/connect`, `server/connect/perfvar`, and `server/proxy` benchmark tiers | Direct provider ACK application changed median local download work 56,712 -> 54,935 ns (-3.1%), 577.8 -> 596.5 MB/s, about 5,351 -> 2,560 B/op, and 46 -> 37 allocs/op; the helper itself is zero-allocation. Client ACK-sized H1/TLS work fell 533.9 -> 445.0 ns (-16.7%), about 240 -> 288 MB/s, and 0.0693 -> 0.0443 writes/frame, while full-payload and sparse shapes were neutral and storage stayed fixed at 16 KiB. All 175/10/20 current server benchmark samples passed. Broad cross-process time geomeans versus the prior cohort were +1.65%/+2.13%/-3.79% with conflicting directions; exact affected benchmarks show no regression. |
+| 2026-08-24 | Physical H1 speed after 32-ready candidate, retained as memory failure | `h1-ack-direct-batch32-20260824`; one authenticated Wi-Fi H1 session, stable production Chrome, seven Wikipedia pages, ten streamed Cloudflare 1-MiB objects, canonical fast.com, 1-Hz route telemetry, and 15-s Go sampler | Cloudflare completed 10/10 at 1.22--3.13 Mbit/s with a 2.02-Mbit/s median, +19.2% versus the adjacent 1.695-Mbit/s exact-byte run. fast.com settled at 5.7 Mbit/s after 45 s and SDK counters recorded 28.74 MiB H1 ingress. Wikipedia regressed to 787.5/343.0/349.2/388.84-ms median load/request-to-first-byte/TTFB/request-p95. Sustained traffic produced 2,137 / 3.85 MiB outstanding pool, then 6.48 MiB returned pool and a 29.48-MiB Go-runtime crest: three samples exceeded 28 MiB. One automatic quiet rebuild dropped 5.98 MiB and reduced runtime 29.48 -> 19.85 MiB; later values held at 20.15--20.48 MiB. This is reclaimable burst/allocator-span high-water rather than a persistent leak, but it fails the active/post-burst memory gate and is not an accepted release profile. The temporary client was released and credential material removed. |
+| 2026-08-24 | ACK-direct/32-ready final source and build gates | Focused ownership, pre-handshake fallback, wakeup, zero-allocation, batching, and provider-dispatch tests ten times; affected race selection three times; complete Connect/SDK short suites; Android AAR/app/instrumentation/unit build; all current server benchmark packages | Pass. Connect/SDK short main packages completed in 198.841/99.052 s. The Android Github Debug AAR, app, instrumentation, and unit tier completed in 68 s. Server benchmark logs contain 175/10/20 passing samples. The direct ACK path retains ordered fallback before SYN establishment and exact packet ownership, while 32-ready batching remains ready-only with the 12-KiB byte stop and existing 16-KiB wrapper. The DB/vault-backed full-TUN server fixture is still unavailable, so provider deployment and sustained physical memory remain open gates. |
+| 2026-08-25 | Adjacent bulk-read and write-coalescing audit | H1 mobile writer, server H1 writer, Android TUN ingress, NAT/provider return, TCP callback/writev, gVisor TUN batches/GRO, remote multi-client delivery, exchange writes, and Linux `sendmmsg` | H1 now performs repeated ready-only cycles of up to eight priority Transfer ACKs followed by ordinary packets in the same nonblocking flush; the ordinary drain remains 32 messages / 12 KiB inside the fixed 16-KiB wrapper. Server H1 uses the same 32-message ready cap with its existing 16-KiB socket bound. Android already performs one blocking TUN read followed by up to 63 nonblocking reads and one `sendPacketsNoCopy`; NAT, TCP, gVisor, provider return, remote multi-client, exchange, and Linux socket boundaries were already bulk. WebSocket/SCTP logical-message reads and TUN packet writes remain singular because their boundaries cannot be concatenated safely. H3 and DNS are explicitly deferred. |
+| 2026-08-25 | Receive-allocation failure attribution and rejected arms | `h1-coalesce-pack2m-20260825`, `h1-rxbudget2m-wait5-20260825`, and `h1-rxalloc2m-wait10-20260825`; exact pooled-root, decoded-owner, Pack/receive budget telemetry | A Pack-only budget still allowed 6.51 MiB of receive roots and a 30.39-MiB runtime peak. A payload-byte receive budget still hid pooled backing/owner costs: roots reached 6.15 MiB and runtime 29.59 MiB. Charging exact retained allocation reduced the peak to 22.83 MiB, but initially applying that same charge to the per-flow logical window stalled the second Cloudflare sample. The retained design therefore keeps protocol payload flow control independent from one exact shared retained-allocation budget. Tests cover every backing class, owner/root charge, duplicate/remove/clear release, many-flow zero-floor bounds, shared resend accounting, and normal/race repetition. |
+| 2026-08-25 | Final Android H1 24-MiB acceptance | `h1-rxalloc-separate-wait10-20260825`; explicit H1/provider off on Wi-Fi, stable Chrome, 7 Wikipedia + 10 full 1-MiB Cloudflare + fast.com + 7 hot Wikipedia + five-minute quiet + 7 post-recovery Wikipedia; 61 Go samples and 923 privacy-filtered host samples | All ten 1-MiB objects completed at 2.04--6.00 Mbit/s (2.78 median). Pre/hot/post-recovery Wikipedia medians were 455.1/627.4/613.6 ms load and 169.6/248.8/227.8 ms TTFB; one hot reused-H2 resource waited 5.3 s without a concurrent tunnel drop/retry, while all seven post-recovery pages had no multi-second resource tail. fast.com moved at least 20.53 MiB ingress in the inner counter bracket. Runtime peaked at 21.77 MiB with 8.91 MiB live heap, 1.78 MiB packet roots, exact receive use 2.00/2.00 MiB, and zero samples above 24 or 28 MiB. Five-minute steady p50/p95/range/last were 19.91/20.16/19.85--20.20/19.91 MiB with zero queued receive bytes, a 256-KiB packet warm set, zero forced GC, and zero trim. Nine of 11 bounded Pack waits succeeded; two misses returned 2,880 bytes and did not prevent payload completion. The adjacent Direct upper pair was 41.53 Mbit/s, so the remaining public-H1 gap requires deploying the provider grouping/direct-ACK work to a controlled exit; Android does not replace physical iOS `phys_footprint`/jetsam validation. The retained client was released and all credential/device artifacts were removed. |
+| 2026-08-25 | Final source, race, device, and server performance gates | Connect/SDK full short suites; exact shared-lane accounting 50 times and 10 times under race; retained receive/message-pool tests 20 times and five under race; SDK mobile policy 20 times and five under race; server H1 tests 20 times; Android parser/unit/build/instrumentation; Go vet and diff checks; full benchmark-only server tiers and order-balanced detached baseline A/B | Pass. Connect/SDK full short suites completed in 202.273/97.954 s. All focused normal/race repetitions passed, including the regression that caught and fixed encoded resend-frame under-accounting through an embedded queue item. Android unit/parser/build passed and the 912.262-s physical instrumentation test completed normally. Connect, SDK, server/connect, PERFVAR, and proxy vet cleanly; all four worktrees pass `git diff --check`. Server benchmark tiers passed 190/10/20 samples. The 8 -> 32 server H1 sweep improved full-payload/ACK-sized TLS throughput 12.9%/85.2% with unchanged allocations; same-session baseline/current PERFVAR and proxy changed -0.46%/+0.64% with identical B/op and allocs/op. The broad server short tier remains externally blocked waiting on the documented Redis/vault/DB fixtures; focused tests and all benchmark-only tiers pass. |
+| 2026-08-25 | Iterative H1 receive-depth physical isolation on the attached Android surrogate | Two explicit-H1/provider-off arms: count-only 64 -> 128 by 16 after two full observations within 100 ms, then paired count/bytes 64/128 KiB -> 128/256 KiB by 16/32-KiB; Direct 4-MiB brackets, Wikipedia, ten Cloudflare 1-MiB attempts, canonical fast.com, five-plus-minute recovery, and schema-10 saturation/growth telemetry | Count-only growth stayed memory-safe at a 21.39-MiB peak but stopped at 92 Packs / 130,978 of 131,072 bytes and completed only 7/10 Cloudflare transfers at a 1.54-Mbit/s median. The paired arm reached the full earned 128/256-KiB limit and actually queued 128 Packs / 194,688 bytes; all ten Cloudflare objects completed but median goodput was 1.18 Mbit/s. fast.com moved 1.77 MiB in 75 seconds (about 0.20 Mbit/s), requested no additional depth, and session timeout resends reached 620, while the Direct median was 87.4 Mbit/s. Paired runtime peaked at 22.45 MiB; 390-second recovery p50/p95/range/last were 20.58/20.91/20.19--20.97/20.19 MiB with zero samples above 24/28 MiB. Post-recovery Wikipedia was 439.6-ms load / 186.2-ms TTFB median. Reject adaptive depth as the production mobile default: it is memory-safe in this arm but does not unlock the public-provider path. Keep fixed H1 64/128 KiB, retain generic opt-in telemetry for a controlled provider, and deploy provider grouping/direct ACK before another client budget spend. The retained client and on-device credential artifacts were removed. |
+| 2026-08-25 | Iterative-depth final source and performance gates | New count/byte saturation, expiry, H3 exclusion, exact-budget, telemetry aggregation, SDK policy/schema, and owner-size tests repeated ten times normally and under race; full Connect/SDK short suites; Connect/SDK/server vet; Android final SDK AAR, Github Debug app/test APKs, unit tests, and ten collector/parser tests; all server benchmark-only tiers | Pass. Connect/SDK full suites completed in 203.712/98.092 s. The opt-in fixed/adaptive Pack microbenchmark measured 58.22/58.20-ns medians with zero allocations. Server adaptive settings and retained Pack scanning remain default-off; all 190/10/20 `server/connect`, PERFVAR, and proxy samples passed. Production full-payload/ACK-sized H1 TLS medians were 1,032/419.1 ns with 17/10 B/op and two allocations; PERFVAR receive credits were 783.1 ns and proxy batch-64 was 6,426 ns. The production mobile SDK explicitly clears adaptive settings and remains fixed at H1 64/128 KiB. |
+| 2026-08-25 | Bounded H1 logical-lane and Transfer-ACK overflow isolation | Controlled four-flow PERFVAR lane-zero/eight-lane comparison at similar calibrated underlay; clean 50-ms ACK-coalescer A/B; adjacent physical explicit-H1/provider-off lane-eight and rebuilt lane-zero arms with Wikipedia, canonical fast.com, Direct brackets, SDK counters, and Go memory | Controlled lane eight reached 29.058 Mbit/s versus lane zero 20.247 Mbit/s at 43.704/41.474-Mbit/s underlays (+43.5% raw). Lossless ACK-window folding changed clean H1 134.551 -> 134.529 Mbit/s (-0.016%). On device, lane eight improved Wikipedia median load/TTFB from lane zero's 1,157.8/367.9 ms to 348.8/126.1 ms and reduced exact-burst timeout resends 1,053 -> 152; runtime peaks were 19.43/20.60 MiB with zero >28-MiB samples. Public fast.com displayed 3.6--10 Mbit/s on lane eight and 4.4 Mbit/s on lane zero while Direct displayed 410 Mbit/s and 1.1 Gbit/s. The provider return sender remained on lane zero, so client lanes isolated requests/inner TCP ACKs but could not split download data. Keep eight shared-budget lanes and lossless ACK overflow as an explicit-H1 symmetric provider candidate; do not claim 40 Mbit/s or enable default Auto before the pinned provider A/B. |
+| 2026-08-25 | Symmetric-H1 candidate final gates | ACK overflow and logical-lane selections 20 times normally / 10 and three times under race; complete Connect/SDK short suites; all affected vet tiers; clean-host affected server benchmarks; Android SDK AAR, Github Debug app/test APKs and unit tests; physical collector and fast.com harness syntax/privacy checks | Pass for every self-contained gate. Exact-source Connect/SDK complete suites finished in 199.341/97.135 s. An earlier Connect rerun under an accidentally retained benchmark probe missed 2/240 callbacks in the unrelated six-minute `TestTransferBudgetLiveness`; after stopping that 15.5-hour campaign process, the exact test passed 20/20 normally and 5/5 under race, followed by the complete green rerun. Five clean-host repetitions measured production server H1 TLS at 891.7 ns full-payload and 370.3 ns ACK-sized with two allocations/op; PERFVAR receive credits were 673.6 ns and proxy batch-64 was 5,406 ns. Android built successfully in 32 s; all ten collector tests and the fast.com script syntax gate passed. The broad server correctness attempt reproduced the documented external fixture block (`WARP_ENV` unset and vault `pg.yml` absent, including `TestProxyWgHandoffPollExpiry` after five retries); it is not reported as green. The production change is deliberately limited to mobile <=24-MiB explicit H1 on both client and provider; Auto/H3 are unchanged pending the pinned provider A/B. |
+| 2026-08-25 | Deterministic reliable-H1 synthetic-loss isolation | Pinned controlled provider over explicit H1/eight lanes; fixed 64/128-KiB receive depth and unchanged exact 2-MiB Pack/reorder budgets; schema-11 carrier-drop/backpressure and Pack/recovery counters; three canonical fast.com runs, seven Wikipedia pages, and a 345-second quiet connected window | The fixed-depth control displayed 6.1 Mbit/s while the 32-message platform route discarded 530 complete messages / 1,186,363 bytes, the receive-reorder budget pinned at 1.993/2.000 MiB, and provider recovery produced 1,357 timeout plus 348 selective writes. Making only the carrier route lossless moved the failure to the finite Pack boundary: carrier drops became zero, Pack drops rose to 24, reorder pinned at 1.994 MiB, and fast.com displayed 3.5 Mbit/s. Making both reliable H1 handoffs wait for capacity or cancellation—without adding a slot or byte—produced 38, 41, and 52 Mbit/s. Across the accepted session, carrier/Pack drop deltas were zero, 762/762 Pack waits succeeded, final Pack/reorder use was zero, and selective provider recovery rose only during the first run. Wikipedia load/document-TTFB/request-p95 medians were 439.2/181.5/183.58 ms with 7/7 success. Runtime peaked at 17.60 MiB; quiet p50/p95/range/last were 17.57/17.61/17.23--17.61/17.41 MiB with no >24/28-MiB sample, zero queued ownership, 0.50-MiB maximum retained pools, and no forced GC/trim. Accept for mobile H1; H3/DNS and physical iOS footprint remain separate gates. |
+| 2026-08-25 | Lossless-H1 root-cause and regression gates | Filled one-slot carrier and Pack queues; exact pooled-slice delivery/return, cancellation, H3-DNS nonblocking policy, and production-source mode audit; 50 normal and three race repetitions; complete Connect/SDK suites; Android AAR/app/test/unit build; shared server/connect, PERFVAR, and proxy benchmarks | All deterministic repetitions pass, including cancellation returning Pack ownership to its caller and the audit permitting exactly one cancellable H1 receive send while forbidding direct blocking H3/DNS/P2P reader handoffs. Complete Connect/SDK suites passed in 442.156/459.385 s; affected race selections, vet, and the Android 90-task build passed. All 190/10/20 server benchmark samples passed. Production full-payload/ACK-sized H1 TLS medians were 896.2/373.0 ns with unchanged 17/10 B/op and two allocations (about +0.5%/+0.7% versus the adjacent cohort); PERFVAR receive-credit improved 673.6 -> 636.8 ns and proxy batch-64 improved 5,406 -> 5,348 ns. The DB-backed H1 PERFVAR track was attempted with its documented environment and remains externally blocked by the down local Redis fixture; it is not reported green. The 29.7-minute instrumentation session finished normally, all four temporary Android clients were released, provider shutdown removed its retained client, and private device credentials/pins plus the temporary provider harness were removed. |
+| 2026-08-25 | Complete exact-lane receive remediation | RouteManager-to-Pack receive reliability; H1, H3/H3Dns/H3DnsPump stream, SCTP, H3 DATAGRAM, native P2P, resident/exchange TCP, resident shared-callback overflow, and server H3 hybrid cutoff; filled one-slot queues, explicit cancellation barriers, pooled-owner witnesses, artificial sequence markers, gob round trips, source inventories, and hybrid queue-slot accounting | Supersedes the earlier H1-only policy above. Hybrid H3 and production P2P publish distinct immutable receive routes. Reliable stream/SCTP/framed-TCP lanes retain only their already-read frame to fixed capacity or cancellation; H3 DATAGRAM and native P2P remain bounded zero-wait. The final Pack handoff uses exact lane reliability rather than transport family. Internal server readers backpressure; a shared callback that cannot wait retires the generation instead of skipping a reliable frame. Server H3 serializes the exact contiguous DATAGRAM byte cutoff through the resident exchange. Splitting H3 lanes keeps the same total payload slots. The affected topology test now requires one SCTP and one native P2P receive route in each intermediary direction. |
+| 2026-08-25 | Exact-lane fast.com regression bracket on the attached Pixel | Current `lane-remediation-20260825`, retained pre-change SDK AAR, then closing current `lane-candidate-close-20260825`; fresh authenticated app and Chrome per arm; explicit H1/provider off; stable DevTools; three canonical runs per arm; SDK carrier/memory counters | Opening current displayed 8.7/6.9/7.3 Mbit/s (7.3 median), the retained AAR 84/95/1.2 (84 median), and closing current 160/130/140 (140 median). Exact H1 ingress deltas were 43.80/223.70/504.00 MB, ruling out Direct leakage. Go-runtime peaks were 18.73/19.25/20.21 MiB. Closing current recorded 5,769 backpressures / 8,483,576 bytes, zero route drops, 1,804/1,804 successful Pack waits, zero Pack drops, and zero final Pack/reorder use. All three closing samples exceeded the 40-Mbit/s target and the median exceeded the bracketed baseline, so no systematic H1 fast.com regression is present. Preserve the slow opening arm and baseline outlier: public-provider selection was not pinned, so this is a target/regression gate, not a 66.7% speedup claim. All three temporary clients were released and private credentials/device artifacts removed. |
+| 2026-08-25 | Post-pull fast.com route-limited bracket | Final rebased current, retained pre-change AAR, final rebased current; same attached Pixel/Wi-Fi/Chrome/canonical harness; fresh authenticated app and Chrome per arm; explicit H1/provider off; exact counters and memory | Current primary displayed 0.58/27/52 Mbit/s (27 median), followed by preserved extension 17/8.1/13; retained AAR displayed 28/15/10 (15 median); closing current displayed 0.65/17/10 (10 median). Exact H1 deltas were 302.43 MB over six / 147.21 MB over three / 64.37 MB over three. Runtime peaks were 19.66/17.70/19.89 MiB; carrier and Pack drops were zero in every arm, and current completed 165/165 opening plus 38/38 closing Pack waits. Timeout resends were 14,057/330/6,926, exposing sharply changing provider conditions. Baseline was also below 40 and current produced the only above-40 sample, so this degraded public route is neutral regression evidence, not a percentage comparison or replacement for the earlier 140-Mbit/s closing target gate. The final APK was restored, all clients released, and private artifacts removed. |
+| 2026-08-25 | Exact-lane final source, memory, and server-performance gates | Complete Connect/SDK short suites; focused Connect/server/SDK normal and race repetitions; intermediary P2P topology 20 times plus three race runs; vet; Android final AAR, Github Debug app/test APKs and unit tests; collector/parser and fast harness checks; five-repeat 300-ms benchmem sweeps | Connect/SDK complete suites passed in 199.474/98.001 s; every focused normal/race gate and all affected vet tiers passed. The Android 90-task build passed in 1m12s and all ten privacy/eligibility collector tests passed. Before the final generated-data pull, all 210 server/connect, 10 PERFVAR, and 20 proxy samples passed. The rebased source then passed all 30 exact affected H1/admission samples: production full-payload/ACK-sized H1 TLS medians were 884.2/366.7 ns with unchanged 17/10 B/op and two allocations, -1.34%/-1.69% versus the adjacent cohort. Pre-rebase PERFVAR receive-credit was 673.4 ns (+5.75%) and unchanged proxy batch-64 5,444 ns (+1.80%); these unaffected cross-package shifts are host noise. Post-rebase reliable/unreliable queue fast paths measured 31.17/32.67 ns and full ResidentTransport wrappers 40.47/38.06 ns, all zero B/op and zero allocs/op. No server or device-throughput regression is detected. |
+| 2026-08-26 | Cross-project research, deterministic no-retransmit guard, and two-device provider/client matrix | Final schema-12 Android artifact on both attached phones; exact peer cross-pinning; each device alternated Wi-Fi H1, same-LAN P2P, and cellular as client while the other provided; real Wikipedia and fast.com traffic; Direct Wi-Fi/cellular brackets; primitive client/provider recovery and memory counters; fresh synthetic provider heap/goroutine profile; WireGuard/Tailscale/gVisor/DPDK/VPP design comparison | Client phases all stayed below 24 MiB (17.19--18.57 MiB on the Galaxy and 22.78--23.04 MiB on the Pixel), but provider work failed the gate: Pixel peaked at 26.12 MiB and Galaxy at 30.43 MiB with ten samples above 28 MiB. At the Galaxy maximum, live heap was 13.99 MiB, packet outstanding was at most 1.78 MiB, returned packet-pool storage was only about 0.21 MiB, and 748 goroutines were live. A fresh 192-UDP-flow provider profile reproduced 30.7 MiB runtime / 13.6 MiB live heap and 621 goroutines, including 384 per-flow UDP reader/send loops; the next provider-memory direction is a bounded shared socket poller, not a larger pool or shorter unmeasured timeout. Exact-peer H1 fast.com medians were 3.6/7.6 Mbit/s on the Galaxy Wi-Fi/cell and 0.61/5.3 Mbit/s on the Pixel, with P2P 2.7/2.9; adjacent Direct Wi-Fi medians were 960/390 Mbit/s. These variable exits do not replace the earlier controlled 38/41/52-Mbit/s lossless-H1 pass. The retained deterministic ACK race emits one initial wire Pack and zero recovery writes; the fixed RTT ring reduces per-ACK accounting from 43.64--44.92 ns, 64 B, and one allocation to 20.26--20.32 ns, 0 B, and zero allocations. A 32-frame/48-KiB provider group was about 12% faster locally but showed no physical win, so production remains 16/24. Full analysis and research ordering are in `MEMSTEADY.md`. |
+| 2026-08-26 | CNN H1 poisoned-exit remediation and two-device playback/memory validation | Deterministic post-establishment H1 DASH blackhole, quarantined-affinity donor, sticky-flow bound, source-scoped provider diagnostics and reset-priority tests; two 27-minute production-rate Android sessions; public United States H1 on Wi-Fi/cellular and exact-ID same-LAN P2P in both provider directions; Chrome on the real CNN Nepal live-news page | Both public paths and both P2P directions advanced through preroll into CNN footage, with zero local client/provider security blocks. A reused media session across an egress change returned a CNN error; a fresh connection on the stable P2P route played, matching the rule that a poisoned established H1 connection is reset rather than rebound across egress IPs. Pixel/Galaxy provider runtime peaked at 38.84/39.26 MiB, live heap at 21.54/22.35 MiB, and goroutines at 1,346/1,071; exact returned pool storage was only 0.25 MiB. P2P clients peaked at 23.74/24.02 MiB and both final disconnected states were below 24 MiB. A fresh 192-UDP-flow profile again showed 192 socket readers plus 192 send/idle loops and 621 loaded goroutines. Provider build/policy identity and per-source block counters now cross Connect, SDK and mobile RPC. The reliability fix passes functional device validation; provider-active memory still fails the 24/28-MiB gates. Root attribution and collision-safe poller/lifecycle candidates are in `MEMSTEADY.md`. |
+| 2026-08-26 | Exact-final Android P2P telemetry/playback smoke | Rebuilt current Connect + SDK into stamped Play Debug app/test APKs; 5.8-minute commanded sessions on Pixel 8 Pro and Galaxy S24 Ultra; reversed exact-ID same-LAN provider/client roles; explicit H1; real CNN page and video | Both directions played moving video. Each client received exactly one provider diagnostic with nonempty build and policy hashes; all local and source-scoped provider block counters remained zero. Pixel/Galaxy combined-role runtime peaks were 32.23/31.16 MiB with 4/11 samples above 28 MiB; packet ownership peaked at only 0.39/0.28 MiB, returned pools at 0.25 MiB, and packet-pressure/H1 queue drops were zero. Client snapshots were 19.78/21.83 MiB, while provider snapshots were 30.38/29.34 MiB. Both instrumentation tests passed, temporary clients were released, and credentials/device/host artifacts were removed. Functional final-source validation passes; provider-active memory remains outside the 24/28-MiB gate. |
+| 2026-08-26 | Final poisoned-exit source and adjacent server-performance gates | Complete Connect package and subpackages; three race repetitions of the affected DASH blackhole, affinity, sticky-flow, reset-priority and diagnostics tests; complete short SDK suite; Connect/SDK/server vet; full five-repeat 300-ms `-benchmem` tiers for `server/connect`, PERFVAR and proxy | Connect passed in 440.220 s, SDK in 100.040 s, every focused race and vet gate passed, and all 210/10/20 server benchmark samples passed. Production H1 full-payload/ACK-sized medians were 908.5/371.4 ns with unchanged 17/10 B/op and two allocations, +2.75%/+1.28% versus the adjacent cohort. PERFVAR receive-credit improved 673.4 -> 651.0 ns (-3.33%); proxy batch-64 moved 5,444 -> 5,523 ns (+1.45%) with unchanged allocation shape. The small opposing host shifts provide no measured evidence of a shared-server performance regression. |
+| 2026-08-26 | Post-pull pushed-head Android and server closeout | Rebuilt stamped Play Debug app/test APKs after pulling two generated security/blocker updates; fresh exact-ID H1 P2P role reversal on Pixel 8 Pro and Galaxy S24 Ultra; cache-busted real CNN video; repeated 210/10/20 server benchmark tiers; seven-sample parent/current/parent H1 bracket | Both directions progressed into moving CNN footage. Each client received the stamped build and new policy hash; all local and provider block counters were zero. Pixel/Galaxy client snapshots were 19.09/21.98 MiB; combined-role peaks were 32.02/31.96 MiB with 4/5 samples above 28 MiB, 0.28/0.32 MiB packet ownership, 0.25 MiB returned pools, and zero packet-pressure/H1 queue drops. Both 242/246-second instrumentation sessions passed and private clients/artifacts were removed. All benchmark tiers passed; current H1 full/ACK medians were only +0.65%/+0.86% versus the interpolated parent bracket with identical allocations. Functional pushed-head validation passes; provider memory still fails the 24/28-MiB gate. |
+| 2026-08-26 | Latest generated-policy P2P closeout | Exact `8b1d9bf` generated security/blocker table; rebuilt `cnnfixmem-20260826-f` Play Debug app/test APKs; fresh Galaxy-provider -> Pixel-client exact-ID same-LAN P2P; explicit H1; cache-busted real CNN video | Preroll advanced into moving CNN footage. The client received stamped build/policy diagnostics and all local, provider, and source-scoped remote block counters were zero. Client/provider snapshots were 22.56/33.85 MiB; complete-session peaks were 23.31/39.41 MiB with zero/seven samples above 28 MiB, 0.33/0.28 MiB packet ownership, 0.25 MiB returned pools, and zero packet-pressure/H1 receive-drop/backpressure events. Both 162/168-second instrumentation tests passed; temporary clients and private artifacts were removed. Functional latest-policy parity passes, while the provider still fails the 24/28-MiB memory gate. |
+| 2026-08-27 | Bloomberg failure boundary on two attached Android devices | Exact Bloomberg video page; Galaxy direct cellular control, public United States H1 on both devices, and exact-ID same-LAN Pixel-to-Galaxy P2P; privacy-safe Chrome video/connection probe; SDK memory, security and provider diagnostics | Direct cellular advanced from 0 to 1.674 s in five seconds with `readyState=4` and 13.34 s buffered. Both public-H1 attempts and the P2P attempt remained at time 0. The P2P path returned about 10.5 MiB and reported zero local/provider security blocks, so it was not a packet blackhole. Six media 403 responses were retried on the same H2 connection and could not invoke MultiClient again. Public exits exposed zero provider build/policy diagnostics, so external Bloomberg reputation deployment could not be verified. This run isolates route-selection opportunity; it does not prove a source fix yet. |
+| 2026-08-27 | Bloomberg playback memory surrogate | Two 76-sample long-lived Android sessions spanning public H1 and P2P provider/client work | Pixel/client peak runtime was 21,241,888 B (20.26 MiB), live heap 7,293,320 B, with zero samples over 28 MiB. Galaxy/provider peak was 31,858,704 B (30.38 MiB), live heap 16,271,136 B, with seven samples over 28 MiB and 740 goroutines. Packet roots peaked at 1,102,592 B and returned packet storage at 262,144 B. The provider excess is live flow/goroutine topology, not returned-pool high-water; hard-affinity removal must not be credited as a memory fix until a rebuilt-device A/B is measured. |
+| 2026-08-27 | Default-off fresh affinity and ACK-rate placement candidate | Deterministic ordinary/pinned/legacy IPv4 and DNS-hint gates; exact TCP cumulative-ACK baseline, duplicate/reorder, wrap and ACK-compression tests; unmeasured-prior, equal completed/live short histories, low-provider, fast-provider, established-flow, still-open H2, bounded-table/TTL and SDK projection tests | Ordinary fresh flows remain unassigned for the provider race; explicit pins and the legacy override inherit; existing tuples are untouched. Each provider starts at advertised bandwidth, while completed and still-open TCP/443 evidence are weighted by quantized active time and ACKed bytes. Exact endpoint and canonical domain are both scored, equal short outcomes stay tied, and the 128-entry/10-minute learner fails open. Five 500-ms M4 Pro repetitions measured median advancing/duplicate ACK costs of 9.426/1.003 ns/op and cold/completed/live fresh-race scoring at 137.9/195.7/198.7 ns/op; all were 0 B/op and zero allocations. Complete Connect/SDK short suites, Connect vet, focused race tests, Android AAR/app/test/unit builds, and all 13 script tests passed. |
+| 2026-08-27 | Current-source default-off affinity physical closeout | Two approximately 20.25-minute stamped Android sessions; each phone alternated validated Wi-Fi and cellular public United States H1; exact-ID same-LAN P2P; real Wikipedia, fast.com and Bloomberg traffic; 81 primitive memory samples per phone | Pixel Wi-Fi fast.com measured 61/40/110 Mbit/s (61 median) with 153.1-ms Wikipedia document TTFB, proving no 40-Mbit/s ceiling. Other public medians were 0.68, 6.3 and 4.4 Mbit/s and P2P was 3.5 Mbit/s, so route quality remains variable. Bloomberg played on Galaxy Wi-Fi but failed on Pixel cellular and P2P. Same-H2 403 Fetch requests were not reroutable; a forced fresh transport got another placement but its top-level document was also challenged and Chrome did not retry. The client runtime peak/p95 was 22.00/21.61 MiB with zero samples above 24 or 28 MiB. The provider-inclusive phone peaked at 29.45 MiB, had two >28-MiB samples, and its 20-sample quiet p95 was 25.20 MiB. Returned pools remained 0.25 MiB and queues/drops were zero, leaving provider flow/goroutine topology—not affinity or pool reclaim—as the open memory issue. Public exits exposed no build/policy diagnostics; P2P did and reported zero provider block counters. Temporary clients and private artifacts were removed. |
 
 ## References
 

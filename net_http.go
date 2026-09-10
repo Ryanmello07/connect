@@ -44,7 +44,7 @@ const DefaultMaxHttpResponseBodyBytes int64 = 2 * 1024 * 1024
 var ErrHttpResponseBodyTooLarge = errors.New("http response body exceeds memory limit")
 
 func DefaultClientStrategySettings() *ClientStrategySettings {
-	return &ClientStrategySettings{
+	settings := &ClientStrategySettings{
 		ExposeServerIps:       true,
 		ExposeServerHostNames: true,
 
@@ -74,8 +74,30 @@ func DefaultClientStrategySettings() *ClientStrategySettings {
 		MinNextConnectDelay: 100 * time.Millisecond,
 		MaxNextConnectDelay: 1000 * time.Millisecond,
 
+		Http2SendPingTimeout: 10 * time.Second,
+		Http2PingTimeout:     5 * time.Second,
+
 		ConnectSettings: *DefaultConnectSettings(),
 	}
+	// A configured process budget identifies an embedded/mobile client. Bound
+	// the connection-resident HTTP/WebSocket working set there; an unset or
+	// reference-sized budget leaves Go and gorilla defaults untouched for
+	// desktop and server callers.
+	if 0 < MemoryBudget() && MemoryBudget() < referenceMemoryBudgetByteCount {
+		settings.HttpReadBufferSize = MemoryScaledCount(4*1024, 2*1024)
+		settings.HttpWriteBufferSize = MemoryScaledCount(4*1024, 2*1024)
+		settings.WebSocketReadBufferSize = MemoryScaledCount(4*1024, 2*1024)
+		settings.WebSocketWriteBufferSize = MemoryScaledCount(4*1024, 2*1024)
+		settings.Http2MaxDecoderHeaderTableSize = MemoryScaledCount(4*1024, 2*1024)
+		settings.Http2MaxEncoderHeaderTableSize = MemoryScaledCount(4*1024, 2*1024)
+		settings.Http2MaxReceiveBufferPerConnection = int(
+			MemoryScaledByteCount(mib(1), kib(256)),
+		)
+		settings.Http2MaxReceiveBufferPerStream = int(
+			MemoryScaledByteCount(kib(512), kib(128)),
+		)
+	}
+	return settings
 }
 
 type ClientStrategySettings struct {
@@ -117,6 +139,14 @@ type ClientStrategySettings struct {
 	ExtenderConfigs []*ExtenderConfig
 
 	DohSettings *DohSettings
+	// InternalDohDomains are network-space domains whose exact host and
+	// subdomains resolve through the strategy's direct DoH cache before a
+	// control connection is dialed by raw IP. The request hostname remains
+	// unchanged for HTTP Host, TLS SNI, and certificate verification.
+	//
+	// An explicit ConnectSettings.Resolver takes precedence and disables this
+	// rule. This lets embedders and tests retain a resolver they installed.
+	InternalDohDomains []string
 
 	HelloRetryTimeout time.Duration
 
@@ -124,6 +154,30 @@ type ClientStrategySettings struct {
 	// materialize. Values <= 0 use DefaultMaxHttpResponseBodyBytes so a partial
 	// settings struct cannot accidentally restore an unbounded io.ReadAll.
 	MaxHttpResponseBodyBytes int64
+
+	// Embedded low-memory transports set explicit connection-resident buffer
+	// and HTTP/2 dynamic-table/receive-window bounds. Zero preserves the
+	// library defaults, which is the desktop/server behavior.
+	HttpReadBufferSize                 int
+	HttpWriteBufferSize                int
+	WebSocketReadBufferSize            int
+	WebSocketWriteBufferSize           int
+	Http2MaxDecoderHeaderTableSize     int
+	Http2MaxEncoderHeaderTableSize     int
+	Http2MaxReceiveBufferPerConnection int
+	Http2MaxReceiveBufferPerStream     int
+
+	// HTTP/2 health check for POOLED control-plane connections. Go performs no
+	// health check at all when SendPingTimeout is zero (net/http.HTTP2Config:
+	// "If zero, no health check is performed"), so a connection that connected
+	// cleanly and later went dark stays in the idle pool and every later
+	// request multiplexed onto it hangs to the request timeout.
+	//
+	// Settings fields rather than package constants, per CONSTANTAUDIT.md:
+	// they are per-connection tunables and the settings struct that owns the
+	// transport reaches the use site directly.
+	Http2SendPingTimeout time.Duration
+	Http2PingTimeout     time.Duration
 
 	// retry a GET whose RESPONSE status is in `GetRetryStatusCodes` —
 	// transient gateway statuses meaning the lb momentarily had no healthy
@@ -153,10 +207,16 @@ type ClientStrategySettings struct {
 
 // stores statistics on client strategies
 type ClientStrategy struct {
-	ctx context.Context
-	log Logger
+	ctx                context.Context
+	cancel             context.CancelFunc
+	closeOnce          sync.Once
+	unsubNetworkChange func()
+	log                Logger
 
 	settings *ClientStrategySettings
+	// internalDohResolver exists only when InternalDohDomains are configured
+	// and the caller did not install ConnectSettings.Resolver.
+	internalDohResolver *internalDohResolver
 
 	mutex sync.Mutex
 	// dialers are only updated inside the mutex
@@ -184,58 +244,66 @@ func newNormalDialTlsContext(
 	nextProtos []string,
 ) DialTlsContextFunction {
 	tlsConfig := newClientTlsConfig(settings.TlsConfig, nextProtos)
-	if settings.ProxySettings == nil && settings.DialContextSettings == nil {
-		netDialer := settings.NetDialer()
-		tlsDialer := &tls.Dialer{
-			NetDialer: netDialer,
-			Config:    tlsConfig,
-		}
-		return tlsDialer.DialContext
-	}
+	// Every dial takes the explicit path below, including the mobile shape
+	// (no proxy, no injected dial context) that used to shortcut to a raw
+	// tls.Dialer here. That shortcut bypassed ConnectSettings.DialContext, so
+	// the address-family policy expressed there was honored by the fragment
+	// and reorder dialers and ignored by this one -- a strategy that raced a
+	// forced dialer against an unforced one. It also hid the tls handshake,
+	// which is where a blackholed path actually fails.
+	//
+	// The cost is that ConnectTimeout and TlsTimeout are now separate budgets
+	// rather than one deadline shared across connect and handshake. That is
+	// the intended behavior, and it applies to every dial, not only forced
+	// ones.
 
 	return func(ctx context.Context, network string, addr string) (net.Conn, error) {
+		// the handshake half of the dial. It does NOT close the connection it
+		// was handed on its own error paths -- dialControlTlsWithFamilyFallback
+		// owns that connection, because it has to read the family off it before
+		// it goes away.
+		handshake := func(ctx context.Context, conn net.Conn) (net.Conn, error) {
+			netDialer := settings.NetDialer()
+			if netDialer.Timeout != 0 {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, netDialer.Timeout)
+				defer cancel()
+			}
+			if !netDialer.Deadline.IsZero() {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithDeadline(ctx, netDialer.Deadline)
+				defer cancel()
+			}
+
+			host, _, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+
+			config := tlsConfig.Clone()
+			if config.ServerName == "" {
+				config.ServerName = host
+			}
+			tlsConn := tls.Client(conn, config)
+			tlsCtx, tlsCancel := context.WithTimeout(ctx, settings.TlsTimeout)
+			defer tlsCancel()
+			if err := tlsConn.HandshakeContext(tlsCtx); err != nil {
+				tlsConn.Close()
+				return nil, err
+			}
+			return tlsConn, nil
+		}
 		// DialContext preserves injected userspace networks in tests and proxy
 		// routing in production before wrapping the resulting connection in TLS.
-		conn, err := settings.DialContext(ctx, network, addr)
-		if err != nil {
-			return nil, err
-		}
-
-		netDialer := settings.NetDialer()
-		if netDialer.Timeout != 0 {
-			var cancel context.CancelFunc
-			ctx, cancel = context.WithTimeout(ctx, netDialer.Timeout)
-			defer cancel()
-		}
-		if !netDialer.Deadline.IsZero() {
-			var cancel context.CancelFunc
-			ctx, cancel = context.WithDeadline(ctx, netDialer.Deadline)
-			defer cancel()
-		}
-
-		host, _, err := net.SplitHostPort(addr)
-		if err != nil {
-			conn.Close()
-			return nil, err
-		}
-
-		config := tlsConfig.Clone()
-		if config.ServerName == "" {
-			config.ServerName = host
-		}
-		tlsConn := tls.Client(conn, config)
-		tlsCtx, tlsCancel := context.WithTimeout(ctx, settings.TlsTimeout)
-		defer tlsCancel()
-		if err := tlsConn.HandshakeContext(tlsCtx); err != nil {
-			tlsConn.Close()
-			return nil, err
-		}
-		return tlsConn, nil
+		return dialControlTlsWithFamilyFallback(
+			ctx, &settings.ConnectSettings, network, addr, settings.DialContext, handshake)
 	}
 }
 
 // extender udp 53 to platform extender
 func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *ClientStrategy {
+	settings, internalDohResolver := clientStrategySettingsWithInternalDoh(settings)
+
 	// propagate so a strategy-level logger covers dial logging. Copy instead
 	// of writing through the caller's settings: the caller may share them
 	// with concurrent constructions or other readers (see the platform
@@ -352,10 +420,13 @@ func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *C
 		}
 	*/
 
+	strategyCtx, strategyCancel := context.WithCancel(ctx)
 	clientStrategy := &ClientStrategy{
-		ctx:                 ctx,
+		ctx:                 strategyCtx,
+		cancel:              strategyCancel,
 		log:                 loggerOrDefault(settings.Log),
 		settings:            settings,
+		internalDohResolver: internalDohResolver,
 		dialers:             dialers,
 		resolvedExtenderIps: resolvedExtenderIps,
 		extenderIpSecrets:   map[netip.Addr]string{},
@@ -365,22 +436,50 @@ func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *C
 	// find-providers) would otherwise stall on a dead socket until its
 	// timeout. Clients rebuild lazily on next use. Unsubscribe rides ctx.
 	unsubNetworkChange := AddNetworkChangeListener(clientStrategy.networkChanged)
+	clientStrategy.unsubNetworkChange = unsubNetworkChange
 	go HandleError(func() {
-		<-ctx.Done()
-		unsubNetworkChange()
+		<-strategyCtx.Done()
+		clientStrategy.Close()
 	})
 	return clientStrategy
+}
+
+// Releases every strategy-owned idle HTTP connection without making the
+// strategy terminal. Network changes use the same operation before lazy
+// redial on the new path.
+func (self *ClientStrategy) CloseIdleConnections() {
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	for dialer := range self.dialers {
+		dialer.Close()
+	}
+	if self.internalDohResolver != nil {
+		self.internalDohResolver.CloseIdleConnections()
+	}
+}
+
+// Ends discovery and releases pooled HTTP connections. APIs and transports
+// sharing the strategy must be closed first; repeated calls are safe.
+func (self *ClientStrategy) Close() {
+	self.closeOnce.Do(func() {
+		if self.cancel != nil {
+			self.cancel()
+		}
+		if self.unsubNetworkChange != nil {
+			self.unsubNetworkChange()
+		}
+		self.CloseIdleConnections()
+		if self.internalDohResolver != nil {
+			self.internalDohResolver.Close()
+		}
+	})
 }
 
 // networkChanged drops every dialer's pooled connections (idle sockets bound
 // to the old network path); in-flight requests finish on their own
 // connections, and the http clients rebuild lazily on next use.
 func (self *ClientStrategy) networkChanged() {
-	self.mutex.Lock()
-	defer self.mutex.Unlock()
-	for dialer := range self.dialers {
-		dialer.Close()
-	}
+	self.CloseIdleConnections()
 }
 
 func (self *ClientStrategy) SetCustomExtenders(extenderIpSecrets map[netip.Addr]string) {
@@ -574,9 +673,8 @@ type evalResult struct {
 	dialer *clientDialer
 	wsConn *websocket.Conn
 	err    error
-	// materialize is run only for the selected HTTP response, while the
-	// request context is still alive. Losing parallel responses are closed
-	// without allocating their bodies.
+	// materialize is run only for the selected HTTP response. A canceled
+	// parallel HTTP response is released by its attempt context instead.
 	materialize func() error
 
 	httpResult
@@ -608,6 +706,29 @@ func readHttpResponseBody(response *http.Response, maxBytes int64) ([]byte, erro
 	return bodyBytes, nil
 }
 
+func httpResponseContextCanceled(ctx context.Context, response *http.Response) bool {
+	return ctx.Err() != nil ||
+		(response != nil &&
+			response.Request != nil &&
+			response.Request.Context().Err() != nil)
+}
+
+// releaseHttpResponseBody explicitly closes a live response. Once its request
+// context is canceled, net/http owns HTTP/1 connection or HTTP/2 stream cleanup
+// and the body reference is dropped without entering a potentially blocking
+// HTTP/2 Close.
+func releaseHttpResponseBody(ctx context.Context, response *http.Response) {
+	if response == nil || response.Body == nil {
+		return
+	}
+	body := response.Body
+	response.Body = nil
+	if httpResponseContextCanceled(ctx, response) {
+		return
+	}
+	body.Close()
+}
+
 func newEvalResultFromHttpResponse(response *http.Response, err error, maxBodyBytes int64) *evalResult {
 	result := &evalResult{
 		err: err,
@@ -619,10 +740,8 @@ func newEvalResultFromHttpResponse(response *http.Response, err error, maxBodyBy
 		result.err = fmt.Errorf("http response has no body")
 	} else if err == nil {
 		result.materialize = func() error {
-			defer func() {
-				response.Body.Close()
-				response.Body = nil
-			}()
+			// Ownership stays with evalResult until the read outcome is known.
+			// A canceled read must not enter a synchronous HTTP/2 Body.Close.
 			bodyBytes, readErr := readHttpResponseBody(response, maxBodyBytes)
 			if readErr == nil {
 				result.bodyBytes = bodyBytes
@@ -641,22 +760,79 @@ func (self *evalResult) Selected() *evalResult {
 	return self
 }
 
+// Close synchronously releases a live result. Canceled HTTP results must use
+// discardAfterContextCancellation because their transport already owns cleanup.
 func (self *evalResult) Close() {
 	self.materialize = nil
 	if self.wsConn != nil {
-		self.wsConn.Close()
+		wsConn := self.wsConn
+		self.wsConn = nil
+		wsConn.Close()
 		// if wsConn is set, the response does not need to be closed
 		// https://pkg.go.dev/github.com/gorilla/websocket#Dialer.DialContext
 	} else if self.response != nil && self.response.Body != nil {
-		self.response.Body.Close()
+		body := self.response.Body
+		self.response.Body = nil
+		body.Close()
 	}
+}
+
+// discardAfterContextCancellation releases a result after the request context
+// used to create it has already been canceled. net/http owns
+// HTTP stream/connection cancellation through that context. Calling an unread
+// HTTP/2 response Body.Close here is unsafe: it may wait indefinitely for the
+// connection write mutex. A WebSocket has escaped its handshake context once
+// DialContext returns, so it still needs an explicit close.
+func (self *evalResult) discardAfterContextCancellation() {
+	self.materialize = nil
+	if self.wsConn != nil {
+		wsConn := self.wsConn
+		self.wsConn = nil
+		wsConn.Close()
+	}
+	if self.response != nil {
+		self.response.Body = nil
+	}
+}
+
+// releaseAfterUse closes an ordinary live response, but lets net/http finish
+// cleanup when either the evaluation or response request context was canceled.
+// The response context also catches a timeout derived internally by http.Client.
+func (self *evalResult) releaseAfterUse(ctx context.Context) {
+	if httpResponseContextCanceled(ctx, self.response) {
+		self.discardAfterContextCancellation()
+		return
+	}
+	self.Close()
 }
 
 // materializeHttpResult returns the response body already read when the
 // strategy selected this result.
 func materializeHttpResult(result *evalResult) (*httpResult, error) {
-	defer result.Close()
+	defer result.releaseAfterUse(context.Background())
 	return &result.httpResult, result.err
+}
+
+// Give each synchronous route an equal share of the remaining deadline while
+// retaining one share for parallel discovery/fallback. A route remembered as
+// successful may have become a black hole; it must not consume the request's
+// entire deadline before another route is allowed to run.
+func preferredEvalAttemptContext(
+	ctx context.Context,
+	remainingAttemptCount int,
+) (context.Context, context.CancelFunc) {
+	deadline, ok := ctx.Deadline()
+	if !ok || remainingAttemptCount <= 0 {
+		return context.WithCancel(ctx)
+	}
+	remainingTimeout := time.Until(deadline)
+	if remainingTimeout <= 0 {
+		attemptCtx, attemptCancel := context.WithCancel(ctx)
+		attemptCancel()
+		return attemptCtx, func() {}
+	}
+	attemptTimeout := remainingTimeout / time.Duration(remainingAttemptCount+1)
+	return context.WithTimeout(ctx, attemptTimeout)
 }
 
 func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx context.Context, dialer *clientDialer) *evalResult) *evalResult {
@@ -666,9 +842,23 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 	// 3. expand the extenders and try new extenders in parallel blocks
 
 	handleCtx, handleCancel := context.WithTimeout(ctx, self.settings.RequestTimeout)
-	defer handleCancel()
+	// Every parallel attempt remains owned by this call until its eval stack
+	// returns. Cancellation only asks a dial to stop; it is not completion.
+	// Register before launch so cleanup never races Wait with a later Add.
+	var workerWaitGroup sync.WaitGroup
+	startWorker := func(run func(), handlers ...any) {
+		workerWaitGroup.Add(1)
+		go func() {
+			defer workerWaitGroup.Done()
+			HandleError(run, handlers...)
+		}()
+	}
+	defer func() {
+		handleCancel()
+		workerWaitGroup.Wait()
+	}()
 	// merge handleCtx with self.ctx
-	go HandleError(func() {
+	startWorker(func() {
 		defer handleCancel()
 		select {
 		case <-handleCtx.Done():
@@ -676,7 +866,7 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 		case <-self.ctx.Done():
 			return
 		}
-	})
+	}, handleCancel)
 
 	out := make(chan *evalResult)
 
@@ -700,7 +890,7 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 		case out <- result:
 			success = true
 		case <-handleCtx.Done():
-			result.Close()
+			result.discardAfterContextCancellation()
 		}
 	}
 
@@ -728,10 +918,7 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 			dialers := slices.Collect(maps.Keys(dialerWeights))
 			WeightedShuffle(dialers, dialerWeights)
 
-			// always try the top options first
-			serialDialers = append(serialDialers, dialers[0])
-
-			for _, dialer := range dialers[1:] {
+			for _, dialer := range dialers {
 				if dialer.IsLastSuccess() {
 					serialDialers = append(serialDialers, dialer)
 				} else {
@@ -743,16 +930,22 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 			slices.SortStableFunc(serialDialers, func(a *clientDialer, b *clientDialer) int {
 				return a.priority - b.priority
 			})
-			for _, dialer := range serialDialers {
+			for i, dialer := range serialDialers {
 				select {
 				case <-handleCtx.Done():
 					return nil
 				default:
 				}
 
-				result := eval(handleCtx, dialer)
+				attemptCtx, attemptCancel := preferredEvalAttemptContext(
+					handleCtx,
+					len(serialDialers)-i,
+				)
+				result := eval(attemptCtx, dialer)
 				if result != nil {
+					result.dialer = dialer
 					if result.Selected().err == nil {
+						attemptCancel()
 						if self.log.V(2).Enabled() {
 							self.log.Infof("[net][p]select: %s\n", dialer.String())
 						}
@@ -761,7 +954,15 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 					if self.log.V(2).Enabled() {
 						self.log.Infof("[net][p]select: %s = %s\n", dialer.String(), result.err)
 					}
-					result.Close()
+					result.releaseAfterUse(attemptCtx)
+				}
+				attemptErr := attemptCtx.Err()
+				attemptCancel()
+				if attemptErr != nil && handleCtx.Err() == nil {
+					// eval ignores errors caused by its context because parallel
+					// losers share that signal. This private attempt deadline is
+					// different: it is evidence that this route black-holed.
+					dialer.Update(handleCtx, attemptErr)
 				}
 			}
 
@@ -770,7 +971,7 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 			n := min(len(parallelDialers), self.settings.ParallelBlockSize)
 			p += n
 			for _, dialer := range parallelDialers[0:n] {
-				go HandleError(func() {
+				startWorker(func() {
 					run(dialer)
 				})
 			}
@@ -789,9 +990,9 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 						if self.log.V(2).Enabled() {
 							self.log.Infof("[net][p]select: %s = %s\n", result.dialer.String(), result.err)
 						}
-						result.Close()
+						result.releaseAfterUse(handleCtx)
 					}
-					go HandleError(func() {
+					startWorker(func() {
 						run(dialer)
 					})
 				}
@@ -802,7 +1003,7 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 			n := min(len(expandedDialers), self.settings.ParallelBlockSize-p)
 			p += n
 			for _, dialer := range expandedDialers[0:n] {
-				go HandleError(func() {
+				startWorker(func() {
 					run(dialer)
 				})
 			}
@@ -821,9 +1022,9 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 						if self.log.V(2).Enabled() {
 							self.log.Infof("[net][p]select: %s = %s\n", result.dialer.String(), result.err)
 						}
-						result.Close()
+						result.releaseAfterUse(handleCtx)
 					}
-					go HandleError(func() {
+					startWorker(func() {
 						run(dialer)
 					})
 				}
@@ -839,7 +1040,7 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 					if result.Selected().err == nil {
 						return result
 					}
-					result.Close()
+					result.releaseAfterUse(handleCtx)
 				}
 			}
 		}
@@ -857,17 +1058,27 @@ func (self *ClientStrategy) parallelEval(ctx context.Context, eval func(ctx cont
 
 func (self *ClientStrategy) serialEval(ctx context.Context, eval func(ctx context.Context, dialer *clientDialer) *evalResult, helloEval func(ctx context.Context, dialer *clientDialer) *evalResult) *evalResult {
 	handleCtx, handleCancel := context.WithTimeout(ctx, self.settings.RequestTimeout)
-	defer handleCancel()
+	// The strategy-context bridge is function-owned; join it so even a fast
+	// successful serial result leaves no callback racing the caller's cleanup.
+	var contextWaitGroup sync.WaitGroup
+	defer func() {
+		handleCancel()
+		contextWaitGroup.Wait()
+	}()
 	// merge handleCtx with self.ctx
-	go HandleError(func() {
-		defer handleCancel()
-		select {
-		case <-handleCtx.Done():
-			return
-		case <-self.ctx.Done():
-			return
-		}
-	}, handleCancel)
+	contextWaitGroup.Add(1)
+	go func() {
+		defer contextWaitGroup.Done()
+		HandleError(func() {
+			defer handleCancel()
+			select {
+			case <-handleCtx.Done():
+				return
+			case <-self.ctx.Done():
+				return
+			}
+		}, handleCancel)
+	}()
 
 	// keep trying as long as there is time left
 	for {
@@ -892,16 +1103,22 @@ func (self *ClientStrategy) serialEval(ctx context.Context, eval func(ctx contex
 		slices.SortStableFunc(serialDialers, func(a *clientDialer, b *clientDialer) int {
 			return a.priority - b.priority
 		})
-		for _, dialer := range serialDialers {
+		for i, dialer := range serialDialers {
 			select {
 			case <-handleCtx.Done():
 				return nil
 			default:
 			}
 
-			result := eval(handleCtx, dialer)
+			attemptCtx, attemptCancel := preferredEvalAttemptContext(
+				handleCtx,
+				len(serialDialers)-i,
+			)
+			result := eval(attemptCtx, dialer)
 			if result != nil {
+				result.dialer = dialer
 				if result.Selected().err == nil {
+					attemptCancel()
 					if self.log.V(2).Enabled() {
 						self.log.Infof("[net][s]select: %s\n", dialer.String())
 					}
@@ -910,7 +1127,14 @@ func (self *ClientStrategy) serialEval(ctx context.Context, eval func(ctx contex
 				if self.log.V(2).Enabled() {
 					self.log.Infof("[net][s]select: %s = %s\n", dialer.String(), result.err)
 				}
-				result.Close()
+				result.releaseAfterUse(attemptCtx)
+			}
+			attemptErr := attemptCtx.Err()
+			attemptCancel()
+			if attemptErr != nil && handleCtx.Err() == nil {
+				// See parallelEval: a private attempt timeout is a route
+				// failure, not cancellation of the caller's request.
+				dialer.Update(handleCtx, attemptErr)
 			}
 		}
 
@@ -920,7 +1144,10 @@ func (self *ClientStrategy) serialEval(ctx context.Context, eval func(ctx contex
 			helloStartTime := time.Now()
 			result := self.parallelEval(handleCtx, helloEval)
 			if result != nil {
-				result.Close()
+				// The nested evaluation cancels its selected attempt before
+				// returning. Let net/http own that response cleanup rather
+				// than synchronously closing an HTTP/2 body after cancellation.
+				result.releaseAfterUse(handleCtx)
 			}
 			helloEndTime := time.Now()
 
@@ -969,12 +1196,59 @@ func (self *ClientStrategy) applyExtraHeaders(h http.Header) {
 	}
 }
 
+// Multi-route evaluation requires an independent body reader for every
+// attempt. Clone copies request metadata; GetBody resets consumed content.
+func cloneHttpRequestForAttempt(ctx context.Context, request *http.Request) (*http.Request, error) {
+	attemptRequest := request.Clone(ctx)
+	if request.Body == nil {
+		return attemptRequest, nil
+	}
+	if request.GetBody == nil {
+		return nil, fmt.Errorf("http request body is not replayable")
+	}
+	attemptBody, err := request.GetBody()
+	if err != nil {
+		return nil, fmt.Errorf("rebuild http request body: %w", err)
+	}
+	attemptRequest.Body = attemptBody
+	return attemptRequest, nil
+}
+
+// Rejects a body that cannot be rebuilt before any route consumes it.
+func validateHttpRequestForAttempts(request *http.Request) error {
+	if request == nil {
+		return fmt.Errorf("http request is nil")
+	}
+	if request.Body != nil && request.GetBody == nil {
+		return fmt.Errorf("http request body is not replayable")
+	}
+	return nil
+}
+
 func (self *ClientStrategy) HttpParallel(request *http.Request) (*httpResult, error) {
+	if err := validateHttpRequestForAttempts(request); err != nil {
+		return nil, err
+	}
+	if request.Body != nil {
+		defer request.Body.Close()
+	}
 	self.applyExtraHeaders(request.Header)
 
+	// js/wasm: one fetch, no dialer strategies (net_http_platform_js.go)
+	if result, ok := self.httpPlatformDirect(request); ok {
+		if result == nil {
+			return nil, fmt.Errorf("http request failed")
+		}
+		return result, nil
+	}
+
 	eval := func(handleCtx context.Context, dialer *clientDialer) *evalResult {
+		attemptRequest, err := cloneHttpRequestForAttempt(handleCtx, request)
+		if err != nil {
+			return &evalResult{err: err}
+		}
 		httpClient := dialer.HttpClient()
-		response, err := httpClient.Do(request.WithContext(handleCtx))
+		response, err := httpClient.Do(attemptRequest)
 		if self.log.V(2).Enabled() {
 			if err != nil {
 				self.log.Infof("[net]http parallel %s %s = %s\n", request.Method, request.URL, err)
@@ -1001,13 +1275,37 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 	// 2. retest and expand dialers using get of the hello request.
 	//    This is a basic ping to the server, which is run in parallel.
 	// 3. continue from 1 until timeout
+	if err := validateHttpRequestForAttempts(request); err != nil {
+		return nil, err
+	}
+	if err := validateHttpRequestForAttempts(helloRequest); err != nil {
+		return nil, err
+	}
+	if request.Body != nil {
+		defer request.Body.Close()
+	}
+	if helloRequest.Body != nil {
+		defer helloRequest.Body.Close()
+	}
 
 	self.applyExtraHeaders(request.Header)
 	self.applyExtraHeaders(helloRequest.Header)
 
+	// js/wasm: one fetch, no dialer strategies (net_http_platform_js.go)
+	if result, ok := self.httpPlatformDirect(request); ok {
+		if result == nil {
+			return nil, fmt.Errorf("http request failed")
+		}
+		return result, nil
+	}
+
 	eval := func(handleCtx context.Context, dialer *clientDialer) *evalResult {
+		attemptRequest, err := cloneHttpRequestForAttempt(handleCtx, request)
+		if err != nil {
+			return &evalResult{err: err}
+		}
 		httpClient := dialer.HttpClient()
-		response, err := httpClient.Do(request.WithContext(handleCtx))
+		response, err := httpClient.Do(attemptRequest)
 		if self.log.V(2).Enabled() {
 			if err != nil {
 				self.log.Infof("[net]http serial %s %s = %s\n", request.Method, request.URL, err)
@@ -1021,8 +1319,12 @@ func (self *ClientStrategy) HttpSerial(request *http.Request, helloRequest *http
 		return newEvalResultFromHttpResponse(response, err, self.settings.MaxHttpResponseBodyBytes)
 	}
 	helloEval := func(handleCtx context.Context, dialer *clientDialer) *evalResult {
+		attemptRequest, err := cloneHttpRequestForAttempt(handleCtx, helloRequest)
+		if err != nil {
+			return &evalResult{err: err}
+		}
 		httpClient := dialer.HttpClient()
-		response, err := httpClient.Do(helloRequest.WithContext(handleCtx))
+		response, err := httpClient.Do(attemptRequest)
 		if self.log.V(2).Enabled() {
 			if err != nil {
 				self.log.Infof("[net]http serial hello %s %s = %s\n", helloRequest.Method, helloRequest.URL, err)
@@ -1090,12 +1392,20 @@ func (self *ClientStrategy) collapseExtenderDialers() {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
 
+	now := time.Now()
 	for dialer, _ := range self.dialers {
-		if dialer.IsExtender() && !dialer.persistent && dialer.IsLastSuccess() {
-			if self.settings.ExtenderDropTimeout <= time.Now().Sub(dialer.lastErrorTime) {
-				dialer.Close()
-				delete(self.dialers, dialer)
-			}
+		shouldDrop := func() bool {
+			dialer.mutex.Lock()
+			defer dialer.mutex.Unlock()
+
+			return dialer.extenderConfig != nil &&
+				!dialer.persistent &&
+				!dialer.isLastSuccessWithLock() &&
+				self.settings.ExtenderDropTimeout <= now.Sub(dialer.lastErrorTime)
+		}()
+		if shouldDrop {
+			dialer.Close()
+			delete(self.dialers, dialer)
 		}
 	}
 }
@@ -1314,6 +1624,15 @@ type clientDialer struct {
 	settings *ClientStrategySettings
 }
 
+// nativeHttp2Config applies the socket-progress invariant shared by every
+// native net/http HTTP/2 client. WriteByteTimeout renews whenever bytes move,
+// so ConnectTimeout bounds a stalled write without limiting a healthy request.
+func nativeHttp2Config(settings *ConnectSettings) *http.HTTP2Config {
+	return &http.HTTP2Config{
+		WriteByteTimeout: settings.ConnectTimeout,
+	}
+}
+
 func (self *clientDialer) HttpClient() *http.Client {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
@@ -1335,6 +1654,8 @@ func (self *clientDialer) HttpClient() *http.Client {
 			ResponseHeaderTimeout: self.settings.ConnectTimeout,
 			ExpectContinueTimeout: self.settings.ConnectTimeout,
 			DisableKeepAlives:     false,
+			ReadBufferSize:        self.settings.HttpReadBufferSize,
+			WriteBufferSize:       self.settings.HttpWriteBufferSize,
 			// A custom DialTLSContext disables net/http's automatic HTTP/2
 			// attempt unless this is set. ConnectControl and peer-key requests
 			// arrive in parallel while a provider window forms; keeping the
@@ -1343,6 +1664,31 @@ func (self *clientDialer) HttpClient() *http.Client {
 			// and creating visible CPU/pause bursts on mobile. HTTP/2
 			// multiplexes those requests over the established connection.
 			ForceAttemptHTTP2: true,
+		}
+		// A control-plane connection that went dark AFTER connecting is
+		// invisible to any dial-time policy: http/2 multiplexes every later
+		// request onto it and each one hangs to the request timeout, for as
+		// long as the idle pool holds it. Go performs NO health check when
+		// SendPingTimeout is zero (net/http.HTTP2Config: "If zero, no health
+		// check is performed"), which is what leaves that connection in the
+		// pool. The ping is what turns a silent pool poisoning into an
+		// eviction.
+		//
+		// Built unconditionally. The memory-budget fields below are set only
+		// when an embedder asked for them -- that guard is about the mobile
+		// heap -- but it used to gate the whole config, so a desktop build had
+		// no HTTP2Config at all and therefore no health check either.
+		transport.HTTP2 = nativeHttp2Config(&self.settings.ConnectSettings)
+		transport.HTTP2.SendPingTimeout = self.settings.Http2SendPingTimeout
+		transport.HTTP2.PingTimeout = self.settings.Http2PingTimeout
+		if 0 < self.settings.Http2MaxDecoderHeaderTableSize ||
+			0 < self.settings.Http2MaxEncoderHeaderTableSize ||
+			0 < self.settings.Http2MaxReceiveBufferPerConnection ||
+			0 < self.settings.Http2MaxReceiveBufferPerStream {
+			transport.HTTP2.MaxDecoderHeaderTableSize = self.settings.Http2MaxDecoderHeaderTableSize
+			transport.HTTP2.MaxEncoderHeaderTableSize = self.settings.Http2MaxEncoderHeaderTableSize
+			transport.HTTP2.MaxReceiveBufferPerConnection = self.settings.Http2MaxReceiveBufferPerConnection
+			transport.HTTP2.MaxReceiveBufferPerStream = self.settings.Http2MaxReceiveBufferPerStream
 		}
 		// a custom dial context applies to plain (non-tls) connections;
 		// tls connections use the dialTlsContext chain above
@@ -1383,8 +1729,8 @@ func (self *clientDialer) WsDialer(settings *ClientStrategySettings) *websocket.
 		self.websocketDialer = &websocket.Dialer{
 			NetDialTLSContext: netDialTlsContext,
 			HandshakeTimeout:  settings.HandshakeTimeout,
-			// ReadBufferSize: size,
-			// WriteBufferSize: size,
+			ReadBufferSize:    settings.WebSocketReadBufferSize,
+			WriteBufferSize:   settings.WebSocketWriteBufferSize,
 			// WriteBufferPool: pool,
 			EnableCompression: false,
 		}
@@ -1444,11 +1790,17 @@ func (self *clientDialer) IsExtender() bool {
 	return self.extenderConfig != nil
 }
 
+// Reports whether the latest completed outcome succeeded. The caller holds
+// mutex.
+func (self *clientDialer) isLastSuccessWithLock() bool {
+	return 0 < self.successCount && !self.lastSuccessTime.Before(self.lastErrorTime)
+}
+
 func (self *clientDialer) IsLastSuccess() bool {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
 
-	return !self.lastSuccessTime.Before(self.lastErrorTime)
+	return self.isLastSuccessWithLock()
 }
 
 func (self *clientDialer) String() string {
@@ -1789,6 +2141,18 @@ func HttpGetWithRawFunction[R any](
 /**
  * Streaming POST
  */
+// newHttpPostStreamTransport constructs the native streaming transport with
+// the same dial and HTTP/2 progress bounds as other API clients.
+func newHttpPostStreamTransport(settings *ConnectSettings) *http.Transport {
+	return &http.Transport{
+		DialContext:         wrapControlDial("api", settings.Log, true, settings.DialContext),
+		TLSClientConfig:     settings.TlsConfig,
+		TLSHandshakeTimeout: settings.TlsTimeout,
+		ForceAttemptHTTP2:   true,
+		HTTP2:               nativeHttp2Config(settings),
+	}
+}
+
 func HttpPostStreamWithStrategyRaw(
 	ctx context.Context,
 	requestUrl string,
@@ -1812,21 +2176,19 @@ func HttpPostStreamWithStrategyRaw(
 	// resolves in-process. See egress.go / egress_dial.go; identical behavior
 	// everywhere else.
 	settings := DefaultConnectSettings()
-	client := &http.Client{
-		Transport: &http.Transport{
-			DialContext:         wrapControlDial("api", settings.Log, true, settings.DialContext),
-			TLSClientConfig:     settings.TlsConfig,
-			TLSHandshakeTimeout: settings.TlsTimeout,
-			ForceAttemptHTTP2:   true,
-		},
+	var transport http.RoundTripper = newHttpPostStreamTransport(settings)
+	if direct := platformDirectHttpTransport(); direct != nil {
+		// js/wasm: the browser's fetch, which no custom dialer can reach
+		transport = direct
 	}
+	client := &http.Client{Transport: transport}
 	defer client.CloseIdleConnections()
 	res, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
 
-	defer res.Body.Close()
+	defer releaseHttpResponseBody(ctx, res)
 	bodyBytes, err := readHttpResponseBody(res, DefaultMaxHttpResponseBodyBytes)
 	if err != nil {
 		return nil, err

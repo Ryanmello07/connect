@@ -87,6 +87,7 @@ func NewExtenderHttpClient(
 	transport := &http.Transport{
 		DialTLSContext:    newExtenderDialTlsContext(connectSettings, extenderConfig, clientHttpNextProtos),
 		ForceAttemptHTTP2: true,
+		HTTP2:             nativeHttp2Config(connectSettings),
 	}
 	return &http.Client{
 		Transport: transport,
@@ -157,6 +158,15 @@ func newExtenderDialTlsContext(
 
 		switch extenderConfig.Profile.ConnectMode {
 		case ExtenderConnectModeTcpTls:
+			// Deliberately NOT routed through dialControlTlsWithFamilyFallback,
+			// unlike the normal and resilient dialers. `authority` is built
+			// from extenderConfig.Ip, a netip.Addr, so it is always an IP
+			// LITERAL: the family is fixed by the address, there is no other
+			// family to retry onto -- `dial tcp6 1.1.1.1:443` is "no suitable
+			// address found" -- and there is no name resolution whose family
+			// choice a strike could inform. controlDialNetwork leaves literal
+			// dials unnarrowed for the same reason, which is what keeps this
+			// whole fallback layer alive under a demotion.
 			conn, err := connectSettings.DialContext(ctx, "tcp", authority)
 			if err != nil {
 				return nil, err
@@ -188,7 +198,7 @@ func newExtenderDialTlsContext(
 					return nil, err
 				}
 				// once the stream is established, no longer need the resilient features
-				if err := rconn.Off(); err != nil {
+				if err := offResilientTlsConn(ctx, rconn, connectSettings.ConnectTimeout); err != nil {
 					return nil, err
 				}
 
@@ -282,8 +292,7 @@ func newExtenderDialTlsContext(
 		headerBytes := make([]byte, 4+len(headerMessageBytes))
 		binary.BigEndian.PutUint32(headerBytes[0:4], uint32(len(headerMessageBytes)))
 		copy(headerBytes[4:4+len(headerMessageBytes)], headerMessageBytes)
-		_, err = serverConn.Write(headerBytes)
-		if err != nil {
+		if err = writeConnPhaseWithDeadline(ctx, serverConn, headerBytes, connectSettings.ConnectTimeout); err != nil {
 			return nil, err
 		}
 

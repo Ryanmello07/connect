@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -961,6 +963,9 @@ type WebRtcSettings struct {
 	// peer teardown closes its sockets but not this shared object. Browser
 	// WebRTC ignores it.
 	Network transport.Net
+	// Nil in production; tests provide a context-aware DNS boundary without
+	// depending on the host resolver or packet timing.
+	iceResolverForTest *net.Resolver
 	// Nil in production; tests can pause native fast-path publication before
 	// the remaining peer setup continues.
 	afterFastPathPublishForTest func()
@@ -2062,12 +2067,17 @@ func (self *WebRtcManager) closeNetworkChangeWorker() {
 // resources.
 type webRtcPeerConnectionFactory struct {
 	// newPeerConnection builds a peer connection using the network-peer SCTP
-	// receive window when networkPeer is true, else the public window.
-	newPeerConnection func(networkPeer bool) (*webrtc.PeerConnection, error)
-	close             func() error
+	// receive window when networkPeer is true, else the public window. Its
+	// cancel function owns address resolution for exactly that generation.
+	newPeerConnection func(
+		networkPeer bool,
+	) (*webrtc.PeerConnection, context.CancelFunc, error)
+	close func() error
 }
 
-func (self *webRtcPeerConnectionFactory) NewPeerConnection(networkPeer bool) (*webrtc.PeerConnection, error) {
+func (self *webRtcPeerConnectionFactory) NewPeerConnection(
+	networkPeer bool,
+) (*webrtc.PeerConnection, context.CancelFunc, error) {
 	return self.newPeerConnection(networkPeer)
 }
 
@@ -2078,14 +2088,16 @@ func (self *webRtcPeerConnectionFactory) Close() error {
 	return self.close()
 }
 
-func (self *WebRtcManager) newPeerConnection(networkPeer bool) (*webrtc.PeerConnection, error) {
+func (self *WebRtcManager) newPeerConnection(
+	networkPeer bool,
+) (*webrtc.PeerConnection, context.CancelFunc, error) {
 	self.startNetworkChangeWorker()
 
 	self.peerConnectionFactoryLock.Lock()
 	defer self.peerConnectionFactoryLock.Unlock()
 
 	if self.peerConnectionFactoryClosed || self.ctx.Err() != nil {
-		return nil, os.ErrClosed
+		return nil, nil, os.ErrClosed
 	}
 	if !self.peerConnectionFactoryInitialized ||
 		(self.peerConnectionFactoryInitErr != nil &&
@@ -2108,7 +2120,7 @@ func (self *WebRtcManager) newPeerConnection(networkPeer bool) (*webrtc.PeerConn
 		}
 	}
 	if self.peerConnectionFactoryInitErr != nil {
-		return nil, self.peerConnectionFactoryInitErr
+		return nil, nil, self.peerConnectionFactoryInitErr
 	}
 	return self.peerConnectionFactory.NewPeerConnection(networkPeer)
 }
@@ -2583,7 +2595,7 @@ func (self *WebRtcManager) newP2pConn(ctx context.Context, path TransferPath, ac
 		active,
 		self.signalSender,
 		self.settings,
-		func() (*webrtc.PeerConnection, error) {
+		func() (*webrtc.PeerConnection, context.CancelFunc, error) {
 			return self.newPeerConnection(networkPeer)
 		},
 	)
@@ -2684,7 +2696,7 @@ type peerConnectionTeardownStage int32
 
 const (
 	peerConnectionTeardownStarting peerConnectionTeardownStage = iota
-	peerConnectionTeardownStoppingIce
+	peerConnectionTeardownStoppingDtls
 	peerConnectionTeardownClosingPeer
 	peerConnectionTeardownClosingFastPath
 	peerConnectionTeardownClosingDataChannel
@@ -2696,8 +2708,8 @@ func (self peerConnectionTeardownStage) String() string {
 	switch self {
 	case peerConnectionTeardownStarting:
 		return "starting"
-	case peerConnectionTeardownStoppingIce:
-		return "stopping-ice"
+	case peerConnectionTeardownStoppingDtls:
+		return "stopping-dtls"
 	case peerConnectionTeardownClosingPeer:
 		return "closing-peer"
 	case peerConnectionTeardownClosingFastPath:
@@ -2714,6 +2726,39 @@ func (self peerConnectionTeardownStage) String() string {
 }
 
 const peerConnectionSlowTeardownTimeout = 5 * time.Second
+
+// logPeerConnectionTeardownStacks keeps each goroutine in its own log record.
+// The glog backend truncates one record at 15 KB; one monolithic runtime.Stack
+// dump therefore hides precisely the later goroutine that owns a shutdown
+// dependency when the process has many workers.
+func logPeerConnectionTeardownStacks(
+	log Logger,
+	stage peerConnectionTeardownStage,
+	key peerConnKey,
+) {
+	stackBuffer := make([]byte, 256*1024)
+	for {
+		stackByteCount := runtime.Stack(stackBuffer, true)
+		if stackByteCount < len(stackBuffer) {
+			goroutineStacks := strings.Split(
+				strings.TrimSpace(string(stackBuffer[:stackByteCount])),
+				"\n\n",
+			)
+			for stackIndex, goroutineStack := range goroutineStacks {
+				log.Infof(
+					"[peerconn]teardown goroutine %d/%d at %s %s:\n%s\n",
+					stackIndex+1,
+					len(goroutineStacks),
+					stage,
+					key,
+					goroutineStack,
+				)
+			}
+			return
+		}
+		stackBuffer = make([]byte, 2*len(stackBuffer))
+	}
+}
 
 func startPeerConnectionTeardownWatchdog(
 	timeout time.Duration,
@@ -2792,6 +2837,19 @@ type peerConn struct {
 
 	// api *webrtc.API
 	pc *webrtc.PeerConnection
+	// Pion's transport.Net resolver API has no context. The native factory
+	// supplies a per-generation context so teardown can cancel a STUN/TURN name
+	// lookup before PeerConnection.Close joins ICE candidate gathering.
+	cancelIceResolve context.CancelFunc
+	// pionLifecycleLock serializes every operation that can lazily create or
+	// advance Pion-owned ICE state with physical teardown. Run is allowed to
+	// remain blocked in SignalSender after startup, so teardown cannot join the
+	// whole Run worker before closing Pion; it must instead join this bounded
+	// mutation section. Without this gate a canceled replacement could close a
+	// pristine PeerConnection between Run's context check and
+	// SetLocalDescription, after which Run could create an ICE task loop on the
+	// already-closed connection with no remaining owner able to stop it.
+	pionLifecycleLock sync.Mutex
 
 	connectedCallbacks *CallbackList[*connectedCallback]
 	connMonitor        *Monitor
@@ -2812,6 +2870,9 @@ type peerConn struct {
 	beforeReceiveSignalBatchForTest       func()
 	// Nil test barrier confirms Run installed its Pion callback registrations.
 	afterPionCallbacksRegisteredForTest func()
+	// Nil test barrier pauses active startup after offer creation and before
+	// the cancellation recheck and SetLocalDescription mutation.
+	beforeSetLocalDescriptionForTest func()
 
 	// Closed once when the outer transport should reconnect without honoring
 	// the usual backoff delay. A persistent one-shot channel cannot lose a
@@ -2897,9 +2958,9 @@ func newPeerConn(
 	active bool,
 	signalSender SignalSender,
 	settings *WebRtcSettings,
-	newPeerConnection func() (*webrtc.PeerConnection, error),
+	newPeerConnection func() (*webrtc.PeerConnection, context.CancelFunc, error),
 ) (*peerConn, error) {
-	pc, err := newPeerConnection()
+	pc, cancelIceResolve, err := newPeerConnection()
 	if err != nil {
 		return nil, err
 	}
@@ -2923,6 +2984,7 @@ func newPeerConn(
 		signalGeneration: NewId(),
 		// api:                api,
 		pc:                 pc,
+		cancelIceResolve:   cancelIceResolve,
 		connectedCallbacks: NewCallbackList[*connectedCallback](),
 		connMonitor:        NewMonitor(),
 		connectedMonitor:   NewMonitor(),
@@ -2983,109 +3045,143 @@ func (self *peerConn) lifecycleWorkers() *lifecycleAdmission {
 	return self.workers
 }
 
+// withPionMutation admits one bounded operation that can initialize or advance
+// PeerConnection state. It establishes the single lock order used by startup,
+// signaling, fast-path configuration, and teardown, and releases the owner
+// even if the Pion boundary panics into the caller's recovery handler.
+func (self *peerConn) withPionMutation(run func() error) error {
+	self.pionLifecycleLock.Lock()
+	defer self.pionLifecycleLock.Unlock()
+	if self.ctx != nil && self.ctx.Err() != nil {
+		if err := context.Cause(self.ctx); err != nil {
+			return err
+		}
+		return self.ctx.Err()
+	}
+	return run()
+}
+
 func (self *peerConn) Run() {
 	if self.ctx.Err() != nil {
 		return
 	}
 
-	// Connected callback dispatch starts lazily with the first subscriber.
-	// Failed negotiations that never install a P2P route therefore do not
-	// allocate another waiting goroutine.
+	// Each bounded Pion mutation is serialized with teardown. Deliberately
+	// blocking hooks and SignalSender calls stay outside the gate so physical
+	// teardown never waits on application work.
+	if err := self.withPionMutation(func() error {
+		self.pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
+			self.runPionCallback("ICE connection state callback", func() {
+				self.handleICEConnectionState(state)
+			}, self.cancel)
+		})
+		self.pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+			self.runPionCallback("peer connection state callback", func() {
+				self.handlePeerConnectionState(state)
+			}, self.cancel)
+		})
+		return nil
+	}); err != nil {
+		return
+	}
 
-	self.pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
-		self.runPionCallback("ICE connection state callback", func() {
-			self.handleICEConnectionState(state)
-		}, self.cancel)
-	})
-	self.pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
-		self.runPionCallback("peer connection state callback", func() {
-			self.handlePeerConnectionState(state)
-		}, self.cancel)
-	})
 	if err := self.configureFastPath(); err != nil {
 		self.cancelBecause(fmt.Errorf("configure datagram fast path: %w", err))
 		return
 	}
 
-	// register ice candidate handler before SetLocalDescription so candidates
-	// emitted during gathering aren't dropped. candidates are buffered until
-	// the negotiation is far enough along to send them (after the peer has
-	// our sdp). flushIceCandidates flips the ready flag and drains the buffer.
-	self.pc.OnICECandidate(func(candidate *webrtc.ICECandidate) {
-		self.runPionCallback("ICE candidate callback", func() {
-			self.handleLocalIceCandidate(candidate)
-		}, self.cancel)
-	})
-
-	if self.active {
-		dc, err := self.pc.CreateDataChannel(
-			self.settings.DataChannelLabel,
-			webRtcDataChannelInit(self.settings),
-		)
-		if err != nil {
-			self.cancelBecause(fmt.Errorf("create data channel: %w", err))
-			return
-		}
-
-		dc.OnOpen(func() {
-			self.runPionCallback("data channel open callback", func() {
-				self.handleOpenDataChannel(dc)
+	startupErr := self.withPionMutation(func() error {
+		// Register the candidate handler before SetLocalDescription so
+		// candidates emitted during gathering are not dropped.
+		self.pc.OnICECandidate(func(candidate *webrtc.ICECandidate) {
+			self.runPionCallback("ICE candidate callback", func() {
+				self.handleLocalIceCandidate(candidate)
 			}, self.cancel)
 		})
-	} else {
-		self.pc.OnDataChannel(func(dc *webrtc.DataChannel) {
-			self.runPionCallback("data channel callback", func() {
-				if dc.Label() != self.settings.DataChannelLabel {
-					self.log.V(1).Infof("[peerconn]ignoring unexpected data channel label %q\n", dc.Label())
-					// Installing a custom handler replaces Pion's default handler,
-					// which closes undeclared channels. Preserve that resource
-					// bound explicitly so a peer cannot retain arbitrary SCTP
-					// streams by opening labels this transport never consumes.
-					if err := dc.Close(); err != nil && self.log.V(1).Enabled() {
-						self.log.Infof("[peerconn]unexpected data channel close err = %s\n", err)
+		if self.active {
+			dc, err := self.pc.CreateDataChannel(
+				self.settings.DataChannelLabel,
+				webRtcDataChannelInit(self.settings),
+			)
+			if err != nil {
+				return fmt.Errorf("create data channel: %w", err)
+			}
+			dc.OnOpen(func() {
+				self.runPionCallback("data channel open callback", func() {
+					self.handleOpenDataChannel(dc)
+				}, self.cancel)
+			})
+		} else {
+			self.pc.OnDataChannel(func(dc *webrtc.DataChannel) {
+				self.runPionCallback("data channel callback", func() {
+					if dc.Label() != self.settings.DataChannelLabel {
+						self.log.V(1).Infof("[peerconn]ignoring unexpected data channel label %q\n", dc.Label())
+						// Installing a custom handler replaces Pion's default
+						// handler. Close labels this transport does not consume.
+						if err := dc.Close(); err != nil && self.log.V(1).Enabled() {
+							self.log.Infof("[peerconn]unexpected data channel close err = %s\n", err)
+						}
+						return
 					}
-					return
-				}
-				dc.OnOpen(func() {
-					self.runPionCallback("data channel open callback", func() {
-						self.handleOpenDataChannel(dc)
-					}, self.cancel)
-				})
-			}, self.cancel)
-		})
+					dc.OnOpen(func() {
+						self.runPionCallback("data channel open callback", func() {
+							self.handleOpenDataChannel(dc)
+						}, self.cancel)
+					})
+				}, self.cancel)
+			})
+		}
+		return nil
+	})
+	if startupErr != nil {
+		if self.ctx.Err() == nil {
+			self.cancelBecause(startupErr)
+		}
+		return
 	}
 	if self.afterPionCallbacksRegisteredForTest != nil {
 		self.afterPionCallbacksRegisteredForTest()
 	}
 
 	if self.active {
-		offer, err := self.pc.CreateOffer(nil)
+		var offer webrtc.SessionDescription
+		err := self.withPionMutation(func() (err error) {
+			offer, err = self.pc.CreateOffer(nil)
+			return
+		})
 		if err != nil {
-			self.cancelBecause(fmt.Errorf("create offer: %w", err))
+			if self.ctx.Err() == nil {
+				self.cancelBecause(fmt.Errorf("create offer: %w", err))
+			}
 			return
 		}
-		err = self.pc.SetLocalDescription(offer)
+		if self.beforeSetLocalDescriptionForTest != nil {
+			self.beforeSetLocalDescriptionForTest()
+		}
+		err = self.withPionMutation(func() error {
+			return self.pc.SetLocalDescription(offer)
+		})
 		if err != nil {
-			self.cancelBecause(fmt.Errorf("set local offer: %w", err))
+			if self.ctx.Err() == nil {
+				self.cancelBecause(fmt.Errorf("set local offer: %w", err))
+			}
 			return
 		}
-
 		offerBytes, err := json.Marshal(&offer)
 		if err != nil {
 			self.cancelBecause(fmt.Errorf("encode local offer: %w", err))
 			return
 		}
-
-		signal := &protocol.ExchangeSignal{
+		startupSignal := &protocol.ExchangeSignal{
 			SignalType: protocol.SignalType_SdpOffer,
 			Sdp:        offerBytes,
 		}
-		self.setOfferSignal(signal)
+		self.setOfferSignal(startupSignal)
 		// Mark only the first offer from this PeerConnection generation. A
 		// remote passive association may still answer ICE consent after its
 		// SCTP data plane went stale; ResetSignals distinguishes this fresh
 		// generation from an ordinary duplicate/replay of our cached offer.
-		self.sendSignalsWithReset([]*protocol.ExchangeSignal{signal}, true)
+		self.sendSignalsWithReset([]*protocol.ExchangeSignal{startupSignal}, true)
 	} else {
 		// Signal receive can legitimately win the scheduler race and process an
 		// offer before this Run goroutine starts. Avoid the now-redundant
@@ -3130,26 +3226,43 @@ func (self *peerConn) teardown() {
 					stage,
 					self.key,
 				)
+				logPeerConnectionTeardownStacks(
+					loggerOrDefault(self.log),
+					stage,
+					self.key,
+				)
 			},
 		)
 		defer slowTeardownTimer.StopAndWait()
 		self.cancel()
+		// Direct peer owners and the manager lifecycle worker share teardown.
+		// Closing the gate here makes callback rejection an invariant of the
+		// resource owner rather than an assumption about its caller.
+		self.lifecycleWorkers().close()
+		if self.cancelIceResolve != nil {
+			self.cancelIceResolve()
+		}
 
-		// Break the physical path before PeerConnection.Close starts its normal
+		// Break the data transport before PeerConnection.Close starts its normal
 		// SCTP-first shutdown. Pion's SCTP Abort waits for its read loop after
 		// setting a deadline on the DTLS-backed net.Conn. On physical Android
 		// that wait was observed stranded for hours after an idle peer vanished:
 		// peerConns was empty while both make-before-break receive-window
 		// reservations remained charged. Every later same-peer setup was then
-		// refused by the full fixed budget. Stopping ICE first closes the
-		// underlying packet path, which deterministically releases the
-		// DTLS/SCTP read stack before Close performs its idempotent component
-		// cleanup. This is an abrupt cancellation path, not graceful shutdown.
-		if self.pc != nil {
+		// refused by the full fixed budget. Stopping DTLS closes that SCTP-facing
+		// connection before Close performs its idempotent component cleanup. Do
+		// not stop ICE here: ICE Stop joins its agent and mux readers and was
+		// observed blocking this pre-close stage indefinitely on Linux.
+		func() {
+			self.pionLifecycleLock.Lock()
+			defer self.pionLifecycleLock.Unlock()
+			if self.pc == nil {
+				return
+			}
 			stopTransport := webRtcPeerConnectionTransportStop(self.pc)
 			if err := closeTransportBeforePeerConnection(
 				func() error {
-					teardownStage.Store(int32(peerConnectionTeardownStoppingIce))
+					teardownStage.Store(int32(peerConnectionTeardownStoppingDtls))
 					if stopTransport == nil {
 						return nil
 					}
@@ -3163,7 +3276,7 @@ func (self *peerConn) teardown() {
 				self.log.V(1).Enabled() {
 				self.log.Infof("[peerconn]close err = %s\n", err)
 			}
-		}
+		}()
 
 		teardownStage.Store(int32(peerConnectionTeardownClosingFastPath))
 		self.closeFastPath()
@@ -3340,19 +3453,31 @@ func (self *peerConn) receiveSignalFromPeerWithTransferKey(
 	if self.beforeReceiveSignalLockForTest != nil {
 		self.beforeReceiveSignalLockForTest()
 	}
-	self.signalLock.Lock()
-	if self.ctx != nil && self.ctx.Err() != nil {
-		self.signalLock.Unlock()
-		return nil
-	}
-	toSend, flushLocalCandidates, immediateReconnect, fatal, err := self.receiveSignalFromPeerLocked(
-		signal,
-		senderGenerationId,
-		senderGenerationSet,
-		transferKey,
-		transferKeySet,
-	)
-	self.signalLock.Unlock()
+	var toSend []*protocol.ExchangeSignal
+	var flushLocalCandidates bool
+	var immediateReconnect bool
+	var fatal bool
+	var err error
+	func() {
+		// Pion lifecycle is the outer lock everywhere it composes with
+		// generation signaling. Teardown needs only this lock while closing
+		// Pion and therefore cannot form a signal->Pion lock cycle.
+		self.pionLifecycleLock.Lock()
+		defer self.pionLifecycleLock.Unlock()
+		self.signalLock.Lock()
+		defer self.signalLock.Unlock()
+		if self.ctx != nil && self.ctx.Err() != nil {
+			return
+		}
+		toSend, flushLocalCandidates, immediateReconnect, fatal, err =
+			self.receiveSignalFromPeerLocked(
+				signal,
+				senderGenerationId,
+				senderGenerationSet,
+				transferKey,
+				transferKeySet,
+			)
+	}()
 
 	if err != nil {
 		if fatal {

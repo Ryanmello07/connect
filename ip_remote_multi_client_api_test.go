@@ -19,8 +19,180 @@ import (
 	"testing"
 	"time"
 
+	gojwt "github.com/golang-jwt/jwt/v5"
+
 	"github.com/urnetwork/connect/protocol"
 )
+
+// The default runtime history is derived rather than copied: ten possible
+// live clients across both windows, retained for each 15-second maintenance
+// opportunity in one 60-minute channel lifetime.
+func TestDefaultApiRuntimeExcludeClientMaxCountTracksWindowLifecycle(t *testing.T) {
+	multiSettings := DefaultMultiClientSettings()
+	if got, want := apiRuntimeExcludeClientMaxCount(multiSettings), 2400; got != want {
+		t.Fatalf("default runtime exclusion max = %d, want %d", got, want)
+	}
+	if got, want := DefaultApiMultiClientGeneratorSettings().RuntimeExcludeClientMaxCount,
+		apiRuntimeExcludeClientMaxCount(multiSettings); got != want {
+		t.Fatalf("API runtime exclusion max = %d, want derived %d", got, want)
+	}
+
+	custom := &MultiClientSettings{
+		WindowSizes: map[WindowType]WindowSizeSettings{
+			WindowTypeQuality: {WindowSizeHardMax: 2},
+			WindowTypeSpeed:   {WindowSizeHardMax: 1},
+		},
+		MaxClientLifetime:   61 * time.Second,
+		WindowResizeTimeout: 30 * time.Second,
+	}
+	if got, want := apiRuntimeExcludeClientMaxCount(custom), 9; got != want {
+		t.Fatalf("custom runtime exclusion max = %d, want %d", got, want)
+	}
+}
+
+// Runtime exclusions are a bounded FIFO independent of constructor policy.
+// Overflow makes only the oldest runtime provider eligible again; seeded
+// exclusions remain durable and duplicate calls consume no capacity.
+func TestApiRuntimeExclusionsEvictOldestAndPreserveConstructor(t *testing.T) {
+	seeded := []Id{NewId(), NewId()}
+	constructorExclusions := []Id{seeded[0], seeded[1], seeded[0]}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	settings := DefaultApiMultiClientGeneratorSettings()
+	settings.RuntimeExcludeClientMaxCount = 3
+	generator := NewApiMultiClientGenerator(
+		ctx,
+		nil,
+		nil,
+		constructorExclusions,
+		"",
+		"synthetic-token",
+		"",
+		"synthetic-device",
+		"synthetic-spec",
+		"0.0.0-test",
+		nil,
+		DefaultClientSettings,
+		settings,
+	)
+	constructorExclusions[0] = NewId()
+	if got := generator.ExcludeClientIds(); !slices.Equal(got, seeded) {
+		t.Fatalf("constructor exclusion snapshot aliases caller slice: %v, want %v", got, seeded)
+	}
+	first := NewId()
+	second := NewId()
+	third := NewId()
+	fourth := NewId()
+	for _, clientId := range []Id{seeded[0], first, second, third, second} {
+		generator.ExcludeClientId(clientId)
+	}
+	if got, want := generator.ExcludeClientIds(),
+		append(slices.Clone(seeded), first, second, third); !slices.Equal(got, want) {
+		t.Fatalf("full exclusions = %v, want %v", got, want)
+	}
+	fullCapacity := cap(generator.runtimeExcludeClientIds)
+
+	generator.ExcludeClientId(fourth)
+	if got, want := generator.ExcludeClientIds(),
+		append(slices.Clone(seeded), second, third, fourth); !slices.Equal(got, want) {
+		t.Fatalf("overflow exclusions = %v, want %v", got, want)
+	}
+	// The evicted id is eligible to enter again at the newest edge. This is the
+	// bounded recovery path; the generator never latches discovery closed.
+	generator.ExcludeClientId(first)
+	if got, want := generator.ExcludeClientIds(),
+		append(slices.Clone(seeded), third, fourth, first); !slices.Equal(got, want) {
+		t.Fatalf("recovered exclusions = %v, want %v", got, want)
+	}
+	if got := cap(generator.runtimeExcludeClientIds); got != fullCapacity {
+		t.Fatalf("runtime exclusion capacity grew after overflow: %d -> %d", fullCapacity, got)
+	}
+}
+
+// Concurrent status callbacks and discovery snapshots preserve the strict
+// runtime cap and set/ring agreement. Exact survivors depend on scheduling;
+// the final sequential add pins the newest ordering edge deterministically.
+func TestApiRuntimeExclusionsConcurrentAddAndSnapshot(t *testing.T) {
+	seeded := []Id{NewId(), NewId()}
+	const runtimeMax = 64
+	generator := &ApiMultiClientGenerator{
+		excludeClientIds:             slices.Clone(seeded),
+		runtimeExcludeClientMaxCount: runtimeMax,
+	}
+	clientIds := make([]Id, 8*runtimeMax)
+	for i := range clientIds {
+		clientIds[i] = NewId()
+	}
+
+	var wait sync.WaitGroup
+	for _, clientId := range clientIds {
+		clientId := clientId
+		wait.Add(2)
+		go func() {
+			defer wait.Done()
+			generator.ExcludeClientId(clientId)
+			generator.ExcludeClientId(clientId)
+			generator.ExcludeClientId(seeded[0])
+		}()
+		go func() {
+			defer wait.Done()
+			_ = generator.ExcludeClientIds()
+		}()
+	}
+	wait.Wait()
+
+	newest := NewId()
+	generator.ExcludeClientId(newest)
+	got := generator.ExcludeClientIds()
+	if len(got) != len(seeded)+runtimeMax {
+		t.Fatalf("bounded exclusion count = %d, want %d", len(got), len(seeded)+runtimeMax)
+	}
+	if !slices.Equal(got[:len(seeded)], seeded) {
+		t.Fatalf("constructor exclusions changed: %v, want %v", got[:len(seeded)], seeded)
+	}
+	if got[len(got)-1] != newest {
+		t.Fatalf("newest runtime exclusion = %s, want %s", got[len(got)-1], newest)
+	}
+	seen := map[Id]bool{}
+	for _, clientId := range got {
+		if seen[clientId] {
+			t.Fatalf("duplicate exclusion in snapshot: %s", clientId)
+		}
+		seen[clientId] = true
+	}
+	if len(generator.runtimeExcludeClientIdSet) != runtimeMax {
+		t.Fatalf("runtime exclusion set count = %d, want %d", len(generator.runtimeExcludeClientIdSet), runtimeMax)
+	}
+}
+
+// At the strict default runtime cap, the serialized discovery request remains
+// under a conservative Connect-owned 512 KiB amplification budget. This
+// measures the wire representation rather than estimating from 16-byte Id
+// storage or copying another repository's mutable HTTP limit.
+func TestDefaultApiRuntimeExclusionsKeepDiscoveryRequestBounded(t *testing.T) {
+	settings := DefaultApiMultiClientGeneratorSettings()
+	generator := &ApiMultiClientGenerator{
+		excludeClientIds:             []Id{NewId()},
+		runtimeExcludeClientMaxCount: settings.RuntimeExcludeClientMaxCount,
+	}
+	for range settings.RuntimeExcludeClientMaxCount + 17 {
+		generator.ExcludeClientId(NewId())
+	}
+	requestBytes, err := json.Marshal(&FindProviders2Args{
+		Specs:            []*ProviderSpec{{BestAvailable: true}},
+		ExcludeClientIds: generator.ExcludeClientIds(),
+		Count:            DefaultMultiClientSettings().WindowExpandBlockCount,
+		RankMode:         WindowTypeQuality.RankMode(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const discoveryRequestMax = 512 * 1024
+	if len(requestBytes) >= discoveryRequestMax {
+		t.Fatalf("bounded discovery request = %d bytes, want below %d-byte Connect budget", len(requestBytes), discoveryRequestMax)
+	}
+	t.Logf("bounded discovery request = %d bytes (%d runtime ids)", len(requestBytes), settings.RuntimeExcludeClientMaxCount)
+}
 
 // Discovery retains the destination and the nearest eight intermediaries when
 // a server returns a longer path; shorter legacy paths are unaffected.
@@ -30,14 +202,24 @@ func TestNextDestinationsRetainsMaximumIntermediariesAndDestination(t *testing.T
 		intermediaryIds[idIndex] = NewId()
 	}
 	providerId := NewId()
+	wantEstimatedBytesPerSecond := ByteCount(7_500_000)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/hello" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		if request.URL.Path != "/network/find-providers2" {
-			t.Errorf("discovery path=%q", request.URL.Path)
+			http.NotFound(w, request)
+			return
 		}
 		if err := json.NewEncoder(w).Encode(&FindProviders2Result{
 			Providers: []*FindProvidersProvider{{
-				ClientId:        providerId,
-				IntermediaryIds: intermediaryIds,
+				ClientId:                providerId,
+				IntermediaryIds:         intermediaryIds,
+				EstimatedBytesPerSecond: wantEstimatedBytesPerSecond,
+				Tier:                    0,
+				NetworkOnly:             true,
+				ReputationFailedNames:   " Bloomberg ,canva,bloomberg",
 			}},
 		}); err != nil {
 			t.Errorf("encode discovery response: %v", err)
@@ -77,9 +259,97 @@ func TestNextDestinationsRetainsMaximumIntermediariesAndDestination(t *testing.T
 		slices.Clone(intermediaryIds[len(intermediaryIds)-MaxMultihopLength:]),
 		providerId,
 	)
-	for destination := range destinations {
+	for destination, stats := range destinations {
 		if !slices.Equal(destination.Ids(), wantIds) {
 			t.Fatalf("destination ids=%v want=%v", destination.Ids(), wantIds)
+		}
+		if stats.EstimatedBytesPerSecond != wantEstimatedBytesPerSecond || !stats.NetworkOnly {
+			t.Fatalf("discovery stats=%+v, want speed and network-only metadata", stats)
+		}
+		if !slices.Equal(stats.ReputationFailures, []string{"bloomberg", "canva"}) {
+			t.Fatalf("reputation failures=%q, want normalized Bloomberg/Canva", stats.ReputationFailures)
+		}
+	}
+}
+
+// A DeviceLocal refreshes its top-level client JWT independently of an
+// already-running destination window. Later expansion and retirement must use
+// that refreshed credential; keeping the generator's constructor JWT turns
+// healthy long-lived sessions into 401s once the old token expires.
+func TestApiMultiClientGeneratorUsesRefreshedJwtForFutureClientLifecycle(t *testing.T) {
+	derivedClientId := NewId()
+	derivedToken := gojwt.NewWithClaims(gojwt.SigningMethodHS256, gojwt.MapClaims{
+		"client_id": derivedClientId.String(),
+	})
+	derivedJwt, err := derivedToken.SignedString([]byte("test-only-key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type requestAuth struct {
+		path          string
+		authorization string
+	}
+	requests := make(chan requestAuth, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/hello":
+			w.WriteHeader(http.StatusOK)
+		case "/network/auth-client":
+			requests <- requestAuth{path: request.URL.Path, authorization: request.Header.Get("Authorization")}
+			_ = json.NewEncoder(w).Encode(&AuthNetworkClientResult{
+				ByClientJwt: derivedJwt,
+			})
+		case "/network/remove-client":
+			requests <- requestAuth{path: request.URL.Path, authorization: request.Header.Get("Authorization")}
+			_, _ = w.Write([]byte("{}"))
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	strategySettings := DefaultClientStrategySettings()
+	strategySettings.EnableNormal = true
+	strategySettings.EnableResilient = false
+	strategySettings.RequestTimeout = time.Second
+	strategy := NewClientStrategy(ctx, strategySettings)
+	generator := NewApiMultiClientGenerator(
+		ctx,
+		nil,
+		strategy,
+		nil,
+		server.URL,
+		"constructor-jwt",
+		server.URL,
+		"test-description",
+		"test-spec",
+		"0.0.0-test",
+		nil,
+		DefaultClientSettings,
+		DefaultApiMultiClientGeneratorSettings(),
+	)
+	generator.SetByJwt("refreshed-jwt")
+
+	args, err := generator.NewClientArgsContext(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generator.RemoveClientArgs(args)
+
+	for _, wantPath := range []string{"/network/auth-client", "/network/remove-client"} {
+		select {
+		case request := <-requests:
+			if request.path != wantPath {
+				t.Fatalf("request path = %q, want %q", request.path, wantPath)
+			}
+			if request.authorization != "Bearer refreshed-jwt" {
+				t.Fatalf("%s authorization = %q, want refreshed JWT", request.path, request.authorization)
+			}
+		case <-ctx.Done():
+			t.Fatalf("waiting for %s: %v", wantPath, ctx.Err())
 		}
 	}
 }
@@ -392,5 +662,132 @@ func TestRemoveClientWithArgsJoinsOobBeforeIdentityRevocation(t *testing.T) {
 	}
 	if !waitForCondition(5*time.Second, func() bool { return removeCount.Load() == 1 }) {
 		t.Fatal("identity was not revoked after cleanup control completed")
+	}
+}
+
+// A generated client's channel hands retirement back asynchronously after its
+// cancellation edge. Generator teardown must wait for that Client/OOB join;
+// otherwise a P2P send route can retain pooled Transfer frames after teardown.
+func TestApiMultiClientGeneratorCloseAndWaitJoinsGeneratedClientRetirement(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	strategySettings := DefaultClientStrategySettings()
+	strategy := NewClientStrategy(ctx, strategySettings)
+	generator := NewApiMultiClientGenerator(
+		ctx,
+		nil,
+		strategy,
+		nil,
+		"http://127.0.0.1:1",
+		"network-jwt",
+		"http://127.0.0.1:1",
+		"test-description",
+		"test-spec",
+		"0.0.0-test",
+		nil,
+		DefaultClientSettings,
+		DefaultApiMultiClientGeneratorSettings(),
+	)
+	client := NewClient(ctx, NewId(), NewNoContractClientOob(), closeWaitClientSettings())
+	args := &MultiClientGeneratorClientArgs{
+		ClientId: client.ClientId(),
+		ClientAuth: &ClientAuth{
+			InstanceId: NewId(),
+		},
+	}
+
+	// Model the successful NewClient boundary without making a platform request.
+	// The channel owner observes Client.Done and then returns the client through
+	// the same RemoveClientWithArgs path used by RemoteUserNatMultiClient.
+	generator.transportLock.Lock()
+	generator.transportIdle = make(chan struct{})
+	generator.transports[client] = &apiWindowClientTransport{}
+	generator.transportLock.Unlock()
+	go func() {
+		<-client.Done()
+		generator.RemoveClientWithArgs(client, args)
+	}()
+
+	retirementEntered := make(chan struct{})
+	releaseRetirement := make(chan struct{})
+	var enteredOnce sync.Once
+	var releaseOnce sync.Once
+	client.beforeRunDoneWaitForTest = func() {
+		enteredOnce.Do(func() { close(retirementEntered) })
+		<-releaseRetirement
+	}
+	defer releaseOnce.Do(func() { close(releaseRetirement) })
+
+	closeResult := make(chan error, 1)
+	go func() {
+		closeResult <- generator.CloseAndWait(ctx)
+	}()
+	waitCloseWaitBarrier(t, ctx, retirementEntered, "generated client retirement")
+	select {
+	case err := <-closeResult:
+		t.Fatalf("generator close skipped held client retirement: %v", err)
+	default:
+	}
+
+	releaseOnce.Do(func() { close(releaseRetirement) })
+	select {
+	case err := <-closeResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("wait for generated client retirement: %v", ctx.Err())
+	}
+}
+
+// A destination generator is replaced while its parent DeviceLocal remains
+// alive. Its own API and identity workers must end at generator retirement;
+// otherwise every reconnect retains one loader/writer tree until the entire
+// device closes.
+func TestApiMultiClientGeneratorCloseCancelsOwnedIdentityWorkers(t *testing.T) {
+	parentCtx, parentCancel := context.WithCancel(context.Background())
+	defer parentCancel()
+	strategy := NewClientStrategy(parentCtx, DefaultClientStrategySettings())
+	generator := NewApiMultiClientGenerator(
+		parentCtx,
+		nil,
+		strategy,
+		nil,
+		"http://127.0.0.1:1",
+		"network-jwt",
+		"http://127.0.0.1:1",
+		"test-description",
+		"test-spec",
+		"0.0.0-test",
+		nil,
+		DefaultClientSettings,
+		DefaultApiMultiClientGeneratorSettings(),
+	)
+	store := &contextLoadIdentityStore{
+		started:  make(chan struct{}),
+		canceled: make(chan struct{}),
+	}
+	generator.SetIdentityStore(store)
+	select {
+	case <-store.started:
+	case <-time.After(time.Second):
+		t.Fatal("identity loader did not start")
+	}
+
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer closeCancel()
+	if err := generator.CloseAndWait(closeCtx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-store.canceled:
+	case <-time.After(time.Second):
+		t.Fatal("generator close did not cancel its identity loader")
+	}
+	select {
+	case <-parentCtx.Done():
+		t.Fatal("generator close canceled its DeviceLocal parent")
+	default:
 	}
 }

@@ -59,10 +59,65 @@ const TransportVersion = 2
 const DebugCloseSend = false
 
 // The platform WebSocket writer combines only messages already waiting on its
-// bounded route. Eight ordinary transfer frames remain below the wrapper's
-// 16 KiB retained-byte bound, reducing write syscalls without adding a
-// batching delay. Oversized frames flush through the same bounded wrapper.
-const platformWebSocketWriteBatchMaxMessages = 8
+// bounded route. ACK-sized traffic may drain thirty-two at once; ordinary data
+// stops once the batch has reached 12 KiB, so one complete ordinary <=4-KiB H1
+// data message fits the existing 16-KiB coalescer. A larger handshake carrier
+// may make the bounded wrapper flush its prefix before the batch ends. A
+// dedicated ACK lane may consume at most eight ready slots before one ready
+// ordinary packet gets a turn. The writer then starts another ACK burst and
+// repeats both bursts inside the same nonblocking physical flush. If either
+// lane is empty, the other drains without an artificial flush boundary. This
+// changes neither storage nor sparse latency and prevents Transfer feedback
+// from starving inner TCP ACKs or request data during a sustained download.
+const platformWebSocketWriteBatchMaxMessages = 32
+const platformWebSocketWriteBatchDrainByteCount = 12 * 1024
+const platformWebSocketAckPriorityBurstMaxMessages = 8
+
+func platformWebSocketWriteBatchCanDrain(
+	messageCount int,
+	messageByteCount int,
+) bool {
+	return messageCount < platformWebSocketWriteBatchMaxMessages &&
+		messageByteCount < platformWebSocketWriteBatchDrainByteCount
+}
+
+func platformWebSocketWriteBatchNextReady(
+	ackPrioritySend <-chan []byte,
+	send <-chan []byte,
+	priorityMessageCount int,
+) (
+	message []byte,
+	priority bool,
+	sendOpen bool,
+	ready bool,
+) {
+	// Once the ACK quantum is consumed, give already-ready ordinary work the
+	// first look. If none exists, keep draining ready ACKs into this same
+	// physical write rather than flushing a partial batch. The caller resets
+	// priorityMessageCount after an ordinary selection, producing repeated
+	// <=8 ACK / 1 ordinary-packet bursts while both sources remain continuously
+	// ready. The enclosing writer keeps those bursts in one bulk flush.
+	if platformWebSocketAckPriorityBurstMaxMessages <= priorityMessageCount {
+		select {
+		case message, sendOpen = <-send:
+			return message, false, sendOpen, true
+		default:
+		}
+	}
+	if ackPrioritySend != nil {
+		select {
+		case message = <-ackPrioritySend:
+			return message, true, true, true
+		default:
+		}
+	}
+	select {
+	case message, sendOpen = <-send:
+		return message, false, sendOpen, true
+	default:
+		return nil, false, true, false
+	}
+}
 
 const (
 	platformH3WriteBatchMaxMessageCount = 16
@@ -140,12 +195,15 @@ func normalizeTransportModePreferences(preferences map[TransportMode]int) map[Tr
 }
 
 // PlatformTransportReceiveModeStatsSnapshot is one lock-free view of complete
-// Transfer-frame messages refused by a full platform receive route. Bytes are
-// the complete message bytes read from the carrier, before pool ownership is
-// returned. Transfer recovery owns retransmission for these drops.
+// Transfer-frame messages encountering a full platform receive route. Bytes
+// are the complete message bytes read from the carrier. QueueDrop is
+// application-level loss returned to Transfer recovery; QueueBackpressure is
+// reliable-carrier ownership retained while waiting for bounded route space.
 type PlatformTransportReceiveModeStatsSnapshot struct {
-	QueueDropMessageCount uint64
-	QueueDropByteCount    uint64
+	QueueDropMessageCount         uint64
+	QueueDropByteCount            uint64
+	QueueBackpressureMessageCount uint64
+	QueueBackpressureByteCount    uint64
 }
 
 // PlatformTransportReceiveStatsSnapshot keeps the carrier mode visible: DNS
@@ -161,14 +219,18 @@ type PlatformTransportReceiveStatsSnapshot struct {
 }
 
 type platformTransportReceiveModeStats struct {
-	queueDropMessageCount atomic.Uint64
-	queueDropByteCount    atomic.Uint64
+	queueDropMessageCount         atomic.Uint64
+	queueDropByteCount            atomic.Uint64
+	queueBackpressureMessageCount atomic.Uint64
+	queueBackpressureByteCount    atomic.Uint64
 }
 
 func (self *platformTransportReceiveModeStats) snapshot() PlatformTransportReceiveModeStatsSnapshot {
 	return PlatformTransportReceiveModeStatsSnapshot{
-		QueueDropMessageCount: self.queueDropMessageCount.Load(),
-		QueueDropByteCount:    self.queueDropByteCount.Load(),
+		QueueDropMessageCount:         self.queueDropMessageCount.Load(),
+		QueueDropByteCount:            self.queueDropByteCount.Load(),
+		QueueBackpressureMessageCount: self.queueBackpressureMessageCount.Load(),
+		QueueBackpressureByteCount:    self.queueBackpressureByteCount.Load(),
 	}
 }
 
@@ -206,6 +268,16 @@ func (self *PlatformTransportReceiveStats) recordQueueDrop(mode TransportMode, b
 	if counters := self.mode(mode); counters != nil {
 		counters.queueDropMessageCount.Add(1)
 		counters.queueDropByteCount.Add(uint64(max(0, byteCount)))
+	}
+}
+
+func (self *PlatformTransportReceiveStats) recordQueueBackpressure(
+	mode TransportMode,
+	byteCount int,
+) {
+	if counters := self.mode(mode); counters != nil {
+		counters.queueBackpressureMessageCount.Add(1)
+		counters.queueBackpressureByteCount.Add(uint64(max(0, byteCount)))
 	}
 }
 
@@ -426,16 +498,21 @@ type PlatformTransportSettings struct {
 	// SendRouteObserver exposes route ownership to deterministic integration
 	// harnesses. It must not block. Nil retains normal production behavior.
 	SendRouteObserver func(transport Transport, route Route, connected bool)
-	// ReceiveStats, when non-nil, aggregates zero-wait carrier-to-route
-	// admission loss across every reconnect generation. The constructor uses a
-	// private counter set when it is nil.
+	// ReceiveStats, when non-nil, aggregates carrier-to-route admission loss and
+	// reliable-H1 backpressure across every reconnect generation. The
+	// constructor uses a private counter set when it is nil.
 	ReceiveStats *PlatformTransportReceiveStats
 	// AuthFrameObserver borrows the exact pooled authentication frame before
 	// transport I/O. Tests may retain it to prove lifecycle ownership. It must
 	// not block; nil retains normal production behavior.
-	AuthFrameObserver    func(authFrameBytes []byte)
-	TransportBufferSize  int
-	InactiveDrainTimeout time.Duration
+	AuthFrameObserver   func(authFrameBytes []byte)
+	TransportBufferSize int
+	// H1AckPriorityBufferSize enables a separate bounded writer lane used only
+	// by Transfer acknowledgements. Zero (the server/default policy) leaves the
+	// lane absent. Mobile embedders can spend a handful of channel slots so ACK
+	// feedback cannot sit behind a full bulk route and trigger resend storms.
+	H1AckPriorityBufferSize int
+	InactiveDrainTimeout    time.Duration
 	// InactiveDrainMaxTimeout is the absolute lifetime of a carrier after a
 	// strictly better mode supersedes it. Payload activity may extend the quiet
 	// drain, but never beyond this bound. A non-positive value uses twice
@@ -448,10 +525,14 @@ type PlatformTransportSettings struct {
 	// remain held through reconnects so socket churn cannot escape the cap.
 	PlatformTransportBudget *PlatformTransportBudget
 	// Non-positive carrier/socket values resolve to the memory-scaled defaults.
-	H1BudgetByteCount            ByteCount
-	H3BudgetByteCount            ByteCount
-	H3SocketReadBufferByteCount  ByteCount
-	H3SocketWriteBufferByteCount ByteCount
+	H1BudgetByteCount                         ByteCount
+	H3BudgetByteCount                         ByteCount
+	H3SocketReadBufferByteCount               ByteCount
+	H3SocketWriteBufferByteCount              ByteCount
+	H3InitialStreamReceiveWindowByteCount     ByteCount
+	H3MaxStreamReceiveWindowByteCount         ByteCount
+	H3InitialConnectionReceiveWindowByteCount ByteCount
+	H3MaxConnectionReceiveWindowByteCount     ByteCount
 	// PlatformTransportBudgetPriority orders optional Auto-H3 leases when the
 	// aggregate budget cannot hold every caller. Foreground client windows use
 	// the zero value; background/provider transports use the background value.
@@ -485,9 +566,10 @@ type PlatformTransportSettings struct {
 	PtDnsSlowMultiple int
 
 	// H3PacketConnFactory, when set, creates the UDP endpoint for a plain H3
-	// dial. Tests use it to place QUIC below a userspace network model. Nil
-	// retains the host UDP socket and physical-egress binding path. The
-	// platform transport owns and closes every returned endpoint.
+	// dial. Tests use it to place QUIC below a userspace network model, while
+	// headless multi-provider hosts use it to preserve distinct source
+	// identities. Nil retains the host UDP socket and physical-egress binding
+	// path. The platform transport owns and closes every returned endpoint.
 	H3PacketConnFactory func(context.Context) (net.PacketConn, error)
 	// Enables the RFC 9221 Transfer carrier only when the server accepts the
 	// same version on the authenticated control stream. A legacy peer retains
@@ -559,18 +641,78 @@ func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 		V2H1Auth: true,
 		// the platform transport must carry the per-peer encryption handshake,
 		// so its framer max is the connect runtime minimum message length
-		FramerSettings:               DefaultFramerSettings(int(DefaultClientSettings().MinimumMessageLenLimit())),
-		H1MaxMessageByteCount:        DefaultClientSettings().MinimumMessageLenLimit(),
-		PlatformTransportBudget:      DefaultPlatformTransportBudget(),
-		H1BudgetByteCount:            MemoryScaledByteCount(kib(512), kib(256)),
-		H3BudgetByteCount:            MemoryScaledByteCount(mib(8), mib(3)),
-		H3SocketReadBufferByteCount:  MemoryScaledByteCount(mib(1), kib(256)),
-		H3SocketWriteBufferByteCount: MemoryScaledByteCount(mib(1), kib(256)),
-		PtDnsSlowMultiple:            4,
-		EnableH3Datagrams:            true,
-		H3DatagramSettings:           DefaultH3DatagramSettings(),
-		H3QuicPacketStats:            &H3QuicPacketStats{},
+		FramerSettings:                            DefaultFramerSettings(int(DefaultClientSettings().MinimumMessageLenLimit())),
+		H1MaxMessageByteCount:                     DefaultClientSettings().MinimumMessageLenLimit(),
+		PlatformTransportBudget:                   DefaultPlatformTransportBudget(),
+		H1BudgetByteCount:                         MemoryScaledByteCount(kib(512), kib(256)),
+		H3BudgetByteCount:                         MemoryScaledByteCount(mib(8), mib(3)),
+		H3SocketReadBufferByteCount:               MemoryScaledByteCount(mib(1), kib(256)),
+		H3SocketWriteBufferByteCount:              MemoryScaledByteCount(mib(1), kib(256)),
+		H3InitialStreamReceiveWindowByteCount:     kib(256),
+		H3MaxStreamReceiveWindowByteCount:         MemoryScaledByteCount(mib(3), kib(384)),
+		H3InitialConnectionReceiveWindowByteCount: kib(512),
+		H3MaxConnectionReceiveWindowByteCount:     MemoryScaledByteCount(mib(4), kib(512)),
+		PtDnsSlowMultiple:                         4,
+		EnableH3Datagrams:                         true,
+		H3DatagramSettings:                        DefaultH3DatagramSettings(),
+		H3QuicPacketStats:                         &H3QuicPacketStats{},
 	}
+}
+
+// DefaultPlatformTransportSettingsWithMemoryTarget returns platform carrier
+// settings whose admission, socket buffers, QUIC receive windows, and
+// datagram reassembly state derive from one explicit owner memory target. Each
+// call owns a private carrier budget. A nonpositive target retains the legacy
+// process-global defaults.
+func DefaultPlatformTransportSettingsWithMemoryTarget(
+	memoryTargetByteCount ByteCount,
+) *PlatformTransportSettings {
+	settings := DefaultPlatformTransportSettings()
+	if memoryTargetByteCount <= 0 {
+		return settings
+	}
+	settings.PlatformTransportBudget =
+		NewPlatformTransportBudgetForMemoryTarget(memoryTargetByteCount)
+	settings.H1BudgetByteCount = MemoryTargetScaledByteCount(
+		memoryTargetByteCount,
+		kib(512),
+		kib(256),
+	)
+	settings.H3BudgetByteCount = MemoryTargetScaledByteCount(
+		memoryTargetByteCount,
+		mib(8),
+		mib(3),
+	)
+	settings.H3SocketReadBufferByteCount = MemoryTargetScaledByteCount(
+		memoryTargetByteCount,
+		mib(1),
+		kib(256),
+	)
+	settings.H3SocketWriteBufferByteCount = MemoryTargetScaledByteCount(
+		memoryTargetByteCount,
+		mib(1),
+		kib(256),
+	)
+	settings.H3MaxStreamReceiveWindowByteCount = MemoryTargetScaledByteCount(
+		memoryTargetByteCount,
+		mib(3),
+		kib(384),
+	)
+	settings.H3MaxConnectionReceiveWindowByteCount = MemoryTargetScaledByteCount(
+		memoryTargetByteCount,
+		mib(4),
+		kib(512),
+	)
+	if settings.H3DatagramSettings != nil {
+		settings.H3DatagramSettings.ProcessReassemblyByteCount = int64(
+			MemoryTargetScaledByteCount(
+				memoryTargetByteCount,
+				mib(8),
+				kib(512),
+			),
+		)
+	}
+	return settings
 }
 
 type PlatformTransport struct {
@@ -587,7 +729,10 @@ type PlatformTransport struct {
 	routeManager   *RouteManager
 
 	platformUrl string
-	auth        *ClientAuth
+	// auth is an immutable clone guarded by stateLock. Each connection
+	// generation takes one value snapshot so its JWT, instance, app version,
+	// and JWT-derived client/device identity can never come from mixed updates.
+	auth *ClientAuth
 
 	settings *PlatformTransportSettings
 	// receiveStats is always non-nil, including when the settings did not expose
@@ -655,6 +800,22 @@ func newPlatformQuicConfig(
 	settings *PlatformTransportSettings,
 	slowMultiple int,
 ) *quic.Config {
+	initialStreamReceiveWindow := settings.H3InitialStreamReceiveWindowByteCount
+	if initialStreamReceiveWindow <= 0 {
+		initialStreamReceiveWindow = kib(256)
+	}
+	maxStreamReceiveWindow := settings.H3MaxStreamReceiveWindowByteCount
+	if maxStreamReceiveWindow <= 0 {
+		maxStreamReceiveWindow = MemoryScaledByteCount(mib(3), kib(384))
+	}
+	initialConnectionReceiveWindow := settings.H3InitialConnectionReceiveWindowByteCount
+	if initialConnectionReceiveWindow <= 0 {
+		initialConnectionReceiveWindow = kib(512)
+	}
+	maxConnectionReceiveWindow := settings.H3MaxConnectionReceiveWindowByteCount
+	if maxConnectionReceiveWindow <= 0 {
+		maxConnectionReceiveWindow = MemoryScaledByteCount(mib(4), kib(512))
+	}
 	config := &quic.Config{
 		HandshakeIdleTimeout: time.Duration(slowMultiple) *
 			(settings.QuicConnectTimeout + settings.QuicHandshakeTimeout),
@@ -667,10 +828,10 @@ func newPlatformQuicConfig(
 		InitialPacketSize: H3InitialPacketByteCount,
 		// Pin the receive windows and stream counts. The platform transport
 		// uses one bidirectional stream; the stream counts bound abuse.
-		InitialStreamReceiveWindow:     uint64(kib(256)),
-		MaxStreamReceiveWindow:         uint64(MemoryScaledByteCount(mib(3), kib(384))),
-		InitialConnectionReceiveWindow: uint64(kib(512)),
-		MaxConnectionReceiveWindow:     uint64(MemoryScaledByteCount(mib(4), kib(512))),
+		InitialStreamReceiveWindow:     uint64(initialStreamReceiveWindow),
+		MaxStreamReceiveWindow:         uint64(maxStreamReceiveWindow),
+		InitialConnectionReceiveWindow: uint64(initialConnectionReceiveWindow),
+		MaxConnectionReceiveWindow:     uint64(maxConnectionReceiveWindow),
 		MaxIncomingStreams:             8,
 		MaxIncomingUniStreams:          8,
 		EnableDatagrams:                settings.EnableH3Datagrams,
@@ -770,13 +931,30 @@ func (self *PlatformTransport) DatagramStats() H3DatagramStatsSnapshot {
 	return self.h3DatagramStats.Snapshot()
 }
 
-// offerReceive transfers one complete carrier message to the shared Client
-// route without parking the socket reader. A full queue drops and counts the
-// frame; Transfer ACK/retry is the only recovery owner above this boundary.
-// False means the connection generation ended and its reader should exit.
+// Splitting hybrid receive-lane metadata must not duplicate the payload queue.
+// DATAGRAM retains the historical bounded queue while the reliable stream uses
+// an unbuffered route and may retain only its one already-read frame.
+func platformH3ReceiveRouteBufferSizes(
+	transportBufferSize int,
+	useH3Datagrams bool,
+) (reliable int, unreliable int) {
+	if useH3Datagrams {
+		return 0, transportBufferSize
+	}
+	return transportBufferSize, 0
+}
+
+// offerReceive transfers one complete carrier message to a lane-specific
+// Client route. Dropping after a reliable WebSocket, QUIC-stream, or other
+// stream read manufactures a Transfer hole and defeats the carrier's own
+// backpressure. A reliable reader therefore retains exactly its already-read
+// message until route capacity or cancellation. Unreliable DATAGRAM lanes keep
+// zero-wait admission and Transfer recovery. False means the connection
+// generation ended and its reader should exit.
 func (self *PlatformTransport) offerReceive(
 	done <-chan struct{},
 	mode TransportMode,
+	reliability CarrierReliability,
 	receive chan<- []byte,
 	message []byte,
 ) (open bool, delivered bool) {
@@ -784,6 +962,16 @@ func (self *PlatformTransport) offerReceive(
 	case pooledReceiveOfferDelivered:
 		return true, true
 	case pooledReceiveOfferFull:
+		if reliability == CarrierReliabilityReliable {
+			self.receiveStats.recordQueueBackpressure(mode, len(message))
+			select {
+			case <-done:
+				MessagePoolReturn(message)
+				return false, false
+			case receive <- message:
+				return true, true
+			}
+		}
 		self.receiveStats.recordQueueDrop(mode, len(message))
 		MessagePoolReturn(message)
 		return true, false
@@ -911,7 +1099,7 @@ func NewPlatformTransportWithTargetMode(
 		clientStrategy:     clientStrategy,
 		routeManager:       routeManager,
 		platformUrl:        platformUrl,
-		auth:               auth,
+		auth:               cloneClientAuth(auth),
 		settings:           settings,
 		receiveStats:       receiveStats,
 		framerSettings:     framerSettings,
@@ -972,12 +1160,28 @@ func NewPlatformTransportWithTargetMode(
 	return transport
 }
 
-// the auth is used on future connections
+// cloneClientAuth transfers a caller-owned auth value into transport ownership.
+// PlatformTransport historically requires non-nil auth and intentionally keeps
+// that fail-fast contract.
+func cloneClientAuth(auth *ClientAuth) *ClientAuth {
+	cloned := *auth
+	return &cloned
+}
+
+// authSnapshot returns one coherent auth generation for a connection attempt.
+func (self *PlatformTransport) authSnapshot() ClientAuth {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return *self.auth
+}
+
+// SetAuth installs an immutable snapshot for future connections. An existing
+// authenticated connection keeps its generation until it reconnects.
 func (self *PlatformTransport) SetAuth(auth *ClientAuth) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
-	self.auth = auth
+	self.auth = cloneClientAuth(auth)
 }
 
 // setModeAvailable records whether a mode has a live connection, waking the
@@ -1433,8 +1637,6 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 	// connect and update route manager for this transport
 	defer self.cancel()
 
-	clientId, _ := self.auth.ClientId()
-
 	if 0 < initialTimeout {
 		select {
 		case <-self.ctx.Done():
@@ -1464,14 +1666,16 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				}
 			}
 		}()
+		auth := self.authSnapshot()
+		clientId, _ := auth.ClientId()
 
 		reconnect := NewReconnect(self.settings.ReconnectTimeout)
 		connect := func() (*websocket.Conn, error) {
 			header := http.Header{}
 			if self.settings.V2H1Auth {
-				header.Add("Authorization", fmt.Sprintf("Bearer %s", self.auth.ByJwt))
-				header.Add("X-UR-AppVersion", self.auth.AppVersion)
-				header.Add("X-UR-InstanceId", self.auth.InstanceId.String())
+				header.Add("Authorization", fmt.Sprintf("Bearer %s", auth.ByJwt))
+				header.Add("X-UR-AppVersion", auth.AppVersion)
+				header.Add("X-UR-InstanceId", auth.InstanceId.String())
 				header.Add("X-UR-TransportVersion", fmt.Sprintf("%d", TransportVersion))
 			}
 
@@ -1490,9 +1694,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 
 			if !self.settings.V2H1Auth {
 				authBytes, err := EncodeFrame(&protocol.Auth{
-					ByJwt:      self.auth.ByJwt,
-					AppVersion: self.auth.AppVersion,
-					InstanceId: self.auth.InstanceId.Bytes(),
+					ByJwt:      auth.ByJwt,
+					AppVersion: auth.AppVersion,
+					InstanceId: auth.InstanceId.Bytes(),
 				}, self.settings.ProtocolVersion)
 				if err != nil {
 					return nil, err
@@ -1644,6 +1848,14 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			send := make(chan []byte, self.settings.TransportBufferSize)
 			receive := make(chan []byte, self.settings.TransportBufferSize)
 			controlSend := make(chan []byte, self.settings.TransportBufferSize)
+			var ackPrioritySend chan []byte
+			ackPriorityBufferSize := min(
+				max(0, self.settings.H1AckPriorityBufferSize),
+				max(0, self.settings.TransportBufferSize),
+			)
+			if 0 < ackPriorityBufferSize {
+				ackPrioritySend = make(chan []byte, ackPriorityBufferSize)
+			}
 
 			drain := func(c chan []byte) {
 				for {
@@ -1696,6 +1908,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			} else {
 				exportedSend = send
 			}
+			if ackPrioritySend != nil {
+				registerH1AckPriorityRoute(exportedSend, ackPrioritySend)
+			}
 
 			// the platform can route any destination,
 			// since every client has a platform transport
@@ -1712,11 +1927,21 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			if self.settings.SendRouteObserver != nil {
 				self.settings.SendRouteObserver(sendTransport, exportedSend, true)
 			}
-			self.routeManager.UpdateTransport(receiveTransport, []Route{receive})
+			self.routeManager.UpdateTransportWithProperties(
+				receiveTransport,
+				[]Route{receive},
+				TransferCarrierProperties{
+					ReceiveReliability: CarrierReliabilityReliable,
+				},
+			)
 			self.setRegistered(true)
 
 			defer func() {
 				self.setRegistered(false)
+				// Stop new priority admissions before retiring the public route.
+				// RemoveTransport then joins any writer that already acquired the
+				// old snapshot, so the final drain cannot race an enqueue.
+				unregisterH1AckPriorityRoute(exportedSend)
 				self.routeManager.RemoveTransport(sendTransport)
 				if self.settings.SendRouteObserver != nil {
 					self.settings.SendRouteObserver(sendTransport, exportedSend, false)
@@ -1734,8 +1959,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				// and socket-writer ownership before completion is published.
 				connectionWaitGroup.Wait()
 				// No producer can enqueue after the join, so one deterministic
-				// drain releases every pooled message still sitting in send.
+				// drain releases every pooled message still sitting in either lane.
 				drain(send)
+				drain(ackPrioritySend)
 			}()
 			startConnectionWorker(func() {
 				self.runInactiveDrain(
@@ -1805,6 +2031,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					ws.UnderlyingConn().(*WebSocketWriteBatchConn)
 				writeReadySendBatch := func(
 					firstMessage []byte,
+					firstPriority bool,
 				) (sendOpen bool, err error) {
 					if writeBatchConn == nil {
 						ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout))
@@ -1819,23 +2046,46 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					}
 
 					sendOpen = true
+					batchMessageCount := 1
+					batchMessageByteCount := len(firstMessage)
+					priorityMessageCount := 0
+					if firstPriority {
+						priorityMessageCount = 1
+					}
 				drainReady:
-					for range platformWebSocketWriteBatchMaxMessages - 1 {
+					for platformWebSocketWriteBatchCanDrain(
+						batchMessageCount,
+						batchMessageByteCount,
+					) {
 						select {
 						case <-handleCtx.Done():
 							writeBatchConn.AbortWriteBatch()
 							return false, nil
-						case message, ok := <-send:
-							if !ok {
-								sendOpen = false
-								break drainReady
-							}
-							if err = writeSendMessage(message); err != nil {
-								writeBatchConn.AbortWriteBatch()
-								return true, err
-							}
 						default:
+						}
+						message, priority, open, ready :=
+							platformWebSocketWriteBatchNextReady(
+								ackPrioritySend,
+								send,
+								priorityMessageCount,
+							)
+						if !ready {
 							break drainReady
+						}
+						if !open {
+							sendOpen = false
+							break drainReady
+						}
+						if err = writeSendMessage(message); err != nil {
+							writeBatchConn.AbortWriteBatch()
+							return true, err
+						}
+						batchMessageCount += 1
+						batchMessageByteCount += len(message)
+						if priority {
+							priorityMessageCount += 1
+						} else {
+							priorityMessageCount = 0
 						}
 					}
 					if err = writeBatchConn.FlushWriteBatch(); err != nil {
@@ -1848,6 +2098,31 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				}
 
 				for {
+					// A nonblocking pass makes priority deterministic when the
+					// ordinary route is continuously readable. The blocking
+					// selects below also include the lane so a newly arriving ACK
+					// wakes an otherwise idle writer.
+					if ackPrioritySend != nil && !speedTest {
+						select {
+						case message := <-ackPrioritySend:
+							if speedTest {
+								if len(message) <= 16 {
+									self.log.Infof("[ts]send message must be >16 bytes (%d)\n", len(message))
+									MessagePoolReturn(message)
+								} else if writePayload(message) != nil {
+									return
+								}
+							} else {
+								sendOpen, err := writeReadySendBatch(message, true)
+								if err != nil || !sendOpen {
+									return
+								}
+							}
+							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
+							continue
+						default:
+						}
+					}
 					if speedTest {
 						// during speed test, continue draining user traffic
 						// so the route manager does not back up. mixing user
@@ -1888,6 +2163,14 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 								return
 							}
 							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
+						case message := <-ackPrioritySend:
+							if len(message) <= 16 {
+								self.log.Infof("[ts]send message must be >16 bytes (%d)\n", len(message))
+								MessagePoolReturn(message)
+							} else if writePayload(message) != nil {
+								return
+							}
+							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
 						}
 					} else {
 						select {
@@ -1901,7 +2184,13 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 							// 	panic("[t]shared should be set")
 							// }
 
-							sendOpen, err := writeReadySendBatch(message)
+							sendOpen, err := writeReadySendBatch(message, false)
+							if err != nil || !sendOpen {
+								return
+							}
+							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
+						case message := <-ackPrioritySend:
+							sendOpen, err := writeReadySendBatch(message, true)
 							if err != nil || !sendOpen {
 								return
 							}
@@ -2017,6 +2306,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 						open, delivered := self.offerReceive(
 							handleCtx.Done(),
 							TransportModeH1,
+							CarrierReliabilityReliable,
 							receive,
 							message,
 						)
@@ -2089,8 +2379,6 @@ func (self *PlatformTransport) runH3(
 		panic(fmt.Errorf("Bad slow multiple: %d", slowMultiple))
 	}
 
-	clientId, _ := self.auth.ClientId()
-
 	if 0 < initialTimeout {
 		select {
 		case <-ctx.Done():
@@ -2124,6 +2412,8 @@ func (self *PlatformTransport) runH3(
 		if ctx.Err() != nil {
 			return
 		}
+		auth := self.authSnapshot()
+		clientId, _ := auth.ClientId()
 
 		reconnect := NewReconnect(self.settings.ReconnectTimeout)
 
@@ -2140,9 +2430,9 @@ func (self *PlatformTransport) runH3(
 			// 	HandshakeIdleTimeout: self.settings.QuicConnectTimeout + self.settings.QuicHandshakeTimeout,
 			// }
 			authMessage := &protocol.Auth{
-				ByJwt:      self.auth.ByJwt,
-				AppVersion: self.auth.AppVersion,
-				InstanceId: self.auth.InstanceId.Bytes(),
+				ByJwt:      auth.ByJwt,
+				AppVersion: auth.AppVersion,
+				InstanceId: auth.InstanceId.Bytes(),
 			}
 			SetH3DatagramAuthOffer(authMessage, self.settings.EnableH3Datagrams)
 			authBytes, err := EncodeFrame(authMessage, self.settings.ProtocolVersion)
@@ -2233,17 +2523,26 @@ func (self *PlatformTransport) runH3(
 			switch ptMode {
 			case TransportModeH3Dns:
 				tld := self.settings.DnsTlds[mathrand.Intn(len(self.settings.DnsTlds))]
-				// resolveEgressUDPAddr, not net.ResolveUDPAddr: the socket is
-				// egress-pinned above, but the NAME must not resolve through
-				// the OS resolver, whose query follows the route table into
-				// the tunnel this process provides. See egress_dial.go.
-				udpAddr, err = resolveEgressUDPAddr(attemptCtx, fmt.Sprintf("%s:%d", serverName, self.settings.DnsPort))
+				// The strategy resolver applies the network-space DoH policy
+				// before preserving the existing egress-aware fallback. The
+				// socket can be pinned above while an OS name query still loops
+				// into this process's own tunnel. See egress_dial.go.
+				udpAddr, err = self.clientStrategy.resolveControlUDPAddr(attemptCtx, fmt.Sprintf("%s:%d", serverName, self.settings.DnsPort))
 				if err != nil {
 					return nil, err
 				}
 				ptSettings := DefaultPacketTranslationSettings()
 				ptSettings.DnsTlds = [][]byte{tld}
-				packetConn, err = NewPacketTranslation(attemptCtx, PacketTranslationModeDns, packetConn, ptSettings)
+				// The connection cleanup owns the translated PacketConn. Keep its
+				// encoder alive while cancellation closes QUIC gracefully; otherwise
+				// the parent cancellation can discard the CONNECTION_CLOSE before
+				// CloseWithError reaches the wire and leave a stale server route.
+				packetConn, err = NewPacketTranslation(
+					context.WithoutCancel(attemptCtx),
+					PacketTranslationModeDns,
+					packetConn,
+					ptSettings,
+				)
 				if err != nil {
 					return nil, err
 				}
@@ -2253,18 +2552,23 @@ func (self *PlatformTransport) runH3(
 				if pumpServerName == "" {
 					return nil, fmt.Errorf("H3 DNS pump host is empty")
 				}
-				udpAddr, err = resolveEgressUDPAddr(attemptCtx, fmt.Sprintf("%s:%d", pumpServerName, self.settings.DnsPort))
+				udpAddr, err = self.clientStrategy.resolveControlUDPAddr(attemptCtx, fmt.Sprintf("%s:%d", pumpServerName, self.settings.DnsPort))
 				if err != nil {
 					return nil, err
 				}
 				ptSettings := DefaultPacketTranslationSettings()
 				ptSettings.DnsTlds = [][]byte{tld}
-				packetConn, err = NewPacketTranslation(attemptCtx, PacketTranslationModeDnsPump, packetConn, ptSettings)
+				packetConn, err = NewPacketTranslation(
+					context.WithoutCancel(attemptCtx),
+					PacketTranslationModeDnsPump,
+					packetConn,
+					ptSettings,
+				)
 				if err != nil {
 					return nil, err
 				}
 			default:
-				udpAddr, err = resolveEgressUDPAddr(attemptCtx, fmt.Sprintf("%s:%d", serverName, self.settings.H3Port))
+				udpAddr, err = self.clientStrategy.resolveControlUDPAddr(attemptCtx, fmt.Sprintf("%s:%d", serverName, self.settings.H3Port))
 				if err != nil {
 					return nil, err
 				}
@@ -2567,7 +2871,20 @@ func (self *PlatformTransport) runH3(
 			)
 
 			send := make(chan []byte, self.settings.TransportBufferSize)
-			receive := make(chan []byte, self.settings.TransportBufferSize)
+			// Stream-only H3 retains its historical bounded burst queue. Hybrid H3
+			// gives the existing bounded queue to DATAGRAM while the reliable stream
+			// route is unbuffered: its reader may retain exactly one already-read
+			// frame, so splitting lane metadata cannot double payload retention.
+			reliableReceiveBufferSize, unreliableReceiveBufferSize :=
+				platformH3ReceiveRouteBufferSizes(
+					self.settings.TransportBufferSize,
+					connStream.useH3Datagrams,
+				)
+			reliableReceive := make(chan []byte, reliableReceiveBufferSize)
+			var unreliableReceive chan []byte
+			if connStream.useH3Datagrams {
+				unreliableReceive = make(chan []byte, unreliableReceiveBufferSize)
+			}
 
 			drain := func(c chan []byte) {
 				for {
@@ -2615,7 +2932,24 @@ func (self *PlatformTransport) runH3(
 			if self.settings.SendRouteObserver != nil {
 				self.settings.SendRouteObserver(sendTransport, send, true)
 			}
-			self.routeManager.UpdateTransport(receiveTransport, []Route{receive})
+			self.routeManager.UpdateTransportWithProperties(
+				receiveTransport,
+				[]Route{reliableReceive},
+				TransferCarrierProperties{
+					ReceiveReliability: CarrierReliabilityReliable,
+				},
+			)
+			var unreliableReceiveTransport Transport
+			if unreliableReceive != nil {
+				unreliableReceiveTransport = newReceiveLaneTransport(receiveTransport)
+				self.routeManager.UpdateTransportWithProperties(
+					unreliableReceiveTransport,
+					[]Route{unreliableReceive},
+					TransferCarrierProperties{
+						ReceiveReliability: CarrierReliabilityUnreliable,
+					},
+				)
+			}
 			self.setRegistered(true)
 
 			defer func() {
@@ -2625,6 +2959,9 @@ func (self *PlatformTransport) runH3(
 					self.settings.SendRouteObserver(sendTransport, send, false)
 				}
 				self.routeManager.RemoveTransport(receiveTransport)
+				if unreliableReceiveTransport != nil {
+					self.routeManager.RemoveTransport(unreliableReceiveTransport)
+				}
 				if self.settings.afterRoutesRemovedForTest != nil {
 					self.settings.afterRoutesRemovedForTest()
 				}
@@ -2636,7 +2973,10 @@ func (self *PlatformTransport) runH3(
 				// Route removal and the worker join leave no producer that can
 				// enqueue after these deterministic pooled-message drains.
 				drain(send)
-				drain(receive)
+				drain(reliableReceive)
+				if unreliableReceive != nil {
+					drain(unreliableReceive)
+				}
 			}()
 			// Hybrid H3 dispatches the two physical lanes before either writer can
 			// block. The extra queue transfers pooled-message ownership under both
@@ -2900,10 +3240,15 @@ func (self *PlatformTransport) runH3(
 				}, handleCancel)
 			}
 
-			offerRoutedMessage := func(message []byte) bool {
+			offerRoutedMessage := func(
+				message []byte,
+				reliability CarrierReliability,
+				receive chan<- []byte,
+			) bool {
 				open, delivered := self.offerReceive(
 					handleCtx.Done(),
 					ptMode,
+					reliability,
 					receive,
 					message,
 				)
@@ -2929,7 +3274,10 @@ func (self *PlatformTransport) runH3(
 				// legitimately idle. QUIC's connection-level idle timeout still
 				// detects a dead peer, and closing the connection unblocks this read.
 				startConnectionWorker(func() {
-					defer handleCancel()
+					defer func() {
+						handleCancel()
+						close(reliableReceive)
+					}()
 					if err := stream.SetReadDeadline(time.Time{}); err != nil {
 						return
 					}
@@ -2940,7 +3288,11 @@ func (self *PlatformTransport) runH3(
 						}
 						if len(message) != 0 {
 							self.h3DatagramStats.RecordStreamReceived(len(message))
-							if !offerRoutedMessage(message) {
+							if !offerRoutedMessage(
+								message,
+								CarrierReliabilityReliable,
+								reliableReceive,
+							) {
 								return
 							}
 							continue
@@ -2957,7 +3309,11 @@ func (self *PlatformTransport) runH3(
 						self.settings.beforeReceiveWorkerCleanupForTest()
 					}
 					handleCancel()
-					close(receive)
+					if unreliableReceive != nil {
+						close(unreliableReceive)
+					} else {
+						close(reliableReceive)
+					}
 				}()
 
 				for {
@@ -2994,13 +3350,23 @@ func (self *PlatformTransport) runH3(
 							continue
 						}
 					}
-					if !offerRoutedMessage(message) {
+					reliability := CarrierReliabilityReliable
+					receive := (chan<- []byte)(reliableReceive)
+					if unreliableReceive != nil {
+						reliability = CarrierReliabilityUnreliable
+						receive = unreliableReceive
+					}
+					if !offerRoutedMessage(message, reliability, receive) {
 						return
 					}
 				}
 			}, func() {
 				handleCancel()
-				close(receive)
+				if unreliableReceive != nil {
+					close(unreliableReceive)
+				} else {
+					close(reliableReceive)
+				}
 			})
 
 			select {
