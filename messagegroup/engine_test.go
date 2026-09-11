@@ -21,6 +21,7 @@ import (
 	"testing"
 
 	"github.com/urnetwork/connect/mls"
+	"github.com/urnetwork/connect/mls/syntax"
 )
 
 // ---------------------------------------------------------------------------
@@ -956,6 +957,14 @@ func TestTheAdapterDrivesAGroupThroughAnEpoch(t *testing.T) {
 
 // NewKeyPackage answers a key package connect/mls itself will parse and admit, and persists the
 // two private halves the store carries.
+//
+// THE ADMIT IS INTO ANOTHER DEVICE'S GROUP AFTER j1 TASK 4, and the move is the finding rather
+// than a fixture convenience. This case used to add the engine's own key package to a group the
+// SAME engine founded, and that assertion goes RED on the commit that points the mint at
+// self.signer -- it was the only one of this package's 186 cases that did. It is re-pointed here,
+// where it keeps meaning exactly what it was written to mean: the encoding is one ProposeAdd
+// takes rather than merely some octets. The self-add it used to perform is now its own case below,
+// with the refusal asserted by name.
 func TestNewKeyPackageAnswersOneConnectMlsWillAdmit(t *testing.T) {
 	fixture := newTestEngine(t)
 	encoded, err := fixture.engine.NewKeyPackage()
@@ -969,12 +978,48 @@ func TestNewKeyPackageAnswersOneConnectMlsWillAdmit(t *testing.T) {
 		t.Errorf("the store holds %d key packages after one was minted, want 1: a key package published without its private halves stored is a Welcome nobody can open",
 			len(fixture.store.keyPackages))
 	}
-	// and the group admits it, which is the reading that says the encoding is the one
+	// and ANOTHER device's group admits it, which is the reading that says the encoding is the one
 	// ProposeAdd takes rather than merely some octets.
-	handle := fixture.createGroup(t, "admits")
+	admitting := newTestEngine(t)
+	handle := admitting.createGroup(t, "admits")
 	defer handle.Close()
 	if _, err := handle.ProposeAdd(encoded); err != nil {
-		t.Errorf("ProposeAdd over this engine's own key package: %v", err)
+		t.Errorf("ProposeAdd over another device's key package: %v", err)
+	}
+}
+
+// TestAnEngineAddingItsOwnKeyPackageToItsOwnGroupIsRefusedAtProposeAdd is the other half of
+// j1 task 4's fourth property, and the two are not one assertion in two moods: they are two
+// assertions over two different groups, and an earlier reading that stated them as one required
+// a self-add to succeed and to be refused two sentences apart.
+//
+// THE REFUSAL EXISTS ONLY UNDER THIS TASK. Before the mint was pointed at self.signer the engine
+// published leaves under a key it did not hold, so a self-add published a signature key the
+// group's own leaf did not carry and RFC 9420's ValSem101 saw no duplicate. It fires at
+// ProposeAdd and not at Commit, because mls validates the proposal list against its own
+// pre-commit tree.
+//
+// THE REFUSAL IS ASSERTED BY NAME. A case that accepted "some error" here would also pass over a
+// device with no leaf keys, which is a different defect with a different repair.
+func TestAnEngineAddingItsOwnKeyPackageToItsOwnGroupIsRefusedAtProposeAdd(t *testing.T) {
+	fixture := newTestEngine(t)
+	encoded, err := fixture.engine.NewKeyPackage()
+	if err != nil {
+		t.Fatalf("NewKeyPackage: %v", err)
+	}
+	handle := fixture.createGroup(t, "the-self-add")
+	defer handle.Close()
+
+	proposal, err := handle.ProposeAdd(encoded)
+	if !errorIs(err, mls.ErrAddDuplicateSignatureKey) {
+		t.Errorf("ProposeAdd over this engine's OWN key package answered %v, want mls.ErrAddDuplicateSignatureKey: after task 4 the leaf this device publishes and the leaf it founded under name one key, which is the whole point",
+			err)
+	}
+	if errorIs(err, ErrEngineLeafKeys) {
+		t.Errorf("the refusal reads as a leaf keys failure (%v); a gate that accepted any error here could not tell the duplicate signature key from a device with no leaf keys at all", err)
+	}
+	if proposal != nil {
+		t.Error("ProposeAdd answered a proposal beside its refusal")
 	}
 }
 
@@ -982,4 +1027,359 @@ func TestNewKeyPackageAnswersOneConnectMlsWillAdmit(t *testing.T) {
 // as a chain of unwraps.
 func errorIs(err error, want error) bool {
 	return errors.Is(err, want)
+}
+
+// ---------------------------------------------------------------------------
+// j1 task 4: the engine mints under its own signer
+// ---------------------------------------------------------------------------
+
+// engineLeafKeyOf decodes one leaf out of a handle's published ratchet tree and answers the
+// signature key it names and the signature over it.
+//
+// THIS IS THE ONLY ROUTE from package messagegroup to a leaf's signature_key, and naming the
+// wrong one is what the control below exists for. MemberAt answers
+// (leafIndex, identityPub, leafKeys, err) and DROPS mls.Member.SignatureKey at the seam, so a
+// gate that compared MemberAt's identityPub against this device's signer is comparing the
+// CREDENTIAL against the SIGNER -- two independent draws after this package's fixture repair --
+// and reports a key mismatch where there is none.
+func engineLeafKeyOf(t *testing.T, handle GroupHandle, at uint32) (signatureKey []byte, signature []byte) {
+	t.Helper()
+	snapshot, err := handle.RatchetTreeSnapshot()
+	if err != nil {
+		t.Fatalf("RatchetTreeSnapshot: %v", err)
+	}
+	tree, err := mls.UnmarshalRatchetTree(snapshot)
+	if err != nil {
+		t.Fatalf("UnmarshalRatchetTree: %v", err)
+	}
+	leaf := tree.Leaf(mls.LeafIndex(at))
+	if leaf == nil {
+		t.Fatalf("the published tree carries no leaf at %d", at)
+	}
+	return bytes.Clone(leaf.SignatureKey), bytes.Clone(leaf.Signature)
+}
+
+// engineKeyPackageLeafKeyOf decodes a published key package encoding and answers the signature key
+// its leaf names. It is door 1's route, and every name on it is exported.
+func engineKeyPackageLeafKeyOf(t *testing.T, encoded []byte) []byte {
+	t.Helper()
+	var kp mls.KeyPackage
+	if err := syntax.Unmarshal(encoded, &kp); err != nil {
+		t.Fatalf("decode the key package this engine published: %v", err)
+	}
+	return bytes.Clone(kp.LeafNode.SignatureKey)
+}
+
+// TestEveryLeafThisEngineMintsNamesTheDeviceSigner is j1 task 4's first property, over the doors
+// this seam has to an MLS leaf rather than over "the key package".
+//
+// CLAUSE A rests on nothing anybody has to rule: it is mls.JoinFromWelcome's own caller-material
+// gate read backwards. That gate compares the public half of a joiner's signing key against the
+// signature_key its published leaf names, BEFORE one octet of the Welcome is judged -- so a key
+// package whose leaf names a key this device cannot sign with is a key package no Welcome
+// addressed to it can ever be opened with. Clause A is the whole of what tasks 5 and 6 need.
+//
+// CLAUSE B rests on J1-1, which this plan files as UNRULED: MASTER section 5.2 calls device_sig
+// "the MLS leaf signature key" and does not say in as many words that EVERY leaf this device
+// publishes -- including a KeyPackage's, which RFC 9420 permits to carry a fresh key per
+// advertisement -- names it. The wide reading is taken here, and what falls under the narrow one
+// is clause B itself, this package's fixture repair, the duplicate-signature-key case below, and
+// task 5's assembly.
+//
+// THE CLASS IS THE DOORS AND IT IS FOUR, derived and printed rather than asserted at a number:
+// GroupEngine.NewKeyPackage, GroupEngine.CreateGroup, GroupHandle.ProposeUpdate and
+// GroupHandle.Commit are the four sites at which this device's code mints or re-signs an MLS
+// leaf. Three of the four are OBSERVABLE from this package and all three are driven; the fourth,
+// ProposeUpdate, is printed as UNOBSERVED with its reason. The fifth door of section 6's own
+// method set -- JoinFromWelcome -- is the COMPLEMENT: its leaf comes off a peer's ratchet tree
+// and it mints none, which is why it is named and excluded here and covered by the two-engine
+// join instead.
+func TestEveryLeafThisEngineMintsNamesTheDeviceSigner(t *testing.T) {
+	fixture := newTestEngine(t)
+
+	// THE CONTROL ON THE FIXTURE, not on the engine. If the credential identity and the signer's
+	// public half are one draw, then "the leaf names the device signer" and "the leaf names the
+	// credential" are the same program and this gate cannot fail for the reason it exists.
+	if bytes.Equal(fixture.signerPub, fixture.identityPub) {
+		t.Fatalf("this device's credential identity and its signer's public half are the same %d octets, so the comparison below is equal by construction and observes nothing",
+			len(fixture.signerPub))
+	}
+
+	// DOOR 1 -- GroupEngine.NewKeyPackage, through mls.NewKeyPackageWithSigner -> NewLeafNode.
+	// The method answers the encoding; the route is syntax.Unmarshal and kp.LeafNode.SignatureKey.
+	encoded, err := fixture.engine.NewKeyPackage()
+	if err != nil {
+		t.Fatalf("NewKeyPackage: %v", err)
+	}
+	if published := engineKeyPackageLeafKeyOf(t, encoded); !bytes.Equal(published, fixture.signerPub) {
+		t.Errorf("door 1, GroupEngine.NewKeyPackage: the published leaf names %x as its signature_key and this device signs with %x",
+			published, fixture.signerPub)
+	}
+
+	// DOOR 2 -- GroupEngine.CreateGroup, through mls.NewGroup -> NewLeafNode.
+	handle := fixture.createGroup(t, "the-doors-of-this-engine")
+	defer handle.Close()
+	founding, foundingSignature := engineLeafKeyOf(t, handle, handle.OwnLeafIndex())
+	if !bytes.Equal(founding, fixture.signerPub) {
+		t.Errorf("door 2, GroupEngine.CreateGroup: the founding leaf names %x as its signature_key and this device signs with %x",
+			founding, fixture.signerPub)
+	}
+
+	// DOOR 4 -- GroupHandle.Commit, through mls's own CreateUpdatePathSecrets -> leaf.Sign, which
+	// is a SECOND, INDEPENDENT mls site. An empty proposal list is PathRequired, so Commit(nil) on
+	// this one member group populates the update path and re-signs leaf 0.
+	if _, _, _, err := handle.Commit(nil); err != nil {
+		t.Fatalf("Commit(nil), which is door 4's own driver: %v", err)
+	}
+	if err := handle.MergePendingCommit(); err != nil {
+		t.Fatalf("MergePendingCommit: %v", err)
+	}
+	committed, committedSignature := engineLeafKeyOf(t, handle, handle.OwnLeafIndex())
+	// the control on door 4, and without it a gate that read the tree BEFORE the merge passes a
+	// committer that re-signed under a key of its own: the leaf it read was never re-signed.
+	if bytes.Equal(committedSignature, foundingSignature) {
+		t.Errorf("door 4, GroupHandle.Commit: leaf %d carries the FOUNDING signature %x after a commit that merged, so this door was never driven and the assertion below reads door 2's leaf a second time",
+			handle.OwnLeafIndex(), foundingSignature)
+	}
+	if !bytes.Equal(committed, fixture.signerPub) {
+		t.Errorf("door 4, GroupHandle.Commit: the re-signed leaf names %x as its signature_key and this device signs with %x",
+			committed, fixture.signerPub)
+	}
+
+	// DOOR 3 -- GroupHandle.ProposeUpdate -- PRINTED AS UNOBSERVED rather than asserted.
+	t.Logf("door 3, GroupHandle.ProposeUpdate: UNOBSERVED. The method answers a serialized MLSMessage carrying an RFC 9420 section 6.3 PrivateMessage, so the leaf it re-signs is inside the AEAD, and the proposer cannot commit its own update to get that leaf into a tree -- mls refuses a committer that covers its own update. What is KNOWN without observing it is an argument and not an observation: mls clones the caller's signer into every group, so this door keeps working after the engine's own key is destroyed, which is exactly why task 5's erase is invisible from a handle. Owed: an UNOBSERVED entry, or a section 6 amendment that lets a caller read its own leaf")
+	t.Logf("the complement, printed: GroupEngine.JoinFromWelcome is the one door of the five whose leaf does not come out of this device -- it comes off a peer's ratchet tree and this device mints none -- and it is covered by the two-engine join rather than here")
+}
+
+// TestNewKeyPackageErasesEveryPrivateHalfItMintedBeforeItReturns holds j1 task 4's second and
+// fifth properties, which are the MINT half of one aliasing rule: a method that erases a value
+// aliasing self.signer destroys the device, and a method that drops the values un-erased leaves
+// three private keys in the heap for the collector to move around. Either alone is a defect and
+// the pair is the only safe state.
+//
+// THE TWO ROUTES ARE DIFFERENT AND NEITHER ALONE IS THE PROPERTY.
+//
+//   - THE ERASE clause -- the two HPKE halves are zero when the method returns -- is observed
+//     through the ALIAS, recordingAliasStore, which retains the caller's slice headers. It cannot
+//     be observed through memoryStateStore: that store COPIES at call time, so its entry is
+//     byte-identical under a correct body, under a body that erases neither half and under one
+//     that erases only the init half. Measured, and it is the reason the instrument exists.
+//   - THE ORDERING clause -- the erase happens AFTER PutKeyPackage returns -- is observed through
+//     the COPY, memoryStateStore's own map, which holds the real octets under a correct body and
+//     32 zeros under a body that erased first. The alias cannot see that one.
+//
+// The third secret, the key package's own clone of device_sig, has NO RUNTIME ROUTE from this
+// package: the value is a local of the method and never leaves it. That clause is held over the
+// method's own source, and the route is named rather than left implied.
+func TestNewKeyPackageErasesEveryPrivateHalfItMintedBeforeItReturns(t *testing.T) {
+	// (1) THE ERASE CLAUSE, through the alias.
+	fixture, aliasing := newRecordingEngine(t)
+	if _, err := fixture.engine.NewKeyPackage(); err != nil {
+		t.Fatalf("NewKeyPackage over the aliasing instrument: %v", err)
+	}
+	if len(aliasing.initAlias) == 0 || len(aliasing.encAlias) == 0 {
+		t.Fatalf("the instrument retained %d init octets and %d encryption octets, so this clause observes nothing",
+			len(aliasing.initAlias), len(aliasing.encAlias))
+	}
+	for _, held := range []struct {
+		what  string
+		array []byte
+	}{
+		{what: "the init private half", array: aliasing.initAlias},
+		{what: "the encryption private half", array: aliasing.encAlias},
+	} {
+		for _, octet := range held.array {
+			if octet != 0 {
+				t.Errorf("%s is still in the heap after NewKeyPackage returned: %x", held.what, held.array)
+				break
+			}
+		}
+	}
+
+	// (2) THE ORDERING CLAUSE, through the copy. The store's own entry must hold the REAL octets:
+	// a body that erased before the put leaves the store holding 32 zeros where the init private
+	// belongs, and every Welcome addressed to this device is then unopenable -- with the whole
+	// suite otherwise green, because nothing joins in this task.
+	copied := newTestEngine(t)
+	if _, err := copied.engine.NewKeyPackage(); err != nil {
+		t.Fatalf("NewKeyPackage over the copying store: %v", err)
+	}
+	if len(copied.store.keyPackages) != 1 {
+		t.Fatalf("the store holds %d key packages, want 1", len(copied.store.keyPackages))
+	}
+	for _, entry := range copied.store.keyPackages {
+		for at, what := range []string{"the encoding", "the init private half", "the encryption private half"} {
+			zero := true
+			for _, octet := range entry[at] {
+				if octet != 0 {
+					zero = false
+					break
+				}
+			}
+			if len(entry[at]) == 0 || zero {
+				t.Errorf("the store holds %d octets of %s and every one of them is zero; the erase ran BEFORE the put and this device published a key package nobody can address",
+					len(entry[at]), what)
+			}
+		}
+	}
+
+	// (3) ERASING DOES NOT DISTURB self.signer. A second mint on the same engine must still name
+	// the same key, which is false the moment the engine's own signer has been zeroed -- and
+	// nothing refuses an all-zero seed: it derives a perfectly valid public key.
+	second, err := copied.engine.NewKeyPackage()
+	if err != nil {
+		t.Fatalf("a second NewKeyPackage on the same engine: %v", err)
+	}
+	if published := engineKeyPackageLeafKeyOf(t, second); !bytes.Equal(published, copied.signerPub) {
+		t.Errorf("the engine's SECOND key package names %x and this device signs with %x; the first mint's erase reached self.signer",
+			published, copied.signerPub)
+	}
+
+	// (4) THE THIRD SECRET, over the method's own source, because no runtime route from this
+	// package reaches it. The minted key package holds a COPY of device_sig on an unexported
+	// field, the value is a local, and a method that returned the encoding and dropped it leaves
+	// the device's long term signing key in the heap.
+	erases := engineNewKeyPackageErasesInSource(t)
+	t.Logf("(*connectMlsEngine).NewKeyPackage reaches these erases in its own source: %v", erases)
+	for _, owed := range []string{"keyPackage.Zeroize", "zeroize(initPrivate)", "zeroize(encryptPrivate)"} {
+		if !slices.Contains(erases, owed) {
+			t.Errorf("(*connectMlsEngine).NewKeyPackage does not reach %s; it holds three private halves and drops every one this method does not erase",
+				owed)
+		}
+	}
+}
+
+// engineNewKeyPackageErasesInSource reads this package's own production source and answers, for
+// (*connectMlsEngine).NewKeyPackage, the erase calls its body makes -- rendered as callee plus
+// argument so the gate can name WHICH array is missing rather than reporting "an erase is
+// missing".
+func engineNewKeyPackageErasesInSource(t *testing.T) []string {
+	t.Helper()
+	fileSet, sources := messagegroupProductionSources(t)
+	found := []string{}
+	seen := false
+	for _, source := range sources {
+		for _, declaration := range source.parsed.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || function.Name.Name != "NewKeyPackage" || function.Recv == nil {
+				continue
+			}
+			seen = true
+			ast.Inspect(function.Body, func(node ast.Node) bool {
+				call, isCall := node.(*ast.CallExpr)
+				if !isCall {
+					return true
+				}
+				rendered := &strings.Builder{}
+				if err := printer.Fprint(rendered, fileSet, call); err != nil {
+					t.Fatalf("render a call of %s: %v", function.Name.Name, err)
+				}
+				text := rendered.String()
+				if strings.HasPrefix(text, "zeroize(") || strings.HasSuffix(text, ".Zeroize()") {
+					found = append(found, strings.TrimSuffix(text, "()"))
+				}
+				return true
+			})
+		}
+	}
+	if !seen {
+		t.Fatal("no production method of this package is named NewKeyPackage, so this clause read nothing")
+	}
+	slices.Sort(found)
+	return found
+}
+
+// TestWhatReachesTheStoreWhenAKeyPackageIsPublishedIsFourValuesAndNothingElse is j1 task 4's
+// third property, and it has two halves that do not share one route.
+//
+// THE CONTENT half -- the ref is KeyPackage.Ref over the encoding, and the encoding is the octets
+// the method returned -- is readable off the landed fixture's own map. THE ARITY half -- "and
+// nothing else" -- is not: a map records no call, so a body that persisted a fifth value through
+// a SECOND store method leaves a keyPackages entry that still looks exactly right. That half
+// reads the call record.
+func TestWhatReachesTheStoreWhenAKeyPackageIsPublishedIsFourValuesAndNothingElse(t *testing.T) {
+	fixture, recording := newRecordingEngine(t)
+	encoded, err := fixture.engine.NewKeyPackage()
+	if err != nil {
+		t.Fatalf("NewKeyPackage: %v", err)
+	}
+
+	puts := recording.callsTo("PutKeyPackage")
+	if len(puts) != 1 {
+		t.Fatalf("publishing one key package drove PutKeyPackage %d times", len(puts))
+	}
+	if got := len(puts[0].args); got != 4 {
+		t.Fatalf("PutKeyPackage was handed %d byte arguments, want 4", got)
+	}
+	// the CONTENT: the encoding the store took is the encoding the caller got, and the ref is
+	// KeyPackage.Ref over it rather than over anything smaller.
+	if !bytes.Equal(puts[0].args[1], encoded) {
+		t.Errorf("the store took %d octets of encoding and the method answered %d",
+			len(puts[0].args[1]), len(encoded))
+	}
+	var kp mls.KeyPackage
+	if err := syntax.Unmarshal(encoded, &kp); err != nil {
+		t.Fatalf("decode the published key package: %v", err)
+	}
+	ref, err := kp.Ref(fixture.crypto)
+	if err != nil {
+		t.Fatalf("KeyPackage.Ref: %v", err)
+	}
+	if !bytes.Equal(puts[0].args[0], ref) {
+		t.Errorf("the store keyed this key package under %x and KeyPackage.Ref over the WHOLE encoding is %x; a ref taken over the leaf alone is not the value a Welcome names",
+			puts[0].args[0], ref)
+	}
+	if len(puts[0].args[2]) == 0 || len(puts[0].args[3]) == 0 {
+		t.Errorf("the store took %d init octets and %d encryption octets",
+			len(puts[0].args[2]), len(puts[0].args[3]))
+	}
+
+	// THE ARITY HALF. Publishing a key package drives PutKeyPackage and nothing else: the set of
+	// things this method persists that it did not persist before task 4 is EMPTY, deliberately,
+	// and device_sig is in the keyfile rather than in the store.
+	called := recording.methodsCalled()
+	if !slices.Equal(called, []string{"PutKeyPackage"}) {
+		t.Errorf("publishing one key package drove %v; a fifth value persisted through a second store method is Option A arriving by the back door, and the map this package's other store holds would still look right",
+			called)
+	}
+}
+
+// TestTheEnginesOwnDocumentationNoLongerNamesTheJoinBlocker is a documentation assertion made
+// over the package's own source, in the shape this package's existing AST gates use.
+//
+// engine.go's NewKeyPackage paragraph used to state the CAUSE of the join refusal -- that
+// mls.NewKeyPackage keeps the signature private half on an unexported field and
+// StateStore.TakeKeyPackage does not carry it, so nothing outside package mls can assemble the
+// join material. After task 4 that sentence is false in the file that publishes it, and a
+// sentence a later reader would trust and re-derive the wrong fix from is the same defect class
+// as a sentinel naming an impossibility that is no longer impossible.
+func TestTheEnginesOwnDocumentationNoLongerNamesTheJoinBlocker(t *testing.T) {
+	_, sources := messagegroupProductionSources(t)
+	found := []string{}
+	seen := false
+	for _, source := range sources {
+		for _, declaration := range source.parsed.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || function.Name.Name != "NewKeyPackage" || function.Recv == nil {
+				continue
+			}
+			seen = true
+			if function.Doc == nil {
+				t.Errorf("%s documents its NewKeyPackage with nothing", source.path)
+				continue
+			}
+			for _, line := range function.Doc.List {
+				if strings.Contains(line.Text, "TakeKeyPackage") {
+					found = append(found, strings.TrimSpace(line.Text))
+				}
+			}
+		}
+	}
+	if !seen {
+		t.Fatal("no production method of this package is named NewKeyPackage, so this gate read nothing")
+	}
+	if len(found) != 0 {
+		t.Errorf("this engine's NewKeyPackage still documents StateStore.TakeKeyPackage as the reason a join is impossible: %v. After task 4 the leaf names device_sig and the material a join needs is assemblable",
+			found)
+	}
 }

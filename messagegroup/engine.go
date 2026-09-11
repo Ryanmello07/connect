@@ -226,13 +226,31 @@ func (self *connectMlsEngine) Suite() uint16 {
 // NewKeyPackage mints and publishes one key package for this device, persisting the two private
 // halves against its reference so that whoever admits this device can be answered.
 //
-// THE THIRD PRIVATE HALF IS NOT REACHABLE AND THAT IS WHY JoinFromWelcome REFUSES.
-// mls.NewKeyPackage draws its own signature key pair and keeps the private half on an unexported
-// field, and StateStore.PutKeyPackage carries only the init and encryption halves, so nothing
-// outside package mls can assemble the mls.JoinKeyMaterial a Welcome join requires.
-// JoinFromWelcome says so with a typed refusal rather than working around it: the two ways around
-// are a second assembly of KeyPackageTBS and a second spelling of its signature label, and both
-// are defect classes this tree has already paid for.
+// THE LEAF NAMES device_sig, WHICH IS THE SAME KEY THIS ENGINE'S FOUNDING LEAVES NAME. That is
+// what mls.NewKeyPackageWithSigner buys and it is the whole of why a join is possible at all:
+// mls.JoinFromWelcome's caller-material gate compares the public half of the signing key a joiner
+// holds against the signature_key its published leaf names, before one octet of the Welcome is
+// judged, so a key package whose leaf named a key this device cannot sign with is a key package
+// no Welcome addressed to it could ever be opened with. Before this, mls.NewKeyPackage drew its
+// own signature key pair and the device published leaves under a key it did not hold, while
+// founding groups under one it did -- one device, two identities, and nothing in the protocol that
+// would ever report it.
+//
+// WHAT REACHES THE STORE IS UNCHANGED: the ref, the encoding, the init private and the encryption
+// private. The signature key is NOT persisted here and the set of things this method persists that
+// it did not persist before is empty: device_sig lives in the keyfile, per Spec A section 8.1, and
+// PutKeyPackage still takes four arguments.
+//
+// ALL THREE PRIVATE HALVES ARE ERASED BEFORE THIS RETURNS, and each for its own reason. The key
+// package holds a COPY of device_sig on its unexported seed -- the constructor clones, so this
+// erase reaches the copy and never self.signer -- and a method that returned the encoding and
+// dropped the value would leave the device's long term signing key in the heap for the collector
+// to move around. The two HPKE halves are the ones mls.JoinKeyMaterial's own header names FIRST:
+// the init key opens every Welcome addressed to this key package and the encryption key is this
+// member's leaf key for as long as it holds that leaf. PutKeyPackage COPIES them, so erasing
+// afterwards costs the store nothing -- and the erases are deferred rather than written before the
+// put for exactly that reason: erased first, the store would hold zeros where the init private
+// belongs and every Welcome addressed here would be unopenable.
 func (self *connectMlsEngine) NewKeyPackage() ([]byte, error) {
 	leafKeys, err := mls.ParseLeafKeysExtension(self.leafKeys)
 	if err != nil {
@@ -242,11 +260,17 @@ func (self *connectMlsEngine) NewKeyPackage() ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrEngineLeafKeys, err)
 	}
-	keyPackage, initPrivate, encryptPrivate, err := mls.NewKeyPackage(self.crypto, self.crypto.Suite(),
-		self.cred, engineCapabilities(), []mls.Extension{leafKeysExtension})
+	keyPackage, initPrivate, encryptPrivate, err := mls.NewKeyPackageWithSigner(self.crypto,
+		self.crypto.Suite(), self.signer, self.cred, engineCapabilities(),
+		[]mls.Extension{leafKeysExtension})
 	if err != nil {
 		return nil, err
 	}
+	// AFTER the put, never before: see the header. Zeroize reaches the key package's own copy of
+	// the seed and nothing else, and the two locals are this method's own.
+	defer keyPackage.Zeroize()
+	defer zeroize(initPrivate)
+	defer zeroize(encryptPrivate)
 	encoded, err := syntax.Marshal(keyPackage)
 	if err != nil {
 		return nil, err

@@ -24,6 +24,8 @@ package messagegroup
 import (
 	"bytes"
 	"fmt"
+	"maps"
+	"slices"
 	"sync"
 	"testing"
 
@@ -125,6 +127,14 @@ type testEngine struct {
 	store       *memoryStateStore
 	identityPub []byte
 	leafKeys    []byte
+	// THE PUBLIC HALF OF THE KEY THIS DEVICE SIGNS WITH, which is a different value from
+	// identityPub after this fixture's own repair below. Without it a gate asserting "the leaf
+	// names the device signer" has nothing to compare the leaf against: testEngine retained the
+	// credential identity and neither the signer nor its public half.
+	signerPub []byte
+	// the store the engine was actually built over, which is memoryStateStore for every fixture
+	// but the ones that hand it an observation instrument.
+	outerStore mls.StateStore
 }
 
 // newTestEngine builds one device's engine, with a real signature key pair and a real X-Wing
@@ -141,11 +151,33 @@ func newTestEngine(t *testing.T) *testEngine {
 // buildTestEngine is newTestEngine without a *testing.T, because the one way ladder probes in
 // recordkey_test.go are plain functions and still have to run on the real thing.
 func buildTestEngine() (*testEngine, error) {
+	memory := newMemoryStateStore()
+	return buildTestEngineOver(memory, memory)
+}
+
+// buildTestEngineOver is buildTestEngine with the store chosen by the caller, so that a gate can
+// put an observation instrument where the engine's store goes without replacing the one every
+// other case runs on. memory is the same store unless the instrument wraps one.
+func buildTestEngineOver(store mls.StateStore, memory *memoryStateStore) (*testEngine, error) {
 	crypto, err := mls.NewCryptoProvider(mls.CipherSuiteX25519ChaCha20Sha256Ed25519)
 	if err != nil {
 		return nil, err
 	}
-	signer, identityPub, err := crypto.SignatureKeyPair()
+	signer, signerPub, err := crypto.SignatureKeyPair()
+	if err != nil {
+		return nil, err
+	}
+	// A SECOND, INDEPENDENT DRAW FOR THE CREDENTIAL IDENTITY, and it is the smaller half of j1
+	// task 4 that matters most. This fixture used to draw signer and identityPub from ONE
+	// SignatureKeyPair call and pass mls.BasicCredential(identityPub) -- so the device's credential
+	// identity WAS its signer's public half, and under that fixture the assertion "the leaf names
+	// the device signer" and the assertion "the leaf names the credential" are the same program. A
+	// gate written over it cannot fail for the reason task 4 exists.
+	//
+	// Blast radius, measured: identityPub appears on 14 lines of this package's tests, and the only
+	// one that compares the two is engine_test.go's MemberAt(0) case, which reads
+	// Credential.Identity and stays true.
+	_, identityPub, err := crypto.SignatureKeyPair()
 	if err != nil {
 		return nil, err
 	}
@@ -160,7 +192,6 @@ func buildTestEngine() (*testEngine, error) {
 	if err != nil {
 		return nil, err
 	}
-	store := newMemoryStateStore()
 	engine, err := NewConnectMlsEngine(crypto, store, signer,
 		mls.BasicCredential(identityPub), leafKeys.ExtensionData)
 	if err != nil {
@@ -169,10 +200,144 @@ func buildTestEngine() (*testEngine, error) {
 	return &testEngine{
 		engine:      engine,
 		crypto:      crypto,
-		store:       store,
+		store:       memory,
 		identityPub: append([]byte(nil), identityPub...),
 		leafKeys:    leafKeys.ExtensionData,
+		signerPub:   append([]byte(nil), signerPub...),
+		outerStore:  store,
 	}, nil
+}
+
+// ---------------------------------------------------------------------------
+// the two observation instruments j1 task 4 builds, and neither is a store
+// ---------------------------------------------------------------------------
+
+// storeCall is one call this device's engine made into its store: the method, and a COPY of every
+// byte argument it was handed, in order.
+//
+// The arity half of "what reaches the store is unchanged" reads this and not the map.
+// memoryStateStore holds two maps and records nothing, so a body that persisted a FIFTH value
+// through a second store method leaves a keyPackages entry that still looks exactly right.
+type storeCall struct {
+	method string
+	args   [][]byte
+}
+
+// recordingAliasStore is mls.StateStore as an OBSERVATION INSTRUMENT and not as a store.
+//
+// It does two things memoryStateStore does not, and each answers a half of a property no other
+// route reaches:
+//
+//   - PutKeyPackage RETAINS the caller's slice headers rather than copying them. That is the only
+//     route to "the two HPKE private halves are erased before NewKeyPackage returns": measured,
+//     memoryStateStore's own entry is byte-identical under a correct body, under a body that
+//     erases NEITHER and under one that erases only the init half, because it copies at call time
+//     and nothing the engine does afterwards changes one octet of it. An erase is observable only
+//     through an ALIAS of the array erased, and wherever the far side copies, the property must
+//     build the alias or it is measuring a photograph.
+//   - it records every call, so "and NOTHING ELSE" is a question that can be asked at all.
+//
+// IT IS NOT A STORE AND MUST NOT BECOME ONE. A production store that aliased a caller's array is
+// exactly the defect the erase discipline forbids, and memoryStateStore must keep copying: the
+// join's put-back is a statement about the store's OWN arrays.
+//
+// The methods are written out rather than promoted from an embedded mls.StateStore on purpose: a
+// method added to that interface would arrive here already implemented, recording nothing, and
+// quietly narrowing what every gate reading this can see.
+type recordingAliasStore struct {
+	inner     *memoryStateStore
+	calls     []storeCall
+	initAlias []byte
+	encAlias  []byte
+}
+
+var _ mls.StateStore = (*recordingAliasStore)(nil)
+
+func newRecordingAliasStore() *recordingAliasStore {
+	return &recordingAliasStore{inner: newMemoryStateStore()}
+}
+
+func (self *recordingAliasStore) recordStoreCall(method string, args ...[]byte) {
+	copies := [][]byte{}
+	for _, argument := range args {
+		copies = append(copies, append([]byte(nil), argument...))
+	}
+	self.calls = append(self.calls, storeCall{method: method, args: copies})
+}
+
+// callsTo answers every call this store took of one method, in order.
+func (self *recordingAliasStore) callsTo(method string) []storeCall {
+	found := []storeCall{}
+	for _, call := range self.calls {
+		if call.method == method {
+			found = append(found, call)
+		}
+	}
+	return found
+}
+
+// methodsCalled answers the distinct method names this store was driven through, sorted.
+func (self *recordingAliasStore) methodsCalled() []string {
+	seen := map[string]bool{}
+	for _, call := range self.calls {
+		seen[call.method] = true
+	}
+	names := slices.Sorted(maps.Keys(seen))
+	return names
+}
+
+func (self *recordingAliasStore) PutGroupState(groupId []byte, epoch uint64, state []byte) error {
+	self.recordStoreCall("PutGroupState", groupId, state)
+	return self.inner.PutGroupState(groupId, epoch, state)
+}
+
+func (self *recordingAliasStore) GetGroupState(groupId []byte, epoch uint64) ([]byte, error) {
+	self.recordStoreCall("GetGroupState", groupId)
+	return self.inner.GetGroupState(groupId, epoch)
+}
+
+func (self *recordingAliasStore) DeleteGroupStateBefore(groupId []byte, epoch uint64) error {
+	self.recordStoreCall("DeleteGroupStateBefore", groupId)
+	return self.inner.DeleteGroupStateBefore(groupId, epoch)
+}
+
+func (self *recordingAliasStore) PutPrivateKey(pub []byte, priv []byte) error {
+	self.recordStoreCall("PutPrivateKey", pub, priv)
+	return self.inner.PutPrivateKey(pub, priv)
+}
+
+func (self *recordingAliasStore) GetPrivateKey(pub []byte) ([]byte, error) {
+	self.recordStoreCall("GetPrivateKey", pub)
+	return self.inner.GetPrivateKey(pub)
+}
+
+func (self *recordingAliasStore) DeletePrivateKey(pub []byte) error {
+	self.recordStoreCall("DeletePrivateKey", pub)
+	return self.inner.DeletePrivateKey(pub)
+}
+
+func (self *recordingAliasStore) PutKeyPackage(ref []byte, kp []byte, initPriv []byte, encPriv []byte) error {
+	self.recordStoreCall("PutKeyPackage", ref, kp, initPriv, encPriv)
+	// THE SLICE HEADERS, not clones. This is the instrument.
+	self.initAlias = initPriv
+	self.encAlias = encPriv
+	return self.inner.PutKeyPackage(ref, kp, initPriv, encPriv)
+}
+
+func (self *recordingAliasStore) TakeKeyPackage(ref []byte) ([]byte, []byte, []byte, error) {
+	self.recordStoreCall("TakeKeyPackage", ref)
+	return self.inner.TakeKeyPackage(ref)
+}
+
+// newRecordingEngine is one device whose engine writes into the instrument above.
+func newRecordingEngine(t *testing.T) (*testEngine, *recordingAliasStore) {
+	t.Helper()
+	store := newRecordingAliasStore()
+	engine, err := buildTestEngineOver(store, store.inner)
+	if err != nil {
+		t.Fatalf("build the engine this gate observes: %v", err)
+	}
+	return engine, store
 }
 
 // createGroup founds a group whose id is thirty two octets, which is the width a record header
