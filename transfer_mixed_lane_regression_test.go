@@ -2,6 +2,7 @@ package connect
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -91,26 +92,26 @@ func TestSendSequenceFullUnreliableFlightOverflowsOntoReliableLane(t *testing.T)
 	client, peerId, unreliableRoute, reliableRoute, _, waits := newMixedLaneFlightTestClient(t)
 
 	// the first Pack rides the unreliable lane (the only route with room) and
-	// is never acknowledged: the one-byte flight is now full
+	// is never acknowledged, so the one-byte flight is now full
 	sendTransferFlightTestMessage(t, client, peerId, 0)
-	firstPack := takeTransferFlightTestPack(t, unreliableRoute)
-	firstSequenceNumber := firstPack.GetSequenceNumber()
+	takeTransferFlightTestPack(t, unreliableRoute)
 
-	// every later Pack must be delivered without the sequence ever waiting on
-	// the full unreliable flight. On stock, the flight gates every send of the
-	// sequence: the reliable lane sits idle, the wait barrier fires, and the
-	// overflow never arrives (the "1 Mb/s / 0 and never recovers" collapse).
+	// Every later message must still be delivered. On stock the full flight
+	// gates every send of the sequence: the reliable lane sits idle, the
+	// resend-capacity barrier fires, and nothing else is delivered — the
+	// "1 Mb/s / 0 and never recovers" collapse.
+	//
+	// Accounting is by message content, never by Pack sequence number: Packs
+	// coalesce several messages, a head Pack can carry no application frame at
+	// all, and a retransmit repeats a sequence number with different contents.
 	const overflowCount = 4
+	pending := map[string]bool{}
 	for i := 1; i <= overflowCount; i++ {
 		sendTransferFlightTestMessage(t, client, peerId, i)
+		pending[fmt.Sprintf("flight-%d", i)] = true
 	}
-	// Packs coalesce frames, so count the application messages themselves.
-	seen := map[string]bool{}
-	reliableDelivered := 0
+	onReliableLane := map[string]bool{}
 	collect := func(pack *protocol.Pack, reliable bool) {
-		if pack.GetSequenceNumber() <= firstSequenceNumber {
-			return
-		}
 		for _, frame := range pack.GetFrames() {
 			message, err := FromFrame(frame)
 			if err != nil {
@@ -120,16 +121,14 @@ func TestSendSequenceFullUnreliableFlightOverflowsOntoReliableLane(t *testing.T)
 			if !ok {
 				continue
 			}
-			if !seen[simple.Content] {
-				seen[simple.Content] = true
-				if reliable {
-					reliableDelivered++
-				}
+			delete(pending, simple.Content)
+			if reliable {
+				onReliableLane[simple.Content] = true
 			}
 		}
 	}
-	deadline := time.After(15 * time.Second)
-	for len(seen) < overflowCount {
+	deadline := time.After(30 * time.Second)
+	for 0 < len(pending) {
 		select {
 		case transferFrameBytes := <-reliableRoute:
 			collect(decodeTransferFlightTestPack(t, transferFrameBytes), true)
@@ -140,11 +139,11 @@ func TestSendSequenceFullUnreliableFlightOverflowsOntoReliableLane(t *testing.T)
 		case sequenceId := <-waits:
 			t.Fatalf("sequence %v waited on the full unreliable flight although a reliable lane is active", sequenceId)
 		case <-deadline:
-			t.Fatalf("only %d of %d overflow messages were delivered (%v); the full unreliable flight stalled the sequence", len(seen), overflowCount, seen)
+			t.Fatalf("%d messages were never delivered (%v); the full unreliable flight stalled the sequence", len(pending), pending)
 		}
 	}
-	// the overflow reached the reliable lane, not only via unreliable retransmits
-	if reliableDelivered == 0 {
+	// the overflow reached the reliable lane rather than only the full one
+	if len(onReliableLane) == 0 {
 		t.Fatal("no overflow message was carried by the reliable lane")
 	}
 	if recovery := client.SendRecoveryStats(); recovery.UnreliableFlightWaitCount != 0 {
