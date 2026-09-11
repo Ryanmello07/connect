@@ -197,3 +197,162 @@ func TestTheJoinLeavesThisDeviceAndItsNewHandleAbleToWork(t *testing.T) {
 	t.Logf("the device signs with %x after a join and a second key package; its joined handle sealed a record the founder verified, and opened the founder's next commit into epoch %d",
 		fixture.joiner.signerPub, joined.Epoch())
 }
+
+// TestTheFounderSurvivesFoundingAndClosingItsOwnGroup is the FOURTH member of the class the pin
+// above stands over three of, and it is a clause rather than a copy because the measurement said so.
+//
+// HOW THE FOURTH WAS FOUND, and it was not by reading the join path again. The class was enumerated
+// from THIS side: every connect/mls entry point reached from this package's fourteen non-test files,
+// intersected with the destinations connect/mls retains and with the twelve erased field names
+// mls/erased_field_alias_test.go derives. Four members came out of that, and the pin above stands
+// over three -- all three on the JOIN path, because the join is where the coupling was noticed.
+// CreateGroup is the fourth: it hands self.signer to mls.NewGroup with no defensive copy of its own,
+// and nothing in either package failed if the far side stopped cloning it.
+//
+// MEASURED BEFORE ANYTHING WAS CHANGED, because "there is no copy at the call site" and "the array
+// is retained" are different claims and only the second is a defect. mls/group.go:668 fills the
+// founded group's signer with SignaturePrivateKey(cloneBytes(signer)). THE FOUNDER PATH IS SAFE
+// TODAY -- by the same clone discipline this pin exists to defend, which is exactly why what it
+// needs is a clause and not a copy. A defensive copy added here would let this device survive a
+// NewGroup that had stopped cloning, and surviving that is the one thing this clause is for.
+//
+// WHAT DRIVES THE ERASE, so that this observes something rather than asserting into the air.
+// (*Group).Close calls zeroizeSecret(self.signer) at mls/group.go:946, over a field its own comment
+// describes as "storage this group DECLARES rather than storage it points at ... NewGroup clones the
+// caller's signing key ... so the erase reaches nothing the caller is still holding". That sentence
+// is the coupling written down in the far side's own words, and until this test existed nothing held
+// it -- every fixture in this package that founds a group closes it inside a t.Cleanup, which runs
+// after the last assertion of the case that registered it. A group closed there is a group whose
+// erase no clause ever reads the far side of.
+//
+// R7, WHICH IS WHY THE ORDER IS FOUND, THEN CLOSE, THEN READ. An erase is observable only through an
+// ALIAS of the array in question. Clause 1 holds the engine's own signer array and reads it
+// directly, which is that alias. Clause 2 drives a door AFTER the close and lets the comparison be a
+// public half captured at construction -- a value no later erase can move, and therefore not a
+// photograph of the thing under test.
+func TestTheFounderSurvivesFoundingAndClosingItsOwnGroup(t *testing.T) {
+	founder := newTestEngine(t)
+	device, isTheAdapter := founder.engine.(*connectMlsEngine)
+	if !isTheAdapter {
+		t.Fatalf("the founder's engine is %T and not the connect/mls adapter, so clause 1 has no array to hold",
+			founder.engine)
+	}
+
+	// THE CONTROL, and it is not optional for the same reason it is not optional above. "Non-zero
+	// afterwards" is satisfied by an array that was non-zero for some other reason, and "all zero
+	// afterwards" is satisfied vacuously by an empty one.
+	control := founder.signer
+	if len(control) == 0 {
+		t.Fatal("the fixture kept no copy of this device's signing key, so every clause below would compare against nothing")
+	}
+	if isAllZero(control) {
+		t.Fatal("this device's signing key was all zero when it was handed to the engine, so 'it is not all zero afterwards' cannot fail and clause 1 is vacuous")
+	}
+	if len(device.signer) == 0 {
+		t.Fatal("the engine's signing key is EMPTY before it has founded anything, so every reading of it below is vacuous")
+	}
+	if !bytes.Equal(device.signer, control) {
+		t.Fatalf("this device signed with %x when its engine was built and the engine holds %x before it has founded anything. Nothing has been driven yet, so this is a fixture fault and not a finding",
+			control, device.signer)
+	}
+
+	handle := founder.createGroup(t, "the-founder-clone-coupling-pin")
+
+	// READ BEFORE THE CLOSE, so a failure names the right site. A NewGroup that retained the
+	// caller's array has not destroyed anything yet -- the erase is on Close -- so this reading
+	// separates "founding it broke the device" from "closing it did".
+	if !bytes.Equal(device.signer, control) {
+		t.Fatalf("this device signed with %x before it founded a group and its engine holds %x straight after CreateGroup, with nothing closed yet",
+			control, device.signer)
+	}
+
+	// THE DOOR THAT DRIVES THE ERASE. GroupHandle.Close is connectMlsHandle.Close is
+	// (*Group).Close, and (*Group).Close zeroizes the group's signer field.
+	if err := handle.Close(); err != nil {
+		t.Fatalf("closing the group this device founded: %v", err)
+	}
+
+	// ---- clause 1: the DEVICE's own signing array survived its own group being closed ----
+	if len(device.signer) == 0 {
+		t.Fatal("the engine's signing key is EMPTY after its group was closed, so every reading below is vacuous")
+	}
+	if isAllZero(device.signer) {
+		t.Errorf("this device's long term signing key reads all zero after it founded ONE group and closed it. It signed with %x before any of this; mls.NewGroup retained the array CreateGroup handed it rather than cloning it, and (*Group).Close zeroized the device through the group. Nothing anywhere refuses afterwards -- an all-zero ed25519 seed derives a perfectly valid public key, so this device goes on publishing leaves and founding groups under a key anybody can derive, with its credential still naming the real identity",
+			control)
+	}
+	if !bytes.Equal(device.signer, control) {
+		t.Errorf("this device signed with %x before it founded a group and its engine holds %x after that group was closed",
+			control, device.signer)
+	}
+
+	// ---- clause 2: the device can still sign, judged by a door driven AFTER the close ----
+	//
+	// The comparison is against the public half this fixture captured at construction, which is
+	// the half of R7 that keeps this from being a photograph: a device whose seed is now zeros
+	// mints a perfectly well formed key package naming the public key of the all-zero seed, and a
+	// clause that asked the key package whether it agreed with itself would be green over it.
+	published, err := founder.engine.NewKeyPackage()
+	if err != nil {
+		t.Fatalf("the engine's NewKeyPackage after its own group was closed: %v", err)
+	}
+	if named := engineKeyPackageLeafKeyOf(t, published); !bytes.Equal(named, founder.signerPub) {
+		t.Errorf("the key package this device publishes after founding and closing a group names %x as its leaf signature_key and this device signs with %x. The founded group was handed this device's own array, and closing it erased the key the device signs with",
+			named, founder.signerPub)
+	}
+
+	// ---- clause 3: and a second group founded afterwards is one a PEER can still verify ----
+	//
+	// Clause 2 is green over a device whose key was destroyed and whose engine then rebuilt a
+	// consistent one, which is not a case this code has -- but "the leaf names the right key" is a
+	// statement about one message, and the thing the coupling protects is the device's ability to
+	// go on being itself to somebody else. The founder seals a record in a NEW group and the
+	// JOINER opens it, verifying the signature against the signature_key the founder's own leaf
+	// names.
+	second := founder.createGroup(t, "the-founder-clone-coupling-pin-second")
+	defer second.Close()
+	if founding, _ := engineLeafKeyOf(t, second, second.OwnLeafIndex()); !bytes.Equal(founding, founder.signerPub) {
+		t.Fatalf("the group this device founded after the close names %x at its own leaf and this device signs with %x",
+			founding, founder.signerPub)
+	}
+	peer := newTestEngine(t)
+	peerKeyPackage, err := peer.engine.NewKeyPackage()
+	if err != nil {
+		t.Fatalf("the peer's NewKeyPackage: %v", err)
+	}
+	if _, err := second.ProposeAdd(peerKeyPackage); err != nil {
+		t.Fatalf("ProposeAdd over the peer's key package: %v", err)
+	}
+	_, welcome, ratchetTree, err := second.Commit(nil)
+	if err != nil {
+		t.Fatalf("the founder's Commit over one add: %v", err)
+	}
+	if err := second.MergePendingCommit(); err != nil {
+		t.Fatalf("the founder's MergePendingCommit: %v", err)
+	}
+	joined, err := peer.engine.JoinFromWelcome(welcome, ratchetTree)
+	if err != nil {
+		t.Fatalf("the peer joining the group this device founded after the close: %v", err)
+	}
+	defer joined.Close()
+
+	aad := []byte("the-founder-clone-coupling-pin-aad")
+	plaintext := []byte("a record the founder seals with the key it still has")
+	protected, err := second.Protect(aad, plaintext)
+	if err != nil {
+		t.Fatalf("the founder's Protect in the group it founded after the close: %v", err)
+	}
+	aadBack, plainBack, senderLeaf, err := joined.Unprotect(protected)
+	if err != nil {
+		t.Fatalf("the peer opening a record this device sealed after founding and closing a group: %v. The peer verifies the signature against the signature_key the sender's own leaf names, so this is the founder having stopped being able to sign as itself",
+			err)
+	}
+	if !bytes.Equal(aadBack, aad) || !bytes.Equal(plainBack, plaintext) {
+		t.Errorf("the peer opened %q/%q and the founder sealed %q/%q", aadBack, plainBack, aad, plaintext)
+	}
+	if senderLeaf != second.OwnLeafIndex() {
+		t.Errorf("the peer reads the sender as leaf %d and the founder is at leaf %d",
+			senderLeaf, second.OwnLeafIndex())
+	}
+	t.Logf("this device signs with %x after founding a group, closing it, publishing a key package and founding a second group a peer verified it in",
+		founder.signerPub)
+}

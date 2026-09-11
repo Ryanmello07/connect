@@ -1026,9 +1026,64 @@ Closed on 2026-09-11, over the clone coupling `connect/messagegroup`'s join body
 defers `(*JoinKeyMaterial).Zeroize` over the result, because that type owns every array it carries.
 Its own header calls the fourth copy *"a fourth instance of a discipline this path already spells
 three times"* — and the three it names are fill sites in **this** package: `mls/group.go`'s
-`signer`, `mls/treekem.go`'s `EncryptionPriv`, `mls/key_package.go`'s `signPriv`. **Nothing held
-them.** Two of the three are spelled `cloneBytes(x)` and the third `append(T(nil), x...)`, so a gate
-keyed to either spelling is blind to the other — this file's own class, one altitude over.
+`signer`, `mls/treekem.go`'s `EncryptionPriv`, `mls/key_package.go`'s `signPriv`. Two of the three
+are spelled `cloneBytes(x)` and the third `append(T(nil), x...)`, so a gate keyed to either spelling
+is blind to the other — this file's own class, one altitude over.
+
+### The sentence that stood here was false, and the way it got here is the transferable part
+
+This section, and the commit message of `75eec1e`, said **"Nothing held them."** in bold. **It is
+false for all three sites**, and it was written from a measurement that had been taken through a
+`-run` filter.
+
+| mutation | pre-existing top-level tests that go red, UNFILTERED | of those, in `mls` | in `messagegroup` |
+|---|---|---|---|
+| `group.go:3422` `signer` ← `keys.SignPrivate`, aliased | **9** | 9 | **0** |
+| `treekem.go:120` `EncryptionPriv` ← `encryptionPriv`, aliased | **40** | 40 | **0** |
+| `key_package.go:410` `signPriv` ← `signer`, aliased | **19** | 6 | **13** |
+
+One of them, `TestNoConstructionOfSealedStorageRetainsItsCallersArrays` in `mls/caller_arrays_test.go`,
+is a **derived runtime aliasing gate added by `aa4838e`, which predates this work entirely** — it
+prints the coupling in the coupling's own words and it reddens under two of the three.
+
+**The cause, which is the reason this belongs in this file rather than in an erratum.** `go test`
+`-run` **splits its pattern on `/` and applies each part at every nesting level**, so a regex written
+to select a few top-level cases also filters every subtest under every case it admits. Over these
+three trees that discards roughly two thirds of all entries. The previous pass drove its mutations
+under such a filter, saw nothing go red outside the tests it had just written, and published
+*"nothing held them"* — a **confident negative derived from a narrowed reading**, which is the exact
+shape of the nine defects above it, with the class narrowed by a command-line flag instead of by a
+predicate.
+
+**So the rule, and it is not about `-run`:**
+
+> A targeted `-run` regex is for ITERATING. Any claim about what a mutation does or does not catch
+> must come from an **unfiltered** run, and the claim must say which it was. A passing suite is
+> consistent with every universal and every negative in a commit message being false, so a negative
+> is a measurement that has to be taken and reported, never an observation that nothing happened.
+
+**What is actually true is narrower than that correction's own first draft, which is why the fourth
+column is there.** The first rewrite of this section said *"nothing caught them from the messagegroup
+side"* — and **that is false for the third site**: thirteen pre-existing `messagegroup` cases redden
+under the `signPriv` mutation, because this engine defers `keyPackage.Zeroize()` over a key package it
+minted with its own signer, so destroying that array breaks the device on its first publication.
+The true statement is per-site and it is the table:
+
+> Two of the three join-path sites — and the **fourth** member found later, `group.go:668` — were held
+> **only from inside `mls`**, by gates over `mls`'s own arrays. **Zero** `messagegroup` cases reddened
+> under any of those three. The third site was already held from both sides.
+
+So `messagegroup/joincoupling_test.go` adds coverage over `group.go:3422`, `treekem.go:120` and
+`group.go:668` and adds none over `key_package.go:410` — it re-states that one from a side that
+already had thirteen. That is a smaller claim than the commit made, and it is the one the measurement
+supports. The derived gate in this package is worth its weight for the second reason its own header
+gives rather than the first: it fails **at the statement** instead of three packages away, and it sees
+a fill site no join happens to exercise.
+
+**And the fourth site is the argument for keeping both halves.** `group.go:668` — `NewGroup`'s clone
+of the founder's signing key — reddens **9 pre-existing `mls` cases and 0 `messagegroup` cases**, and
+of the four clauses of the pin that existed before this round, **none**. It is caught here by
+`TestTheFounderSurvivesFoundingAndClosingItsOwnGroup` and by this package's own derived gate.
 
 **What was built, in two halves, because neither half is enough alone:**
 
@@ -1066,9 +1121,82 @@ silent is worth less than an enumerated one that refuses and prints."*
 |---|---|---|---|
 | the erase **body shape** in `eraseHelpersIn` | yes — a wrong shape empties the class | yes — `t.Fatal`, and the control corpus spells its erase `wipe` | yes — the helper set is printed every run |
 | the **peel forms** in `originOf` | yes — a form it does not know lands in the undecided list | yes — undecided is an error, never an admit | yes — 0 undecided today, printed as a count beside the four other verdicts |
-| the **five dispositions** | yes — each is printed **with its reason** beside the site it excuses, on every passing run | yes in both directions — undisposed is red, stale is red, empty-reason is red | yes — and the 15 admitted sites are printed with where each array came from |
-| the **three opaque callees** the admissions rest on | partly — they are named every run but not opened | no — an opaque call is admitted | yes — `crypto.DeriveSecret`, `r.ReadOpaque`, `self.crypto.DeriveTreeSecret`, named every run |
+| the **binding-position forms** in `eraseFillSitesIn` | yes — a sub-form with no reading is refused by name and line | yes — a refusal is `t.Error`; a positional literal whose type this gate cannot name is refused | yes — **complement 4**, 3,194 binding positions decided NOT to be members, counted under the reading that decided each, and empty is an error |
+| the **five dispositions** | yes — each is printed **with its reason and the array it excuses**, on every passing run | yes in both directions — undisposed is red, stale is red, empty-reason is red, and one reason answering two statements is red | yes — and the 15 admitted sites are printed with where each array came from |
+| the **opaque callees** the admissions rest on | partly — they are named every run but not opened | no — an opaque call is admitted | yes — `crypto.DeriveSecret`, `r.ReadOpaque`, `self.crypto.DeriveTreeSecret`, named every run |
 
-The last row is this gate's own open edge, written down rather than argued away: three callees are
+The last row is this gate's open edge, written down rather than argued away: those callees are
 admitted on the strength of their copying and this gate does not check that they do. It is named on
 every run so a **fourth** name appearing there is visible in a passing log.
+
+### Four holes an adversarial pass found afterwards, by planting statements to falsify the claims above
+
+The three rows the first version of this table did not have are the three it was wrong about. Each
+hole below was **planted and measured green** before it was closed, then planted again and measured
+red; a passing suite is consistent with every one of them, which is why they were looked for.
+
+**1. The fill-site enumerator was blind to two of the five binding positions, SILENTLY.** It read
+`*ast.KeyValueExpr` elements of a composite literal and assignments whose two sides have equal
+length. So `&PathSecret{p}` — a **positional** literal — and `x.Field, err = f()` produced **no site,
+no complement entry and no undecided count**: in this gate's own log, a tree containing either was
+byte-for-byte indistinguishable from a tree containing neither. Twenty-two statements of the second
+form are in this package's production source today, because it is how every decode binds the octets
+it just read.
+
+*The measurement that isolates it, and the caveat that goes with it, because this section exists
+because a negative was published without one.* Planting three aliases — positional, multi-value and
+method-spelled — moved this gate from **20 fill sites to 23**: the method call appeared and was
+admitted as opaque, and the other two produced **+0**. That `+0` is the defect, and it is the only
+reading here that isolates it. What is NOT true is that the plants passed the suite: run unfiltered
+at `75eec1e`, they reddened **three other pre-existing `mls` gates** —
+`TestEveryConstructionInThisPackageLeavesItsInputAlone`,
+`TestEveryTypeHoldingErasableKeyMaterialErasesAllOfIt` and `TestNoStubShapesRemainInSource` — none of
+which was reading the aliasing. They fire on the shape of the added *declarations*, so they would
+fire on a plant that had no defect in it at all. A probe that is not behaviour-neutral measures
+itself as well as its target, and saying which is which is the whole of the correction above.
+
+The remedy is `gatesDeriveDoors`'s and the fix was made the same way: **the boundary is stated and
+the walk fails closed.** Go rebinds a struct field in exactly four syntactic positions —
+`*ast.CompositeLit` (keyed and positional, at any depth of elision), `*ast.AssignStmt` (one-to-one,
+multi-value, operator), `*ast.RangeStmt` and `*ast.IncDecStmt` — every sub-form of each is decided,
+a sub-form with no reading is **refused by name and line**, and what is *outside* the boundary is
+written down instead of implied: a write **through** the field's existing array (`copy(x.Field, p)`)
+and a write through a pointer taken at `&x.Field` are not rebindings, and this gate does not claim to
+see them. Positional elements are named by reading the **declaration order of the struct**, which is
+why this arm needs a type reading and the keyed arm never did.
+
+And the narrowing now **prints what it removed** — complement 4, 3,194 positions by reading, empty is
+an error. *A form nothing counts is a form nothing can miss.*
+
+**2. The disposition list absorbed new fills.** The key was `file:function.field`, and each reason was
+read and written about **one statement** — a particular array from a particular parameter. A key that
+stops at the field name is satisfied by any statement in that function binding that field.
+Demonstrated by planting `secrets.PathSecret = &PathSecret{PathSecret: joinerSecret}` one line under
+`BuildWelcome`'s own fill: **green**, excused by a sentence about `joiner.PathSecret`. The key now
+carries the rendered right-hand side — still never a line, because a line goes stale on the next edit
+above it while the array does not — and one reason answering two statements is red.
+
+**3. A method-call spelling of an alias was admitted.** `originOfCall` answered `opaque` for every
+call whose `Fun` was not a bare identifier, so `h.Bytes()` — a method **declared in this package, on
+a type this package declares, whose body this gate had already parsed** — was admitted as "a call
+this gate did not open". The disclosed open edge does not cover that: it is about callees this gate
+*cannot* open. A method on a concrete type of this package is now **opened**, with the receiver
+mapped back onto the call's receiver expression, and a receiver whose declared type is an
+**interface** stays opaque and stays named in complement 3 — `crypto.DeriveSecret` could be any
+implementation of `CryptoProvider`, and reading the one that happens to live here would be a guess
+wearing a derivation.
+
+**4. A fourth member of the coupling class had no clause.** The class was re-derived from the
+`messagegroup` side — every `mls` entry point reached from its fourteen non-test files, intersected
+with retained destinations and the twelve erased field names — and it has **four** members, not
+three. `CreateGroup` hands `self.signer` to `mls.NewGroup` with no defensive copy of its own.
+**Measured before anything was changed**, because *"there is no copy at the call site"* and *"the
+array is retained"* are different claims and only the second is a defect: `mls/group.go:668` fills the
+founded group's `signer` with `SignaturePrivateKey(cloneBytes(signer))`, so **the founder path is
+safe today, by the very discipline the pin exists to defend.** What it needed was therefore a
+**clause and not a copy** — a defensive copy in `CreateGroup` would let the device survive a
+`NewGroup` that had stopped cloning, which is the one thing the clause is for.
+`TestTheFounderSurvivesFoundingAndClosingItsOwnGroup` founds a group, **closes it** — `(*Group).Close`
+zeroizes `self.signer` at `mls/group.go:946` — and then reads the device's own array. Nothing held
+this either: every fixture in `messagegroup` that founds a group closes it in a `t.Cleanup`, which
+runs after the last assertion of the case that registered it.
