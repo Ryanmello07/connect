@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"go/ast"
 	"go/token"
+	"go/types"
 	"reflect"
 	"slices"
 	"strings"
@@ -1262,5 +1263,444 @@ func TestTheZeroKeyPackageIsRefusedOnItsCredentialAndNotItsLeafSource(t *testing
 	// so a Validate that judged its receiver first would answer for a version nobody chose
 	if err := (&KeyPackage{}).Validate(crypto, keyPackageTestSuite, time.Now()); !errors.Is(err, ErrUnsupportedVersion) {
 		t.Errorf("(&KeyPackage{}).Validate answered %v, want ErrUnsupportedVersion", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// j1 task 1: the key package minted against a caller's signing key
+// ---------------------------------------------------------------------------
+
+// The signer every NewKeyPackageWithSigner test below binds to, written once so a test that
+// means to vary it is visibly doing so. A caller's key here is the device's long term MLS leaf
+// signature key -- MASTER section 5.2's device_sig -- and the whole of this constructor is that
+// the four places a key package names a signing key name THAT one.
+func testKeyPackageSigner(fill byte) SignaturePrivateKey {
+	return SignaturePrivateKey(bytes.Repeat([]byte{fill}, 32))
+}
+
+// TestNewKeyPackageWithSignerBindsAllFourToTheCallersSigner is the whole of what this
+// constructor is for, and it is FOUR clauses rather than a call to Validate.
+//
+// lifecycle_fixtures_test.go's own header is the argument, in this package's words: rebinding
+// the leaf alone "leaves kp.Signature over the old leaf, which KeyPackage.Validate refuses with
+// errKeyPackageBadSignature, and leaves kp.signPriv holding a private key whose public half the
+// leaf no longer names, which nothing refuses at all -- it is read, used to sign a joiner's
+// first message, and rejected by every peer."
+//
+// One of the four failures is LOUD and one is SILENT. Validate sees the leaf's signature_key,
+// the leaf's own signature and the key package signature; it cannot see the fourth, because the
+// seed is not a field of the encoding and no verifier reads it. So a gate that called Validate
+// and stopped would pass the one mutant that costs a joiner its first message.
+func TestNewKeyPackageWithSignerBindsAllFourToTheCallersSigner(t *testing.T) {
+	crypto, err := NewCryptoProvider(keyPackageTestSuite)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	signer := testKeyPackageSigner(0x41)
+	want, err := signaturePublicKeyOf(signer)
+	if err != nil {
+		t.Fatalf("signaturePublicKeyOf over the signer this test injects: %v", err)
+	}
+	kp, initPriv, encPriv, err := NewKeyPackageWithSigner(crypto, keyPackageTestSuite, signer,
+		BasicCredential([]byte("the device this key package names")), testKeyPackageCapabilities(), nil)
+	if err != nil {
+		t.Fatalf("NewKeyPackageWithSigner: %v", err)
+	}
+	if len(initPriv) == 0 || len(encPriv) == 0 {
+		t.Fatalf("the constructor answered %d init octets and %d encryption octets", len(initPriv), len(encPriv))
+	}
+
+	// (1) the leaf NAMES the caller's key
+	if !bytes.Equal(kp.LeafNode.SignatureKey, want) {
+		t.Errorf("the leaf names %x as its signature_key and the caller's signer derives %x",
+			kp.LeafNode.SignatureKey, want)
+	}
+	// (2) the leaf's own signature verifies under it. This is the clause mutation 1 attacks: a
+	// leaf whose signature_key was set from the signer and whose signature was made with some
+	// other key is a leaf every peer refuses and nothing here would otherwise read.
+	if err := kp.LeafNode.VerifySignature(crypto, nil, 0); err != nil {
+		t.Errorf("the leaf this constructor built does not verify under the key it names: %v", err)
+	}
+	// (3) the KeyPackageTBS signature verifies, which is what Validate reads. Mutation 2 leaves
+	// this one over a preimage taken before the leaf was rebound.
+	if err := kp.Validate(crypto, keyPackageTestSuite, time.Now()); err != nil {
+		t.Errorf("Validate refused a key package this constructor minted: %v", err)
+	}
+	// (4) the SILENT one. Nothing in this package or in any peer reads the retained seed, so a
+	// constructor that kept a different key answers a key package that verifies, validates,
+	// refs and round trips, and the member it describes is rejected at its first update.
+	if len(kp.signPriv) == 0 {
+		t.Fatalf("the constructor kept no signature seed, so nothing can sign this member's later updates")
+	}
+	kept, err := signaturePublicKeyOf(kp.signPriv)
+	if err != nil {
+		t.Fatalf("signaturePublicKeyOf over the seed the constructor kept: %v", err)
+	}
+	if !bytes.Equal(kept, want) {
+		t.Errorf("the retained seed derives %x, the caller's signer derives %x, and the leaf names %x",
+			kept, want, kp.LeafNode.SignatureKey)
+	}
+}
+
+// TestNewKeyPackageWithSignerClonesTheCallersSigner is the clause that makes this design safe,
+// and it does not exist for NewKeyPackage because there the seed has no other owner.
+//
+// Here the seed IS device_sig. (*KeyPackage).Zeroize erases whatever signPriv points at, and
+// (*JoinKeyMaterial).Zeroize calls it -- so a constructor that stored the caller's slice hands
+// every holder of the key package a licence to erase the device's long term signing key out from
+// under the engine that owns it. connect/messagegroup's engine is required to erase the value
+// this constructor answers, so that caller is not hypothetical.
+//
+// THE OBSERVATION IS ON THE CALLER'S ARRAY AFTER Zeroize, not on the key package. A gate that
+// read only the key package is green over a body that assigned the caller's slice in: the field
+// holds the right octets either way, and what differs is whose array it is.
+func TestNewKeyPackageWithSignerClonesTheCallersSigner(t *testing.T) {
+	crypto, err := NewCryptoProvider(keyPackageTestSuite)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	signer := testKeyPackageSigner(0x42)
+	asHandedIn := bytes.Clone(signer)
+	kp, _, _, err := NewKeyPackageWithSigner(crypto, keyPackageTestSuite, signer,
+		BasicCredential([]byte("the device whose identity this erase must not reach")),
+		testKeyPackageCapabilities(), nil)
+	if err != nil {
+		t.Fatalf("NewKeyPackageWithSigner: %v", err)
+	}
+	if len(kp.signPriv) != len(signer) {
+		t.Fatalf("the constructor kept %d octets of a %d octet signer", len(kp.signPriv), len(signer))
+	}
+	if &kp.signPriv[0] == &signer[0] {
+		t.Errorf("the key package's seed IS the caller's array, so every Zeroize on it reaches the device's identity")
+	}
+
+	kp.Zeroize()
+
+	if !bytes.Equal(signer, asHandedIn) {
+		t.Errorf("the caller's signer was %x before the erase and is %x after it; the device's long term signing key was destroyed by a key package it minted",
+			asHandedIn, signer)
+	}
+	for _, octet := range kp.signPriv {
+		if octet != 0 {
+			t.Errorf("the key package's own copy of the seed survives its Zeroize: %x", kp.signPriv)
+			break
+		}
+	}
+}
+
+// TestNewKeyPackageWithSignerDrawsTheInitAndEncryptionKeysFromSeparateEntropy is the half of
+// this constructor's entropy claim that a COUNT cannot see.
+//
+// providerStreamDraws holds the count -- 2*KDF.Nh and no NsigPriv -- and that gate catches a
+// body which derives both pairs from one draw, because it draws KDF.Nh fewer octets. It does
+// NOT catch a body that draws twice and derives both pairs from the FIRST draw: that one draws
+// exactly 2*KDF.Nh and passes the count. Nor does it catch a body that derives the init pair
+// from the signer, which is precisely the shape a constructor that "already has a key" invites.
+// So this gate is written over the ANSWERS.
+//
+// The messages are opened rather than the byte strings compared, for the reason NewKeyPackage's
+// own entropy test gives: a comparison catches the crude form and catches neither a constructor
+// that answers the encryption private key in the init position nor one that publishes the
+// encryption public key as the init_key.
+func TestNewKeyPackageWithSignerDrawsTheInitAndEncryptionKeysFromSeparateEntropy(t *testing.T) {
+	crypto, err := NewCryptoProvider(keyPackageTestSuite)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	signer := testKeyPackageSigner(0x43)
+	kp, initPriv, encPriv, err := NewKeyPackageWithSigner(crypto, keyPackageTestSuite, signer,
+		BasicCredential([]byte("alice")), testKeyPackageCapabilities(), nil)
+	if err != nil {
+		t.Fatalf("NewKeyPackageWithSigner: %v", err)
+	}
+	if bytes.Equal(initPriv, encPriv) {
+		t.Fatalf("the two private halves are one key")
+	}
+	if bytes.Equal(kp.InitKey, kp.LeafNode.EncryptionKey) {
+		t.Fatalf("init_key and the leaf's encryption_key are one key")
+	}
+
+	probe := []byte("the message a joiner has to be able to open")
+	info := []byte("key package with signer entropy probe")
+	sealTo := func(what string, pub HpkePublicKey) ([]byte, []byte) {
+		t.Helper()
+		kemOutput, ciphertext, sealErr := crypto.HpkeSeal(pub, info, nil, probe)
+		if sealErr != nil {
+			t.Fatalf("seal to the %s: %v", what, sealErr)
+		}
+		return kemOutput, ciphertext
+	}
+	opens := func(priv HpkePrivateKey, kemOutput []byte, ciphertext []byte) bool {
+		opened, openErr := crypto.HpkeOpen(priv, kemOutput, info, nil, ciphertext)
+		return openErr == nil && bytes.Equal(opened, probe)
+	}
+	initKem, initCiphertext := sealTo("published init_key", kp.InitKey)
+	if !opens(initPriv, initKem, initCiphertext) {
+		t.Errorf("the init private key this constructor returned does not open a message sealed to the init_key it published")
+	}
+	if opens(encPriv, initKem, initCiphertext) {
+		t.Errorf("the encryption private key opens a message sealed to the init_key, so the two key pairs are one")
+	}
+	encKem, encCiphertext := sealTo("leaf encryption_key", kp.LeafNode.EncryptionKey)
+	if !opens(encPriv, encKem, encCiphertext) {
+		t.Errorf("the encryption private key this constructor returned does not open a message sealed to the leaf's encryption_key")
+	}
+	if opens(initPriv, encKem, encCiphertext) {
+		t.Errorf("the init private key opens a message sealed to the leaf's encryption_key, so the two key pairs are one")
+	}
+
+	// and NEITHER pair is a function of the signer. One signer, two different entropy streams:
+	// a body that derived either pair from the caller's key answers the same public half twice,
+	// while drawing exactly the octets providerStreamDraws expects.
+	overOneStream := func(fill byte) *KeyPackage {
+		t.Helper()
+		fixed := mustProviderOver(t, keyPackageTestSuite, constantReader{value: fill})
+		minted, _, _, streamErr := NewKeyPackageWithSigner(fixed, keyPackageTestSuite, signer,
+			BasicCredential([]byte("alice")), testKeyPackageCapabilities(), nil)
+		if streamErr != nil {
+			t.Fatalf("NewKeyPackageWithSigner over a fixed stream: %v", streamErr)
+		}
+		return minted
+	}
+	over11, over22 := overOneStream(0x11), overOneStream(0x22)
+	if bytes.Equal(over11.InitKey, over22.InitKey) {
+		t.Errorf("one signer over two entropy streams answered the init_key %x both times, so the init key pair is derived from the signer",
+			over11.InitKey)
+	}
+	if bytes.Equal(over11.LeafNode.EncryptionKey, over22.LeafNode.EncryptionKey) {
+		t.Errorf("one signer over two entropy streams answered the leaf encryption_key %x both times, so the encryption key pair is derived from the signer",
+			over11.LeafNode.EncryptionKey)
+	}
+}
+
+// keyPackageAnsweringConstructions is the class the seed-and-leaf gate below is stated over, and
+// it is DERIVED rather than named: every function declaration of this package's non test source
+// whose signature mentions a *KeyPackage in any position is the universe, and the ones that
+// ANSWER one are the class.
+//
+// It is an AST question and not a grep question, and that is the whole finding this helper
+// carries. The line command this class used to be published beside --
+// "^func .*\*KeyPackage" over non test mls -- returns SEVEN lines and NONE of them names
+// NewKeyPackage: that declaration WRAPS, and *KeyPackage sits on a continuation line which does
+// not begin with func. The seven lines it does return are exactly this class's COMPLEMENT. So
+// the class the narrowing existed to derive was entirely outside the command printed beside it,
+// at every commit, and a third constructor spelled in this package's own multi line style would
+// leave that answer at seven.
+//
+// Both sets are printed on every run, so a constructor added next month is a number that changed
+// rather than a door nobody drove.
+func keyPackageAnsweringConstructions(t *testing.T) (universe []string, class []string, complement []string) {
+	t.Helper()
+	checked := typeCheckedRoot(t, cryptoOwnRoot)
+	declared := checked.pkg.Scope().Lookup("KeyPackage")
+	if declared == nil {
+		t.Fatalf("this package declares no KeyPackage, so the class below is read off nothing")
+	}
+	is := sameTypeAs(types.NewPointer(declared.Type()))
+	mentions := func(signature *types.Signature) bool {
+		if receiver := signature.Recv(); receiver != nil && is(receiver.Type()) {
+			return true
+		}
+		for _, tuple := range []*types.Tuple{signature.Params(), signature.Results()} {
+			for at := 0; at < tuple.Len(); at++ {
+				if is(tuple.At(at).Type()) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	answers := func(signature *types.Signature) bool {
+		results := signature.Results()
+		for at := 0; at < results.Len(); at++ {
+			if is(results.At(at).Type()) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, function := range declaredFunctionsOf(t, cryptoOwnRoot) {
+		if !mentions(function.signature) {
+			continue
+		}
+		universe = append(universe, function.name)
+		if answers(function.signature) {
+			class = append(class, function.name)
+		} else {
+			complement = append(complement, function.name)
+		}
+	}
+	slices.Sort(universe)
+	slices.Sort(class)
+	slices.Sort(complement)
+	if len(universe) != len(class)+len(complement) {
+		t.Fatalf("the universe reads %v, the class %v and the complement %v, and the two do not sum to the whole",
+			universe, class, complement)
+	}
+	return universe, class, complement
+}
+
+// TestEveryConstructionAnsweringAKeyPackageBindsItsSeedToItsOwnLeaf drives the class rather than
+// a name, which is the difference between this gate and
+// TestNewKeyPackageKeepsTheSigningSeedOffTheWireAndBesideItsOwnLeaf above.
+//
+// That one holds the same sentence over ONE HAND NAMED constructor, and it PASSES with a second
+// minting door present and undriven -- measured, at the commit that added
+// NewKeyPackageWithSigner and before this gate existed. A sibling added beside a hand named gate
+// is a second door outside it, which is this project's most expensive shape, so the class here
+// is read off the package's own declarations and every member of it is required to have a
+// driver.
+//
+// The complement is printed with the class, and it is seven methods rather than an empty set: a
+// narrowing to "functions whose RESULT is a *KeyPackage" removes nothing today and starts
+// removing real members the day one appears, which GATES.md's table calls the dangerous reading.
+// Widening the universe to the whole *KeyPackage signature and splitting it on "answers one"
+// gives the same class, a complement of seven, and a predicate one run of this gate prints.
+func TestEveryConstructionAnsweringAKeyPackageBindsItsSeedToItsOwnLeaf(t *testing.T) {
+	crypto, err := NewCryptoProvider(keyPackageTestSuite)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	cred := BasicCredential([]byte("the device every driver below mints for"))
+	// one driver per member of the class. A member with no driver is a t.Errorf naming it and
+	// never a continue: an underived member is exactly the door this gate exists to find.
+	drivers := map[string]func() (*KeyPackage, error){
+		"NewKeyPackage": func() (*KeyPackage, error) {
+			kp, _, _, mintErr := NewKeyPackage(crypto, keyPackageTestSuite, cred,
+				testKeyPackageCapabilities(), nil)
+			return kp, mintErr
+		},
+		"NewKeyPackageWithSigner": func() (*KeyPackage, error) {
+			kp, _, _, mintErr := NewKeyPackageWithSigner(crypto, keyPackageTestSuite,
+				testKeyPackageSigner(0x44), cred, testKeyPackageCapabilities(), nil)
+			return kp, mintErr
+		},
+	}
+
+	universe, class, complement := keyPackageAnsweringConstructions(t)
+	t.Logf("%d declarations of this package mention a *KeyPackage: %d answer one (%v) and %d do not (%v)",
+		len(universe), len(class), class, len(complement), complement)
+	if len(complement) == 0 {
+		t.Errorf("the complement of this narrowing is empty, so it removes nothing today and starts removing real members the day one appears")
+	}
+
+	driven := []string{}
+	for name := range drivers {
+		driven = append(driven, name)
+	}
+	slices.Sort(driven)
+	for _, name := range class {
+		driver, held := drivers[name]
+		if !held {
+			t.Errorf("%s answers a *KeyPackage and this gate drives it with nothing; the class this package declares is %v and the drivers are %v -- a minting door outside the gate is what this gate exists to find",
+				name, class, driven)
+			continue
+		}
+		kp, mintErr := driver()
+		if mintErr != nil {
+			t.Errorf("%s refused this gate's arguments: %v", name, mintErr)
+			continue
+		}
+		if len(kp.signPriv) == 0 {
+			t.Errorf("%s kept no signature seed, so nothing can sign this member's later updates", name)
+			continue
+		}
+		pub, keyErr := signaturePublicKeyOf(kp.signPriv)
+		if keyErr != nil {
+			t.Errorf("%s kept a seed signaturePublicKeyOf refuses: %v", name, keyErr)
+			continue
+		}
+		if !bytes.Equal(pub, kp.LeafNode.SignatureKey) {
+			t.Errorf("%s kept a seed deriving %x and answered a leaf naming %x as its signature_key",
+				name, pub, kp.LeafNode.SignatureKey)
+		}
+	}
+	for _, name := range driven {
+		if !slices.Contains(class, name) {
+			t.Errorf("this gate drives %s, and no declaration of this package answering a *KeyPackage is spelled that way",
+				name)
+		}
+	}
+}
+
+// TestNewKeyPackageWithSignerRefusesExactlyWhatItMust is NewKeyPackage's refusal set, minus the
+// one this constructor cannot have and plus the one it must.
+//
+// MINUS: NewKeyPackage can fail inside crypto.SignatureKeyPair(). This one never calls it, and
+// the gate says so rather than leaving a reader to wonder -- over a source holding exactly
+// 2*KDF.Nh octets this constructor completes, where a body that drew a signature key pair first
+// would leave the two derivations short and take the process down inside Random.
+//
+// PLUS: a signer that is not a valid signature private key. The length is NOT open coded here:
+// signaturePublicKeyOf checks against ed25519.SeedSize and answers ErrBadSignatureKey, and a
+// second length literal in key_package.go is a second place the constant can be wrong. So the
+// assertion is on the SENTINEL a caller matches with errors.Is and not on "an error came back".
+//
+// KEPT, in NewKeyPackage's order and for its reasons: the nil provider refused before any
+// argument is judged, and the suite refused before anything is drawn. The signer is judged
+// between them -- after the suite and before the two draws -- so a caller's mistake costs no
+// entropy either, and the gate asserts the DRAW COUNT on each refusal rather than only the
+// error.
+func TestNewKeyPackageWithSignerRefusesExactlyWhatItMust(t *testing.T) {
+	params, err := LookupSuite(keyPackageTestSuite)
+	if err != nil {
+		t.Fatalf("look up the suite this gate is built over: %v", err)
+	}
+	cred := BasicCredential([]byte("alice"))
+
+	// the nil provider, refused rather than dereferenced. A body that reached crypto.Suite()
+	// first takes the caller's process instead of its call, so this row is written as a panic
+	// catch rather than as a bare call.
+	var refusal error
+	if raised := recoveredPanic(func() {
+		_, _, _, refusal = NewKeyPackageWithSigner(nil, keyPackageTestSuite,
+			testKeyPackageSigner(0x45), cred, testKeyPackageCapabilities(), nil)
+	}); raised != nil {
+		t.Errorf("a nil provider took the process down with %v rather than being refused", raised)
+	} else if !errors.Is(refusal, ErrNilCryptoProvider) {
+		t.Errorf("a nil provider answered %v, want ErrNilCryptoProvider", refusal)
+	}
+
+	// and the two refusals that must cost no entropy, each read off a counting source
+	for _, testCase := range []struct {
+		what   string
+		suite  CipherSuite
+		signer SignaturePrivateKey
+		want   error
+	}{
+		{what: "a provider running another suite", suite: CipherSuiteX25519AesGcm128Sha256Ed25519,
+			signer: testKeyPackageSigner(0x46), want: errKeyPackageProviderSuite},
+		{what: "a nil signer", suite: keyPackageTestSuite, signer: nil, want: ErrBadSignatureKey},
+		{what: "a signer one octet short", suite: keyPackageTestSuite,
+			signer: SignaturePrivateKey(bytes.Repeat([]byte{0x47}, 31)), want: ErrBadSignatureKey},
+		{what: "a signer one octet long", suite: keyPackageTestSuite,
+			signer: SignaturePrivateKey(bytes.Repeat([]byte{0x48}, 33)), want: ErrBadSignatureKey},
+	} {
+		counting := &countingReader{inner: providerStubStream(0x80)}
+		crypto := mustProviderOver(t, keyPackageTestSuite, counting)
+		_, _, _, refused := NewKeyPackageWithSigner(crypto, testCase.suite, testCase.signer, cred,
+			testKeyPackageCapabilities(), nil)
+		if !errors.Is(refused, testCase.want) {
+			t.Errorf("%s answered %v, want %v", testCase.what, refused, testCase.want)
+		}
+		if counting.drawn != 0 {
+			t.Errorf("%s was refused after %d octets had been drawn; a caller's mistake must cost no entropy",
+				testCase.what, counting.drawn)
+		}
+	}
+
+	// the MINUS clause, as a source that is exactly the two draws long. A body that called
+	// SignatureKeyPair first consumes NsigPriv of these before the derivations start.
+	exact := &countingReader{inner: bytes.NewReader(ascendingBytes(0x90, 2*params.Nh))}
+	crypto := mustProviderOver(t, keyPackageTestSuite, exact)
+	kp, _, _, err := NewKeyPackageWithSigner(crypto, keyPackageTestSuite, testKeyPackageSigner(0x49),
+		cred, testKeyPackageCapabilities(), nil)
+	if err != nil {
+		t.Errorf("a source holding exactly the two KDF.Nh draws was not enough for this constructor: %v; it drew %d of %d",
+			err, exact.drawn, 2*params.Nh)
+	}
+	if kp != nil && exact.drawn != 2*params.Nh {
+		t.Errorf("the constructor drew %d octets where the two key pair derivations are %d; the difference is a draw this gate cannot account for",
+			exact.drawn, 2*params.Nh)
 	}
 }

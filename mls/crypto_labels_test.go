@@ -2217,6 +2217,27 @@ func TestEveryConstructionHandedAProviderRoutesThroughIt(t *testing.T) {
 			}
 			return kp.Signature
 		}},
+		// the sibling key package constructor, which reaches the provider FIVE times -- two
+		// entropy draws, two KEM derivations and the KeyPackageTBS signature -- and none of it
+		// is visible in the answer, for the row above's reason: a key package keyed and signed
+		// with a provider of its own is a well formed key package that verifies against every
+		// peer, because both registered suites and every corpus here are X25519 and Ed25519,
+		// which is what it would have hardcoded. The sixth call the row above counts is the
+		// signature key pair, and this one does not make it: the signing key is the caller's.
+		//
+		// A REFUSAL is the answer over the tagging provider, for NewLeafNode's reason: the leaf
+		// this constructor builds verifies what it just signed, and a provider whose signing
+		// half flips its answer cannot satisfy that. A constructor that computed the signature
+		// itself hands back the same bytes it handed back over the real provider.
+		{name: "NewKeyPackageWithSigner", call: func(crypto CryptoProvider) []byte {
+			kp, _, _, kpErr := NewKeyPackageWithSigner(crypto, CipherSuiteX25519ChaCha20Sha256Ed25519,
+				SignaturePrivateKey(bytes.Repeat([]byte{0x3d}, 32)),
+				BasicCredential([]byte("alice")), leafNodeStubCapabilities(), nil)
+			if kpErr != nil {
+				return []byte("refused: " + kpErr.Error())
+			}
+			return kp.Signature
+		}},
 		// the path secret ladder. Every rung after the first is a DeriveSecret through the
 		// provider, and none of that is visible in the answer: a ladder climbed with a provider
 		// of its own is well formed 32 byte rungs that agree with the published TreeKEM corpus,

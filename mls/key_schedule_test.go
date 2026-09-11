@@ -5098,6 +5098,24 @@ func TestEveryConstructionHandedAProviderReadsKdfNhFromIt(t *testing.T) {
 			}
 			return [][]byte{kp.Signature}
 		}},
+		// the sibling constructor, which reads the SAME two KDF.Nh entropy draws off the provider
+		// and takes its signature key from the caller instead of drawing one. The provider's
+		// KDF.Nh is still what both DeriveKeyPair inputs are cut to, so the row states exactly
+		// what NewKeyPackage's states: it must WORK over a provider whose KDF.Nh is not 32, and
+		// a body that drew a written down 32 into DeriveKeyPair would key every member of every
+		// group at that suite from less entropy than the suite asks for, invisibly.
+		//
+		// The signature is the answer read, and the two private halves are not, for the row
+		// above's reason: an X25519 scalar is 32 octets at either width.
+		{name: "NewKeyPackageWithSigner", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
+			kp, _, _, kpErr := NewKeyPackageWithSigner(crypto, CipherSuiteX25519ChaCha20Sha256Ed25519,
+				SignaturePrivateKey(bytes.Repeat([]byte{0x3e}, 32)),
+				BasicCredential([]byte("alice")), leafNodeStubCapabilities(), nil)
+			if kpErr != nil {
+				t.Fatalf("NewKeyPackageWithSigner over a provider whose KDF.Nh is %d: %v", crypto.HashSize(), kpErr)
+			}
+			return [][]byte{kp.Signature}
+		}},
 		// the path secret ladder, whose every rung is DeriveSecret at KDF.Nh. A body that cut
 		// a rung to a written down 32 answers correctly at both registered suites and hands a
 		// short secret to every derivation above it at the first suite whose hash is wider.

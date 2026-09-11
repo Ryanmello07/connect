@@ -2933,9 +2933,18 @@ type JoinKeyMaterial struct {
 // lacks while destroying a value the caller still owns.
 //
 // ITS ONE UNPUBLISHED FIELD IS. signPriv is the seed the leaf's signature key was minted from,
-// NewKeyPackage sets it, and marshalCore stops above it -- so a joiner assembled out of a key
-// package this process minted is holding a signature private key inside a structure that is
-// otherwise entirely public. (*KeyPackage).Zeroize erases that field and leaves the rest, which is
+// key_package.go's two constructors set it, and marshalCore stops above it -- so a joiner
+// assembled out of a key package this process minted is holding a signature private key inside a
+// structure that is otherwise entirely public.
+//
+// UNDER NewKeyPackageWithSigner THAT SEED IS A COPY OF THE CALLER'S OWN SIGNING KEY, and the copy
+// is what makes this erase safe rather than what makes it dangerous: the constructor clones, so
+// the array this reaches is the key package's and never the device's. A CALLER ASSEMBLING THIS
+// STRUCTURE OWES THE SAME. Every field here is erased by name below, so SignPrivate must be an
+// array the caller is willing to have destroyed -- a material assembled directly over a device's
+// long term signing key loses that key on the first join, and nothing anywhere refuses
+// afterwards: an all-zero seed derives a perfectly valid public key and every leaf the device
+// publishes after it names that one. (*KeyPackage).Zeroize erases that field and leaves the rest, which is
 // why the call is to it rather than to a zeroizeSecret written here: this type cannot see whether
 // it was handed a minted key package or one decoded off the wire, and the type that can does not
 // have to.

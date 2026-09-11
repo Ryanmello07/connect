@@ -4039,6 +4039,27 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 			return [][]byte{group.GroupId(), leaf.Credential.Identity, leaf.SignatureKey,
 				members[0].LeafKeys.DeviceXwingPub}
 		}},
+		// the sibling key package constructor, which is in this class because of ONE parameter:
+		// signer is a caller's byte run, and it is the device's long-term MLS leaf signature key.
+		// A constructor that normalised, padded or wrote through it would be editing the identity
+		// its caller signs every other group's leaves with.
+		//
+		// The leaf's signature_key is the one answer read, and it is read rather than the key
+		// package's own storage for two reasons that both matter here. It is a pure function of
+		// the array this row handed in, so two calls agree even though the constructor draws two
+		// fresh HPKE pairs and stamps a wall clock lifetime into what it signs; and it is the
+		// value the whole constructor exists to bind, so a row that answered anything else would
+		// pass over a body that read the signer and then published somebody else's key.
+		{name: "NewKeyPackageWithSigner", call: func(take func([]byte) []byte) [][]byte {
+			kp, _, _, kpErr := NewKeyPackageWithSigner(crypto, params.Suite,
+				SignaturePrivateKey(take(bytes.Repeat([]byte{0x2f}, 32))),
+				BasicCredential(take([]byte("the device this key package names"))),
+				testCapabilities(), nil)
+			if kpErr != nil {
+				t.Fatalf("NewKeyPackageWithSigner: %v", kpErr)
+			}
+			return [][]byte{kp.LeafNode.SignatureKey}
+		}},
 		{name: "compareMemberIds", call: func(take func([]byte) []byte) [][]byte {
 			compareMemberIds(take([]byte{0x01, 0x02}), take([]byte{0x01, 0x03}))
 			return nil
@@ -4464,6 +4485,7 @@ var providerConstructionValues = map[string]any{
 	"SenderDataKeyNonce":            SenderDataKeyNonce,
 	"NewLeafNode":                   NewLeafNode,
 	"NewKeyPackage":                 NewKeyPackage,
+	"NewKeyPackageWithSigner":       NewKeyPackageWithSigner,
 	"DerivePathSecrets":             DerivePathSecrets,
 	"DeriveNodeKeyPair":             DeriveNodeKeyPair,
 	"SignAuthenticatedContent":      SignAuthenticatedContent,
@@ -5494,6 +5516,13 @@ var providerStreamDependentOperations = []string{
 	// rather than on what it was handed. It refusing an exhausted source is what says it
 	// does not fall back onto one of its own.
 	"NewKeyPackage",
+	// the SIBLING constructor, which draws TWICE and not three times: two entropy draws, one
+	// for each of the two HPKE key pairs it must not derive from one seed, and NO signature
+	// key pair -- the signing key is the caller's. That difference is the one place its
+	// distance from NewKeyPackage is a number rather than a property somebody has to think to
+	// compare, and providerStreamDraws is where the number is written down. It refusing an
+	// exhausted source is what says it does not fall back onto a stream of its own.
+	"NewKeyPackageWithSigner",
 	"Random",
 	"SealPrivateMessage",
 	"SealWithLabel",
@@ -5575,6 +5604,13 @@ var providerConstructionsWithUndefinedResults = map[string][]string{
 	// through. The entry stops being correct the moment this constructor starts producing
 	// some other leaf source, at which point it fails.
 	"NewKeyPackage": {"result 0 field 4 is empty"},
+	// the sibling constructor's identical leaf, at the identical position: it answers the same
+	// *KeyPackage shape, so the byte fields of its answer are the init key, then the leaf's
+	// five, then the signature and the signing seed, and field 4 is that leaf's parent_hash --
+	// empty for NewLeafNode's reason, since a key package is minted before there is a tree to
+	// hash a path through. The entry stops being correct the moment this constructor starts
+	// producing some other leaf source, at which point it fails.
+	"NewKeyPackageWithSigner": {"result 0 field 4 is empty"},
 	// the FramedContentAuthData's confirmation tag. RFC 9420 section 8.2 takes the confirmed
 	// transcript hash over this very signature and the tag is a MAC over that hash, so the tag
 	// cannot exist at the moment the signature is made: a commit's caller sets it afterwards.
@@ -5620,6 +5656,7 @@ var providerConstructionsAnsweringOffTheWallClock = map[string]string{
 	// two calls a second apart answer different signatures for a reason that is not the
 	// arguments. Everything above the comparisons still runs for it.
 	"NewKeyPackage": "builds its leaf through NewLeafNode, which stamps a key package Lifetime from the wall clock, so two calls a second apart sign different key packages; TestNewKeyPackageReadsEveryArgumentItWasHanded holds it to reading each of its arguments, with the lifetime normalised out and the parameter list derived off its own declaration, TestNewKeyPackageDrawsTheInitAndEncryptionKeysFromSeparateEntropy to answering two key pairs rather than one, TestNewKeyPackageKeepsTheSigningSeedOffTheWireAndBesideItsOwnLeaf to the seed it keeps, and the routing and KDF.Nh differentials to reaching the provider it was handed",
+	"NewKeyPackageWithSigner": "builds its leaf through NewLeafNode, which stamps a key package Lifetime from the wall clock, so two calls a second apart sign different key packages; the sibling row above carries the same argument. Everything above the comparisons still runs for it, and what the comparisons would have held is held by name instead: TestNewKeyPackageWithSignerBindsAllFourToTheCallersSigner to the four bindings the caller's key is put on, TestNewKeyPackageWithSignerDrawsTheInitAndEncryptionKeysFromSeparateEntropy to answering two key pairs rather than one, TestNewKeyPackageWithSignerClonesTheCallersSigner to the copy it keeps, and the routing, KDF.Nh and draw-count differentials to reaching the provider it was handed",
 	"NewLeafNode":   "stamps a key package Lifetime from the wall clock, so two calls a second apart sign different leaves; TestNewLeafNodeReadsEveryArgumentItWasHanded holds it to reading each of its arguments, with the lifetime normalised out, and TestNewLeafNodeRoutesThroughTheProviderItWasHanded to routing through the provider",
 }
 
@@ -8208,6 +8245,17 @@ var providerStreamDraws = map[string]func(params *SuiteParams) int{
 	// so this is the one place in the package where that substitution is a NUMBER rather
 	// than a property somebody has to think to compare.
 	"NewKeyPackage": func(params *SuiteParams) int { return params.NsigPriv + 2*params.Nh },
+	// the sibling, and the difference from the row above is the WHOLE of what a count can say
+	// about it: NsigPriv fewer octets, because the signature key is the caller's and this
+	// constructor never calls SignatureKeyPair. The two KDF.Nh draws are still two for the row
+	// above's reason -- a body that derived the init pair and the encryption pair from ONE seed
+	// draws KDF.Nh fewer and answers a key package that encodes, signs, refs and validates.
+	//
+	// What this row CANNOT see is a body that draws twice and derives BOTH pairs from the first
+	// draw: it draws exactly 2*KDF.Nh and passes here. That half is held by
+	// TestNewKeyPackageWithSignerDrawsTheInitAndEncryptionKeysFromSeparateEntropy, over the
+	// ANSWERS rather than over the draws.
+	"NewKeyPackageWithSigner": func(params *SuiteParams) int { return 2 * params.Nh },
 	// section 6.3.1's reuse_guard, which is four octets whatever the suite is: RFC 9420 fixes
 	// its width in the SenderData structure rather than deriving it from the AEAD, so this is
 	// one of the two entries in this table that is not a registry field.

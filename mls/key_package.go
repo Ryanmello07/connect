@@ -54,13 +54,18 @@ type KeyPackage struct {
 	Extensions  []Extension
 	Signature   []byte
 
-	// The seed the leaf's signature key was derived from, set by NewKeyPackage and by
-	// nothing else. It is not a field of the encoding -- marshalCore stops above it and
-	// UnmarshalMLS clears it -- so it is zero on every key package that arrived off the
+	// The seed the leaf's signature key was derived from, set by the TWO constructors of this
+	// file and by nothing else. It is not a field of the encoding -- marshalCore stops above it
+	// and UnmarshalMLS clears it -- so it is zero on every key package that arrived off the
 	// wire, which is the only honest value there: nobody publishes a private key.
 	//
-	// Unexported and read directly by the group lifecycle plan when it assembles
-	// JoinKeyMaterial, because package mls is one package.
+	// Unexported, and NOTHING READS IT ACROSS THE PACKAGE WALL. The sentence here used to say
+	// the group lifecycle plan reads it directly when it assembles JoinKeyMaterial, and that was
+	// never true: every assembly of that structure in this tree puts a signing key the CALLER
+	// already holds into SignPrivate, and none of them reaches this field. The key package the
+	// material carries has the seed beside its own leaf because the two must agree, not because
+	// a caller is expected to read one off the other -- and a caller outside this package cannot.
+	// NewKeyPackageWithSigner is the door that was missing; see its header.
 	signPriv SignaturePrivateKey
 }
 
@@ -257,8 +262,17 @@ func (self *KeyPackage) signedPreimage() ([]byte, error) {
 // The two HPKE halves are RESULTS, because the caller has to persist them against the ref
 // before it publishes anything -- a key package published without its private halves stored is
 // a Welcome nobody can open. The signature seed rides on the unexported field instead, because
-// it is the same key the leaf named as its signature_key and the group lifecycle plan reads it
-// off the value when it assembles JoinKeyMaterial.
+// it is the same key the leaf named as its signature_key and nothing but this package has any
+// use for it.
+//
+// AND THAT LAST CLAUSE IS WHY THIS CONSTRUCTOR IS NOT THE ONE A DEVICE WITH AN IDENTITY WANTS.
+// The seed here has exactly one holder, so no caller outside this package can sign as the leaf
+// this key package publishes -- which means a device that mints through this door publishes
+// leaves under a key it does not hold, while founding groups under one it does. The sentence
+// that used to close this paragraph said the group lifecycle plan reads the seed off the value
+// when it assembles JoinKeyMaterial; it does not, and it cannot, because the field is
+// unexported. NewKeyPackageWithSigner is the door for a caller that already owns a signing key,
+// and this one stays exactly as it is for a caller that does not.
 //
 // The provider and the suite are compared before anything is drawn, and
 // errKeyPackageProviderSuite carries the argument: they are one decision written twice, and a
@@ -318,6 +332,100 @@ func NewKeyPackage(crypto CryptoProvider, suite CipherSuite, cred Credential,
 		return nil, nil, nil, err
 	}
 	signature, err := crypto.SignWithLabel(signPriv, keyPackageSignatureLabel, content)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	kp.Signature = signature
+	return kp, initPriv, encPriv, nil
+}
+
+// NewKeyPackageWithSigner mints a key package whose leaf is bound to a signing key the CALLER
+// already holds: the leaf's signature_key, the leaf's own signature, the KeyPackageTBS signature
+// and the seed retained beside the leaf are all one key, and it is the caller's.
+//
+// FOUR BINDINGS AND NOT THREE, ASSEMBLED IN ONE STATEMENT LIST. Rebinding a leaf alone leaves
+// kp.Signature over the leaf it used to name, which Validate refuses with
+// errKeyPackageBadSignature; rebinding those two leaves kp.signPriv holding a key whose public
+// half the leaf no longer names, and NOTHING refuses that -- it is read, used to sign a joiner's
+// first message and rejected by every peer. One of the four failures is loud and one is silent,
+// which is why all four are made here rather than left to a caller to perform in order.
+//
+// It draws TWO key pairs and no signature key pair, which is the one place its difference from
+// NewKeyPackage is a number: NewKeyPackage draws NsigPriv + 2*KDF.Nh and this draws 2*KDF.Nh.
+// The two HPKE pairs still come from SEPARATE entropy for NewKeyPackage's stated reason, and
+// neither is derived from signer -- a constructor that "already has a key" is exactly the shape
+// that invites deriving an init key from it.
+//
+// THE SEED IS CLONED AND NOT RETAINED. Here the signer has another owner: it is the device's
+// long-term MLS leaf signature key, MASTER section 5.2's device_sig, and (*KeyPackage).Zeroize --
+// reached by (*JoinKeyMaterial).Zeroize at group.go's join material -- erases whatever this field
+// points at. A constructor that stored the caller's slice would hand every holder of the key
+// package a licence to destroy the device's identity, and nothing in this package or in any peer
+// would report it: an all-zero seed derives a perfectly valid public key.
+//
+// The refusals are NewKeyPackage's, minus the one it cannot have and plus the one it must. It
+// never calls crypto.SignatureKeyPair, so that error path does not exist here. It gains a refusal
+// for a signer that is not a valid signature private key, and that refusal is NOT open coded: the
+// length is checked by signaturePublicKeyOf against ed25519.SeedSize, which answers
+// ErrBadSignatureKey, and a second length literal in this file is a second place the constant can
+// be wrong. The order is the same as NewKeyPackage's for the same reasons -- the nil provider
+// before any argument is judged, the suite before anything is drawn -- with the signer judged
+// between them, so a caller's mistake costs no entropy either.
+func NewKeyPackageWithSigner(crypto CryptoProvider, suite CipherSuite, signer SignaturePrivateKey,
+	cred Credential, caps Capabilities, exts []Extension) (kp *KeyPackage, initPriv HpkePrivateKey,
+	encPriv HpkePrivateKey, err error) {
+	// the provider is refused before any argument is judged, which is the only order that
+	// does not dereference it: a draw that reached the provider for a length first would
+	// take the caller's process rather than its call
+	if crypto == nil {
+		return nil, nil, nil, fmt.Errorf("%w: the two key pairs are drawn and the key package is signed through it",
+			ErrNilCryptoProvider)
+	}
+	// before anything is drawn, so a caller's mistake costs no entropy and no key pair; see
+	// errKeyPackageProviderSuite for why a disagreement cannot be answered anywhere else
+	if crypto.Suite() != suite {
+		return nil, nil, nil, fmt.Errorf("%w: the provider runs %#04x and this key package would name %#04x",
+			errKeyPackageProviderSuite, uint16(crypto.Suite()), uint16(suite))
+	}
+	// and the signer before anything is drawn too, for the same reason. NewLeafNode below
+	// would refuse it with this very value four statements later, by which point two key
+	// pairs have been drawn and thrown away; the check is here so the ordering claim is the
+	// same one NewKeyPackage makes, and it delegates to signaturePublicKeyOf rather than
+	// writing a second length literal into this file.
+	if _, keyErr := signaturePublicKeyOf(signer); keyErr != nil {
+		return nil, nil, nil, fmt.Errorf("%w: the leaf's signature_key, its signature, the key package signature and the retained seed are all this key",
+			keyErr)
+	}
+	initPriv, initPub, err := crypto.DeriveKeyPair(crypto.Random(crypto.HashSize()))
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	// a SECOND draw, for NewKeyPackage's reason: one draw feeding both DeriveKeyPair calls
+	// answers two identical key pairs, and nothing about the key package that comes back
+	// says so
+	encPriv, encPub, err := crypto.DeriveKeyPair(crypto.Random(crypto.HashSize()))
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	leaf, err := NewLeafNode(crypto, signer, cred, encPub, caps, exts)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	kp = &KeyPackage{
+		Version:     ProtocolVersionMls10,
+		CipherSuite: suite,
+		InitKey:     initPub,
+		LeafNode:    *leaf,
+		Extensions:  nil,
+		// a COPY. The caller goes on owning its own array, and (*KeyPackage).Zeroize erases
+		// this one; see the header.
+		signPriv: append(SignaturePrivateKey(nil), signer...),
+	}
+	content, err := kp.signedPreimage()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	signature, err := crypto.SignWithLabel(signer, keyPackageSignatureLabel, content)
 	if err != nil {
 		return nil, nil, nil, err
 	}

@@ -1310,7 +1310,8 @@ var theFieldsOfTheEraseClassThatAreNotKeyMaterial = map[string]string{
 		"the field-by-field gate, in the same words and for the same reason",
 	"WelcomeJoiner.KeyPackage": "the joiner's PUBLISHED key package. It arrived in an Add proposal that went to " +
 		"every member of the group and to the delivery service, every field of its encoding is public, and the " +
-		"one field of the Go struct that is not encoded -- signPriv -- is written only by NewKeyPackage and " +
+		"one field of the Go struct that is not encoded -- signPriv -- is written only by this file's two " +
+		"constructors, NewKeyPackage and NewKeyPackageWithSigner, and " +
 		"cleared by UnmarshalMLS, so a committer's copy of somebody else's key package holds no private half. " +
 		"Erasing it would remove nothing an attacker lacks and would destroy a value the caller still owns; " +
 		"the path secret beside it is the key material, and (*WelcomeJoiner).Zeroize erases that",

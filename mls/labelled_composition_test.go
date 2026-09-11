@@ -1847,6 +1847,7 @@ var labelledCompositionClass = []string{
 	"framing_protect.go VerifyAuthenticatedContent: FramedContentTBSBytes -> *suiteCryptoProvider.VerifyWithLabel content (refused at the construction)",
 	"key_package.go *KeyPackage.Validate: signedPreimage -> *suiteCryptoProvider.VerifyWithLabel content (refused at the construction)",
 	"key_package.go NewKeyPackage: signedPreimage -> *suiteCryptoProvider.SignWithLabel content (refused at the construction)",
+	"key_package.go NewKeyPackageWithSigner: signedPreimage -> *suiteCryptoProvider.SignWithLabel content (refused at the construction)",
 	"key_schedule.go DeriveJoinerSecret: marshalBoundedComposition -> *suiteCryptoProvider.ExpandWithLabel context (bounded where it is built)",
 	"key_schedule.go NewKeyScheduleFromJoiner: marshalBoundedComposition -> *suiteCryptoProvider.ExpandWithLabel context (bounded where it is built)",
 	"leaf_node.go *LeafNode.Sign: signatureContent -> *suiteCryptoProvider.SignWithLabel content (refused at the construction)",
