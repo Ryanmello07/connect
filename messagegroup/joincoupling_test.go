@@ -221,9 +221,22 @@ func TestTheJoinLeavesThisDeviceAndItsNewHandleAbleToWork(t *testing.T) {
 // describes as "storage this group DECLARES rather than storage it points at ... NewGroup clones the
 // caller's signing key ... so the erase reaches nothing the caller is still holding". That sentence
 // is the coupling written down in the far side's own words, and until this test existed nothing held
-// it -- every fixture in this package that founds a group closes it inside a t.Cleanup, which runs
-// after the last assertion of the case that registered it. A group closed there is a group whose
-// erase no clause ever reads the far side of.
+// it.
+//
+// AND "NOTHING HELD IT" IS A MEASUREMENT HERE, which is not what this comment used to say. It said
+// every fixture in this package that founds a group closes it inside a t.Cleanup, which runs after
+// the last assertion of the case that registered it. The conclusion was right and was measured
+// independently; the universal is FALSE as written, and not marginally. The query is
+// `grep -rnE "^[[:space:]]*t\.Cleanup\(" --include=*_test.go` over this package and it answers TWO
+// statements -- engine_test.go:1493, which closes a group handle, and sessionfixture_test.go:507,
+// which closes a session -- against FORTY-TWO `defer x.Close()` statements across eight files, with
+// engine_test.go:744 closing one inline. A universal written by hand is a list wearing a quantifier.
+//
+// The measurement it was standing in for: run UNFILTERED over ./mls/... ./message/...
+// ./messagegroup/..., the mls/group.go:668 mutation -- filling the founded group's signer with the
+// caller's own array instead of cloneBytes(signer) -- reddens NINE pre-existing top-level mls cases
+// and ZERO in messagegroup, and all four clauses of the pin above are green over it. This case is
+// the one that goes red.
 //
 // R7, WHICH IS WHY THE ORDER IS FOUND, THEN CLOSE, THEN READ. An erase is observable only through an
 // ALIAS of the array in question. Clause 1 holds the engine's own signer array and reads it

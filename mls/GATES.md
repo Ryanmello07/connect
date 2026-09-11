@@ -1197,6 +1197,167 @@ safe today, by the very discipline the pin exists to defend.** What it needed wa
 **clause and not a copy** — a defensive copy in `CreateGroup` would let the device survive a
 `NewGroup` that had stopped cloning, which is the one thing the clause is for.
 `TestTheFounderSurvivesFoundingAndClosingItsOwnGroup` founds a group, **closes it** — `(*Group).Close`
-zeroizes `self.signer` at `mls/group.go:946` — and then reads the device's own array. Nothing held
-this either: every fixture in `messagegroup` that founds a group closes it in a `t.Cleanup`, which
-runs after the last assertion of the case that registered it.
+zeroizes `self.signer` at `mls/group.go:946` — and then reads the device's own array.
+
+**Nothing held this either — and that sentence is a MEASUREMENT, which is not what stood here.** What
+stood here was a reason: *every fixture in `messagegroup` that founds a group closes it in a
+`t.Cleanup`, which runs after the last assertion of the case that registered it.* The conclusion is
+right and was measured independently. **The universal is false as written, and not marginally.** The
+query is `grep -rnE '^[[:space:]]*t\.Cleanup\(' --include=*_test.go` over `connect/messagegroup`, and
+it answers **two** statements — `engine_test.go:1493`, which closes a group handle, and
+`sessionfixture_test.go:507`, which closes a session — against **forty-two** `defer x.Close()`
+statements across eight files. Almost every fixture that founds a group closes it with `defer`, and
+`engine_test.go:744` closes one inline. A universal written by hand is a list wearing a quantifier;
+this one was a list of two.
+
+What was actually measured, and what the claim is now: run **unfiltered** over
+`./mls/... ./message/... ./messagegroup/...`, the `mls/group.go:668` mutation reddens **nine**
+pre-existing top-level `mls` cases and **zero** in `messagegroup`, and **all four clauses of the join
+pin above are green over it** — only `TestTheFounderSurvivesFoundingAndClosingItsOwnGroup` goes red.
+That is the whole of the evidence, and it neither needs the universal nor survives on it.
+
+### Four more, and the check that found them is the transferable part
+
+The round above closed four holes and **checked five of the eight clauses it added** by deleting each
+and confirming something noticed. The three it did not check were the three sub-form decisions —
+`*ast.RangeStmt`, `*ast.IncDecStmt`, and the operator-assignment reading. Deleting the first two left
+an **unfiltered** run over all three trees reading exactly what it read before. That is the
+test-that-cannot-fail defect applied to *gate clauses*, and it is the fourth finding on this line to
+be about the artifact written to stop the previous one.
+
+So the check was run over **every clause of `mls/erased_field_alias_test.go`** — seventy-one of them,
+each deleted or neutralised in a disposable copy, each landing confirmed by a byte-level assert on
+the re-read file, each measured by an unfiltered run over `./mls/... ./message/... ./messagegroup/...`.
+
+**THIRTY-THREE of the seventy-one were driven by nothing.** Not wrong — *undriven*. **Three are the
+ones the finding named**, and all three are measured at `3e287a4` rather than taken on trust:
+deleting the `*ast.RangeStmt` and `*ast.IncDecStmt` arms together, and separately deleting the whole
+of the operator-assignment reading, each leaves the unfiltered run over all three trees at **7,701
+pass / 0 fail / 1 skip** — which is that copy's own baseline, entry for entry. **Thirty more** came
+out of running the same check over the rest of the file once those three had drivers: **thirteen**
+further readings of the form walk — four of its refusals and **nine of its thirteen non-member
+counts** — and **seventeen** arms of the resolver: the
+type-assertion peel, the selector arm, the refusal of a name no scope binds, the scope-qualified
+cycle key, the call arm and both comma-ok arms of the result-position reading, the `[]byte(nil)`
+conversion, the `make` arm, the builtin arm, the opaque answer itself, the result-qualified cycle
+key, the named-result reading, the return walk's stop at a nested literal, the `var` declaration and
+the range form of a local's assignments, and the expectation handed to an elided literal.
+
+**THE CAUSE IS THE SHAPE OF THE ASSERTIONS AND NOT THE COVERAGE OF THE CORPUS, and that is the part
+that transfers.** Two assertions were doing the work of twenty:
+
+- Complement 4 was asserted **only to be non-empty**. Non-empty is satisfied by twelve readings when
+  there are thirteen, so any single reading could stop being taken with nothing anywhere noticing. *A
+  complement asserted only to be non-empty is a complement with one clause, however many rows it
+  prints.*
+- The control corpus asserted only that a copy **is not the caller's**. That is satisfied by a copy
+  that degraded into an **opaque** admission — and opaque is admitted *on trust*, named in complement
+  3, precisely because this gate did not read it. A gate has more than one admission, and an
+  assertion that does not name which one is a weaker assertion than it looks.
+
+Both are now exact. Every spelling is asserted **by the kind it must answer**; the complement is
+asserted **reading by reading**; and both corpora are **type-checked with `go/types`**, because a
+driver that could not compile is not evidence about a form real source can hold.
+
+**FOUR READINGS ARE UNREACHED RATHER THAN DRIVEN, and are named instead of left looking driven.**
+Three are kept and are unreachable for a stated reason, because what deleting them produces is a
+panic or a silently undecided binding position rather than a wrong answer:
+
+- the bounds guard on a positional element past the end of a struct's field list — more elements
+  than fields is a compile error, and the field list this gate reads holds exactly one entry per
+  declared field, embedded ones included;
+- the refusal of an assignment whose two sides differ in length and whose right side is not one
+  expression — Go's grammar has no such assignment;
+- the `UNDECIDED` default of the result-position reading — only a call, a map index, a type assertion
+  and a channel receive are multi-valued in Go, and each already has its own arm.
+
+The fourth is **not claimed to be unreachable**: the cycle key in `originOfBody` is qualified by the
+result position as well as the callee, and **no compilable driver for that qualification was found**.
+Reaching it needs one resolution chain that asks one callee at two different result positions, and
+`originOfBody` returns at the first parameter- or receiver-rooted answer, so the attempt did not get
+there. *"I could not reach it" is not "it cannot be reached"*, and it is recorded as the first and
+not the second.
+
+And one reading was **removed** rather than kept: the two that handed a struct field's declared type
+down to a nested literal, for an elision Go permits only *"within a composite literal of array,
+slice, or map type"* — `C{{x}}` and `C{H: {x}}` are not Go, and `go/types` refuses both. The
+`eraseShape.types` field they were the only reader of went with them.
+
+**One reason was also false rather than merely undriven.** The refusal of an unkeyed element in a
+literal whose other elements have keys said *"which Go does not permit"*. Go permits exactly that in
+a **slice, an array and a map** literal and forbids it only for a struct, so the arm is reachable —
+`[]Pair{0: {1, 2}, {3, 4}}` — and it is now driven by that spelling, with the reason corrected to
+what it is actually refused for.
+
+#### The other three findings
+
+**A fill site inside a function literal was resolved in the wrong frame.** `ast.Inspect` over a
+declaration's body walks into every `*ast.FuncLit` in it, and every reading took an `*ast.FuncDecl`.
+So an alias handed to a **closure parameter** whose name also existed as a fresh local one frame out
+resolved to the local and was **admitted**. A literal is now a scope of its own, chained to the one
+enclosing it, and a name is bound by the innermost scope of that chain that declares it. The return
+walk stops at a nested literal for the same reason: `return x` inside a closure is the closure's
+return, and counting it both invented a return the function never makes and handed the caller-side
+mapping a name that is a parameter of the literal.
+
+**A method promoted from an embedded struct was not opened**, although it satisfied every word of the
+condition the method arm states — declared in this package, on a type this package declares, with its
+body already parsed. The only thing between it and the reading was a map lookup keyed to the outer
+type's own name. It is opened now, breadth-first by embedding depth, refusing an ambiguity at one
+depth the way Go does; an embedded interface is skipped and the call stays opaque, on the same line
+the interface receiver already sat on. *The code was widened to the condition rather than the
+condition narrowed to the code, because a condition that describes more than the code does is the
+defect this whole line has been about.*
+
+**And the fourth is above, in place**: the universal about `t.Cleanup` is gone and the measurement it
+was standing in for is what the paragraph now says.
+
+#### The four clone-site mutations, re-driven unfiltered, and the table still holds
+
+| site | mutation | pre-existing `mls` red | pre-existing `messagegroup` red |
+|---|---|---:|---:|
+| `group.go:3422` | `signer` aliased | 9 | 0 |
+| `treekem.go:120` | `EncryptionPriv` aliased | 40 | 0 |
+| `key_package.go:410` | `signPriv` aliased | 6 | 13 |
+| `group.go:668` | `signer` aliased | 9 | 0 |
+
+**And one of them nearly went the way of the `-run` mistake.** `sed -n '668p'` over `mls/group.go`
+answers a line that occurs **twice** — `NewGroup` at 668 and `LoadGroup` at 2883 — so a one-line
+anchor would have mutated both sites and measured a different thing entirely. The byte-level landing
+assert refused it (`LANDED=NO matches=2`) and the anchor was widened to two lines. *An assert that
+says how many times the pattern matched is worth more than one that says it matched.*
+
+#### A fifth, open and named rather than closed
+
+The same check found a defect that is **not** one of the four and was **not** introduced by closing
+them. `eraseAssignmentsTo`'s multi-value arm records the one expression on the right for **every**
+target on the left, so the **result position is lost**: a local bound at result 1 of a two-result call
+is decided by the origin of result 0.
+
+```go
+func twoOut(x []byte) ([]byte, []byte) { return copyOf(x), x }
+
+func probe(x []byte) *Held {
+    h := &Held{}
+    first, second := twoOut(x)
+    _ = first
+    h.Secret = second          // the caller's array
+    return h
+}
+```
+
+Driven through this resolver over exactly that corpus, the site at `h.Secret = second` comes out **"a
+fresh array"** — an alias admitted in silence. The **fill-site walk has this right**; it passes the
+target index and resolves through `originOfResult`, so `first, h.Secret = twoOut(x)` is decided
+correctly. It is only a local standing in front of the field that loses the position.
+
+**It is latent rather than live, and that is measured.** The query is the reading itself, made to
+refuse: with every local bound at a result position other than 0 forced to have no assignment at all
+— so that any site resolving through one comes out `UNDECIDED` and is refused — the gate over
+`connect/mls` answers the **same twenty fill sites**, 5 parameter / 12 fresh / 0 receiver / 3 opaque
+/ **0 undecided**, and stays green. No fill site in this package resolves through such a local today.
+
+It is open on purpose. The round that found it was closing four named findings, and *a round that
+opens a fifth front is a round that stops finishing* — but an unnamed defect is worse than an
+unclosed one, so it is written here, in `eraseAssignmentsTo`'s own header, and in the judgement that
+closed this line.
