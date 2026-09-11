@@ -36,8 +36,11 @@ package mls
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"go/ast"
+	"go/token"
 	"maps"
+	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -3724,5 +3727,338 @@ func TestJoinFromWelcomeRefusesAPathSecretOfTheWrongWidth(t *testing.T) {
 		}), result.RatchetTree, keys)
 	if !errors.Is(err, errPathSecretLength) {
 		t.Fatalf("JoinFromWelcome over a path secret one octet short = %v, want errPathSecretLength", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// j1 task 3: the first join in this tree whose material came out of an EXPORTED constructor
+// ---------------------------------------------------------------------------
+
+// The label and length every exporter comparison in this file is taken at. It is the label
+// connect/messagegroup's storage root is derived under, written here so that the in-package round
+// trip and the two-engine one outside it are asking the same question of the same octets.
+const joinTestExporterLabel = "URmessage/v1/storage"
+
+// TestAKeyPackageMintedThroughTheExportedConstructorIsJoinable is the standing proof that
+// connect/messagegroup depends on and cannot observe from outside.
+//
+// mls.JoinFromWelcome is complete and exercised -- 144 references across 13 test files -- but
+// until task 3 EVERY one of those references reached it through lifecycle_fixtures_test.go's
+// testKeyPackage, a fixture that wrote an unexported field and re-signed with an unexported
+// label. The join was therefore proved only over a path no package outside mls can take, which is
+// exactly what messagegroup/engine.go's refusal said. This is the first join whose material came
+// out of an exported constructor, and if it fails, wave 2 cannot be written.
+//
+// THE EXPORTER EQUALITY IS THE PROPERTY AND THE OTHER FOUR CLAUSES ARE ITS PRECONDITIONS. Group
+// id, epoch and member count agree between a joiner that really joined and one that built
+// plausible state out of a Welcome it mis-derived; the exported secret does not, and it is the
+// exact value connect/messagegroup's session layer builds every record key from.
+func TestAKeyPackageMintedThroughTheExportedConstructorIsJoinable(t *testing.T) {
+	crypto := testCrypto(t)
+	founder := testIdentity(t, crypto, "the founder, signer A")
+	joiner := testIdentity(t, crypto, "the joiner, signer B")
+	if bytes.Equal(founder.SigPriv, joiner.SigPriv) {
+		t.Fatal("the two signers are one key, so this case proves nothing about two of them")
+	}
+	group := testNewGroup(t, crypto, founder, "the-exported-constructor-round-trip")
+	defer group.Close()
+
+	// B's key package, minted through the EXPORTED door with B's own signing key -- no field
+	// write, no second preimage, no second spelling of the label
+	kp, initPriv, encPriv, err := NewKeyPackageWithSigner(crypto, crypto.Suite(), joiner.SigPriv,
+		BasicCredential(joiner.IdentityPub), testCapabilities(), []Extension{testLeafKeys(t, joiner)})
+	if err != nil {
+		t.Fatalf("NewKeyPackageWithSigner for the joiner: %v", err)
+	}
+	result, err := group.CreateCommit(nil,
+		[]Proposal{{ProposalType: ProposalTypeAdd, Add: &Add{KeyPackage: *kp}}}, nil)
+	if err != nil {
+		t.Fatalf("the founder's commit adding a key package the exported constructor minted: %v", err)
+	}
+	if len(result.Welcome) == 0 || len(result.RatchetTree) == 0 {
+		t.Fatalf("the commit answered a %d octet welcome and a %d octet ratchet tree",
+			len(result.Welcome), len(result.RatchetTree))
+	}
+	joinTestMerge(t, group)
+
+	joined, err := JoinFromWelcome(testGroupConfig(t, crypto, joiner, "the-exported-constructor-round-trip"),
+		result.Welcome, result.RatchetTree, &JoinKeyMaterial{
+			KeyPackage:     *kp,
+			InitPrivate:    initPriv,
+			EncryptPrivate: encPriv,
+			SignPrivate:    joiner.SigPriv,
+		})
+	if err != nil {
+		t.Fatalf("JoinFromWelcome over material an exported constructor produced: %v", err)
+	}
+	defer joined.Close()
+
+	if !bytes.Equal(joined.GroupId(), group.GroupId()) {
+		t.Errorf("the joiner is in group %x and the founder is in %x", joined.GroupId(), group.GroupId())
+	}
+	if joined.Epoch() != group.Epoch() {
+		t.Errorf("the joiner is at epoch %d and the founder is at %d", joined.Epoch(), group.Epoch())
+	}
+	if got := len(joined.Members()); got != 2 {
+		t.Errorf("the joiner sees %d members, want 2", got)
+	}
+	if got := len(group.Members()); got != 2 {
+		t.Errorf("the founder sees %d members, want 2", got)
+	}
+	// THE CLAUSE THAT MATTERS. A joiner that half succeeded agrees on the three above.
+	founderExport, err := group.Export(joinTestExporterLabel, nil, 32)
+	if err != nil {
+		t.Fatalf("Export on the founder: %v", err)
+	}
+	joinerExport, err := joined.Export(joinTestExporterLabel, nil, 32)
+	if err != nil {
+		t.Fatalf("Export on the joiner: %v", err)
+	}
+	if !bytes.Equal(founderExport, joinerExport) {
+		t.Errorf("the founder exports %x and the joiner exports %x under %q",
+			founderExport, joinerExport, joinTestExporterLabel)
+	}
+	if len(founderExport) != 32 {
+		t.Errorf("the exporter answered %d octets, want 32", len(founderExport))
+	}
+}
+
+// TestTheCallerMaterialGateRefusesEverySignerButTheLeafsBeforeItReadsTheWelcome is the other
+// direction of the same door, and the ORDERING is the property rather than the refusal.
+//
+// mls/group.go's caller-material gate runs BEFORE ParseMLSMessage, so a corrupt Welcome handed in
+// beside a wrong signer still answers the SIGNER's refusal. That ordering is what tells a caller
+// whose keyring has parted company with its stored key package apart from a caller who was handed
+// a tampered message -- two different problems for whoever has to fix one of them.
+//
+// A PLAN CLAIM THIS TREE CONTRADICTS, recorded here rather than quietly satisfied: the third
+// input was specified as "a signer that is the right length and not a valid seed", answering the
+// ciphersuite-length refusal. There is no such value. signaturePublicKeyOf length-checks against
+// ed25519.SeedSize and expands with ed25519.NewKeyFromSeed, and EVERY 32-octet string is a valid
+// ed25519 seed -- so a right-length signer that is not the leaf's is the FIRST input, not a third
+// one. The third row here is a wrong-length signer, which is the other half of what the length
+// check can actually refuse.
+func TestTheCallerMaterialGateRefusesEverySignerButTheLeafsBeforeItReadsTheWelcome(t *testing.T) {
+	crypto := testCrypto(t)
+	founder := testIdentity(t, crypto, "the founder")
+	joiner := testIdentity(t, crypto, "the joiner")
+	stranger := testIdentity(t, crypto, "a second, perfectly valid signer")
+	group := testNewGroup(t, crypto, founder, "the-caller-material-gate")
+	defer group.Close()
+
+	kp, initPriv, encPriv, err := NewKeyPackageWithSigner(crypto, crypto.Suite(), joiner.SigPriv,
+		BasicCredential(joiner.IdentityPub), testCapabilities(), []Extension{testLeafKeys(t, joiner)})
+	if err != nil {
+		t.Fatalf("NewKeyPackageWithSigner for the joiner: %v", err)
+	}
+	result, err := group.CreateCommit(nil,
+		[]Proposal{{ProposalType: ProposalTypeAdd, Add: &Add{KeyPackage: *kp}}}, nil)
+	if err != nil {
+		t.Fatalf("the founder's commit: %v", err)
+	}
+	joinTestMerge(t, group)
+
+	// the control: the material as it stands joins, so every refusal below is the one octet the
+	// row changed and not a broken fixture
+	control, err := JoinFromWelcome(testGroupConfig(t, crypto, joiner, "the-caller-material-gate"),
+		result.Welcome, result.RatchetTree, &JoinKeyMaterial{
+			KeyPackage: *kp, InitPrivate: initPriv, EncryptPrivate: encPriv,
+			SignPrivate: joiner.SigPriv,
+		})
+	if err != nil {
+		t.Fatalf("the control join, which every row below is a single change away from: %v", err)
+	}
+	control.Close()
+
+	corrupt := bytes.Clone(result.Welcome)
+	corrupt[0] ^= 0xff
+
+	for _, testCase := range []struct {
+		what    string
+		signer  SignaturePrivateKey
+		welcome []byte
+		want    error
+	}{
+		{what: "a second, valid signer", signer: stranger.SigPriv, welcome: result.Welcome,
+			want: errJoinerSignatureKeyNotTheLeafs},
+		{what: "a nil signer", signer: nil, welcome: result.Welcome, want: ErrBadSignatureKey},
+		{what: "a signer one octet short", signer: SignaturePrivateKey(bytes.Repeat([]byte{0x5c}, 31)),
+			welcome: result.Welcome, want: ErrBadSignatureKey},
+		// THE ORDERING CLAUSE. Both the message and the caller are wrong, and the refusal names
+		// the caller: a gate that only ever passed a well formed Welcome cannot see this.
+		{what: "a second valid signer beside a corrupted welcome", signer: stranger.SigPriv,
+			welcome: corrupt, want: errJoinerSignatureKeyNotTheLeafs},
+		{what: "a nil signer beside a corrupted welcome", signer: nil, welcome: corrupt,
+			want: ErrBadSignatureKey},
+	} {
+		refused, err := JoinFromWelcome(testGroupConfig(t, crypto, joiner, "the-caller-material-gate"),
+			testCase.welcome, result.RatchetTree, &JoinKeyMaterial{
+				KeyPackage: *kp, InitPrivate: initPriv, EncryptPrivate: encPriv,
+				SignPrivate: testCase.signer,
+			})
+		if !errors.Is(err, testCase.want) {
+			t.Errorf("%s answered %v, want %v", testCase.what, err, testCase.want)
+		}
+		if refused != nil {
+			t.Errorf("%s answered a group alongside its refusal", testCase.what)
+			refused.Close()
+		}
+	}
+}
+
+// testKeyPackageBodyReferences reads ONE function's own parse tree and answers what it does with
+// two identifiers: writes to the unexported signPriv field, and references to
+// keyPackageSignatureLabel.
+//
+// It is over the BODY and not over the 112 call sites, which is the repair that makes task 3's
+// third property refutable at all. The old statement of it asked a gate to report 112 and to
+// assert the equivalence "at the ones this task exercises" -- satisfiable by any implementation
+// and falsifiable by none, because no mutation of the task could make it red. The substitution is
+// total because the BODY moved; the call sites move with it by construction rather than by
+// inspection.
+func testKeyPackageBodyReferences(t *testing.T, function string) (signPrivWrites []string, labelRefs []string, callSites int) {
+	t.Helper()
+	found := false
+	for _, path := range append(packageLevelFunctions(t).files, testKeyPackageFixtureFile) {
+		parsed := mustParseSource(t, path)
+		for _, declaration := range parsed.file.Decls {
+			declared, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || declared.Name.Name != function || declared.Recv != nil {
+				continue
+			}
+			found = true
+			ast.Inspect(declared.Body, func(node ast.Node) bool {
+				at := func(position token.Pos) string {
+					return fmt.Sprintf("%s:%d", path, parsed.fileSet.Position(position).Line)
+				}
+				switch typed := node.(type) {
+				case *ast.AssignStmt:
+					for _, target := range typed.Lhs {
+						selector, isSelector := target.(*ast.SelectorExpr)
+						if isSelector && selector.Sel.Name == "signPriv" {
+							signPrivWrites = append(signPrivWrites, at(selector.Pos()))
+						}
+					}
+				case *ast.Ident:
+					if typed.Name == keyPackageSignatureLabelIdentifier {
+						labelRefs = append(labelRefs, at(typed.Pos()))
+					}
+				}
+				return true
+			})
+		}
+	}
+	if !found {
+		t.Fatalf("no package level function named %s was found in this package's sources, so this gate read nothing", function)
+	}
+	// and the class this substitution reaches, reported so that a 113th site added next month is
+	// a number that changed rather than a call nobody looked at
+	for _, path := range testKeyPackageScanRoots(t) {
+		parsed := mustParseSource(t, path)
+		ast.Inspect(parsed.file, func(node ast.Node) bool {
+			call, isCall := node.(*ast.CallExpr)
+			if !isCall {
+				return true
+			}
+			if name, isName := call.Fun.(*ast.Ident); isName && name.Name == function {
+				callSites++
+			}
+			return true
+		})
+	}
+	return signPrivWrites, labelRefs, callSites
+}
+
+// The file lifecycle_fixtures_test.go is, found rather than written down: packageLevelFunctions
+// scans only non test source, and the fixture this property is about is a test file.
+var testKeyPackageFixtureFile = "lifecycle_fixtures_test.go"
+
+// Every Go file of this package, test files included, which is the scan the call site count is
+// taken over. The class is "every call site of testKeyPackage in package mls's tests", and a scan
+// that read only the file the fixture lives in would answer 1.
+func testKeyPackageScanRoots(t *testing.T) []string {
+	t.Helper()
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read this package's own directory: %v", err)
+	}
+	paths := []string{}
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".go") {
+			paths = append(paths, entry.Name())
+		}
+	}
+	if len(paths) == 0 {
+		t.Fatal("this package has no Go files, so the class below is read off nothing")
+	}
+	slices.Sort(paths)
+	return paths
+}
+
+// TestTheKeyPackageFixtureMintsThroughTheExportedConstructorAndRebindsNothing is task 3's third
+// property, stated over the fixture's own parse tree.
+//
+// After this task testKeyPackage contains NO write to kp.signPriv and NO second spelling of
+// keyPackageSignatureLabel, and the 112 call sites move with the body rather than one at a time.
+// Both halves matter: a re-expression that left the field write in place beneath the delegate
+// still answers a correct key package, which is exactly why the old statement of this property
+// could not be refuted by any mutation.
+//
+// THE COMPLEMENT IS PRINTED AND THIS PROPERTY RULES NONE OF IT. Three SignWithLabel sites in
+// mls's tests are NOT this fixture's and do not move when its body does:
+// caller_arrays_test.go's standalone hand assembly, group_test.go's testKeyPackagePublishing --
+// which delegates here for the mint and then re-signs a PLANTED encryption key by hand -- and
+// key_package_test.go's re-sign through the key package's own kept seed. Whether a site is a
+// negative fixture that must keep its mismatch is a reading of the case around it, and an
+// implementer who converted one without reading it deletes a negative case that holds the
+// refusal gate above.
+func TestTheKeyPackageFixtureMintsThroughTheExportedConstructorAndRebindsNothing(t *testing.T) {
+	writes, labels, callSites := testKeyPackageBodyReferences(t, "testKeyPackage")
+	t.Logf("testKeyPackage's body: %d writes to signPriv (%v), %d references to %s (%v); %d call sites in this package",
+		len(writes), writes, len(labels), keyPackageSignatureLabelIdentifier, labels, callSites)
+	if len(writes) != 0 {
+		t.Errorf("testKeyPackage writes kp.signPriv at %v; after task 3 the binding is the constructor's and a write here is a partial rebind the tree cannot see",
+			writes)
+	}
+	if len(labels) != 0 {
+		t.Errorf("testKeyPackage names %s at %v; a second spelling of this label is one of the two ways over this package's wall",
+			keyPackageSignatureLabelIdentifier, labels)
+	}
+	// the class is reported rather than asserted at a number, because what a number here would
+	// hold is a fixture nobody may call -- but zero is a gate reading nothing
+	if callSites < 2 {
+		t.Errorf("this package calls testKeyPackage %d times, so the substitution this property claims reaches nothing",
+			callSites)
+	}
+	// and the complement, printed with its size. The three are not converted and are not ruled.
+	signing := []string{}
+	for _, path := range testKeyPackageScanRoots(t) {
+		if !strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		parsed := mustParseSource(t, path)
+		ast.Inspect(parsed.file, func(node ast.Node) bool {
+			call, isCall := node.(*ast.CallExpr)
+			if !isCall {
+				return true
+			}
+			selector, isSelector := call.Fun.(*ast.SelectorExpr)
+			if !isSelector || !strings.Contains(selector.Sel.Name, "SignWithLabel") {
+				return true
+			}
+			for _, argument := range call.Args {
+				if name, isName := argument.(*ast.Ident); isName && name.Name == keyPackageSignatureLabelIdentifier {
+					signing = append(signing, fmt.Sprintf("%s:%d", path,
+						parsed.fileSet.Position(call.Pos()).Line))
+				}
+			}
+			return true
+		})
+	}
+	slices.Sort(signing)
+	t.Logf("the complement this property does not move: %d key package signing sites in this package's tests that are not testKeyPackage's own: %v",
+		len(signing), signing)
+	if len(signing) == 0 {
+		t.Errorf("this narrowing removed nothing: after task 3 the fixture signs through the constructor, and the sites that still sign by hand are the negative fixtures this property must not touch")
 	}
 }

@@ -201,45 +201,39 @@ func testUpdateLeafNodeNaming(t *testing.T, crypto CryptoProvider, m *testMember
 }
 
 // testKeyPackage mints a key package plus its init and encryption private keys, IN THAT ORDER,
-// through TreeKEM's constructor rather than by hand.
+// bound to the MEMBER's own signing key.
 //
-// NewKeyPackage takes no signer: it draws its own signature key pair, puts the public half in
-// the leaf and signs both the leaf and the whole key package with the private half. Every later
-// task of this plan needs the key package to be the MEMBER's -- task 12 compares an Add's leaf
-// signature key against the proposer's identity, and task 16 reads kp.signPriv into
-// JoinKeyMaterial -- so all three of those are rebound here.
+// THE BODY MOVED RATHER THAN ITS 112 CALL SITES, and that is the whole of j1 task 3's third
+// property. This fixture used to mint through NewKeyPackage -- which draws its own signature key
+// pair -- and then rebind three things by hand: the leaf's signature_key, the leaf signature, and
+// the unexported kp.signPriv, followed by a second assembly of the KeyPackageTBS and a SECOND
+// SPELLING of keyPackageSignatureLabel. Both of those are ways over this package's wall that
+// messagegroup/engine.go names as defect classes this tree has paid for, and this fixture was
+// the only thing in the tree performing either.
 //
-// All THREE, and that is the correction. Rebinding the leaf alone leaves kp.Signature over the
-// old leaf, which KeyPackage.Validate refuses with errKeyPackageBadSignature, and leaves
-// kp.signPriv holding a private key whose public half the leaf no longer names, which nothing
-// refuses at all -- it is read, used to sign a joiner's first message, and rejected by every
-// peer. A key_package leaf's LeafNodeTBS excludes group_id and leaf_index, which is why those
-// two arguments are nil and 0.
+// NewKeyPackageWithSigner binds all four in one statement list, so the rebinding, the second
+// preimage and the second label reference leave the tree WITH THE BODY. The old header's own
+// warning is what makes that worth stating: rebinding the leaf alone leaves kp.Signature over the
+// old leaf, which Validate refuses with errKeyPackageBadSignature, and leaves kp.signPriv holding
+// a private key whose public half the leaf no longer names, which NOTHING refuses at all -- it is
+// read, used to sign a joiner's first message, and rejected by every peer. A partial rebind is
+// now unreachable rather than avoided.
+//
+// ONE DIFFERENCE IS REAL AND IS WRITTEN DOWN: kp.signPriv is now a COPY of m.SigPriv rather than
+// the member's own array, because the constructor clones. That is the property task 1 exists for
+// -- (*KeyPackage).Zeroize must not reach a key its caller still owns -- and it means a test that
+// erased a fixture key package no longer erases the member behind it.
 func testKeyPackage(t *testing.T, crypto CryptoProvider, m *testMember) (*KeyPackage, HpkePrivateKey, HpkePrivateKey) {
 	t.Helper()
-	// THE PROVIDER'S OWN SUITE AND NOT A LITERAL. NewKeyPackage refuses a suite the provider does
+	// THE PROVIDER'S OWN SUITE AND NOT A LITERAL. The constructor refuses a suite the provider does
 	// not run, so a hard coded code point here made this fixture answerable only under the default
 	// provider -- and a corpus that can mint a key package for only one suite is a corpus in which
 	// every ciphersuite read of the proposal door is the same program as that one constant.
-	kp, initPriv, encPriv, err := NewKeyPackage(crypto, crypto.Suite(),
+	kp, initPriv, encPriv, err := NewKeyPackageWithSigner(crypto, crypto.Suite(), m.SigPriv,
 		BasicCredential(m.IdentityPub), testCapabilities(), []Extension{testLeafKeys(t, m)})
 	if err != nil {
-		t.Fatalf("NewKeyPackage(%s): %v", m.Name, err)
+		t.Fatalf("NewKeyPackageWithSigner(%s): %v", m.Name, err)
 	}
-	kp.LeafNode.SignatureKey = m.SigPub
-	if err := kp.LeafNode.Sign(crypto, m.SigPriv, nil, 0); err != nil {
-		t.Fatalf("LeafNode.Sign(%s): %v", m.Name, err)
-	}
-	kp.signPriv = m.SigPriv
-	content, err := kp.signedPreimage()
-	if err != nil {
-		t.Fatalf("KeyPackage.signedPreimage(%s): %v", m.Name, err)
-	}
-	signature, err := crypto.SignWithLabel(m.SigPriv, keyPackageSignatureLabel, content)
-	if err != nil {
-		t.Fatalf("SignWithLabel(%s): %v", m.Name, err)
-	}
-	kp.Signature = signature
 	return kp, initPriv, encPriv
 }
 
