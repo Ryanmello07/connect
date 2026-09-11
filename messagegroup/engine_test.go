@@ -1454,8 +1454,31 @@ type engineJoinFixture struct {
 // has what it needs.
 func newEngineJoinFixture(t *testing.T, name string, joinerFirst bool) *engineJoinFixture {
 	t.Helper()
-	founder := newTestEngine(t)
 	joiner, joinerStore := newRecordingEngine(t)
+	return buildEngineJoinFixture(t, name, joinerFirst, joiner, joinerStore)
+}
+
+// newEraseObservingJoinFixture is newEngineJoinFixture whose JOINER also carries the provider
+// instrument, so the array the join assembles and is obliged to erase is aliased.
+func newEraseObservingJoinFixture(t *testing.T, name string, joinerFirst bool) (*engineJoinFixture,
+	*aliasingCryptoProvider) {
+
+	t.Helper()
+	joiner, joinerStore, observed := newEraseObservingEngine(t)
+	return buildEngineJoinFixture(t, name, joinerFirst, joiner, joinerStore), observed
+}
+
+// buildEngineJoinFixture is the body both constructors share, with the joiner handed in.
+//
+// The joiner is a PARAMETER rather than built here because the two instruments a gate may need on
+// that device -- the recording store and the aliasing provider -- are chosen by the property being
+// observed, and a fixture that built one of them would make the other a second fixture with a
+// second copy of this commit chain.
+func buildEngineJoinFixture(t *testing.T, name string, joinerFirst bool, joiner *testEngine,
+	joinerStore *recordingAliasStore) *engineJoinFixture {
+
+	t.Helper()
+	founder := newTestEngine(t)
 	other := newTestEngine(t)
 
 	joinerKeyPackage, err := joiner.engine.NewKeyPackage()
@@ -1938,4 +1961,112 @@ func engineJoinMaterialEraseSites(t *testing.T) (deferred []string, plain []stri
 	slices.Sort(deferred)
 	slices.Sort(plain)
 	return deferred, plain
+}
+
+// TestTheJoinErasesTheArrayAndNotOnlyAMethodNamed Zeroize is the R7 half of task 5's erase
+// obligation, and it is here because the source read at the bottom of TestTheDeviceSurvivesItsOwnJoin
+// was the whole of that obligation and BINDS ONLY A METHOD NAME.
+//
+// MEASURED, and this is the reason the file gained an instrument rather than a sentence:
+// `defer keys.Zeroize()` rewritten as `defer mutantEraser{}.Zeroize()`, with
+// `type mutantEraser struct{}` and a no-op `Zeroize()` beside it in engine.go, leaves the source
+// read seeing exactly one deferred erase and no plain one -- and left the whole of ./mls/...
+// ./message/... ./messagegroup/... GREEN at 7,692 passing, 0 failing, 0 skipped. A join that
+// erased nothing passed the entire shipped suite. Every private half the material was assembled
+// over -- both HPKE halves and the copy of device_sig -- stayed in the heap, and nothing anywhere
+// said so.
+//
+// R7, quoted from recordingAliasStore because this gate is that rule one seam over: "an erase is
+// observable only through an ALIAS of the array erased, and wherever the far side copies, the
+// property must build the alias or it is measuring a photograph." The source read is the
+// photograph. aliasingCryptoProvider's header carries the one seam through which the material's
+// own array crosses back into a type this package controls.
+//
+// THE CONTROL IS THE AT-CALL COPY AND IT IS NOT OPTIONAL. "It reads all zero afterwards" is
+// satisfied by an array that was all zero when it was handed over and by an empty one, so the
+// alias is admitted only when the copy taken at call time is non-zero AND is the octets the store
+// held under this device's own ref. That last clause is what says the aliased array is the
+// material's InitPrivate rather than some other private half the join happened to open with.
+//
+// IT IS TAKEN ON BOTH EXITS, for TestTheDeviceSurvivesItsOwnJoin's reason: an implementation that
+// erases on the success return only is what a defer refactor produces by accident, and the
+// failure-after-take exit is the one it walks out of holding the copies.
+func TestTheJoinErasesTheArrayAndNotOnlyAMethodNamedZeroize(t *testing.T) {
+	for _, exit := range []struct {
+		what string
+		join func(fixture *engineJoinFixture) (GroupHandle, error)
+	}{
+		{what: "a join that succeeded", join: func(fixture *engineJoinFixture) (GroupHandle, error) {
+			return fixture.joiner.engine.JoinFromWelcome(fixture.welcome, fixture.ratchetTree)
+		}},
+		{what: "a join that failed after the take", join: func(fixture *engineJoinFixture) (GroupHandle, error) {
+			other := newEngineJoinFixture(t, "the-erase-other-commit", true)
+			return fixture.joiner.engine.JoinFromWelcome(fixture.welcome, other.ratchetTree)
+		}},
+	} {
+		fixture, observed := newEraseObservingJoinFixture(t, "the-erase-"+exit.what, true)
+		stored, held := fixture.joiner.store.keyPackages[fmt.Sprintf("%x", fixture.joinerRef)]
+		if !held {
+			t.Fatalf("%s: the joiner's store holds no entry under its own ref %x before the attempt",
+				exit.what, fixture.joinerRef)
+		}
+		initPrivate := bytes.Clone(stored[1])
+		if isAllZero(initPrivate) {
+			t.Fatalf("%s: the init private half this device published is all zero before the join, so every reading below would pass against an erase that did nothing",
+				exit.what)
+		}
+		before := len(observed.hpkeOpenPriv)
+
+		handle, err := exit.join(fixture)
+		if handle != nil {
+			defer handle.Close()
+		}
+		_ = err
+
+		// the alias, found by WHAT IT HELD and not by its position: mls.JoinFromWelcome opens more
+		// than one ciphertext on this path and which of them is the welcome secret is that
+		// function's business rather than this gate's.
+		found := -1
+		for at := before; at < len(observed.hpkeOpenPriv); at += 1 {
+			if bytes.Equal(observed.hpkeOpenPrivAtCall[at], initPrivate) {
+				found = at
+				break
+			}
+		}
+		if found < 0 {
+			t.Fatalf("%s: the join made %d HpkeOpen call(s) and none of them was handed the init private half the store held under this device's ref; this gate is aliasing nothing and would report clean having read nothing",
+				exit.what, len(observed.hpkeOpenPriv)-before)
+		}
+		alias := observed.hpkeOpenPriv[found]
+		t.Logf("%s: the join handed HPKE an init private half of %d octets and the array is %d octets after it returned",
+			exit.what, len(observed.hpkeOpenPrivAtCall[found]), len(alias))
+		if len(alias) == 0 {
+			t.Errorf("%s: the aliased array is empty, so every octet of it reads zero vacuously", exit.what)
+		}
+		if !isAllZero(alias) {
+			t.Errorf("%s: the array the join assembled its material over reads %x after JoinFromWelcome returned and it was %x when the join handed it to HPKE; the material was NOT erased and a method named Zeroize having been deferred over it says nothing",
+				exit.what, alias, initPrivate)
+		}
+
+		// AND THE ERASE REACHED A COPY. The store's own array is the one the put-back writes, so
+		// an erase that reached it would put zeroed octets back -- which is the property
+		// TestAJoinThatFailsPutsTheKeyPackageBackByteForByte holds from the other end, and it is
+		// asserted here too because this gate is the one holding an alias at all.
+		if bytes.Equal(alias, stored[1]) && isAllZero(stored[1]) {
+			t.Errorf("%s: the store's own init private half is all zero after the join; the material was assembled over the store's arrays rather than over copies",
+				exit.what)
+		}
+	}
+}
+
+// isAllZero answers whether every octet of a slice is zero. An EMPTY slice answers true and every
+// caller above refuses that case separately, because "all of no octets are zero" is the vacuous
+// reading an erase gate must never accept as its observation.
+func isAllZero(value []byte) bool {
+	for _, octet := range value {
+		if octet != 0 {
+			return false
+		}
+	}
+	return true
 }

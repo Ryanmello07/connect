@@ -910,3 +910,108 @@ Nine tests in `mls/gates_index_test.go`, and they are the whole reason this file
 - **Close entries by deleting them,** and name in the same commit the gate where the narrowing now
   fails closed. A row that outlives its narrowing is the file describing a tree that no longer
   exists — and that direction is now decided by a test rather than by the reader's diligence.
+
+---
+
+## Two more instances, in `messagegroup`, and why they are not round ten
+
+Found by a reviewer on the j1 join, closed on 2026-09-10. They are recorded here because they are
+this file's class exactly — **a gate whose class is a NAME rather than the property** — and because
+the way they were closed is the answer this file already gives rather than another turn of the arms
+race. **Neither was closed by making a list longer.** Both were closed by the two questions.
+
+### Instance A — an erase obligation that bound a method NAME
+
+`engineJoinMaterialEraseSites` in `messagegroup/engine_test.go` derived the join's erase obligation
+off the syntax tree: in the function that calls `mls.JoinFromWelcome`, count calls whose selector is
+spelled `Zeroize`, require exactly one to be deferred and none to be a plain statement. The class
+is derived. The literal is `Zeroize`, and **being wrong about it was invisible**: a deferred call
+named `Zeroize` that erases nothing reads identically.
+
+**Measured.** `defer keys.Zeroize()` rewritten as `defer mutantEraser{}.Zeroize()`, with
+`type mutantEraser struct{}` and a no-op `Zeroize()` beside it in `engine.go`. The source read saw
+exactly one deferred erase and no plain one. The whole of `./mls/... ./message/... ./messagegroup/...`
+stayed **GREEN at 7,692 passing, 0 failing, 0 skipped** — a join that erased nothing, with both HPKE
+private halves and a copy of `device_sig` left in the heap, passing the entire shipped suite.
+
+**What closed it is R7 and not a wider list.** This project already had the rule, in
+`recordingAliasStore`'s own header: *an erase is observable only through an ALIAS of the array
+erased, and wherever the far side copies, the property must build the alias or it is measuring a
+photograph.* The join's material is four copies made in a production local, so no store route
+reaches it — but `mls.JoinFromWelcome` opens the welcome secret through
+`OpenWithLabel(crypto, keys.InitPrivate, …)`, which reaches `crypto.HpkeOpen(priv, …)` with the
+slice passed straight through. `aliasingCryptoProvider` retains that header.
+`TestTheJoinErasesTheArrayAndNotOnlyAMethodNamedZeroize` is red under the mutant on both exits, with
+an at-call copy as the control so an empty or already-zero array cannot satisfy it. The `Zeroize`
+literal is unchanged and is now at a level **where being wrong is visible.**
+
+**The sweep, because the finding named one gate and the class is bigger.** Every erase obligation in
+`messagegroup` was read for whether a runtime observation stands behind its source read. The query:
+`grep -rn "would pass against\|did nothing\|so this reading would" --include=*_test.go` for the
+runtime controls, against `grep -rn "ErasesInSource\|EraseSites\|erase helpers"` for the source
+reads. Eleven obligations carry a non-zero control that fails over an erase that did nothing —
+`zeroize_test.go`, `keyschedule_test.go`, `ratchet_test.go` twice, `epoch_test.go` twice,
+`session_test.go`. `engineNewKeyPackageErasesInSource` is a source read and is covered, because
+`TestNewKeyPackageErasesEveryPrivateHalfItMintedBeforeItReturns` holds the same property through
+`recordingAliasStore`'s retained headers. `zeroizeEraseClass`'s `Zeroize` and `zeroize` literals are
+positive controls that **fatal** when absent, which is this file's keep verdict.
+
+**The join was the only one of the eleven with no runtime observation at all**, and the reason is
+worth keeping: it is the only erase whose subject is a local that no interface this package controls
+ever sees. Wherever the far side copies, somebody has to go and build the alias.
+
+### Instance B — an impossibility class narrowed to two identifiers
+
+`TestNoProductionSentenceOfThisPackageSaysAJoinIsImpossible` in `messagegroup/enginejoin_test.go`
+derived "a production sentence asserting a join is impossible" as: a comment or string literal that
+NAMES `TakeKeyPackage` or `ErrEngineJoinUnavailable` **and** carries one of six phrases. The subject
+was two identifiers.
+
+**Measured.** Two comment lines above `JoinFromWelcome`'s header — *"A SECOND DEVICE CANNOT JOIN A
+GROUP THIS ENGINE FOUNDS. The adapter publishes no joiner material a founder could address, so a
+welcome join is not reachable from this package."* The gate reported *"production sentences asserting
+a join is impossible: 0"* and the package stayed green. The sentence even carried a phrase from the
+list; it simply named neither identifier.
+
+**What closed it.** The subject is now derived and has no literal: the seed is the production
+declaration whose body calls `mls.JoinFromWelcome` — found, not named — and the vocabulary is the
+words of the path's declaration names, twice narrowed, with both complements printed. The two
+narrowings are *shared with the rest of the package* (removes `key`, `package`, `engine`, `handle`,
+`err`, `no`, `for`, `from`, `mls`, `connect`, `zeroize`) and **RECURRENCE**: a word that names what
+the join IS appears in more than one of the path's names, a word incidental to one helper's spelling
+appears in exactly one. Without recurrence the vocabulary is `{join, welcome, with, taken, shape}`
+and `with` alone carries the class from 54 sentences to 266. With it, `{join, welcome}`.
+
+**And the predicate literal was answered the way this file says to answer one.** The phrase list
+cannot be derived — *"asserts the join cannot happen"* is a judgement, and a negation adjacent to a
+join word is not it: *"Rejected: taking only after a successful join, which this interface cannot
+express"* is a true sentence of exactly that shape. So the complement is printed sentence by
+sentence on every run, and **the set of DECLARATIONS allowed to speak about the join in the negative
+is pinned**, seven of them, each with the reason its sentences are true. A new declaration making a
+new claim is red on the commit that adds it **whatever words it chooses** — measured with
+`engineJoinerHorizon`, whose *"a welcome never yields a member here"* matches no phrase in the list
+and is caught by the pin.
+
+That is this file's own closing rule applied rather than quoted: **a derived class whose literal is
+invisible and silent is worth less than an enumerated one that refuses and prints.** The class is
+derived; the disposition is enumerated; both complements are printed.
+
+### One clause of the fix was itself wrong, and the measurement is why it is not still there
+
+The first version failed closed on an empty SUBJECT complement, on this project's standing rule that
+an empty complement is the dangerous reading. **It went red over correct source** the moment
+`doc.go` was corrected: the phrase list is deliberately join-specific, so "asserts an impossibility
+about something else" is expected to be small or empty, and the clause was measuring the phrase
+list's breadth while calling it a class boundary. It was replaced by the check it was reaching for —
+that the vocabulary does not admit EVERY sentence, which is the real form of "reported clean having
+read nothing" for a subject narrowing. **An empty complement is a question, not a verdict**, and
+which one it is depends on whether the narrowing was supposed to remove anything.
+
+### And a third, found while closing the second
+
+`TestThisFileSaysWhatItDoesNotEstablish` asserted four sentences were present by reading its own file
+for a needle. A constant was rewritten back to its old, one-sided wording and the gate stayed green:
+the needle still matched the **paragraph above the constant, which describes it**. A gate satisfied
+by prose about a value is not holding the value. Each needle is now asked twice, of the file and of
+the constant — which is not the self-comparison that file warns about, because the needle is
+assembled in the gate independently of the constant.

@@ -13,8 +13,22 @@
 // no default -- absent rather than defaulted, which is the discipline this project's own rule
 // states; the state store, which is a map and persists nothing; the clock, which is a constant
 // because this package has no timing sensitive test and must not gain one; and the server nonce,
-// which the submitting connection chooses and there is no connection. None of the four is a KEY,
-// which is the distinction CP3b's "no test-only key source anywhere on the path" draws.
+// which the submitting connection chooses and there is no connection.
+//
+// AND ONE OF THE FOUR IS A KEY. This paragraph used to end "none of the four is a KEY", and that
+// is wrong about pq_secret and only about pq_secret: StorageRoot takes it as the IKM of every
+// storage_root this session extracts, so it is key material on the seal and open path by the only
+// definition that matters. Three things are true at once and the sentence has to carry all three.
+// It is a KEY VALUE the test supplies; NewPqSecret is a PRODUCTION function and is what draws the
+// real one, so it is not a test-only key SOURCE -- which is the distinction CP3b's bar draws and
+// the reason the owner's 2026-09-10 ruling reads "key SOURCE" literally; and NOTHING IN PRODUCTION
+// CALLS NewPqSecret, anywhere in this package, so this value has no production driver at all. That
+// last clause is the one worth carrying forward: its delivery is m1 task 14, gated on ledger item
+// 152, which is an owner ruling. Do not build a driver for it here.
+//
+// The other three are not keys and the reasons differ: a store holds key material and is not any,
+// a clock is a number, and the server nonce is a mac input spec A hands to the server in the
+// clear.
 //
 // The state store is in memory and is test-only by construction: it is declared in a _test.go
 // file, so no production build of this package can reach it, and imports_test.go's pin over the
@@ -159,6 +173,18 @@ func buildTestEngine() (*testEngine, error) {
 // put an observation instrument where the engine's store goes without replacing the one every
 // other case runs on. memory is the same store unless the instrument wraps one.
 func buildTestEngineOver(store mls.StateStore, memory *memoryStateStore) (*testEngine, error) {
+	return buildTestEngineWrapped(store, memory, nil)
+}
+
+// buildTestEngineWrapped is buildTestEngineOver with the PROVIDER chosen by the caller too, so a
+// gate can put an observation instrument where the engine's crypto goes. wrap is nil for every
+// fixture but the one that observes the join's erase through an alias.
+//
+// The provider is wrapped AFTER the key pairs and the X-Wing seed are drawn, so the instrument
+// observes only what the engine does with it and not what this fixture did.
+func buildTestEngineWrapped(store mls.StateStore, memory *memoryStateStore,
+	wrap func(mls.CryptoProvider) mls.CryptoProvider) (*testEngine, error) {
+
 	crypto, err := mls.NewCryptoProvider(mls.CipherSuiteX25519ChaCha20Sha256Ed25519)
 	if err != nil {
 		return nil, err
@@ -191,6 +217,9 @@ func buildTestEngineOver(store mls.StateStore, memory *memoryStateStore) (*testE
 	}).Encode()
 	if err != nil {
 		return nil, err
+	}
+	if wrap != nil {
+		crypto = wrap(crypto)
 	}
 	engine, err := NewConnectMlsEngine(crypto, store, signer,
 		mls.BasicCredential(identityPub), leafKeys.ExtensionData)
@@ -348,6 +377,27 @@ func newRecordingEngine(t *testing.T) (*testEngine, *recordingAliasStore) {
 	return engine, store
 }
 
+// newEraseObservingEngine is one device whose engine writes into BOTH instruments: the store that
+// records its calls and the provider that retains the private key array the join hands to HPKE.
+//
+// The two are needed together and neither is redundant. The store answers where the material came
+// from -- the arrays TakeKeyPackage handed back, which the join must NOT erase and must put back
+// byte for byte. The provider answers whether the copies the join assembled over them were erased
+// at all, which is the half no route through a store can reach.
+func newEraseObservingEngine(t *testing.T) (*testEngine, *recordingAliasStore, *aliasingCryptoProvider) {
+	t.Helper()
+	store := newRecordingAliasStore()
+	observed := &aliasingCryptoProvider{}
+	engine, err := buildTestEngineWrapped(store, store.inner, func(inner mls.CryptoProvider) mls.CryptoProvider {
+		observed.inner = inner
+		return observed
+	})
+	if err != nil {
+		t.Fatalf("build the engine this gate observes: %v", err)
+	}
+	return engine, store, observed
+}
+
 // createGroup founds a group whose id is thirty two octets, which is the width a record header
 // carries.
 func (self *testEngine) createGroup(t *testing.T, name string) GroupHandle {
@@ -458,3 +508,135 @@ func (self *testSession) trackOwn(t *testing.T) {
 		t.Fatalf("TrackSender: %v", err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// the erase observation instrument: a provider, and it is not a provider
+// ---------------------------------------------------------------------------
+
+// aliasingCryptoProvider is mls.CryptoProvider as an OBSERVATION INSTRUMENT and not as a provider,
+// and it is recordingAliasStore's rule applied one seam over.
+//
+// THE RULE, quoted from that type because this one exists for exactly it: "an erase is observable
+// only through an ALIAS of the array erased, and wherever the far side copies, the property must
+// build the alias or it is measuring a photograph."
+//
+// THE ARRAY IN QUESTION IS A LOCAL OF A PRODUCTION METHOD AND NO RUNTIME ROUTE FROM THIS PACKAGE
+// REACHES IT. joinWithTakenKeyPackage assembles mls.JoinKeyMaterial over four copies it made --
+// that is the whole point of the helper -- so the store's arrays are the wrong arrays, the
+// engine's own signer is the wrong array, and the joined handle holds clones connect/mls made.
+// There is ONE seam through which the material's own array crosses back into a type this package
+// controls: mls.JoinFromWelcome opens the welcome secret with OpenWithLabel(crypto,
+// keys.InitPrivate, ...), which reaches crypto.HpkeOpen(priv, ...) with the slice passed
+// STRAIGHT THROUGH -- no clone at either hop. A provider that RETAINS that slice header holds an
+// alias of the exact array (*mls.JoinKeyMaterial).Zeroize is obliged to erase.
+//
+// WHAT IT BUYS, measured rather than argued: a deferred call named Zeroize that erases NOTHING --
+// spelled as a no-op method of a decoy type, so the source read at the bottom of
+// TestTheDeviceSurvivesItsOwnJoin sees exactly one deferred erase and no plain one -- left the
+// whole of ./mls/... ./message/... ./messagegroup/... green at 7,692 passing, 0 failing. Through
+// this instrument that mutant is red.
+//
+// IT IS NOT A PROVIDER AND MUST NOT BECOME ONE. A production provider that retained a caller's
+// private key array is the defect the erase discipline exists to forbid.
+//
+// The methods are written out rather than promoted from an embedded mls.CryptoProvider for
+// recordingAliasStore's reason: a method added to that interface would arrive here already
+// implemented, recording nothing, and quietly narrowing what every gate reading this can see.
+type aliasingCryptoProvider struct {
+	inner mls.CryptoProvider
+	// one entry per HpkeOpen, in order: the slice HEADER the caller handed over, and a COPY of
+	// what it held at call time. The copy is the control -- "it reads all zero afterwards" is
+	// satisfied by an array that was all zero to begin with, and by an empty one.
+	hpkeOpenPriv       [][]byte
+	hpkeOpenPrivAtCall [][]byte
+}
+
+var _ mls.CryptoProvider = (*aliasingCryptoProvider)(nil)
+
+func (self *aliasingCryptoProvider) Suite() mls.CipherSuite { return self.inner.Suite() }
+func (self *aliasingCryptoProvider) HashSize() int          { return self.inner.HashSize() }
+func (self *aliasingCryptoProvider) KeySize() int           { return self.inner.KeySize() }
+func (self *aliasingCryptoProvider) NonceSize() int         { return self.inner.NonceSize() }
+
+func (self *aliasingCryptoProvider) Hash(data []byte) []byte { return self.inner.Hash(data) }
+
+func (self *aliasingCryptoProvider) Mac(key []byte, data []byte) []byte {
+	return self.inner.Mac(key, data)
+}
+
+func (self *aliasingCryptoProvider) MacVerify(key []byte, data []byte, tag []byte) bool {
+	return self.inner.MacVerify(key, data, tag)
+}
+
+func (self *aliasingCryptoProvider) Extract(salt []byte, ikm []byte) []byte {
+	return self.inner.Extract(salt, ikm)
+}
+
+func (self *aliasingCryptoProvider) Expand(prk []byte, info []byte, length int) []byte {
+	return self.inner.Expand(prk, info, length)
+}
+
+func (self *aliasingCryptoProvider) ExpandWithLabel(secret []byte, label string, context []byte,
+	length int) []byte {
+
+	return self.inner.ExpandWithLabel(secret, label, context, length)
+}
+
+func (self *aliasingCryptoProvider) DeriveSecret(secret []byte, label string) []byte {
+	return self.inner.DeriveSecret(secret, label)
+}
+
+func (self *aliasingCryptoProvider) DeriveTreeSecret(secret []byte, label string, generation uint32,
+	length int) []byte {
+
+	return self.inner.DeriveTreeSecret(secret, label, generation, length)
+}
+
+func (self *aliasingCryptoProvider) AeadSeal(key []byte, nonce []byte, aad []byte,
+	plaintext []byte) ([]byte, error) {
+
+	return self.inner.AeadSeal(key, nonce, aad, plaintext)
+}
+
+func (self *aliasingCryptoProvider) AeadOpen(key []byte, nonce []byte, aad []byte,
+	ciphertext []byte) ([]byte, error) {
+
+	return self.inner.AeadOpen(key, nonce, aad, ciphertext)
+}
+
+func (self *aliasingCryptoProvider) SignWithLabel(priv mls.SignaturePrivateKey, label string,
+	content []byte) ([]byte, error) {
+
+	return self.inner.SignWithLabel(priv, label, content)
+}
+
+func (self *aliasingCryptoProvider) VerifyWithLabel(pub mls.SignaturePublicKey, label string,
+	content []byte, sig []byte) error {
+
+	return self.inner.VerifyWithLabel(pub, label, content, sig)
+}
+
+func (self *aliasingCryptoProvider) HpkeSeal(pub mls.HpkePublicKey, info []byte, aad []byte,
+	plaintext []byte) ([]byte, []byte, error) {
+
+	return self.inner.HpkeSeal(pub, info, aad, plaintext)
+}
+
+// HpkeOpen RETAINS the caller's private key slice header. This is the instrument.
+func (self *aliasingCryptoProvider) HpkeOpen(priv mls.HpkePrivateKey, kemOutput []byte, info []byte,
+	aad []byte, ciphertext []byte) ([]byte, error) {
+
+	self.hpkeOpenPriv = append(self.hpkeOpenPriv, priv)
+	self.hpkeOpenPrivAtCall = append(self.hpkeOpenPrivAtCall, append([]byte(nil), priv...))
+	return self.inner.HpkeOpen(priv, kemOutput, info, aad, ciphertext)
+}
+
+func (self *aliasingCryptoProvider) DeriveKeyPair(ikm []byte) (mls.HpkePrivateKey, mls.HpkePublicKey, error) {
+	return self.inner.DeriveKeyPair(ikm)
+}
+
+func (self *aliasingCryptoProvider) SignatureKeyPair() (mls.SignaturePrivateKey, mls.SignaturePublicKey, error) {
+	return self.inner.SignatureKeyPair()
+}
+
+func (self *aliasingCryptoProvider) Random(n int) []byte { return self.inner.Random(n) }

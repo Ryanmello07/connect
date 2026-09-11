@@ -47,6 +47,32 @@ import (
 // factories and this one reads like a group operation: a member joining from a Welcome has no
 // handle yet, and putting it on the handle would require one to exist before the join that
 // creates it.
+//
+// THE OBLIGATION JoinFromWelcome HANDS ITS CALLER, AND IT IS STATED HERE BECAUSE THIS IS THE
+// SURFACE AN APP CALLS. A WELCOME AUTHENTICATES NOBODY. mls.JoinFromWelcome's own header spends
+// fifteen lines on this and the adapter below repeats it, but a sentence one layer down is not an
+// obligation on the caller of this interface, and until now this interface stated none of its own.
+//
+// What that means concretely, and it was REPRODUCED rather than argued: an attacker holding a key
+// package this device published -- which went to the delivery service and to every member of every
+// group that ever added this device -- can found a group of its own, add this device, and hand
+// over the Welcome. Every check in this package and every check in connect/mls passes. The handle
+// this method answers is a real handle: its group id, its epoch, its member count and its exporter
+// all agree with the founder's, because the founder is the attacker and the group is real. What is
+// false is only the thing no octet on that path carries -- that the group is the one the user
+// meant to be in.
+//
+// SO A CALLER MUST ANCHOR THE WELCOME TO SOMETHING IT ALREADY TRUSTED BEFORE IT ACTS ON THE
+// HANDLE. Membership is the natural anchor, and this interface hands a caller everything it needs
+// to read one: GroupHandle.MemberAt answers each member's identity, and a caller that expected an
+// invitation from a particular person can require that person's identity to be in the group before
+// it renders a message, publishes a key, or tells a user they have been added.
+//
+// THIS PACKAGE DOES NOT PERFORM THAT CHECK AND MUST NOT INVENT ONE. Which identity a joiner should
+// expect, where the expectation comes from, and what a device does when the anchor is absent are a
+// design ruling and not an adapter's decision -- an anchoring mechanism chosen here would be a
+// security argument taken by the layer with the least context to take it. Open item MG-1, in this
+// directory's OPENITEMS.md, states the obligation and files the mechanism.
 type GroupEngine interface {
 	Suite() uint16
 	NewKeyPackage() (keyPackage []byte, err error)
@@ -332,10 +358,11 @@ func (self *connectMlsEngine) CreateGroup(groupId []byte, policy []byte, leafKey
 //
 // THE TAKE IS DESTRUCTIVE AND THE POSITION IS TAKE-AND-PUT-BACK. TakeKeyPackage reads and deletes
 // in one call and there is no non-destructive read on the eight-method interface. A Welcome
-// authenticates nobody -- mls.JoinFromWelcome's own header spends fifteen lines on it -- so
-// anybody holding this device's published key package can seal a well formed one to it, and a
-// joiner that took and then failed would have consumed the device's only copy: the legitimate
-// Welcome could never be opened. This body puts the entry back on EVERY failure path after the
+// authenticates nobody -- mls.JoinFromWelcome's own header spends fifteen lines on it, and
+// GroupEngine's header states what that leaves the CALLER of this method owing, which is open item
+// MG-1 -- so anybody holding this device's published key package can seal a well formed one to it,
+// and a joiner that took and then failed would have consumed the device's only copy: the
+// legitimate Welcome could never be opened. This body puts the entry back on EVERY failure path after the
 // take, so a bogus Welcome costs a store round trip rather than the device's only copy.
 // Rejected: taking only after a successful join, which this interface cannot express, because
 // mls.JoinFromWelcome needs the material in order to decide. THE WINDOW THIS LEAVES AND DOES NOT
