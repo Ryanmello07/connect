@@ -45,10 +45,16 @@
 // one.
 //
 // WHAT IS ABSENT MATTERS MORE THAN WHAT IS PRESENT, and the honest inventory is this. This package
-// can seal and open ONE client's records in memory. It cannot join a group: the adapter's
-// JoinFromWelcome refuses, because connect/mls keeps a minted key package's signature private half
-// on an unexported field and StateStore.TakeKeyPackage does not carry it, so no caller outside that
-// package can assemble the mls.JoinKeyMaterial a Welcome join takes. It seals only the DURABLE
+// can seal and open ONE client's records in memory. TWO ENGINES CAN NOW SHARE ONE GROUP: the
+// adapter mints every key package under the device's own signing key, its JoinFromWelcome recovers
+// the ref the Welcome addresses to this device, takes it, assembles the join material over copies
+// it made and joins -- and enginejoin_test.go is the standing proof, two independent engines at one
+// epoch whose exporters agree octet for octet. WHAT THAT IS NOT is the milestone: no record crosses
+// between those two engines, because a session refuses an empty pq_secret and there is no delivery
+// channel for one; the joiner cannot compute a sender_handle, because an epoch beyond the first
+// refuses a handle that was given no group_handle_key; and the Welcome is handed over as a VALUE IN
+// ONE PROCESS, which is a named, gated, test-only hand-off rather than a delivery channel. It seals
+// only the DURABLE
 // retention class, because MASTER section 8.1 and section 5.3 disagree about which record_key seals
 // ct_head and open item M1-6 has not ruled -- so the permanent, media and eph classes are refused
 // rather than guessed at. It reaches no message server: every task of wave 1 stops at a *Record in

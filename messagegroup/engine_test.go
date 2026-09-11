@@ -814,19 +814,18 @@ func TestTheEngineRefusesEveryThingItCannotBeBuiltWithout(t *testing.T) {
 	}
 }
 
-// JoinFromWelcome refuses, and after j1 task 5 what it refuses is a MESSAGE rather than its own
-// exported surface.
+// TestJoinFromWelcomeRefusesAndSaysWhatIsMissing is INVERTED rather than deleted, and it keeps its
+// name so that the record of what it used to assert is not lost with it.
 //
-// THE SENTINEL THIS CASE USED TO ASSERT IS GONE, and its spelling is gone with it -- the package
-// honesty gate's own query would answer this comment otherwise. It named an impossibility --
-// "connect/mls does not publish the joiner's own signature private key" -- and that impossibility
-// no longer exists: mls.NewKeyPackageWithSigner binds the leaf to a key the caller holds, and this
-// engine mints under self.signer. A sentinel naming an impossibility that is no longer impossible
-// is the same defect class as a doc paragraph stating a cause that has been removed, so it left
-// the tree with the body rather than being kept declared and unused.
+// It used to hold a refusal that named a gap in connect/mls's exported surface, and the two shapes
+// its own comment rejected were: a join that answered a handle built on a signature key this device
+// does not hold, and a second assembly of KeyPackageTBS beside a second spelling of its signature
+// label. NEITHER IS WHAT LANDED. The label and the preimage have exactly one assembly each in
+// package mls, and the leaf this device publishes names the key it signs with -- so the refusal's
+// own reason is gone and the case becomes the positive statement it was standing in for.
 //
-// The case keeps its name and its shape: the octets it hands in are still not a Welcome, and the
-// refusal is still asserted BY NAME and still answers no handle. What changed is which name.
+// BOTH HALVES ARE HELD HERE. The join answers a HANDLE over a real Welcome, and it still refuses
+// octets that are not one -- by name, and with no handle beside the error.
 func TestJoinFromWelcomeRefusesAndSaysWhatIsMissing(t *testing.T) {
 	fixture := newTestEngine(t)
 	handle, err := fixture.engine.JoinFromWelcome([]byte("a welcome"), []byte("a tree"))
@@ -835,6 +834,39 @@ func TestJoinFromWelcomeRefusesAndSaysWhatIsMissing(t *testing.T) {
 	}
 	if handle != nil {
 		t.Error("JoinFromWelcome answered a handle beside its error, which is a member built on a key this device does not hold")
+	}
+
+	// THE INVERSION: a real welcome answers a real handle, built on the key this device DOES
+	// hold. The signature key is read through the joined group's own ratchet tree, because that
+	// is the only route from this package to a leaf's signature_key -- MemberAt drops it.
+	founder := newTestEngine(t)
+	keyPackage, err := fixture.engine.NewKeyPackage()
+	if err != nil {
+		t.Fatalf("NewKeyPackage: %v", err)
+	}
+	group := founder.createGroup(t, "the-inversion")
+	defer group.Close()
+	if _, err := group.ProposeAdd(keyPackage); err != nil {
+		t.Fatalf("ProposeAdd: %v", err)
+	}
+	_, welcome, ratchetTree, err := group.Commit(nil)
+	if err != nil {
+		t.Fatalf("Commit(nil): %v", err)
+	}
+	if err := group.MergePendingCommit(); err != nil {
+		t.Fatalf("MergePendingCommit: %v", err)
+	}
+	joined, err := fixture.engine.JoinFromWelcome(welcome, ratchetTree)
+	if err != nil {
+		t.Fatalf("JoinFromWelcome over a real welcome: %v", err)
+	}
+	defer joined.Close()
+	if joined == nil {
+		t.Fatal("JoinFromWelcome answered no handle and no error")
+	}
+	if named, _ := engineLeafKeyOf(t, joined, joined.OwnLeafIndex()); !bytes.Equal(named, fixture.signerPub) {
+		t.Errorf("the joined handle sits at a leaf naming %x and this device signs with %x; a member built on a key it does not hold is one every peer refuses at its first commit",
+			named, fixture.signerPub)
 	}
 }
 
