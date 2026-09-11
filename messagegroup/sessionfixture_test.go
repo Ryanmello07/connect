@@ -146,6 +146,13 @@ type testEngine struct {
 	// names the device signer" has nothing to compare the leaf against: testEngine retained the
 	// credential identity and neither the signer nor its public half.
 	signerPub []byte
+	// THE PRIVATE HALF, COPIED AT CONSTRUCTION AND BEFORE ANY DOOR OF THE ENGINE HAS BEEN DRIVEN.
+	// It is the CONTROL for the clone coupling pin in joincoupling_test.go and it is a copy rather
+	// than the engine's own array on purpose: NewConnectMlsEngine clones what it is handed, so this
+	// field and the engine's field are two arrays, and a pin comparing them is comparing the array
+	// under test against a value taken before anything could have erased it. A field that aliased
+	// the engine's would read zero exactly when the engine's did and would prove nothing.
+	signer []byte
 	// the store the engine was actually built over, which is memoryStateStore for every fixture
 	// but the ones that hand it an observation instrument.
 	outerStore mls.StateStore
@@ -233,6 +240,7 @@ func buildTestEngineWrapped(store mls.StateStore, memory *memoryStateStore,
 		identityPub: append([]byte(nil), identityPub...),
 		leafKeys:    leafKeys.ExtensionData,
 		signerPub:   append([]byte(nil), signerPub...),
+		signer:      append([]byte(nil), signer...),
 		outerStore:  store,
 	}, nil
 }

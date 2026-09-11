@@ -1015,3 +1015,60 @@ the needle still matched the **paragraph above the constant, which describes it*
 by prose about a value is not holding the value. Each needle is now asked twice, of the file and of
 the constant — which is not the self-comparison that file warns about, because the needle is
 assembled in the gate independently of the constant.
+
+---
+
+## A fourth, and it is a gate ADDED rather than a defect found
+
+Closed on 2026-09-11, over the clone coupling `connect/messagegroup`'s join body rests on.
+
+**The coupling.** `joinWithTakenKeyPackage` assembles `mls.JoinKeyMaterial` over four copies and
+defers `(*JoinKeyMaterial).Zeroize` over the result, because that type owns every array it carries.
+Its own header calls the fourth copy *"a fourth instance of a discipline this path already spells
+three times"* — and the three it names are fill sites in **this** package: `mls/group.go`'s
+`signer`, `mls/treekem.go`'s `EncryptionPriv`, `mls/key_package.go`'s `signPriv`. **Nothing held
+them.** Two of the three are spelled `cloneBytes(x)` and the third `append(T(nil), x...)`, so a gate
+keyed to either spelling is blind to the other — this file's own class, one altitude over.
+
+**What was built, in two halves, because neither half is enough alone:**
+
+- `messagegroup/joincoupling_test.go` — a **behavioural pin**. It joins, then asks whether the
+  device's own signing array survived, whether the device can still sign through a door driven
+  after the join, whether the joined handle can still sign **with a peer as the judge**, and
+  whether that handle can still open a path addressed to its own leaf. Each of the four clauses
+  is the only one that catches its own site; all three alias mutations and the removal of the
+  engine's own defensive copy were driven red through it.
+- `mls/erased_field_alias_test.go` — a **derived gate**. The class is derived in three steps that
+  each fatal on empty: erase helpers by **body shape** (a `for i := range p { p[i] = 0 }` over a
+  parameter — the name `zeroizeSecret` appears nowhere in it), erased fields by where those
+  helpers are called on a receiver's field, fill sites by field name over every composite literal
+  and assignment. The decision at each site is an **alias** question, never a spelling one: the
+  RHS is resolved to the origin of its backing array through parens, reslices, derefs, address-of,
+  type conversions including `[]byte(nil)`, `append`'s destination, locals in both the one-to-one
+  and the `a, err := f()` forms, and one hop into any function this package declares.
+
+**The measurement that decided the gate's shape, and it is the part worth reading.** Twenty fill
+sites exist. Fifteen are not caller-rooted. **Five are, and none of the five is a defect** — four
+are ownership transfers this package makes on purpose (`(*SecretTree).newRatchet`'s header states
+its own in words) and the fifth is erased by its caller two frames up. *Nothing in the source tells
+an ownership transfer from a borrow*; it takes escape analysis or a stated contract. Widening the
+decision rule until those five passed would have left a rule that refuses nothing.
+
+**So the class is derived and the DISPOSITION is enumerated** — `eraseOwnershipHandovers`, keyed by
+`file:function.field` and never by line, each entry carrying the evidence. Caller-rooted and
+undisposed is red; a disposition matching no site is red; an empty reason is red. That is this
+file's own remedy rather than a retreat from it: *"a derived class whose literal is invisible and
+silent is worth less than an enumerated one that refuses and prints."*
+
+**Held to the two questions:**
+
+| the literal | visible? | fails closed? | prints its complement? |
+|---|---|---|---|
+| the erase **body shape** in `eraseHelpersIn` | yes — a wrong shape empties the class | yes — `t.Fatal`, and the control corpus spells its erase `wipe` | yes — the helper set is printed every run |
+| the **peel forms** in `originOf` | yes — a form it does not know lands in the undecided list | yes — undecided is an error, never an admit | yes — 0 undecided today, printed as a count beside the four other verdicts |
+| the **five dispositions** | yes — each is printed **with its reason** beside the site it excuses, on every passing run | yes in both directions — undisposed is red, stale is red, empty-reason is red | yes — and the 15 admitted sites are printed with where each array came from |
+| the **three opaque callees** the admissions rest on | partly — they are named every run but not opened | no — an opaque call is admitted | yes — `crypto.DeriveSecret`, `r.ReadOpaque`, `self.crypto.DeriveTreeSecret`, named every run |
+
+The last row is this gate's own open edge, written down rather than argued away: three callees are
+admitted on the strength of their copying and this gate does not check that they do. It is named on
+every run so a **fourth** name appearing there is visible in a passing log.
