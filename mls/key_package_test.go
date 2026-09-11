@@ -1704,3 +1704,364 @@ func TestNewKeyPackageWithSignerRefusesExactlyWhatItMust(t *testing.T) {
 			exact.drawn, 2*params.Nh)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// j1 task 2: one minting body, and the seed the wrapper must not leave behind
+// ---------------------------------------------------------------------------
+
+// seedRetainingProvider hands back what the real provider hands back and RETAINS the signature
+// seed's own array rather than a copy of it.
+//
+// It is the ALIAS the erase property below is observed through, and an alias is the only thing
+// that can observe it. NewKeyPackage's drawn seed is a LOCAL of its body: no test can read a
+// returned function's local, so "the wrapper's array is zero after the call returns" names a
+// value and not a route. The route exists because (*suiteCryptoProvider).SignatureKeyPair hands
+// back the seed BUFFER itself rather than a copy -- so a wrapper that keeps the slice header it
+// was answered holds the same array the body holds, and reading it afterwards IS reading the
+// body's local.
+//
+// A provider that copied on the way out would make this property green under the mutant it
+// exists for. That is the general shape and it is written here because this package meets it
+// twice: an erase is observable only through an alias of the array erased, and wherever the far
+// side copies, the property must build the alias or it is measuring a photograph.
+//
+// It EMBEDS rather than writing the interface out, which is the opposite of
+// taggingCryptoProvider's choice and is deliberate for a different reason: what this instrument
+// overrides is one method, and a method added to CryptoProvider tomorrow must keep working here
+// untouched, exactly as it does for the embedding doubles in group_test.go and
+// framing_protect_test.go. Nothing here tags an answer, so a promoted method narrows nothing.
+type seedRetainingProvider struct {
+	CryptoProvider
+	retained []SignaturePrivateKey
+	// and a COPY of the same seed, which is a different instrument answering a different
+	// question. retained is the ALIAS the erase is read through and is zero afterwards by
+	// construction; copies is what the provider actually ANSWERED, and it is the only way to
+	// ask whether the seed the key package kept is the seed the provider drew. A gate that
+	// recovered "the key it drew" off kp.signPriv is green over a wrapper that handed its
+	// delegate the PUBLIC half: that answer is self consistent at every clause.
+	copies [][]byte
+	// when set, DeriveKeyPair refuses. It is how this gate reaches an exit the DELEGATE takes
+	// AFTER the wrapper has already drawn: NewLeafNode refuses only a nil provider and a bad
+	// signer, and the wrapper hands it neither, so the only refusal downstream of the draw is
+	// one the provider raises.
+	refuseDerive bool
+}
+
+var errSeedRetainingProviderRefuses = errors.New("mls: the retaining provider refuses to derive")
+
+func (self *seedRetainingProvider) DeriveKeyPair(ikm []byte) (HpkePrivateKey, HpkePublicKey, error) {
+	if self.refuseDerive {
+		return nil, nil, errSeedRetainingProviderRefuses
+	}
+	return self.CryptoProvider.DeriveKeyPair(ikm)
+}
+
+func (self *seedRetainingProvider) SignatureKeyPair() (SignaturePrivateKey, SignaturePublicKey, error) {
+	priv, pub, err := self.CryptoProvider.SignatureKeyPair()
+	if err == nil {
+		// the slice HEADER, not a clone. The array behind it is the one NewKeyPackage's body
+		// is about to hold, and a clone here would answer this property from a photograph.
+		self.retained = append(self.retained, priv)
+		self.copies = append(self.copies, bytes.Clone(priv))
+	}
+	return priv, pub, err
+}
+
+// keyPackageDelegationStream is the entropy both halves of the equality below are run over.
+//
+// It is long enough for a signature seed and two KDF.Nh derivations at either registered suite,
+// and it ascends rather than repeating so that a body reading the wrong window answers something
+// visibly different rather than something accidentally equal.
+func keyPackageDelegationStream(t *testing.T) []byte {
+	t.Helper()
+	return ascendingBytes(0x10, 4096)
+}
+
+// TestNewKeyPackageAndTheSignerTakingConstructorAnswerOneKeyPackage is the equality that says
+// the two bodies are one body.
+//
+// NewCryptoProviderWithRandom is what makes it observable: run NewKeyPackage over a recorded
+// stream, recover the signature key it drew, then run NewKeyPackageWithSigner with that key over
+// the SAME stream ADVANCED PAST the signature draw, and compare the two encodings octet for
+// octet along with both private halves.
+//
+// The comparison reports the first differing offset rather than a boolean, because a difference
+// in the leaf and a difference in the signature are two different defects and a caller reading
+// "not equal" cannot tell them apart.
+//
+// The leaf carries a wall clock Lifetime and the signature covers it, so two mints a second
+// apart differ for a reason that is not the bodies. The loop retries rather than normalising:
+// normalising the lifetime out would also have to re-sign, which would compare two preimages
+// this test built instead of the two the constructors did.
+func TestNewKeyPackageAndTheSignerTakingConstructorAnswerOneKeyPackage(t *testing.T) {
+	params, err := LookupSuite(keyPackageTestSuite)
+	if err != nil {
+		t.Fatalf("look up the suite this equality is taken at: %v", err)
+	}
+	stream := keyPackageDelegationStream(t)
+	cred := BasicCredential([]byte("the device both constructors mint for"))
+
+	for attempt := 0; ; attempt++ {
+		if attempt == 8 {
+			t.Fatalf("eight attempts and the two mints never landed inside one wall clock second")
+		}
+		drawn := &seedRetainingProvider{
+			CryptoProvider: mustProviderOver(t, keyPackageTestSuite, bytes.NewReader(stream)),
+		}
+		drew, drewInit, drewEnc, drewErr := NewKeyPackage(drawn, keyPackageTestSuite, cred,
+			testKeyPackageCapabilities(), nil)
+		if drewErr != nil {
+			t.Fatalf("NewKeyPackage over the recorded stream: %v", drewErr)
+		}
+		// THE SEED THE PROVIDER ANSWERED, and not the one the key package kept. The two are the
+		// same value under a correct wrapper and that is the point: a wrapper that handed its
+		// delegate the drawn PUBLIC half, or one that erased the seed before delegating, answers
+		// a key package whose every field agrees with itself, and recovering "the key it drew"
+		// off kp.signPriv would compare that key package against itself.
+		if len(drawn.copies) != 1 {
+			t.Fatalf("the wrapper drew %d signature key pairs, want exactly one", len(drawn.copies))
+		}
+		signer := drawn.copies[0]
+		if len(signer) != params.NsigPriv {
+			t.Fatalf("the drawn seed is %d octets and the suite's NsigPriv is %d", len(signer), params.NsigPriv)
+		}
+		if !bytes.Equal(drew.signPriv, signer) {
+			t.Fatalf("the provider answered the seed %x and the key package kept %x", signer, drew.signPriv)
+		}
+		advanced := mustProviderOver(t, keyPackageTestSuite, bytes.NewReader(stream[params.NsigPriv:]))
+		handed, handedInit, handedEnc, handedErr := NewKeyPackageWithSigner(advanced,
+			keyPackageTestSuite, SignaturePrivateKey(signer), cred, testKeyPackageCapabilities(), nil)
+		if handedErr != nil {
+			t.Fatalf("NewKeyPackageWithSigner over the advanced stream: %v", handedErr)
+		}
+		if drew.LeafNode.Lifetime != handed.LeafNode.Lifetime {
+			continue
+		}
+
+		drewBytes, err := syntax.Marshal(drew)
+		if err != nil {
+			t.Fatalf("Marshal what NewKeyPackage answered: %v", err)
+		}
+		handedBytes, err := syntax.Marshal(handed)
+		if err != nil {
+			t.Fatalf("Marshal what NewKeyPackageWithSigner answered: %v", err)
+		}
+		if !bytes.Equal(drewBytes, handedBytes) {
+			at := 0
+			for at < len(drewBytes) && at < len(handedBytes) && drewBytes[at] == handedBytes[at] {
+				at++
+			}
+			t.Fatalf("the two constructors answered %d and %d octets, first differing at offset %d: %x against %x",
+				len(drewBytes), len(handedBytes), at,
+				drewBytes[at:min(at+16, len(drewBytes))], handedBytes[at:min(at+16, len(handedBytes))])
+		}
+		// the PRIVATE halves as well as the encoding. An encoding comparison alone is satisfied
+		// by a wrapper that answered the two HPKE privates in the opposite order, and by one
+		// that erased the seed it drew before the delegate cloned it.
+		if !bytes.Equal(drewInit, handedInit) {
+			t.Errorf("the init private halves are %x and %x", drewInit, handedInit)
+		}
+		if !bytes.Equal(drewEnc, handedEnc) {
+			t.Errorf("the encryption private halves are %x and %x", drewEnc, handedEnc)
+		}
+		if !bytes.Equal(drew.signPriv, handed.signPriv) {
+			t.Errorf("the retained seeds are %x and %x", drew.signPriv, handed.signPriv)
+		}
+
+
+		// PROPERTY 2, and it is what makes the ordering claim falsifiable rather than
+		// decorative: the equality holds ONLY over the advanced stream. Over the UNADVANCED one
+		// the signer-taking constructor derives its init pair from the octets the signature draw
+		// consumed, so the two answers differ -- which is exactly what every deterministic
+		// provider test in this package observes about the draw order.
+		unadvanced := mustProviderOver(t, keyPackageTestSuite, bytes.NewReader(stream))
+		fromTheTop, _, _, err := NewKeyPackageWithSigner(unadvanced, keyPackageTestSuite,
+			SignaturePrivateKey(signer), cred, testKeyPackageCapabilities(), nil)
+		if err != nil {
+			t.Fatalf("NewKeyPackageWithSigner over the unadvanced stream: %v", err)
+		}
+		if bytes.Equal(fromTheTop.InitKey, drew.InitKey) {
+			t.Errorf("the signer-taking constructor answered the same init_key %x over the stream from its start as NewKeyPackage did after a signature draw, so the signature key is not drawn first",
+				fromTheTop.InitKey)
+		}
+		return
+	}
+}
+
+// TestNewKeyPackageErasesTheSeedItDrewBeforeItReturns is the orphan half of this package's erase
+// discipline, and it is the half no field-by-field gate can reach.
+//
+// Before task 2 the freshly drawn signature seed had exactly ONE holder and
+// (*KeyPackage).Zeroize reached it. After it there are TWO: SignatureKeyPair hands back the seed
+// buffer itself, the wrapper passes it to the delegate, and the delegate CLONES it -- so the
+// wrapper is left holding an array only it can reach and nothing else erases. mls's own
+// staged_erase_test.go cannot see this: that gate holds struct fields and this is a local.
+//
+// The observation is taken on the ERROR path as well as on the success path, because a body that
+// erased after the delegation returned successfully leaves the seed drawn on every refusal the
+// delegate has.
+func TestNewKeyPackageErasesTheSeedItDrewBeforeItReturns(t *testing.T) {
+	inner, err := NewCryptoProvider(keyPackageTestSuite)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	// the alias control first: the instrument has to actually alias, or this whole gate is a
+	// photograph of an array nobody erased.
+	control := &seedRetainingProvider{CryptoProvider: inner}
+	seed, _, err := control.SignatureKeyPair()
+	if err != nil {
+		t.Fatalf("SignatureKeyPair through the retaining provider: %v", err)
+	}
+	if len(control.retained) != 1 || &control.retained[0][0] != &seed[0] {
+		t.Fatalf("the retaining provider kept a copy rather than the array it answered, so this gate observes nothing")
+	}
+
+	for _, testCase := range []struct {
+		what string
+		call func(crypto CryptoProvider) error
+	}{
+		{what: "a mint that succeeded", call: func(crypto CryptoProvider) error {
+			_, _, _, mintErr := NewKeyPackage(crypto, keyPackageTestSuite,
+				BasicCredential([]byte("alice")), testKeyPackageCapabilities(), nil)
+			return mintErr
+		}},
+		// a refusal the DELEGATE raises, after the wrapper has already drawn. It is the
+		// provider that refuses, because NewLeafNode's only refusals are a nil provider and a
+		// bad signer and the wrapper hands it neither -- so a body that erased after a
+		// SUCCESSFUL delegation is green everywhere except here.
+		{what: "a mint the delegate refused", call: func(crypto CryptoProvider) error {
+			crypto.(*seedRetainingProvider).refuseDerive = true
+			_, _, _, mintErr := NewKeyPackage(crypto, keyPackageTestSuite,
+				BasicCredential([]byte("alice")), testKeyPackageCapabilities(), nil)
+			if !errors.Is(mintErr, errSeedRetainingProviderRefuses) {
+				return fmt.Errorf("this row meant to reach the delegate's refusal and the mint answered %v", mintErr)
+			}
+			return nil
+		}},
+	} {
+		retaining := &seedRetainingProvider{CryptoProvider: inner}
+		if err := testCase.call(retaining); err != nil {
+			t.Errorf("%s: %v", testCase.what, err)
+			continue
+		}
+		if len(retaining.retained) != 1 {
+			t.Errorf("%s drew %d signature seeds, want exactly one", testCase.what, len(retaining.retained))
+			continue
+		}
+		for _, octet := range retaining.retained[0] {
+			if octet != 0 {
+				t.Errorf("%s left the seed it drew in the heap: %x", testCase.what, retaining.retained[0])
+				break
+			}
+		}
+	}
+}
+
+// keyPackageSignatureLabelReferences reads this package's non test source and splits every
+// reference to the identifier keyPackageSignatureLabel into three: the sites that hand it to a
+// SIGNING call, the sites that hand it to a VERIFYING one, and everything else -- which at this
+// commit is the constant's own declaration.
+//
+// It is read off the parse tree rather than grepped, because the question is which CALL an
+// identifier is an argument to and a line command cannot answer that. The query a reader can run
+// beside it is `grep -rn "keyPackageSignatureLabel" --include=*.go mls/`, which answers 11 lines
+// at a1f8025: three production and eight across five test files, of which four are SignWithLabel
+// sites of their own. This gate's class is the PRODUCTION signing sites alone, and the two
+// production members it removes are printed rather than swallowed -- a constant cannot sign and a
+// verifier is the reader rather than the writer, and a class that swallowed them could not tell a
+// second signer from a second verifier.
+func keyPackageSignatureLabelReferences(t *testing.T) (signing []string, verifying []string, other []string) {
+	t.Helper()
+	for _, path := range packageLevelFunctions(t).files {
+		parsed := mustParseSource(t, path)
+		ast.Inspect(parsed.file, func(node ast.Node) bool {
+			call, isCall := node.(*ast.CallExpr)
+			if !isCall {
+				return true
+			}
+			for _, argument := range call.Args {
+				identifier, isIdentifier := argument.(*ast.Ident)
+				if !isIdentifier || identifier.Name != keyPackageSignatureLabelIdentifier {
+					continue
+				}
+				at := fmt.Sprintf("%s:%d", path, parsed.fileSet.Position(identifier.Pos()).Line)
+				callee := ""
+				if selector, isSelector := call.Fun.(*ast.SelectorExpr); isSelector {
+					callee = selector.Sel.Name
+				} else if name, isName := call.Fun.(*ast.Ident); isName {
+					callee = name.Name
+				}
+				switch {
+				case strings.Contains(callee, "Verify"):
+					verifying = append(verifying, at+" "+callee)
+				case strings.Contains(callee, "Sign"):
+					signing = append(signing, at+" "+callee)
+				default:
+					other = append(other, at+" "+callee)
+				}
+			}
+			return true
+		})
+		// and the references that are not arguments to a call at all -- the declaration itself
+		ast.Inspect(parsed.file, func(node ast.Node) bool {
+			spec, isSpec := node.(*ast.ValueSpec)
+			if !isSpec {
+				return true
+			}
+			for _, name := range spec.Names {
+				if name.Name == keyPackageSignatureLabelIdentifier {
+					other = append(other, fmt.Sprintf("%s:%d declaration",
+						path, parsed.fileSet.Position(name.Pos()).Line))
+				}
+			}
+			return true
+		})
+	}
+	slices.Sort(signing)
+	slices.Sort(verifying)
+	slices.Sort(other)
+	return signing, verifying, other
+}
+
+// The identifier the gate above reads, spelled once as a string so that the gate names the
+// SYMBOL and a body that spelled the label as a literal cannot satisfy it by accident.
+const keyPackageSignatureLabelIdentifier = "keyPackageSignatureLabel"
+
+// TestExactlyOneProductionSiteSignsUnderTheKeyPackageLabel is the half of task 2's one-body claim
+// that the landed composition gate cannot see.
+//
+// labelled_composition_test.go keys on the SignWithLabel CALL and not on how its label argument
+// was written, so a second constructor spelling "KeyPackageTBS" as a string literal keeps its row
+// and that gate stays green. A second spelling of the label is one of the two ways over this
+// package's wall -- messagegroup/engine.go names both -- so this one is over the IDENTIFIER.
+//
+// The complement is printed with the class: the constant's own declaration and the
+// VerifyWithLabel inside Validate. Both are production references and neither is a signer, and a
+// class that took "every production reference" would have counted three where the property is
+// one.
+func TestExactlyOneProductionSiteSignsUnderTheKeyPackageLabel(t *testing.T) {
+	signing, verifying, other := keyPackageSignatureLabelReferences(t)
+	t.Logf("production references to %s: %d signing (%v), %d verifying (%v), %d neither (%v)",
+		keyPackageSignatureLabelIdentifier, len(signing), signing, len(verifying), verifying,
+		len(other), other)
+	if len(signing) != 1 {
+		t.Errorf("%d production sites hand %s to a signing call: %v. After task 2 there is exactly one body in this package that assembles a KeyPackageTBS, and exactly one that signs it",
+			len(signing), keyPackageSignatureLabelIdentifier, signing)
+	}
+	if len(signing) == 1 && !strings.Contains(signing[0], "key_package.go") {
+		t.Errorf("the one signing site is %s, and the assembly this label covers lives in key_package.go", signing[0])
+	}
+	// the complement, and it is not empty: a narrowing whose complement is empty removes nothing
+	// today and starts removing real members the day one appears.
+	if len(verifying)+len(other) == 0 {
+		t.Errorf("this narrowing removed nothing from the production references, so it is not a narrowing")
+	}
+	if len(verifying) != 1 {
+		t.Errorf("%d production sites hand %s to a verifying call: %v, want the one inside Validate",
+			len(verifying), keyPackageSignatureLabelIdentifier, verifying)
+	}
+	if len(other) != 1 {
+		t.Errorf("%d production references to %s are neither: %v, want the constant's own declaration",
+			len(other), keyPackageSignatureLabelIdentifier, other)
+	}
+}

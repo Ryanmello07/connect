@@ -277,7 +277,16 @@ func (self *KeyPackage) signedPreimage() ([]byte, error) {
 // The provider and the suite are compared before anything is drawn, and
 // errKeyPackageProviderSuite carries the argument: they are one decision written twice, and a
 // key package advertising a suite its keys were not made under is invisible to every behavioural
-// test in this tree for as long as the registered suites share their primitives.
+// test in this tree for as long as the registered suites share their primitives. The delegate
+// compares them a second time, which is not a redundancy worth removing: it is an exported
+// constructor in its own right and its refusals are its own.
+//
+// EXACTLY ONE DRAW HAPPENS HERE and everything after it is NewKeyPackageWithSigner's, which is
+// what makes this file hold ONE assembly of a KeyPackageTBS and ONE call site of
+// keyPackageSignatureLabel. The two ways over this package's wall are a second assembly of that
+// preimage and a second spelling of that label -- messagegroup/engine.go names both as defect
+// classes this tree has paid for -- and a sibling constructor carrying its own copy of each
+// would have been the first of them, inside the package this time.
 //
 // The extensions are the LEAF's, not the key package's. RFC 9420 has both, and this profile
 // puts urmessage_leaf_keys (0xF002) on the leaf because it is a property of the device rather
@@ -304,39 +313,18 @@ func NewKeyPackage(crypto CryptoProvider, suite CipherSuite, cred Credential,
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	initPriv, initPub, err := crypto.DeriveKeyPair(crypto.Random(crypto.HashSize()))
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	// a SECOND draw, and the reason is in this function's own header: one draw feeding both
-	// DeriveKeyPair calls answers two identical key pairs, and nothing about the key package
-	// that comes back says so
-	encPriv, encPub, err := crypto.DeriveKeyPair(crypto.Random(crypto.HashSize()))
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	leaf, err := NewLeafNode(crypto, signPriv, cred, encPub, caps, exts)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	kp = &KeyPackage{
-		Version:     ProtocolVersionMls10,
-		CipherSuite: suite,
-		InitKey:     initPub,
-		LeafNode:    *leaf,
-		Extensions:  nil,
-		signPriv:    signPriv,
-	}
-	content, err := kp.signedPreimage()
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	signature, err := crypto.SignWithLabel(signPriv, keyPackageSignatureLabel, content)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	kp.Signature = signature
-	return kp, initPriv, encPriv, nil
+	// THE ONE DRAW THIS BODY STILL MAKES, AND THE ERASE IT OWES FOR IT. Before the delegation
+	// below the seed had exactly one holder and (*KeyPackage).Zeroize reached it; after it there
+	// are two, because NewKeyPackageWithSigner CLONES what it is handed. So this local is an
+	// array only this frame can reach and nothing else will ever erase, which is the orphan half
+	// of this package's erase discipline -- and staged_erase_test.go cannot see it, because that
+	// gate holds struct FIELDS and this is a local.
+	//
+	// It is deferred rather than written after the call for one reason: the delegate has several
+	// error exits and every one of them leaves the seed drawn. A statement after the call erases
+	// it on the success path alone.
+	defer zeroizeSecret(signPriv)
+	return NewKeyPackageWithSigner(crypto, suite, signPriv, cred, caps, exts)
 }
 
 // NewKeyPackageWithSigner mints a key package whose leaf is bound to a signing key the CALLER
