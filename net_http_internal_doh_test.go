@@ -316,3 +316,145 @@ func TestInternalDohRawDialFallsBackAcrossAddressFamilies(t *testing.T) {
 		t.Fatalf("raw dial attempts = %d, expected IPv6 then IPv4", got)
 	}
 }
+
+// filterByFamilyPolicy should return only IPv4 addresses when Force4 is set,
+// only IPv6 when Force6, and all addresses when Auto with no demotion.
+func TestFilterByFamilyPolicy(t *testing.T) {
+	addrs := []netip.Addr{
+		netip.MustParseAddr("192.0.2.1"),
+		netip.MustParseAddr("2001:db8::1"),
+		netip.MustParseAddr("192.0.2.2"),
+		netip.MustParseAddr("2001:db8::2"),
+	}
+	defer SetControlIpFamilyPolicy(IpFamilyAuto)
+
+	tests := []struct {
+		name   string
+		policy IpFamilyPolicy
+		want   []netip.Addr
+	}{
+		{
+			name:   "force4 picks only v4",
+			policy: IpFamilyForce4,
+			want: []netip.Addr{
+				netip.MustParseAddr("192.0.2.1"),
+				netip.MustParseAddr("192.0.2.2"),
+			},
+		},
+		{
+			name:   "force6 picks only v6",
+			policy: IpFamilyForce6,
+			want: []netip.Addr{
+				netip.MustParseAddr("2001:db8::1"),
+				netip.MustParseAddr("2001:db8::2"),
+			},
+		},
+		{
+			name:   "auto returns all",
+			policy: IpFamilyAuto,
+			want:   addrs,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			SetControlIpFamilyPolicy(test.policy)
+			got := filterByFamilyPolicy(addrs)
+			if len(got) != len(test.want) {
+				t.Fatalf("got %d addresses, want %d", len(got), len(test.want))
+			}
+			for i := range got {
+				if got[i] != test.want[i] {
+					t.Fatalf("got[%d] = %v, want %v", i, got[i], test.want[i])
+				}
+			}
+		})
+	}
+}
+
+// filterByFamilyPolicy returns all addresses when the requested family has
+// no matches, acting as a safety fallback.
+func TestFilterByFamilyPolicyFallback(t *testing.T) {
+	v4Only := []netip.Addr{netip.MustParseAddr("192.0.2.1")}
+	defer SetControlIpFamilyPolicy(IpFamilyAuto)
+
+	SetControlIpFamilyPolicy(IpFamilyForce6)
+	got := filterByFamilyPolicy(v4Only)
+	if len(got) != 1 || got[0] != v4Only[0] {
+		t.Fatalf("expected fallback to original addresses, got %v", got)
+	}
+}
+
+// filterByFamilyPolicy handles empty input gracefully.
+func TestFilterByFamilyPolicyEmpty(t *testing.T) {
+	defer SetControlIpFamilyPolicy(IpFamilyAuto)
+	SetControlIpFamilyPolicy(IpFamilyForce4)
+	got := filterByFamilyPolicy(nil)
+	if got != nil {
+		t.Fatalf("expected nil, got %v", got)
+	}
+}
+
+// resolveUDPAddr round-robins across the filtered subset, not a single address.
+func TestInternalDohUdpRoundRobinWithinFamily(t *testing.T) {
+	dohServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		writeDohWire(w, request, []netip.Addr{
+			netip.MustParseAddr("192.0.2.1"),
+			netip.MustParseAddr("192.0.2.2"),
+			netip.MustParseAddr("192.0.2.3"),
+		}, 60, false)
+	}))
+	defer dohServer.Close()
+
+	dohSettings := DefaultDohSettings()
+	dohSettings.RequestTimeout = time.Second
+	dohSettings.DnsResolverSettings = &DnsResolverSettings{
+		EnableRemoteDoh:   true,
+		RemoteDohUrlsIpv4: []string{dohServer.URL},
+	}
+	resolver := &internalDohResolver{
+		cache: NewDohCache(internalDohSettings(dohSettings)),
+	}
+	defer resolver.Close()
+	defer SetControlIpFamilyPolicy(IpFamilyAuto)
+
+	SetControlIpFamilyPolicy(IpFamilyForce4)
+
+	seen := make(map[string]int)
+	for i := 0; i < 9; i++ {
+		addr, err := resolver.resolveUDPAddr(t.Context(), "api.service.test:443")
+		if err != nil {
+			t.Fatalf("resolve %d: %v", i, err)
+		}
+		seen[addr.IP.String()]++
+	}
+
+	// With 3 v4 addresses and 9 calls, each should be hit 3 times.
+	if len(seen) != 3 {
+		t.Fatalf("expected 3 distinct addresses, got %d: %v", len(seen), seen)
+	}
+	for ip, count := range seen {
+		if count != 3 {
+			t.Fatalf("address %s hit %d times, want 3 (full round-robin)", ip, count)
+		}
+	}
+}
+
+// familyLabel returns the correct label for each policy.
+func TestFamilyLabel(t *testing.T) {
+	defer SetControlIpFamilyPolicy(IpFamilyAuto)
+
+	tests := []struct {
+		policy IpFamilyPolicy
+		want   string
+	}{
+		{IpFamilyForce4, "IPv4"},
+		{IpFamilyForce6, "IPv6"},
+		{IpFamilyAuto, "matching"},
+	}
+	for _, test := range tests {
+		SetControlIpFamilyPolicy(test.policy)
+		if got := familyLabel(); got != test.want {
+			t.Errorf("familyLabel() = %q, want %q", got, test.want)
+		}
+	}
+}

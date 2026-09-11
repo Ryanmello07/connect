@@ -343,9 +343,17 @@ func (self *internalDohResolver) resolveUDPAddr(ctx context.Context, address str
 	if err != nil {
 		return nil, err
 	}
-	index := int((self.nextAddr.Add(1) - 1) % uint64(len(addrs)))
-	addr := addrs[index]
-	return &net.UDPAddr{IP: net.IP(addr.AsSlice()), Port: port, Zone: addr.Zone()}, nil
+	// Filter by family policy first, then round-robin across the matching
+	// subset.  The old round-robin interleaved v6/v4 (orderInternalDohAddrs
+	// is v6-first) and the first pick landed on an IPv6 address that the
+	// AF_INET QUIC socket could not send to.
+	filtered := filterByFamilyPolicy(addrs)
+	if len(filtered) == 0 {
+		return nil, fmt.Errorf("no %s addresses for %s", familyLabel(), host)
+	}
+	index := int(self.nextAddr.Add(1)-1) % len(filtered)
+	pick := filtered[index]
+	return &net.UDPAddr{IP: net.IP(pick.AsSlice()), Port: port, Zone: pick.Zone()}, nil
 }
 
 func (self *internalDohResolver) CloseIdleConnections() {
@@ -370,4 +378,54 @@ func (self *ClientStrategy) resolveControlUDPAddr(ctx context.Context, address s
 		return resolveUDPAddrWithResolver(ctx, address, self.settings.ConnectSettings.Resolver, false)
 	}
 	return resolveEgressUDPAddr(ctx, address)
+}
+
+// filterByFamilyPolicy returns addresses matching the current family policy.
+// It applies the same preference logic as pickControlIPAddr but returns all
+// matching addresses so callers can round-robin across them.
+func filterByFamilyPolicy(addrs []netip.Addr) []netip.Addr {
+	if len(addrs) == 0 {
+		return nil
+	}
+	want := 0 // 0 = no preference
+	switch ControlIpFamilyPolicy() {
+	case IpFamilyForce4:
+		want = 4
+	case IpFamilyForce6:
+		want = 6
+	default:
+		switch controlFamilyDemotedFamily() {
+		case 6:
+			want = 4
+		case 4:
+			want = 6
+		}
+	}
+	if want == 0 {
+		return addrs // no preference: keep original order
+	}
+	var filtered []netip.Addr
+	for _, a := range addrs {
+		is4 := a.Is4() || (a.Is4In6() && a.Unmap().Is4())
+		if is4 == (want == 4) {
+			filtered = append(filtered, a)
+		}
+	}
+	if len(filtered) == 0 {
+		return addrs // fall back to all addresses if none match
+	}
+	return filtered
+}
+
+// familyLabel returns a human-readable name for the current family preference,
+// used in error messages when no matching addresses are found.
+func familyLabel() string {
+	switch ControlIpFamilyPolicy() {
+	case IpFamilyForce4:
+		return "IPv4"
+	case IpFamilyForce6:
+		return "IPv6"
+	default:
+		return "matching"
+	}
 }
