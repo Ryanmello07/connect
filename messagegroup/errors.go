@@ -124,15 +124,19 @@ var (
 	// what its wrap target key is has nothing to fix later: every group it founds would carry
 	// a leaf no epoch fan out can address.
 	ErrEngineLeafKeys = errors.New("messagegroup: an urmessage_leaf_keys body is not one this engine can read")
-	// Fires on every call of the connect/mls adapter's JoinFromWelcome, because the method
-	// cannot be written over connect/mls's exported surface at all: mls.NewKeyPackage keeps the
-	// signature private half of the leaf it mints on an unexported field and
-	// mls.StateStore.TakeKeyPackage does not carry it, so no caller outside package mls can
-	// assemble the mls.JoinKeyMaterial a Welcome join takes. It fails CLOSED and it looks like
-	// what it is, which is this project's own rule about a missing key source; a join answering
-	// a handle built on a signature key this device does not hold would be a member every peer
-	// refuses, discovered at the first commit rather than here.
-	ErrEngineJoinUnavailable = errors.New("messagegroup: this engine cannot join from a welcome, because connect/mls does not publish the joiner's own signature private key")
+	// Fires when the octets handed to JoinFromWelcome are not an MLSMessage carrying a Welcome,
+	// or when what the store held under a ref that message names does not decode as a key
+	// package. It names a RUNTIME condition and not a gap in another package's exported
+	// surface, which is the whole difference from the sentinel it replaces: a join is now
+	// possible, and what is left to refuse is a message.
+	ErrEngineWelcomeShape = errors.New("messagegroup: these octets are not an MLSMessage carrying a welcome")
+	// Fires when no key package ref the Welcome names is one this device's store holds. It
+	// carries the ref count, the refusal count and the last store error VERBATIM, because
+	// StateStore.TakeKeyPackage answers a bare error with no declared not-found value: a broken
+	// disk and a Welcome addressed to somebody else are indistinguishable to a caller matching
+	// on the type, and the only place the difference can survive is the message. The taxonomy
+	// that would let the type tell them apart is owed by whoever owns the store interface.
+	ErrEngineNoKeyPackageForWelcome = errors.New("messagegroup: no key package this store holds is addressed by this welcome")
 	// Fires when MemberAt is asked for an ordinal the membership does not have. It is a
 	// refusal and not a zero member because the two are told apart by nothing downstream: a
 	// projection that dropped mls.MemberAt's second result would turn a missing member into

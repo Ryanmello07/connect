@@ -249,6 +249,11 @@ type recordingAliasStore struct {
 	calls     []storeCall
 	initAlias []byte
 	encAlias  []byte
+	// when set, TakeKeyPackage answers it instead of reading. StateStore.TakeKeyPackage returns
+	// a BARE error with no declared not-found value, so a broken disk and a ref this store never
+	// held are one answer to a caller matching on the type; this is how a gate drives the first
+	// of the two.
+	failTake error
 }
 
 var _ mls.StateStore = (*recordingAliasStore)(nil)
@@ -326,6 +331,9 @@ func (self *recordingAliasStore) PutKeyPackage(ref []byte, kp []byte, initPriv [
 
 func (self *recordingAliasStore) TakeKeyPackage(ref []byte) ([]byte, []byte, []byte, error) {
 	self.recordStoreCall("TakeKeyPackage", ref)
+	if self.failTake != nil {
+		return nil, nil, nil, self.failTake
+	}
 	return self.inner.TakeKeyPackage(ref)
 }
 

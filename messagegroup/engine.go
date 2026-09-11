@@ -314,29 +314,141 @@ func (self *connectMlsEngine) CreateGroup(groupId []byte, policy []byte, leafKey
 	return &connectMlsHandle{group: group}, nil
 }
 
-// JoinFromWelcome refuses, and the refusal names what is missing rather than describing it.
+// JoinFromWelcome builds this device's group state out of a Welcome addressed to a key package it
+// published and the ratchet tree the sender anchored.
 //
-// mls.JoinFromWelcome requires an *mls.JoinKeyMaterial whose SignPrivate is the private half of
-// the signature key the joiner's own published leaf names. mls.NewKeyPackage draws that key itself
-// and keeps it on KeyPackage's unexported signPriv; mls.StateStore.TakeKeyPackage answers the key
-// package, the init private half and the encryption private half and NOT that one; and no
-// exported constructor of connect/mls mints a key package against a signature key its caller
-// supplies. So this method cannot be written over today's exported surface of connect/mls at all.
+// WHERE THE REF COMES FROM, because section 6's signature does not carry one. JoinFromWelcome
+// names no key package, NewKeyPackage returns no ref, and StateStore.TakeKeyPackage demands one.
+// THE WELCOME ITSELF CARRIES THEM: Welcome.Secrets[i].NewMember IS the KeyPackageRef that entry is
+// addressed to, and every type on that path is exported. So no new connect/mls surface is needed
+// and none is added -- no refs helper, no store enumeration, no third parameter on section 6's
+// method. Rejected: the engine remembering the refs it minted, because that state does not survive
+// a restart and would be a second, divergent copy of what the store already holds.
 //
-// It fails CLOSED and it looks like what it is, which is this project's own rule about a missing
-// key source: a join that returned a handle built out of a signature key this device does not
-// hold would be a member every peer refuses, discovered at the first commit rather than here.
+// EXACTLY THE ONE REF THIS STORE HOLDS, and neither the first nor all of them. The refs a Welcome
+// names are addressed to DIFFERENT joiners: a device that took on the first is asking a question
+// of somebody else's entry, and a device that took on every one is destroying other entries'
+// addressing for no reason.
 //
-// It blocks wave 2 task 16 and it is reported as a finding of this batch rather than worked
-// around here.
+// THE TAKE IS DESTRUCTIVE AND THE POSITION IS TAKE-AND-PUT-BACK. TakeKeyPackage reads and deletes
+// in one call and there is no non-destructive read on the eight-method interface. A Welcome
+// authenticates nobody -- mls.JoinFromWelcome's own header spends fifteen lines on it -- so
+// anybody holding this device's published key package can seal a well formed one to it, and a
+// joiner that took and then failed would have consumed the device's only copy: the legitimate
+// Welcome could never be opened. This body puts the entry back on EVERY failure path after the
+// take, so a bogus Welcome costs a store round trip rather than the device's only copy.
+// Rejected: taking only after a successful join, which this interface cannot express, because
+// mls.JoinFromWelcome needs the material in order to decide. THE WINDOW THIS LEAVES AND DOES NOT
+// CLOSE: a crash between the take and the put-back loses the key package permanently, and the
+// device must publish a fresh one and be re-added. That is the store's to close, with a
+// Get/Delete split or a normative sentence, and not this method's.
+//
+// THE REFUSAL CARRIES WHAT THE INTERFACE CANNOT SAY. TakeKeyPackage answers a bare error with no
+// declared not-found value, so a loop that treated every error as "not mine" reports a broken disk
+// as an unaddressed Welcome. ErrEngineNoKeyPackageForWelcome therefore carries the ref count, the
+// refusal count and the LAST STORE ERROR VERBATIM, so an operator reading the message can tell the
+// two apart even though a caller matching on the type cannot. The taxonomy that would let the type
+// tell them apart is owed by whoever owns the store interface.
 func (self *connectMlsEngine) JoinFromWelcome(welcome []byte, ratchetTree []byte) (GroupHandle, error) {
-	// the two arguments are counted into the refusal rather than dropped, and that is not
-	// decoration: a method that named neither of its parameters would be indistinguishable, to
-	// every reading of the source, from a placeholder somebody meant to finish -- which is what
-	// mls's own stub shape gate says about a body that is a function of less than it declares.
-	// This one is a function of nothing on purpose, and the octet counts are what say so.
-	return nil, fmt.Errorf("%w: connect/mls keeps a minted key package's signature private half on an unexported field and StateStore.TakeKeyPackage does not carry it, so the %d octet welcome and the %d octet ratchet tree cannot be joined from here",
-		ErrEngineJoinUnavailable, len(welcome), len(ratchetTree))
+	parsed, err := mls.ParseMLSMessage(welcome)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %d octets do not decode as an MLSMessage: %w",
+			ErrEngineWelcomeShape, len(welcome), err)
+	}
+	if parsed.Welcome == nil {
+		return nil, fmt.Errorf("%w: the %d octet message decodes and carries no welcome arm",
+			ErrEngineWelcomeShape, len(welcome))
+	}
+	refused := 0
+	var lastStoreRefusal error
+	for _, addressed := range parsed.Welcome.Secrets {
+		encoded, initPrivate, encryptPrivate, takeErr := self.store.TakeKeyPackage(addressed.NewMember)
+		if takeErr != nil {
+			refused += 1
+			lastStoreRefusal = takeErr
+			continue
+		}
+		handle, joinErr := self.joinWithTakenKeyPackage(welcome, ratchetTree, encoded,
+			initPrivate, encryptPrivate)
+		if joinErr != nil {
+			// the put-back, on EVERY failure after the take rather than on a named list of
+			// them: an allow-list of failure reasons is the shape that fails open the day
+			// connect/mls adds a check.
+			if putErr := self.store.PutKeyPackage(addressed.NewMember, encoded, initPrivate,
+				encryptPrivate); putErr != nil {
+				return nil, fmt.Errorf("%w: and the key package it was taken from could not be put back: %w",
+					joinErr, putErr)
+			}
+			return nil, joinErr
+		}
+		return handle, nil
+	}
+	return nil, fmt.Errorf("%w: the welcome names %d key package refs, this store refused %d of them, and the last refusal it answered was %v",
+		ErrEngineNoKeyPackageForWelcome, len(parsed.Welcome.Secrets), refused, lastStoreRefusal)
+}
+
+// joinWithTakenKeyPackage assembles the join material out of ONE taken entry and hands it to
+// connect/mls.
+//
+// EVERY FIELD OF THE MATERIAL IS A COPY THIS METHOD MADE, and that sentence is the whole reason
+// this helper exists as its own paragraph. mls.JoinKeyMaterial OWNS every array it carries:
+// (*JoinKeyMaterial).Zeroize erases InitPrivate, EncryptPrivate, SignPrivate and the key package's
+// own retained seed, and this body must call it -- the two HPKE halves open every Welcome
+// addressed to this key package and the signing key is the device's identity, which is that type's
+// own header. So the material is assembled over four copies and the erase destroys COPIES.
+//
+// THE TWO HPKE HALVES because TakeKeyPackage answered the STORE'S OWN arrays: a body that
+// assembled over them and then erased would put zeroed octets back on the put-back path.
+//
+// AND SignPrivate BECAUSE IT IS device_sig, WHICH IS THE ONE THAT COSTS SOMETHING. A material
+// assembled directly over self.signer loses the device's long term signing key on the first
+// successful join, and NOTHING ANYWHERE REFUSES AFTERWARDS: zeroizeSecret writes zeros through the
+// slice, signaturePublicKeyOf accepts an all-zero seed, NewKeyPackage and CreateGroup both go on
+// succeeding, and every leaf this device publishes afterwards names the ed25519 public key of the
+// all-zero seed -- derivable by anyone -- while its credential still names the real device. The
+// joined handle goes on working too, because connect/mls clones SignPrivate into the group before
+// the erase. The defensive copy is a fourth instance of a discipline this path already spells
+// three times: the key package constructor clones the caller's seed, and both the join and the
+// founder clone it into the group.
+//
+// Rejected: narrowing (*JoinKeyMaterial).Zeroize so it leaves SignPrivate alone, which removes a
+// real erase from the type that declares this material for EVERY caller and contradicts its own
+// header. Rejected: not calling Zeroize at all, which leaves the two HPKE halves in the heap and
+// buys nothing.
+func (self *connectMlsEngine) joinWithTakenKeyPackage(welcome []byte, ratchetTree []byte,
+	encoded []byte, initPrivate []byte, encryptPrivate []byte) (GroupHandle, error) {
+
+	var keyPackage mls.KeyPackage
+	if err := syntax.Unmarshal(encoded, &keyPackage); err != nil {
+		return nil, fmt.Errorf("%w: the store answered %d octets under a ref this welcome names and they do not decode as a key package: %w",
+			ErrEngineWelcomeShape, len(encoded), err)
+	}
+	keys := &mls.JoinKeyMaterial{
+		KeyPackage:     keyPackage,
+		InitPrivate:    append(mls.HpkePrivateKey(nil), initPrivate...),
+		EncryptPrivate: append(mls.HpkePrivateKey(nil), encryptPrivate...),
+		SignPrivate:    append(mls.SignaturePrivateKey(nil), self.signer...),
+	}
+	// it destroys COPIES: see the header. Deferred rather than written after the call because
+	// mls.JoinFromWelcome refuses at some fifteen places and every one of them is an exit.
+	defer keys.Zeroize()
+	// THE CONFIG CARRIES ONLY WHAT THE JOIN READS. mls.JoinFromWelcome's body reads Crypto,
+	// Store, Profile -- defaulted if nil -- and GroupId, and GroupId ONLY as an intent match the
+	// caller opts into. Section 6's signature gives this engine no group id to intend, so it is
+	// left unset: a config that guessed one would refuse every legitimate Welcome, and a config
+	// that recovered one from the message it is about to judge would turn an intent match into a
+	// tautology, which is worse than leaving it unset because it reads like a check. Suite,
+	// Extensions, RequiredCaps and LeafKeys are the four CreateGroup sets and this must not --
+	// they are unread on this path, because required capabilities come off the Welcome's own
+	// GroupInfo.
+	group, err := mls.JoinFromWelcome(&mls.GroupConfig{
+		Crypto: self.crypto,
+		Store:  self.store,
+	}, welcome, ratchetTree, keys)
+	if err != nil {
+		return nil, err
+	}
+	return &connectMlsHandle{group: group}, nil
 }
 
 // engineCapabilities is what every leaf this engine publishes advertises.

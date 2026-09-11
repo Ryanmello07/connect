@@ -11,6 +11,7 @@ package messagegroup
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"go/ast"
 	"go/printer"
 	"go/token"
@@ -813,19 +814,24 @@ func TestTheEngineRefusesEveryThingItCannotBeBuiltWithout(t *testing.T) {
 	}
 }
 
-// JoinFromWelcome refuses, and the refusal is the honest answer to a gap in connect/mls's exported
-// surface rather than a placeholder.
+// JoinFromWelcome refuses, and after j1 task 5 what it refuses is a MESSAGE rather than its own
+// exported surface.
 //
-// It is worth a case of its own because the alternative shapes are both worse and both plausible:
-// a join that answered a handle built on a signature key this device does not hold would be a
-// member every peer refuses, discovered at the first commit; and a second assembly of
-// KeyPackageTBS beside a second spelling of its signature label is two defect classes this tree
-// has already paid for.
+// THE SENTINEL THIS CASE USED TO ASSERT IS GONE, and its spelling is gone with it -- the package
+// honesty gate's own query would answer this comment otherwise. It named an impossibility --
+// "connect/mls does not publish the joiner's own signature private key" -- and that impossibility
+// no longer exists: mls.NewKeyPackageWithSigner binds the leaf to a key the caller holds, and this
+// engine mints under self.signer. A sentinel naming an impossibility that is no longer impossible
+// is the same defect class as a doc paragraph stating a cause that has been removed, so it left
+// the tree with the body rather than being kept declared and unused.
+//
+// The case keeps its name and its shape: the octets it hands in are still not a Welcome, and the
+// refusal is still asserted BY NAME and still answers no handle. What changed is which name.
 func TestJoinFromWelcomeRefusesAndSaysWhatIsMissing(t *testing.T) {
 	fixture := newTestEngine(t)
 	handle, err := fixture.engine.JoinFromWelcome([]byte("a welcome"), []byte("a tree"))
-	if !errorIs(err, ErrEngineJoinUnavailable) {
-		t.Errorf("JoinFromWelcome answered %v, want ErrEngineJoinUnavailable", err)
+	if !errorIs(err, ErrEngineWelcomeShape) {
+		t.Errorf("JoinFromWelcome answered %v, want ErrEngineWelcomeShape", err)
 	}
 	if handle != nil {
 		t.Error("JoinFromWelcome answered a handle beside its error, which is a member built on a key this device does not hold")
@@ -1382,4 +1388,522 @@ func TestTheEnginesOwnDocumentationNoLongerNamesTheJoinBlocker(t *testing.T) {
 		t.Errorf("this engine's NewKeyPackage still documents StateStore.TakeKeyPackage as the reason a join is impossible: %v. After task 4 the leaf names device_sig and the material a join needs is assemblable",
 			found)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// j1 task 5: the welcome's refs, the take, and the put-back
+// ---------------------------------------------------------------------------
+
+// engineJoinFixture is one founder and TWO joiners, so that the Welcome the founder answers names
+// TWO refs addressed to two different devices.
+//
+// The class this task's first property derives is EVERY ENTRY of Welcome.Secrets, read off the
+// parsed message rather than assumed to be one, and it is two members here on purpose: a one-entry
+// Welcome cannot distinguish "found mine" from "took the first", which is the whole of what that
+// property says.
+type engineJoinFixture struct {
+	founder *testEngine
+	joiner  *testEngine
+	other   *testEngine
+	// the joiner's engine writes into this, so the refs it took are readable in order
+	joinerStore *recordingAliasStore
+	handle      GroupHandle
+	welcome     []byte
+	ratchetTree []byte
+	joinerRef   []byte
+	welcomeRefs [][]byte
+}
+
+// newEngineJoinFixture founds a group and commits an Add for each joiner, in the order given.
+//
+// joinerFirst chooses whether the joiner under test is the FIRST entry of the Welcome or the
+// second, and both orderings are driven: with the joiner second, a body that took on the first ref
+// never reaches its own; with the joiner first, a body that took on every ref keeps taking after it
+// has what it needs.
+func newEngineJoinFixture(t *testing.T, name string, joinerFirst bool) *engineJoinFixture {
+	t.Helper()
+	founder := newTestEngine(t)
+	joiner, joinerStore := newRecordingEngine(t)
+	other := newTestEngine(t)
+
+	joinerKeyPackage, err := joiner.engine.NewKeyPackage()
+	if err != nil {
+		t.Fatalf("the joiner's NewKeyPackage: %v", err)
+	}
+	otherKeyPackage, err := other.engine.NewKeyPackage()
+	if err != nil {
+		t.Fatalf("the other joiner's NewKeyPackage: %v", err)
+	}
+	handle := founder.createGroup(t, name)
+	t.Cleanup(func() { handle.Close() })
+	added := [][]byte{otherKeyPackage, joinerKeyPackage}
+	if joinerFirst {
+		added = [][]byte{joinerKeyPackage, otherKeyPackage}
+	}
+	for at, keyPackage := range added {
+		if _, err := handle.ProposeAdd(keyPackage); err != nil {
+			t.Fatalf("ProposeAdd %d: %v", at, err)
+		}
+	}
+	commit, welcome, ratchetTree, err := handle.Commit(nil)
+	if err != nil {
+		t.Fatalf("Commit(nil) over two adds: %v", err)
+	}
+	if len(commit) == 0 || len(welcome) == 0 || len(ratchetTree) == 0 {
+		t.Fatalf("the commit answered commit=%d welcome=%d ratchetTree=%d",
+			len(commit), len(welcome), len(ratchetTree))
+	}
+	if err := handle.MergePendingCommit(); err != nil {
+		t.Fatalf("MergePendingCommit: %v", err)
+	}
+
+	// the refs the Welcome names, read off the parsed message rather than assumed
+	parsed, err := mls.ParseMLSMessage(welcome)
+	if err != nil {
+		t.Fatalf("ParseMLSMessage over the welcome this fixture built: %v", err)
+	}
+	if parsed.Welcome == nil {
+		t.Fatal("the message this fixture built carries no welcome arm")
+	}
+	refs := [][]byte{}
+	for _, addressed := range parsed.Welcome.Secrets {
+		refs = append(refs, bytes.Clone(addressed.NewMember))
+	}
+	if len(refs) != 2 {
+		t.Fatalf("this fixture built a welcome naming %d refs, want 2: a one entry welcome cannot distinguish found-mine from took-the-first",
+			len(refs))
+	}
+	var decoded mls.KeyPackage
+	if err := syntax.Unmarshal(joinerKeyPackage, &decoded); err != nil {
+		t.Fatalf("decode the joiner's key package: %v", err)
+	}
+	joinerRef, err := decoded.Ref(joiner.crypto)
+	if err != nil {
+		t.Fatalf("KeyPackage.Ref for the joiner: %v", err)
+	}
+	at := slices.IndexFunc(refs, func(ref []byte) bool { return bytes.Equal(ref, joinerRef) })
+	if at < 0 {
+		t.Fatalf("the welcome names %d refs and none of them is the joiner's %x", len(refs), joinerRef)
+	}
+	if joinerFirst != (at == 0) {
+		t.Fatalf("this fixture asked for joinerFirst=%v and the joiner's entry is at index %d; the ordering is the whole of what the two mutants below are separated by",
+			joinerFirst, at)
+	}
+	return &engineJoinFixture{
+		founder: founder, joiner: joiner, other: other, joinerStore: joinerStore,
+		handle: handle, welcome: welcome, ratchetTree: ratchetTree,
+		joinerRef: joinerRef, welcomeRefs: refs,
+	}
+}
+
+// TestTheJoinTakesExactlyTheOneRefTheWelcomeNamesThatThisStoreHolds is j1 task 5's first property.
+//
+// Not the first ref and not every ref. The refs a Welcome names are addressed to DIFFERENT
+// joiners: a device that took on the first is asking a question of somebody else's entry, and a
+// device that took on every one is destroying other entries' addressing for no reason.
+//
+// THE OBSERVATION IS THE CALL RECORD and not the map. A map records no call, so "which refs were
+// taken, in which order, and where the body stopped" is a question memoryStateStore cannot answer
+// at all -- and it is the only question that separates the two mutants this property exists for.
+func TestTheJoinTakesExactlyTheOneRefTheWelcomeNamesThatThisStoreHolds(t *testing.T) {
+	for _, ordering := range []struct {
+		what        string
+		joinerFirst bool
+	}{
+		{what: "the joiner's entry FIRST", joinerFirst: true},
+		{what: "the joiner's entry SECOND", joinerFirst: false},
+	} {
+		fixture := newEngineJoinFixture(t, "take-exactly-one-"+ordering.what, ordering.joinerFirst)
+		joined, err := fixture.joiner.engine.JoinFromWelcome(fixture.welcome, fixture.ratchetTree)
+		if err != nil {
+			t.Errorf("%s: JoinFromWelcome: %v", ordering.what, err)
+			continue
+		}
+		defer joined.Close()
+
+		// the refs this store was asked for, in order. A correct body walks the Welcome's own
+		// order and STOPS at the one it holds.
+		taken := [][]byte{}
+		for _, call := range fixture.joinerStore.callsTo("TakeKeyPackage") {
+			taken = append(taken, call.args[0])
+		}
+		at := slices.IndexFunc(fixture.welcomeRefs, func(ref []byte) bool {
+			return bytes.Equal(ref, fixture.joinerRef)
+		})
+		want := fixture.welcomeRefs[:at+1]
+		if len(taken) != len(want) {
+			t.Errorf("%s: the join took on %d refs and the welcome names this device's own at index %d, so a body that stops when it finds its own takes %d",
+				ordering.what, len(taken), at, len(want))
+		}
+		for i := range want {
+			if i < len(taken) && !bytes.Equal(taken[i], want[i]) {
+				t.Errorf("%s: take %d was over %x and the welcome's entry %d is addressed to %x",
+					ordering.what, i, taken[i], i, want[i])
+			}
+		}
+		if len(taken) > 0 && !bytes.Equal(taken[len(taken)-1], fixture.joinerRef) {
+			t.Errorf("%s: the last ref this join took was %x and this device's own is %x",
+				ordering.what, taken[len(taken)-1], fixture.joinerRef)
+		}
+	}
+}
+
+// TestAJoinThatFailsPutsTheKeyPackageBackByteForByte is j1 task 5's second and third properties.
+//
+// SECOND: every failure path after the take restores the entry, and the store is byte-identical to
+// what it was before the attempt -- observed by driving a SECOND attempt with the good Welcome
+// over the same ref and requiring it to succeed.
+//
+// THIRD: the arrays the store handed back are NOT the arrays JoinKeyMaterial.Zeroize erases.
+// memoryStateStore's TakeKeyPackage answers the store's OWN arrays, and
+// (*JoinKeyMaterial).Zeroize erases InitPrivate, EncryptPrivate, SignPrivate and the key package's
+// retained seed -- so a body that assembled the material directly over what the store handed back
+// and then erased it puts ZEROED OCTETS back. The octets are compared and not merely the presence
+// of an entry: a gate that compared presence alone passes that mutant, which is why the comparison
+// below is byte for byte.
+func TestAJoinThatFailsPutsTheKeyPackageBackByteForByte(t *testing.T) {
+	fixture := newEngineJoinFixture(t, "the-put-back", true)
+	before, held := fixture.joiner.store.keyPackages[fmt.Sprintf("%x", fixture.joinerRef)]
+	if !held {
+		t.Fatalf("the joiner's store holds no entry under its own ref %x before the attempt", fixture.joinerRef)
+	}
+	beforeCopy := [3][]byte{
+		bytes.Clone(before[0]), bytes.Clone(before[1]), bytes.Clone(before[2]),
+	}
+
+	// a ratchet tree from a DIFFERENT commit, which fails after the take rather than before it
+	second := newEngineJoinFixture(t, "the-put-back-other-commit", true)
+	refused, err := fixture.joiner.engine.JoinFromWelcome(fixture.welcome, second.ratchetTree)
+	if err == nil {
+		t.Fatal("a join over a ratchet tree from another commit succeeded, so this case reaches no failure path")
+	}
+	if refused != nil {
+		t.Error("the refused join answered a handle beside its error")
+	}
+	// the underlying refusal is WRAPPED and not swallowed: "this join failed" and "your keyring is
+	// wrong" are different problems for whoever has to fix one of them
+	if errorIs(err, ErrEngineNoKeyPackageForWelcome) {
+		t.Errorf("a join that took and then failed answered %v, which reads as a welcome addressed to somebody else", err)
+	}
+
+	after, held := fixture.joiner.store.keyPackages[fmt.Sprintf("%x", fixture.joinerRef)]
+	if !held {
+		t.Fatalf("the joiner's store holds no entry under %x after a failed join; the device's only copy is gone and the legitimate welcome can never be opened",
+			fixture.joinerRef)
+	}
+	for at, what := range []string{"the encoding", "the init private half", "the encryption private half"} {
+		if !bytes.Equal(after[at], beforeCopy[at]) {
+			t.Errorf("%s was put back as %x and was stored as %x; the material was assembled over the store's own arrays and the erase reached them",
+				what, after[at], beforeCopy[at])
+		}
+	}
+
+	// and the entry still WORKS, which is the half a byte comparison alone does not say
+	joined, err := fixture.joiner.engine.JoinFromWelcome(fixture.welcome, fixture.ratchetTree)
+	if err != nil {
+		t.Fatalf("a second join with the good welcome over the put-back entry: %v", err)
+	}
+	defer joined.Close()
+}
+
+// TestTheJoinRefusalTellsAStoreFailureFromAWelcomeAddressedElsewhere is j1 task 5's fourth
+// property, and it is DEFERRED rather than defended: the taxonomy that would let a caller matching
+// on the TYPE tell the two apart is owed by whoever owns mls.StateStore, and until then the only
+// place the difference can survive is the message.
+//
+// StateStore.TakeKeyPackage returns a bare error with no declared not-found value, so a loop that
+// treated every error as "not mine" reports a broken disk as an unaddressed Welcome. The refusal
+// therefore carries the ref count, the refusal count and the last store error VERBATIM.
+func TestTheJoinRefusalTellsAStoreFailureFromAWelcomeAddressedElsewhere(t *testing.T) {
+	// (a) a welcome addressed to nobody this store holds
+	fixture := newEngineJoinFixture(t, "the-refusal-taxonomy", true)
+	stranger, _ := newRecordingEngine(t)
+	err := func() error {
+		_, err := stranger.engine.JoinFromWelcome(fixture.welcome, fixture.ratchetTree)
+		return err
+	}()
+	if !errorIs(err, ErrEngineNoKeyPackageForWelcome) {
+		t.Fatalf("a welcome addressed to two other devices answered %v, want ErrEngineNoKeyPackageForWelcome", err)
+	}
+	unaddressed := err.Error()
+	for _, owed := range []string{"2 key package refs", "refused 2"} {
+		if !strings.Contains(unaddressed, owed) {
+			t.Errorf("the refusal does not carry %q: %s", owed, unaddressed)
+		}
+	}
+
+	// (b) the same shape, with the store answering an I/O failure for the ref this device DOES
+	// hold. A caller matching on the type cannot tell these apart; an operator reading the
+	// message must be able to.
+	broken := newEngineJoinFixture(t, "the-broken-disk", true)
+	broken.joinerStore.failTake = errors.New("the disk this store sits on answered EIO")
+	_, ioErr := broken.joiner.engine.JoinFromWelcome(broken.welcome, broken.ratchetTree)
+	if !errorIs(ioErr, ErrEngineNoKeyPackageForWelcome) {
+		t.Fatalf("a store that cannot read answered %v, want ErrEngineNoKeyPackageForWelcome", ioErr)
+	}
+	if !strings.Contains(ioErr.Error(), "EIO") {
+		t.Errorf("the refusal over a broken store does not carry the store's own error: %s", ioErr.Error())
+	}
+	if ioErr.Error() == unaddressed {
+		t.Errorf("a broken disk and a welcome addressed elsewhere answer the same message, so nothing anywhere can tell them apart: %s", unaddressed)
+	}
+}
+
+// TestTheJoinConfigCarriesExactlyTheFieldsTheJoinReads is j1 task 5's fifth property, held over
+// the CONFIG this method builds rather than over mls.JoinFromWelcome's read-set.
+//
+// That is the choice the plan leaves the implementer, and it is taken because the alternative
+// needs a scan root this package does not have: every AST gate here reads this package's own files
+// and none reaches ../mls. The route is named rather than left implied.
+//
+// THE CLASS is the GroupConfig fields mls.JoinFromWelcome reads, and it is FOUR: Crypto, Store,
+// Profile -- defaulted if nil -- and GroupId, which it reads ONLY as an intent match the caller
+// opts into. GroupId is left unset because section 6's signature gives this engine no group id to
+// intend. THE COMPLEMENT IS PRINTED and is the four fields CreateGroup sets and this must not:
+// Suite, Extensions, RequiredCaps and LeafKeys, all unread on the join path because required
+// capabilities come off the Welcome's own GroupInfo. A gate that did not print them would be one
+// nobody can tell from a gate that checked nothing.
+func TestTheJoinConfigCarriesExactlyTheFieldsTheJoinReads(t *testing.T) {
+	read := []string{"Crypto", "Store", "Profile", "GroupId"}
+	complement := []string{"Suite", "Extensions", "RequiredCaps", "LeafKeys"}
+	t.Logf("mls.JoinFromWelcome reads %d GroupConfig fields (%v); the complement this method must not set is %d (%v)",
+		len(read), read, len(complement), complement)
+
+	set := engineGroupConfigFieldsSetOnTheJoinPath(t)
+	t.Logf("the join path builds an mls.GroupConfig naming %v", set)
+	if len(set) == 0 {
+		t.Fatal("no mls.GroupConfig literal was found on this engine's join path, so this gate read nothing")
+	}
+	if slices.Contains(set, "GroupId") {
+		t.Error("the join path sets GroupId. Section 6 gives this engine no group id to intend, so a value here is either a guess that refuses every legitimate welcome or a group id recovered from the message about to be judged -- which turns an intent match into a tautology, and reads like a check")
+	}
+	for _, unread := range complement {
+		if slices.Contains(set, unread) {
+			t.Errorf("the join path sets %s, which mls.JoinFromWelcome does not read: required capabilities come off the welcome's own GroupInfo, and a field nothing reads is a field a later reader will believe is load bearing",
+				unread)
+		}
+	}
+	for _, named := range set {
+		if !slices.Contains(read, named) {
+			t.Errorf("the join path sets %s, which is not one of the %v mls.JoinFromWelcome reads", named, read)
+		}
+	}
+	for _, owed := range []string{"Crypto", "Store"} {
+		if !slices.Contains(set, owed) {
+			t.Errorf("the join path does not set %s, which mls.JoinFromWelcome refuses a nil of", owed)
+		}
+	}
+}
+
+// engineGroupConfigFieldsSetOnTheJoinPath reads this package's own production source and answers
+// the field names of every mls.GroupConfig composite literal built inside a method whose body
+// calls mls.JoinFromWelcome.
+func engineGroupConfigFieldsSetOnTheJoinPath(t *testing.T) []string {
+	t.Helper()
+	_, sources := messagegroupProductionSources(t)
+	named := []string{}
+	for _, source := range sources {
+		for _, declaration := range source.parsed.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || function.Body == nil {
+				continue
+			}
+			joins := false
+			ast.Inspect(function.Body, func(node ast.Node) bool {
+				call, isCall := node.(*ast.CallExpr)
+				if !isCall {
+					return true
+				}
+				selector, isSelector := call.Fun.(*ast.SelectorExpr)
+				if !isSelector || selector.Sel.Name != "JoinFromWelcome" {
+					return true
+				}
+				if qualifier, isIdentifier := selector.X.(*ast.Ident); isIdentifier && qualifier.Name == "mls" {
+					joins = true
+				}
+				return true
+			})
+			if !joins {
+				continue
+			}
+			ast.Inspect(function.Body, func(node ast.Node) bool {
+				literal, isLiteral := node.(*ast.CompositeLit)
+				if !isLiteral {
+					return true
+				}
+				selector, isSelector := literal.Type.(*ast.SelectorExpr)
+				if !isSelector || selector.Sel.Name != "GroupConfig" {
+					return true
+				}
+				for _, element := range literal.Elts {
+					pair, isPair := element.(*ast.KeyValueExpr)
+					if !isPair {
+						continue
+					}
+					if key, isKey := pair.Key.(*ast.Ident); isKey {
+						named = append(named, key.Name)
+					}
+				}
+				return true
+			})
+		}
+	}
+	slices.Sort(named)
+	return slices.Compact(named)
+}
+
+// TestTheDeviceSurvivesItsOwnJoin is j1 task 5's sixth property, and it is the one whose absence
+// destroys a key.
+//
+// mls.JoinKeyMaterial OWNS every array it carries and its header prescribes the erase. If this
+// method assembled SignPrivate directly over self.signer, (*JoinKeyMaterial).Zeroize would destroy
+// the device's long term signing key on the first successful join -- and NOTHING ANYWHERE REFUSES
+// AFTERWARDS. zeroizeSecret writes zeros through the slice, an all-zero seed derives a perfectly
+// valid ed25519 public key, and every leaf this device publishes afterwards names
+// 3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29 while its credential still
+// names the real device.
+//
+// THE OBSERVATION IS ON THE ENGINE AND NOT ON THE HANDLE, and three readings are INADMISSIBLE --
+// each is green over a destroyed device and each is the obvious one:
+//
+//   - MemberAt(0)'s identityPub, which reads Credential.Identity and the erase does not touch;
+//   - anything read off the handle this call answered, because connect/mls CLONES SignPrivate
+//     into the group before the erase, so Commit, ProposeUpdate and Protect are all green on it;
+//   - the two-engine exporter equality itself, which never drives the joiner's engine again.
+//
+// The admissible observation is a DOOR OF THIS ENGINE driven a SECOND time: a second
+// NewKeyPackage whose leaf names the pre-join signature key, and a CreateGroup whose leaf 0 names
+// it -- both read through RatchetTreeSnapshot rather than through MemberAt.
+//
+// IT IS TAKEN ON BOTH EXITS. An implementation that erases on exactly one of them is caught by
+// neither half alone, and erasing on the success path only is what a defer refactor produces by
+// accident.
+func TestTheDeviceSurvivesItsOwnJoin(t *testing.T) {
+	for _, exit := range []struct {
+		what string
+		join func(fixture *engineJoinFixture) (GroupHandle, error)
+	}{
+		{what: "a join that succeeded", join: func(fixture *engineJoinFixture) (GroupHandle, error) {
+			return fixture.joiner.engine.JoinFromWelcome(fixture.welcome, fixture.ratchetTree)
+		}},
+		// a failure AFTER the take, which is the exit a body erasing only on the success return
+		// walks out of with the device intact and a body erasing only on the put-back path
+		// destroys it on
+		{what: "a join that failed after the take", join: func(fixture *engineJoinFixture) (GroupHandle, error) {
+			other := newEngineJoinFixture(t, "the-survival-other-commit", true)
+			return fixture.joiner.engine.JoinFromWelcome(fixture.welcome, other.ratchetTree)
+		}},
+	} {
+		fixture := newEngineJoinFixture(t, "the-device-survives-"+exit.what, true)
+		before := bytes.Clone(fixture.joiner.signerPub)
+
+		handle, err := exit.join(fixture)
+		if handle != nil {
+			defer handle.Close()
+		}
+		_ = err
+
+		// ADMISSIBLE OBSERVATION 1: door 1, driven a second time.
+		published, mintErr := fixture.joiner.engine.NewKeyPackage()
+		if mintErr != nil {
+			t.Errorf("%s: the engine's next NewKeyPackage: %v", exit.what, mintErr)
+			continue
+		}
+		if named := engineKeyPackageLeafKeyOf(t, published); !bytes.Equal(named, before) {
+			t.Errorf("%s: the engine's NEXT key package names %x as its leaf signature_key and this device signed with %x before the join; its long term signing key was destroyed by a material assembled over it",
+				exit.what, named, before)
+		}
+
+		// ADMISSIBLE OBSERVATION 2: door 2, driven a second time, read through the ratchet tree.
+		founded := fixture.joiner.createGroup(t, "after-the-join-"+exit.what)
+		defer founded.Close()
+		if named, _ := engineLeafKeyOf(t, founded, founded.OwnLeafIndex()); !bytes.Equal(named, before) {
+			t.Errorf("%s: a group this engine founds AFTER the join names %x at leaf 0 and this device signed with %x before it",
+				exit.what, named, before)
+		}
+	}
+
+	// AND THE OTHER HALF OF THE OWNERSHIP RULE, over the method's own source, because the
+	// material is a LOCAL and no runtime route from this package reaches it. The copies exist so
+	// that the erase is safe; the erase has to actually happen, on EVERY exit. An implementation
+	// that erases on exactly one of them leaves a copy of device_sig and both HPKE halves in the
+	// heap on the other, and that is what a defer refactor produces by accident -- so the
+	// assertion is that the call is a DEFER and not a statement on one path.
+	deferred, plain := engineJoinMaterialEraseSites(t)
+	t.Logf("the join path erases its material at %d deferred site(s) %v and %d plain one(s) %v",
+		len(deferred), deferred, len(plain), plain)
+	if len(deferred) != 1 {
+		t.Errorf("the join path defers %d erases of the material it assembled, want exactly 1: mls.JoinFromWelcome refuses at some fifteen places and every one of them is an exit this method returns through",
+			len(deferred))
+	}
+	if len(plain) != 0 {
+		t.Errorf("the join path erases its material with %d plain statement(s) %v; a statement erases the exit it stands on and no other",
+			len(plain), plain)
+	}
+}
+
+// engineJoinMaterialEraseSites reads this package's own production source and answers where the
+// method that calls mls.JoinFromWelcome erases the material it assembled: the deferred calls and
+// the plain ones, separately.
+func engineJoinMaterialEraseSites(t *testing.T) (deferred []string, plain []string) {
+	t.Helper()
+	fileSet, sources := messagegroupProductionSources(t)
+	seen := false
+	for _, source := range sources {
+		for _, declaration := range source.parsed.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || function.Body == nil {
+				continue
+			}
+			joins := false
+			ast.Inspect(function.Body, func(node ast.Node) bool {
+				call, isCall := node.(*ast.CallExpr)
+				if !isCall {
+					return true
+				}
+				selector, isSelector := call.Fun.(*ast.SelectorExpr)
+				if !isSelector || selector.Sel.Name != "JoinFromWelcome" {
+					return true
+				}
+				if qualifier, isIdentifier := selector.X.(*ast.Ident); isIdentifier && qualifier.Name == "mls" {
+					joins = true
+				}
+				return true
+			})
+			if !joins {
+				continue
+			}
+			seen = true
+			deferredAt := map[token.Pos]bool{}
+			ast.Inspect(function.Body, func(node ast.Node) bool {
+				if statement, isDefer := node.(*ast.DeferStmt); isDefer {
+					deferredAt[statement.Call.Pos()] = true
+				}
+				return true
+			})
+			ast.Inspect(function.Body, func(node ast.Node) bool {
+				call, isCall := node.(*ast.CallExpr)
+				if !isCall {
+					return true
+				}
+				selector, isSelector := call.Fun.(*ast.SelectorExpr)
+				if !isSelector || selector.Sel.Name != "Zeroize" {
+					return true
+				}
+				at := fmt.Sprintf("%s:%d", source.path, fileSet.Position(call.Pos()).Line)
+				if deferredAt[call.Pos()] {
+					deferred = append(deferred, at)
+				} else {
+					plain = append(plain, at)
+				}
+				return true
+			})
+		}
+	}
+	if !seen {
+		t.Fatal("no production method of this package calls mls.JoinFromWelcome, so this clause read nothing")
+	}
+	slices.Sort(deferred)
+	slices.Sort(plain)
+	return deferred, plain
 }
