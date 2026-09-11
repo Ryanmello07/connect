@@ -812,6 +812,45 @@ func (self *ApiMultiClientGenerator) RemoveClientArgs(args *MultiClientGenerator
 	}))
 }
 
+// removeClientArgsAndWait is the joined form used by the generated Client's
+// retirement worker. RemoveClientArgs is intentionally asynchronous for
+// construction failures on the window-maintenance path, but a successful
+// CloseAndWait must not cancel the generator API while that final request is
+// still in flight. The caller supplies the already-bounded retirement context.
+func (self *ApiMultiClientGenerator) removeClientArgsAndWait(
+	ctx context.Context,
+	args *MultiClientGeneratorClientArgs,
+) {
+	// Preserve restartable identities when the generator's parent is already
+	// closing. With no store, still make the same best-effort removal attempt as
+	// RemoveClientArgs; a strategy whose own owner has already closed may reject
+	// it, and the server-side idle reaper remains the backstop.
+	select {
+	case <-self.ctx.Done():
+		if self.identityState.hasStore() {
+			return
+		}
+	default:
+		instanceId := Id{}
+		if args.ClientAuth != nil {
+			instanceId = args.ClientAuth.InstanceId
+		}
+		if !self.identityState.RemoveIfCurrent(args.ClientId, instanceId) {
+			return
+		}
+	}
+
+	_, _ = HttpPostWithStrategy(
+		ctx,
+		self.clientStrategy,
+		fmt.Sprintf("%s/network/remove-client", self.apiUrl),
+		&RemoveNetworkClientArgs{ClientId: args.ClientId},
+		self.api.ByJwt(),
+		&RemoveNetworkClientResult{},
+		NewNoopApiCallback[*RemoveNetworkClientResult](),
+	)
+}
+
 func (self *ApiMultiClientGenerator) RemoveClientWithArgs(client *Client, args *MultiClientGeneratorClientArgs) {
 	retirements := self.retirementLifecycle()
 	retirementAdmitted := retirements.start()
@@ -862,7 +901,7 @@ func (self *ApiMultiClientGenerator) RemoveClientWithArgs(client *Client, args *
 		}); ok {
 			_ = clientOob.CloseAndWait(retireCtx)
 		}
-		self.RemoveClientArgs(args)
+		self.removeClientArgsAndWait(retireCtx, args)
 	})
 }
 
@@ -978,6 +1017,23 @@ func (self *ApiMultiClientGenerator) NewClientContext(
 		self.RemoveClientWithArgs(client, args)
 		client.Cancel()
 		return nil, ctx.Err()
+	}
+	// A transport delivery ack does not prove the platform has published the
+	// identity key that the provider needs to authenticate this client's proof.
+	// Keep setup owned by callCtx until the processed registration completes.
+	if clientSettings.ClientKeyRegistrationRequired {
+		keyManager := client.ClientKeyManager()
+		var registrationErr error
+		if keyManager == nil {
+			registrationErr = errors.New("client key manager is unavailable")
+		} else {
+			registrationErr = keyManager.WaitForRegistration(callCtx)
+		}
+		if registrationErr != nil {
+			self.RemoveClientWithArgs(client, args)
+			client.Cancel()
+			return nil, fmt.Errorf("client key registration: %w", registrationErr)
+		}
 	}
 	self.transportLock.Lock()
 	if state := self.transports[client]; state != nil {
