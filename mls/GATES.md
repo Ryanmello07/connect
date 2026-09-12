@@ -1124,6 +1124,7 @@ silent is worth less than an enumerated one that refuses and prints."*
 | the **binding-position forms** in `eraseFillSitesIn` | yes — a sub-form with no reading is refused by name and line | yes — a refusal is `t.Error`; a positional literal whose type this gate cannot name is refused | yes — **complement 4**, 3,194 binding positions decided NOT to be members, counted under the reading that decided each, and empty is an error |
 | the **five dispositions** | yes — each is printed **with its reason and the array it excuses**, on every passing run | yes in both directions — undisposed is red, stale is red, empty-reason is red, and one reason answering two statements is red | yes — and the 15 admitted sites are printed with where each array came from |
 | the **opaque callees** the admissions rest on | partly — they are named every run but not opened | no — an opaque call is admitted | yes — `crypto.DeriveSecret`, `r.ReadOpaque`, `self.crypto.DeriveTreeSecret`, named every run |
+| the **readings themselves**, in `eraseReadings` | yes — an arm with no tag is named by file and line, and a name computed rather than written is refused | yes — a declared reading nothing drives is an error, and so is an unreached row that is taken, a stale row, and two arms sharing one name | yes — **complement 5**, the readings the corpora drive that this package's own source does not reach, and empty is an error |
 
 The last row is this gate's open edge, written down rather than argued away: those callees are
 admitted on the strength of their copying and this gate does not check that they do. It is named on
@@ -1361,3 +1362,251 @@ It is open on purpose. The round that found it was closing four named findings, 
 opens a fifth front is a round that stops finishing* — but an unnamed defect is worse than an
 unclosed one, so it is written here, in `eraseAssignmentsTo`'s own header, and in the judgement that
 closed this line.
+
+## The recurrence, not another instance: a standing check that an undriven clause cannot pass
+
+Eleven rounds went into the clone pin and the derived gate that defends it, and the last one ran a
+**deletion sweep over all seventy-one clauses** of `mls/erased_field_alias_test.go` and found
+**thirty-three driven by nothing**. It closed with the observation that makes this round necessary:
+
+> *"The sweep is a measurement, not a standing gate. Nothing in the suite will tell the NEXT round
+> that a newly added clause is undriven; that check has to be re-run by hand. This is the second
+> round on this line where an undriven clause shipped."*
+
+So this round closed the recurrence. `TestEveryReadingOfThisGateIsDrivenBySomething` is the check
+that refuses it, and it is in the suite.
+
+### The shape, and why it is this one rather than either of the two obvious ones
+
+Two shapes were on the table. **Each alone has the same hole**, and it is the hole the last round
+already diagnosed in complement 4: *a reading nothing takes and nothing names is absent from BOTH
+sides of the comparison, so the comparison holds.*
+
+- **Readings that register themselves, compared against what the corpora exercise.** If "registered"
+  means "wrote its name in during this run", registered is a subset of exercised **by construction**
+  and the comparison is vacuous no matter how many arms nothing drives.
+- **The control corpus as the authority, every reading needing a named row.** That is the
+  `expectedComplement` table the last round already built, and it is exactly what complement 4's
+  thirteen readings have. A reading with **no row and no take** is still invisible to it.
+
+**So it is both, with the DECLARED side read out of the gate's own SOURCE TEXT rather than out of a
+run.** Every arm that answers an origin or decides a binding position carries a tag that is *part of
+the expression it returns* — `self.readings.origin("the slice-expression peel", …)` — and:
+
+| set | what it is | how it is read |
+|---|---|---|
+| **DECLARED** | every `eraseReadings` tag written anywhere in `erased_field_alias_test.go` | the file is **parsed**; a tag whose argument is not a string literal is refused |
+| **EXERCISED** | every reading the two control corpora actually took | both corpora are driven through the whole derivation |
+| **UNREACHED** | `eraseUnreachedReadings`, with the reason for each | a row ever taken is red; a row naming no declared arm is red |
+
+and the assertion is **DECLARED minus UNREACHED == EXERCISED, member by member, in both
+directions** — never that either side is non-empty. *An existence assertion is satisfied by twelve
+readings when there are thirteen, which is the precise mechanism that let this gate ship
+twelve-of-thirteen in silence.*
+
+**Four more clauses hold the shape up.** One name may be declared at only one place, or two arms
+share one arm's worth of evidence. Every **case clause** of a registered function must carry a tag,
+which is what catches an arm written *without* one — deleting a tag is then a compile-visible edit
+that this clause fails on, rather than a silent no-op. Every unreached row must begin **`UNREACHABLE:`
+or `UNREACHED:`**, because *"no compilable Go reaches this"* and *"I did not find compilable Go that
+reaches this"* are different claims and a register that let them share a spelling would quietly
+promote the second into the first. And `eraseClausesOutsideTheRegister` may not be empty.
+
+### What it found the first time it ran
+
+Over the gate as it stood at `e331116`, with every arm tagged: **83 readings declared, 57 driven by
+the control corpora.** Twenty-six were driven by nothing at all, and **eight of those were driven
+only by this package's own production source** — the exact gap carried forward as the round's own
+open carry. Seventeen new spellings closed **nineteen** of them, taking the exercised set from 57 to **76**;
+the remaining **seven are unreached and are held there by name**:
+
+| arm | claim | reason |
+|---|---|---|
+| a positional element past the end of the field list | `UNREACHABLE` | more elements than fields is a compile error; the field list holds one entry per declared field. Deleting it produces a **panic**, not a wrong answer |
+| an assignment whose two sides differ in length and whose right side is not one expression | `UNREACHABLE` | Go's grammar has no such assignment |
+| the `UNDECIDED` default of the result-position reading | `UNREACHABLE` | only a call, a map index, a type assertion and a channel receive are multi-valued in Go; each has its own arm and parens are peeled first |
+| `append` with no arguments at all | `UNREACHABLE` | `append()` does not compile. **This register found it**; the seventy-one-clause sweep never named it |
+| a callee answering RECEIVER state called as a plain function | `UNREACHABLE` | receiver state is answered only where a scope of the chain binds a receiver name, and a plain function's chain binds none |
+| the same, on the forwarded half | `UNREACHABLE` | the same argument |
+| the default of `originOf` | **`UNREACHED`** | every Go expression that evaluates to a slice is one of the fourteen `ast.Expr` kinds the switch names; what is left is `*ast.BadExpr`, the type-expression nodes, and `*ast.IndexListExpr`, which is a function value no peel descends into. **No compilable driver was found, and that is the weaker claim** |
+
+### Proved the way this line proves everything else: add a clause and watch it go red
+
+**Seven mutations**, each in a **disposable copy outside both checkouts**, each landing confirmed by a
+byte-level assert naming how many times the anchor matched, each measured by an **unfiltered** run
+over `./mls/... ./message/... ./messagegroup/...`. That copy has a baseline of its own —
+**7,697 pass / 6 fail / 1 skip**, and the six are named rather than waved at: they read `.git`
+(`TestTheCommittedSeedCorpusIsPinnedAsBinary`, `TestTheLineEndingPinIsReadTheWayGitResolvesIt`,
+`TestThePackageSourceIsOneLineEndingThroughout`), the repository root package
+(`TestTheScanRootsAreEveryCryptographicPackageConnectedToThisOne`) and the workflow files
+(`TestSyntaxWorkflowRunsEveryFuzzTarget`, `TestSyntaxWorkflowGatesRatherThanReports`), none of
+which the copy has. The one skip wants a sibling `sdk`. Every row below is entry for entry
+against that baseline.
+
+| mutation | the clause it breaks | run | the one test that went red |
+|---|---|---|---|
+| a new `case *ast.Ellipsis:` arm of `originOf`, tagged, **driven by nothing** | every declared reading is exercised | 7,696 / 7 / 1 | `TestEveryReadingOfThisGateIsDrivenBySomething` |
+| the address-of peel split so one half is reached **only by `welcome.go:608`** and by no spelling | the tree's readings are a **subset** of the control's | 7,696 / 7 / 1 | `TestEveryReadingOfThisGateIsDrivenBySomething` |
+| the slice-expression peel's **tag deleted**, behaviour unchanged | every case clause of a registered function carries a tag | 7,696 / 7 / 1 | `TestEveryReadingOfThisGateIsDrivenBySomething` |
+| the dereference peel **renamed to the parenthesis peel's name** | one name, one arm | 7,696 / 7 / 1 | `TestEveryReadingOfThisGateIsDrivenBySomething` |
+| an `UNREACHED` row written for the slice-expression peel, which the corpora do take | an unreached row is never taken | 7,696 / 7 / 1 | `TestEveryReadingOfThisGateIsDrivenBySomething` |
+| the **fifth defect put back** — the multi-value arm drops the result position again | `alias24` answers the result it was bound at | 7,696 / 7 / 1 | `TestTheErasedFieldGateSeesAnAliasHoweverItIsSpelled` |
+| `(SecretTree).newRatchet`'s disposition key left at the **pre-change spelling** | a disposition names a site, in **both** directions | 7,696 / 7 / 1 | `TestEveryFieldThisPackageErasesIsFilledFromAnArrayItOwns` |
+
+The second row is the one the last round's concern names explicitly, and it fires **two** clauses at
+once — *undriven by either corpus*, and *taken over production source and by neither control*:
+
+> `the reading "the address-of peel onto a COMPOSITE LITERAL" is taken over this package's production
+> source and by NEITHER control corpus. … Write the spelling for it`
+
+And the last row is what answers *"any disposition key written before that change is stale"* as a
+measurement rather than as a reading of five strings. Spelling one key the old way reddens the gate
+**twice over** — the site becomes undisposed, and the key becomes stale:
+
+> `secret_tree.go:370: (SecretTree).newRatchet fills secret with rootSecret, whose backing array is
+> the caller's own parameter "rootSecret" …`
+>
+> `eraseOwnershipHandovers disposes of "secret_tree.go:newRatchet.secret = rootSecret" and no fill
+> site of this package answers to it.`
+
+### What this check cannot see, which is the part worth reading
+
+Every previous round on this line found its successor in exactly this paragraph.
+
+1. **A clause added INSIDE an arm that already carries a tag.** The register's unit is the arm.
+   Another name in `case "len", "cap", …`, another `||` on a condition, another `if` nested in a
+   tagged body, or a sub-expression of a value the arm computes — none of those is a new reading as
+   far as this check is concerned. **R25 is exactly such a sub-expression**, and it is filed below
+   rather than registered.
+2. **The functions outside `eraseRegisteredReadingFunctions`**, which are listed there by name: the
+   readings that answer a **type** or a **set** rather than an origin — `declaredTypeNameOf`,
+   `eraseDeclaredTypeOfName`, `promotedMethod`, `eraseShapeOf`, `shapeOf`, `elementTypesOf`,
+   `eraseCompositeShapes` — the class derivations `eraseHelpersIn`, `eraseFieldsIn`,
+   `eraseSiblingFields`, and the traversal helper `eraseInspectScope`. An arm added to any of those
+   can be driven by nothing and this check stays green. They are not ungated — each is a `t.Fatal`
+   on empty in the gate itself — but that is a different and weaker guarantee.
+3. **Whether a reading was taken on purpose.** The register counts that a reading **answered**, not
+   that answering it decided anything. A peel reached incidentally on the way to another answer
+   counts as driven. *"Driven" here is weaker than "a corpus row asserts what it answers"* — which is
+   what the two tables in the corpora tests are for, and they remain the stronger half.
+4. **A reading whose name is computed.** The declared set is read out of the text, so a tag whose
+   argument is not a string literal is **refused** — which is a refusal, not a reading of it.
+5. **An arm deleted outright.** Deleting an arm takes its tag with it, so both sides of the
+   comparison shrink together and this check stays green. That direction is the **corpora's** job,
+   not this one's — deleting the slice-expression peel leaves `alias3` and `alias4` answering
+   something else, which is a failing row with a name on it. *This check catches an arm added
+   without a driver; the corpus tables catch an arm removed from under one.* What neither catches is
+   an arm removed **together with the only row that drove it**, in one edit.
+
+### The carry the last round left open: complement 4 over the real tree
+
+*Complement 4 is asserted only to be non-empty over the real tree; the exact reading-by-reading
+assertion lives in the control corpus, and a reading exercised only by real source and never modelled
+in the control is the gap.*
+
+**Item 1 closes that gap, and it was measured open before it did.** The register asserts that the
+readings the **tree** takes are a **subset** of the readings the **control** takes, so a reading only
+real source reaches is red at its own name. When the register first ran, **eight** readings were in
+exactly that state — the forwarded-opaque answer, the literal arm, the unnameable receiver, the
+multi-value local at its own result position, the local cycle key, the address-of peel, the index
+peel and the selector peel. All eight now have spellings. **What it does not close** is complement
+4's *counts* over the real tree: the register compares which readings were taken, never how many
+times, so a reading that stops being taken by a **particular statement** while another statement
+still takes it is invisible. That is narrower than the gap that was open and it is the honest
+remainder.
+
+### One thing the register says that nothing said before
+
+It prints the twenty fill sites under the **member reading** that admitted each, and they split
+**13 keyed / 7 one-to-one**. No fill site of an erased field in this package is bound by a
+**positional** literal or by a **multi-value** assignment today — both of those member readings are
+driven only by the corpora. That is not a contradiction of the finding that put the multi-value form
+in: complement 4 counts **22** multi-value assignments in this package's source, and every one of
+them binds a field **no erase reaches**. The form is here; it has simply never yet landed on a member
+of this class. *Which is exactly the state in which a reading rots, and is why it is printed.*
+
+### The fifth defect: closed, not carried
+
+`eraseAssignmentsTo`'s multi-value arm recorded the one right-hand expression for **every** target on
+the left, so the result position was lost: a local bound at result 1 of a two-result call was decided
+by the origin of result 0 — an array it never receives.
+
+```go
+func twoOut(x []byte) ([]byte, []byte) { return copyOf(x), x }
+
+func probe(x []byte) *Held {
+    h := &Held{}
+    first, second := twoOut(x)
+    _ = first
+    h.Secret = second          // the caller's array, answered "a fresh array"
+    return h
+}
+```
+
+It was **latent rather than live**, and that stands as measured: with every local bound at a result
+position other than 0 forced to refuse, the gate answered the same twenty fill sites, 5 parameter /
+12 fresh / 0 receiver / 3 opaque / 0 undecided, green. **The repair was cheap for the reason the
+round that found it gave** — the fill-site walk already passed the target index through
+`originOfResult`, so only the position had to be carried. `eraseAssignmentsTo` now answers
+value-and-position pairs and `originOfIdent` resolves through `originOfResult`;
+`eraseReturnExpressionsAt` carries the same pair because a **named result** assigned by
+`out, err = f()` had the identical hole and nothing had named that one.
+
+It is driven by `alias24`/`copy24`, which differ only in **which** result of one callee holds the
+caller's array. Put the defect back and the run is **7,696 / 7 / 1** with
+`TestTheErasedFieldGateSeesAnAliasHoweverItIsSpelled` red at
+*"alias24 must answer `a parameter of the enclosing function` and the gate answers `a fresh array`"*.
+The twenty fill sites and their five verdicts are unchanged by the repair, which is what "latent"
+predicted.
+
+### R25, filed in the terms it was named in
+
+**R25 — the result qualification of `originOfBody`'s cycle key.** The guard is keyed
+`call:NAME:RESULT`. The **arm** is driven, by `copy27`, a recursive callee. The **`:%d` half** is a
+sub-expression of the key and has no arm of its own, so the register cannot see it — blind spot 1
+above. It is **neither driven nor shown to be beyond compilable Go**: reaching it needs one
+resolution chain that asks **one callee at two different result positions**, and `originOfBody`
+returns at the first parameter- or receiver-rooted answer, so the attempt did not get there.
+
+> *"I could not reach it" is not "it cannot be reached"*, and it is recorded as the first.
+
+It is in `eraseClausesOutsideTheRegister`, printed on every passing run, and that map may not be
+empty — because an empty one would claim the register sees every clause of this gate.
+
+### The four clone-site mutations, re-driven unfiltered again, and the table still holds
+
+Driven in the same disposable copy, against its own **7,697 / 6 / 1** baseline, with the gate carrying
+the register and the fifth-defect repair. *Pre-existing* means everything except this line's own four
+artifacts — the three gate cases, the new register case, the join pin and the founder pin.
+
+| site | mutation | run | pre-existing `mls` red | pre-existing `messagegroup` red |
+|---|---|---|---:|---:|
+| `group.go:3422` | `signer` aliased | 7,686 / 17 / 1 | **9** | **0** |
+| `treekem.go:120` | `EncryptionPriv` aliased | 7,652 / 51 / 1 | **40** | **0** |
+| `key_package.go:410` | `signPriv` aliased | 7,675 / 28 / 1 | **6** | **13** |
+| `group.go:668` | `signer` aliased | 7,686 / 17 / 1 | **9** | **0** |
+
+Every one of the four also reddens `TestEveryFieldThisPackageErasesIsFilledFromAnArrayItOwns`, which
+is the gate doing its job at the statement. And the claim the last round made about `group.go:668`
+still holds exactly: of the join pin's clauses **none** fires, and only
+`TestTheFounderSurvivesFoundingAndClosingItsOwnGroup` does — which is why that site needed a clause
+of its own rather than a copy.
+
+### The disposition keys, all five checked after the spelling change
+
+A disposition key changed spelling — `newRatchet` → `(SecretTree).newRatchet` — when scopes began
+naming methods by receiver type, so **every key written before that change is suspect**. All five
+were re-read against the declarations they name:
+
+| key | declaration | current? |
+|---|---|---|
+| `key_schedule.go:newKeyScheduleFromParts.joinerSecret = joinerSecret` | `key_schedule.go:283`, a **function** | yes — a function takes no receiver qualification |
+| `…newKeyScheduleFromParts.welcomeSecret = welcomeSecret` | the same | yes |
+| `…newKeyScheduleFromParts.epochSecret = epochSecret` | the same | yes |
+| `secret_tree.go:(SecretTree).newRatchet.secret = rootSecret` | `secret_tree.go:367`, a **method** | yes — and it is the one the change was about |
+| `welcome.go:BuildWelcome.PathSecret = joiner.PathSecret` | `welcome.go:552`, a **function** | yes |
+
+*And the property is held by the gate rather than by this table*: a key matching no site is red and
+a caller-rooted site with no key is red, in both directions, on every run — which is why all five
+being current is a **measurement** and not a reading of five strings.
+

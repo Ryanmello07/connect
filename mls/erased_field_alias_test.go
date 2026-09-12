@@ -87,6 +87,19 @@
 // of a multi-value call and the opaque answer itself. A clause nothing drives is a comment however
 // correct it is.
 //
+// AND THAT CHECK IS NOW A STANDING ONE RATHER THAN A SWEEP SOMEBODY REMEMBERS TO RE-RUN, which is
+// the recurrence rather than the instance. Twice on this line a clause was added to this gate,
+// exercised by NOTHING, and shipped green; both times what found it was a hand-run deletion sweep,
+// and nothing in the suite would have told the next round the same thing. So every arm that answers
+// an origin or decides a binding position now REGISTERS ITSELF BY NAME, the set of names this file
+// DECLARES is read out of its own SOURCE TEXT rather than out of a run, and
+// TestEveryReadingOfThisGateIsDrivenBySomething asserts that DECLARED minus UNREACHED equals what
+// the control corpora EXERCISE -- as an exact set, member by member, never as "non-empty". Adding an
+// arm nothing drives turns that test red at the arm's own name; so does adding one that only real
+// source reaches; so does deleting an arm's tag, which is what the case-clause totality half is for.
+// The seven arms nothing can drive are in eraseUnreachedReadings with the reason for each, and what
+// the register CANNOT see is in eraseClausesOutsideTheRegister, printed on every run.
+//
 // THE CAUSE WAS THE SHAPE OF THE ASSERTIONS AND NOT THE COVERAGE OF THE CORPUS. Complement 4 was
 // asserted only to be NON-EMPTY, and non-empty is satisfied by twelve readings when there are
 // thirteen; the copy corpus asserted only that a copy is "not the caller's", and that is satisfied
@@ -94,28 +107,38 @@
 // by the KIND it must answer, and the complement is asserted reading by reading, over corpora that
 // go/types accepts as compilable Go.
 //
-// FOUR CLAUSES ARE UNREACHED RATHER THAN DRIVEN, and they are named here instead of left looking
-// driven. Three are kept and are unreachable for a stated reason, because what deleting them
-// produces is a panic or a silently undecided binding position rather than a wrong answer: the
-// bounds guard on a positional element past the end of a struct's field list (more elements than
-// fields is a compile error, and the field list read here holds exactly one entry per declared
-// field); the refusal of an assignment whose two sides differ in length and whose right side is not
-// one expression (Go's grammar has no such assignment); and the UNDECIDED default of the
-// result-position reading (only a call, a map index, a type assertion and a channel receive are
-// multi-valued in Go, and each has its own arm). The FOURTH is not claimed to be unreachable: the
-// cycle key in originOfBody is qualified by the result position as well as the callee, and no
-// compilable driver for that qualification was found -- "I could not reach it" is not "it cannot be
-// reached", and it is recorded as the first.
+// SEVEN ARMS ARE UNREACHED RATHER THAN DRIVEN, and the register HOLDS them there rather than
+// letting them look driven: each is named in eraseUnreachedReadings with its reason, a row that is
+// ever taken is red, and a row naming an arm this file no longer declares is red. SIX are argued
+// UNREACHABLE from Go's own grammar or from this gate's own structure -- the bounds guard on a
+// positional element past the end of a struct's field list; the refusal of an assignment whose two
+// sides differ in length and whose right side is not one expression; the UNDECIDED default of the
+// result-position reading; the bounds guard on append with no arguments at all; and the two arms
+// that refuse receiver state answered out of a plain function, whose scope chain binds no receiver.
+// THE SEVENTH SAYS THE WEAKER THING ON PURPOSE and is spelled UNREACHED rather than UNREACHABLE: the
+// default of originOf, for which no compilable driver was found. "I could not reach it" is not "it
+// cannot be reached", and the register refuses a row that does not say which of the two it means.
+//
+// AND ONE CLAUSE IS OUTSIDE THE REGISTER ALTOGETHER, in eraseClausesOutsideTheRegister: R25, the
+// RESULT QUALIFICATION of originOfBody's cycle key. The register's unit is the ARM, and that is a
+// sub-expression of one -- the arm itself is driven, by copy27. It is neither driven nor shown to be
+// beyond compilable Go, and it is filed in those terms rather than in stronger ones.
 //
 // AND ONE READING WAS REMOVED rather than kept: the two that handed a struct field's declared type
 // down to a nested literal, for an elision Go permits only "within a composite literal of array,
 // slice, or map type".
 //
-// AND ONE DEFECT IS OPEN AND NAMED, found by that same check and deliberately not fixed by the round
-// that found it, because a round that opens a fifth front is a round that stops finishing: a local
-// bound at a RESULT POSITION other than 0 of a multi-value assignment is resolved through result 0.
-// It is reproduced, and measured to be latent rather than live over this package today. See
-// eraseAssignmentsTo.
+// AND THE FIFTH DEFECT IS CLOSED RATHER THAN CARRIED. A local bound at a RESULT POSITION other than
+// 0 of a multi-value assignment was resolved through result 0 -- an array it never receives -- and
+// the round that found it left it open on purpose, reproduced and measured LATENT: with every such
+// local forced to refuse, the gate answered the same twenty fill sites and stayed green, so nothing
+// in connect/mls resolved through one. The repair is the one that round named and it was small for
+// the reason it gave: the fill-site walk already passed the target index through originOfResult, so
+// the position only had to be carried alongside each value. eraseAssignmentsTo now answers
+// value-and-position pairs, originOfIdent resolves through originOfResult, and
+// eraseReturnExpressionsAt carries the same pair because a NAMED result assigned by `out, err = f()`
+// had the identical hole. It is driven by alias24/copy24, which differ only in WHICH result of one
+// callee holds the caller's array; put the defect back and alias24 answers "a fresh array".
 package mls
 
 import (
@@ -128,9 +151,15 @@ import (
 	"go/types"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 )
+
+// eraseGateFile is this file, by name. The register below reads this gate's own SOURCE TEXT to find
+// out what it DECLARES, which is the only reading of "declared" that a run cannot make true by
+// accident.
+const eraseGateFile = "erased_field_alias_test.go"
 
 // ---------------------------------------------------------------------------
 // what the resolver answers
@@ -186,6 +215,71 @@ type eraseFillSite struct {
 	field       string
 	rhs         string
 	origin      eraseOrigin
+	// the READING of the form walk that decided this binding position was a member. It is here
+	// so that the register below can say which reading admitted which site, rather than only
+	// that the reading answered.
+	reading string
+}
+
+// ---------------------------------------------------------------------------
+// the register every reading of this gate writes its own name into
+// ---------------------------------------------------------------------------
+
+// eraseReadings is the REGISTER, and it is what makes "is every clause of this gate driven by
+// something?" a standing question rather than a sweep somebody remembers to re-run.
+//
+// WHY IT EXISTS. Twice on this line a clause was added to this gate, exercised by NOTHING, and
+// shipped green -- the second time thirty-three of seventy-one at once. Both times the check that
+// found them was a hand-run deletion sweep, which is a MEASUREMENT and not a gate: nothing in the
+// suite told the next round that a newly added clause was undriven.
+//
+// AND THE TWO SHAPES THAT ALREADY FAILED ARE NOT REBUILT HERE:
+//
+//   - AN EXISTENCE ASSERTION CANNOT DETECT A MISSING MEMBER. Complement 4 was asserted only to be
+//     non-empty, and non-empty is satisfied by twelve readings when there are thirteen. So this
+//     register is asserted as an EXACT SET, member by member, in both directions.
+//   - A REGISTER THAT ONLY RECORDS WHAT RAN IS VACUOUS. If "registered" meant "wrote its name in
+//     during this run", then registered would be a subset of exercised by construction and the
+//     comparison would always hold. So the DECLARED set is read out of this file's own SOURCE
+//     TEXT -- every eraseReadings tag written anywhere in it -- and the EXERCISED set is what the
+//     control corpora actually took. A reading present in the text and absent from the run is a
+//     failing diff at its own name.
+//
+// The tag is part of the expression it names and never a statement beside it -- name answers its
+// own argument, origin answers the origin it wraps -- so a tag cannot be deleted into a silent
+// no-op, and an arm written without one is caught by the CASE-CLAUSE TOTALITY check instead.
+type eraseReadings struct {
+	taken map[string]int
+}
+
+func newEraseReadings() *eraseReadings {
+	return &eraseReadings{taken: map[string]int{}}
+}
+
+// name records that the reading called `of` ANSWERED, and answers `of` itself.
+func (self *eraseReadings) name(of string) string {
+	if self != nil {
+		self.taken[of] += 1
+	}
+	return of
+}
+
+// origin is name for an arm that answers an origin.
+func (self *eraseReadings) origin(of string, answer eraseOrigin) eraseOrigin {
+	self.name(of)
+	return answer
+}
+
+// at is name for a reading that answers a RESULT POSITION.
+func (self *eraseReadings) at(of string, position int) int {
+	self.name(of)
+	return position
+}
+
+// declined is name for an arm of the method reading that hands its call back to the opaque arm.
+func (self *eraseReadings) declined(of string) (eraseOrigin, bool) {
+	self.name(of)
+	return eraseOrigin{}, false
 }
 
 // ---------------------------------------------------------------------------
@@ -233,7 +327,7 @@ func TestEveryFieldThisPackageErasesIsFilledFromAnArrayItOwns(t *testing.T) {
 	}
 
 	// ---- step 3: the fill sites ----
-	sites, refusals, removedForms := eraseFillSitesIn(fileSet, sources, erased)
+	sites, refusals, removedForms, _ := eraseFillSitesIn(fileSet, sources, erased)
 	if len(sites) == 0 {
 		t.Fatal("no composite literal and no assignment in this package's production source fills a field an erase reaches, so this gate read nothing")
 	}
@@ -409,8 +503,13 @@ func eraseSiteKey(site eraseFillSite) string {
 	return fmt.Sprintf("%s:%s.%s = %s", file, site.inside, site.field, site.rhs)
 }
 
-// TestTheErasedFieldGateSeesAnAliasHoweverItIsSpelled is the acceptance test for the gate above,
-// and it is the clause that says the gate is about aliasing rather than about spelling.
+// eraseSpellingCorpus is the control corpus of SPELLINGS, and the acceptance test driven over it is
+// TestTheErasedFieldGateSeesAnAliasHoweverItIsSpelled below. It is the clause that says the gate is
+// about aliasing rather than about spelling.
+//
+// IT IS AT PACKAGE LEVEL so that TestEveryReadingOfThisGateIsDrivenBySomething can drive it too:
+// that check asks whether every reading this file DECLARES is taken over these corpora, which it
+// cannot ask about a corpus locked inside one test function.
 //
 // It is here because the three sites the coupling rests on are written two different ways today,
 // and this project has shipped a class defect keyed to ONE spelling nine times. So the resolver is
@@ -431,8 +530,7 @@ func eraseSiteKey(site eraseFillSite) string {
 // It parses a source file of its own rather than reading the tree, because a control has to be able
 // to contain the defect -- and it TYPE-CHECKS it, because a driver that could not compile is not
 // evidence about a form real source can hold.
-func TestTheErasedFieldGateSeesAnAliasHoweverItIsSpelled(t *testing.T) {
-	const control = `package mls
+const eraseSpellingCorpus = `package mls
 
 type Held struct{ Secret []byte }
 
@@ -681,8 +779,132 @@ func channelOk28(ch chan []byte, f *Flag) []byte {
 	v, f.Secret = <-ch
 	return v
 }
+
+// 24 -- a local bound at a RESULT POSITION OTHER THAN 0, which is the fifth defect of this line and
+// the only pair here that differs in WHICH result of one callee holds the caller's array. Before the
+// repair in eraseAssignmentsTo, alias24 answered "a fresh array" -- the origin of result 0, an array
+// that local never receives.
+func twoOut(x []byte) ([]byte, []byte)     { return copyOf(x), x }
+func twoOutCopy(x []byte) ([]byte, []byte) { return x, copyOf(x) }
+
+func alias24(x []byte) *Held { h := &Held{}; _, second := twoOut(x); h.Secret = second; return h }
+func copy24(x []byte) *Held  { h := &Held{}; _, second := twoOutCopy(x); h.Secret = second; return h }
+
+// 25 -- a COMPOSITE LITERAL standing where the array goes.
+func copy25(x []byte) *Held { _ = x; return &Held{Secret: []byte{1, 2, 3}} }
+
+// 26 -- a method answering its own receiver as a BARE NAME, behind a selector whose base is a call
+// rather than a name, so the selector must be peeled instead of read.
+func (self *Box) itself() *Box { return self }
+
+func alias26(b *Box) *Held { return &Held{Secret: b.itself().inner} }
+
+// 27 -- a RECURSIVE callee. Without a cycle key on the call, resolving this never terminates.
+func recurse(x []byte) []byte {
+	if len(x) == 0 {
+		return recurse(x)
+	}
+	return copyOf(x)
+}
+
+func copy27(x []byte) *Held { return &Held{Secret: recurse(x)} }
+
+// 28 -- a LOCAL assigned from ITSELF, which is the cycle key of a local rather than of a call.
+func copy28(x []byte) *Held {
+	out := copyOf(x)
+	out = append(out, 0)
+	h := &Held{}
+	h.Secret = out
+	return h
+}
+
+// 29 -- an ADDRESS-OF and a DEREFERENCE standing between the fill and the array.
+func copy29(x []byte) *Held {
+	c := copyOf(x)
+	p := &c
+	return &Held{Secret: *p}
+}
+
+// 30 -- PARENTHESES, which preserve the array and are peeled before anything else is read.
+func copy30(x []byte) *Held { return &Held{Secret: (copyOf(x))} }
+
+// 31 -- a VARIADIC callee answering a parameter that has NO argument at this call site. The
+// caller-side mapping must refuse rather than index past the arguments it was given.
+func firstOf(a []byte, rest ...[]byte) []byte { _ = a; return rest[0] }
+
+func undecided31(x []byte) *Held { return &Held{Secret: firstOf(x)} }
+
+// 32 -- the same refusal reached through a FORWARDED multi-value return.
+func forwardsVariadic(a []byte, rest ...[]byte) ([]byte, error) { _ = a; return two(rest[0]) }
+
+func undecided32(x []byte) *Held {
+	h := &Held{}
+	s, _ := forwardsVariadic(x)
+	h.Secret = s
+	return h
+}
+
+// 33 -- a METHOD whose body FORWARDS a multi-value call that answers the receiver's own state, so
+// the answer has to be mapped back onto the expression the method was called on.
+func (self *Box) twoInner() ([]byte, error) { return two(self.inner) }
+
+func alias33(b *Box) *Held {
+	h := &Held{}
+	s, _ := b.twoInner()
+	h.Secret = s
+	return h
+}
+
+// 34 -- a FORWARDED return into a callee this gate cannot open, which must stay opaque rather than
+// fall through to "a fresh array".
+var twoHandler = two
+
+func forwardsOpaque(x []byte) ([]byte, error) { return twoHandler(x) }
+
+func opaque34(x []byte) *Held {
+	h := &Held{}
+	s, _ := forwardsOpaque(x)
+	h.Secret = s
+	return h
+}
+
+// 35 -- a callee with SEVERAL returns, one of which this gate cannot open and none of which is
+// caller-rooted. The opaque one has to win: a body this gate only half read must not answer fresh.
+func maybeOpaque(x []byte) []byte {
+	if len(x) == 0 {
+		return handler(x)
+	}
+	return copyOf(x)
+}
+
+func opaque35(x []byte) *Held { return &Held{Secret: maybeOpaque(x)} }
+
+// 36 -- a method call on a struct this package DECLARES that declares no such method and embeds no
+// struct that does, because what it embeds is an INTERFACE. Promotion refuses and the call stays
+// opaque, which is the line an embedded interface sits on.
+type Wrapped struct{ Source }
+
+func opaque36(w *Wrapped) *Held { return &Held{Secret: w.Bytes()} }
+
+// 37 -- a method call on a receiver whose declared type this gate cannot name AT ALL.
+var boxes = func() *Box { return &Box{} }
+
+func opaque37(x []byte) *Held { _ = x; return &Held{Secret: boxes().Raw()} }
+
+// 38 -- a CHANNEL RECEIVE where the array goes: the one unary operator that is neither address-of
+// nor a computation over an array this function already holds.
+func copy38(ch chan []byte) *Held { return &Held{Secret: <-ch} }
+
+// 39 -- MORE PEELS THAN THE RESOLVER HAS DEPTH FOR. It must run out and REFUSE; a resolver that ran
+// out and answered would answer "fresh" for an array it never reached.
+func undecided39(x []byte) *Held { return &Held{Secret: ((((((((((((x)))))))))))) } }
 `
-	fileSet, sources := eraseControlCorpus(t, "erased_field_alias_control.go", control)
+
+// TestTheErasedFieldGateSeesAnAliasHoweverItIsSpelled drives the resolver over every spelling of
+// eraseSpellingCorpus and asserts the KIND each must answer, never merely that a copy "is not the
+// caller's" -- fresh and opaque are different admissions and opaque is admitted on trust.
+func TestTheErasedFieldGateSeesAnAliasHoweverItIsSpelled(t *testing.T) {
+	fileSet, sources := eraseControlCorpus(t, "erased_field_alias_control.go", eraseSpellingCorpus)
 
 	helpers := eraseHelpersIn(sources)
 	if !slices.Contains(helpers, "wipe") {
@@ -694,7 +916,7 @@ func channelOk28(ch chan []byte, f *Flag) []byte {
 		t.Fatalf("the erased-field derivation did not find Held.Secret: it found %v",
 			slices.Sorted(maps_Keys(erased)))
 	}
-	sites, refusals, removedForms := eraseFillSitesIn(fileSet, sources, erased)
+	sites, refusals, removedForms, _ := eraseFillSitesIn(fileSet, sources, erased)
 	for _, refusal := range refusals {
 		t.Errorf("the control corpus holds `%s` at %s, which this gate refused as %s. Every form in THIS corpus is one this gate is supposed to READ; the forms it is supposed to refuse have a corpus of their own",
 			refusal.src, refusal.at, refusal.form)
@@ -767,6 +989,24 @@ func channelOk28(ch chan []byte, f *Flag) []byte {
 		{"opaque27", eraseOriginOpaque, "s.Bytes", "the opaque answer for a method reached through an INTERFACE"},
 		{"commaOk28", eraseOriginFresh, "", "the comma-ok arm of the result-position reading"},
 		{"channelOk28", eraseOriginFresh, "", "the channel-receive arm of the result-position reading"},
+
+		{"alias24", eraseOriginParameter, "x", "the MULTI-VALUE form of a local's assignments AT ITS OWN RESULT POSITION -- the fifth defect of this line, which answered `a fresh array` here"},
+		{"copy24", eraseOriginFresh, "", "the same reading, at the result that does hold a copy"},
+		{"copy25", eraseOriginFresh, "", "the literal arm, over a composite literal"},
+		{"alias26", eraseOriginParameter, "b", "the selector PEEL onto a base that is a call, and the RECEIVER binding of a bare name"},
+		{"copy27", eraseOriginFresh, "", "the RESULT-QUALIFIED cycle key of a callee"},
+		{"copy28", eraseOriginFresh, "", "the SCOPE-qualified cycle key of a local"},
+		{"copy29", eraseOriginFresh, "", "the dereference peel and the address-of peel"},
+		{"copy30", eraseOriginFresh, "", "the parenthesis peel"},
+		{"undecided31", eraseOriginUndecided, "", "the refusal of a callee's parameter this gate could not map back onto an argument, and the index peel"},
+		{"undecided32", eraseOriginUndecided, "", "the same refusal on a FORWARDED return"},
+		{"alias33", eraseOriginParameter, "b", "a FORWARDED return answering the callee's RECEIVER state"},
+		{"opaque34", eraseOriginOpaque, "forwardsOpaque forwards: twoHandler", "a FORWARDED return answering OPAQUE, carried out under the callee's name"},
+		{"opaque35", eraseOriginOpaque, "maybeOpaque: handler", "a callee answering OPAQUE on one of several returns, which must beat the fresh ones"},
+		{"opaque36", eraseOriginOpaque, "w.Bytes", "the refusal of a method neither declared on the receiver's type nor promoted from a struct it embeds"},
+		{"opaque37", eraseOriginOpaque, "boxes().Raw", "the refusal of a receiver whose declared type this gate could not name"},
+		{"copy38", eraseOriginFresh, "", "the unary arm, over a channel receive"},
+		{"undecided39", eraseOriginUndecided, "", "the resolver's own DEPTH LIMIT, which must refuse rather than answer"},
 	} {
 		site, seen := verdict[spelling.inside]
 		if !seen {
@@ -853,8 +1093,7 @@ func eraseControlCorpus(t *testing.T, path string, source string) (*token.FileSe
 //
 // Both are stated here and in GATES.md, and the query that says they are unreached today is the
 // gate's own run: the refusal list over this package's production source is empty on every pass.
-func TestTheFormWalkDecidesEveryBindingPositionAndRefusesTheOnesItCannotPlace(t *testing.T) {
-	const control = `package mls
+const eraseFormCorpus = `package mls
 
 type Held struct{ Secret []byte }
 
@@ -942,7 +1181,11 @@ func walks(xs []int) int {
 	return seen
 }
 `
-	fileSet, sources := eraseControlCorpus(t, "erased_field_form_control.go", control)
+
+// TestTheFormWalkDecidesEveryBindingPositionAndRefusesTheOnesItCannotPlace drives the COMPLEMENT of
+// the form walk over eraseFormCorpus, reading by reading and exactly.
+func TestTheFormWalkDecidesEveryBindingPositionAndRefusesTheOnesItCannotPlace(t *testing.T) {
+	fileSet, sources := eraseControlCorpus(t, "erased_field_form_control.go", eraseFormCorpus)
 
 	helpers := eraseHelpersIn(sources)
 	if !slices.Contains(helpers, "wipe") {
@@ -953,7 +1196,7 @@ func walks(xs []int) int {
 		t.Fatalf("the erased-field derivation did not find Held.Secret: it found %v",
 			slices.Sorted(maps_Keys(erased)))
 	}
-	sites, refusals, removedForms := eraseFillSitesIn(fileSet, sources, erased)
+	sites, refusals, removedForms, _ := eraseFillSitesIn(fileSet, sources, erased)
 
 	// ONE FILL SITE, and it is the one the refusals are measured against. `hidden{x}` inside
 	// local() binds Secret positionally out of a caller's array, and the gate cannot name the type
@@ -1025,6 +1268,432 @@ func walks(xs []int) int {
 	}
 	t.Logf("every binding position Go has that cannot legally carry a member of this class was refused by name and line or counted under its own reading, over a corpus go/types accepts: %d refusal(s), %d reading(s) in the complement",
 		len(refusals), len(removedForms))
+}
+
+// ---------------------------------------------------------------------------
+// the standing check: is every reading of this gate driven by something?
+// ---------------------------------------------------------------------------
+
+// eraseRegisteredReadingFunctions are the functions whose arms the register covers, and the list is
+// the BOUNDARY -- it is stated here rather than implied, because what a check cannot see is the only
+// thing worth naming about it.
+//
+// WHAT IS IN: every reading that ANSWERS AN ORIGIN or DECIDES A BINDING POSITION. That is where all
+// thirty-three of the undriven clauses the last round found were living.
+//
+// WHAT IS OUT, and this is the register's largest blind spot: the readings that answer a TYPE or a
+// SET rather than an origin -- declaredTypeNameOf, eraseDeclaredTypeOfName, promotedMethod,
+// eraseShapeOf, shapeOf, elementTypesOf, eraseCompositeShapes -- and the class derivations
+// themselves, eraseHelpersIn, eraseFieldsIn and eraseSiblingFields, and the traversal helper
+// eraseInspectScope. An arm added to any of those can be driven by nothing and this check stays
+// green. They are not ungated: each is a t.Fatal on empty in the gate itself, which is a different
+// and weaker guarantee, and it is stated in GATES.md as such.
+var eraseRegisteredReadingFunctions = []string{
+	"eraseFillSitesIn",
+	"originOf",
+	"originOfResult",
+	"originOfIdent",
+	"originOfCall",
+	"originOfMethodCall",
+	"originOfBody",
+	"eraseAssignmentsTo",
+	"eraseReturnExpressionsAt",
+}
+
+// eraseUnreachedReadings are the readings this file DECLARES that no compilable Go drives, each with
+// the reason -- and the register asserts both halves: a row here that is never taken is fine, a row
+// here that IS taken is red, and a row naming a reading this file no longer declares is red.
+//
+// THIS IS THE HONEST HALF OF THE REGISTER. Without it, "every declared reading is exercised" would
+// have to be made true by deleting guards that exist to stop a panic, or by widening the corpus with
+// Go that does not compile -- which is the shape of driver the last round already threw out. A
+// reading kept because deleting it produces a panic rather than a wrong answer belongs here, named,
+// with the reason readable beside it.
+var eraseUnreachedReadings = map[string]string{
+	"a positional element past the end of the field list this gate read for its type": "UNREACHABLE: a struct literal with more elements than the struct has fields is a COMPILE ERROR, and the field list this gate reads appends exactly one entry per declared field, an embedded one included and named by its type. It stays as the bounds guard on an index, because what deleting it produces is a PANIC rather than a wrong answer.",
+
+	"an assignment whose two sides have different lengths and whose right side is not a single expression": "UNREACHABLE: Go's grammar has no such assignment -- either the two sides have equal length, or the right side is one multi-valued expression. It stays as the walk's own totality guard, and it is the line that makes \"every sub-form is decided\" true rather than approximately true.",
+
+	"the UNDECIDED default of the result-position reading": "UNREACHABLE: only a call, a map index, a type assertion and a channel receive are multi-valued in Go; each has its own arm above, and parentheses are peeled before the switch reads the node. The default is what makes the reading TOTAL rather than approximately total.",
+
+	"append with NO arguments at all": "UNREACHABLE: append() with no arguments does not compile -- \"not enough arguments in call to append\". It stays as the bounds guard on call.Args[0], because what deleting it produces is a PANIC rather than a wrong answer. THIS REGISTER FOUND IT; the seventy-one-clause deletion sweep of the round before never named it.",
+
+	"a callee answering RECEIVER state that this gate called as a plain function": "UNREACHABLE: eraseOriginReceiver is answered only where eraseBindingOf finds a name bound as the RECEIVER of some scope of the chain, and the chain of a plain function declares none -- eraseScopeOf(declared).receiver() is nil for every *ast.FuncDecl with no Recv. A body this gate called with receiver == nil therefore cannot answer receiver state. It stays as the arm that REFUSES rather than resolving a nil receiver expression.",
+
+	"a FORWARDED return answering receiver state out of a plain function": "UNREACHABLE: the same argument as the arm above, on the forwarded half. A plain function's scope chain binds no receiver, so a forwarded return out of one cannot answer receiver state, and the arm refuses rather than resolving a nil receiver expression.",
+
+	"the REFUSAL of an expression form this gate has no peel for": "UNREACHED: no compilable driver was found, and that is a WEAKER claim than the six above rather than the same one. Every Go expression that evaluates to a slice is one of the fourteen ast.Expr kinds this switch already names. What is left is *ast.BadExpr, which only a parse error produces and which this gate fatals on before reading; the type-expression nodes, which are not values; and *ast.IndexListExpr, a generic instantiation with TWO type arguments, which is a function value and which no peel of this resolver descends into. Reaching this default needs an expression that both evaluates to an array and arrives at originOf as one of those, and the attempt did not find one. \"I COULD NOT REACH IT\" IS NOT \"IT CANNOT BE REACHED\", and it is recorded as the first.",
+}
+
+// eraseClausesOutsideTheRegister are the clauses of this gate that the register CANNOT SEE, named
+// here rather than left to prose in a commit message, because the blind spot of a check is where the
+// next finding on this line has come from four rounds running.
+//
+// The register's unit is the ARM -- a case clause, or the expression a tag wraps. A clause written
+// INSIDE an arm that already has a tag is invisible to it: another name in a case's expression list,
+// another || on a condition, another if nested in a tagged body, or a sub-expression of a value the
+// arm computes. Each row here is such a clause, with what is known about it.
+var eraseClausesOutsideTheRegister = map[string]string{
+	"R25 -- the RESULT QUALIFICATION of originOfBody's cycle key": "originOfBody keys its cycle guard `call:NAME:RESULT`, and the register sees only the arm that guard protects -- driven by copy27, a recursive callee. The `:%d` half is a sub-expression of the key and has no arm of its own. NEITHER DRIVEN NOR SHOWN TO BE BEYOND COMPILABLE GO: reaching it needs one resolution chain that asks ONE callee at TWO different result positions, and originOfBody returns at the first parameter- or receiver-rooted answer, so the attempt did not get there. \"I COULD NOT REACH IT\" IS NOT \"IT CANNOT BE REACHED\", and it is recorded as the first. Removing the qualification would key two different questions about one callee to one answer; keeping it costs nothing and is not evidence of anything.",
+}
+
+// eraseDeclaredReadings reads every reading name this file DECLARES, out of its own SOURCE TEXT.
+//
+// THIS IS THE HALF THAT MAKES THE CHECK NON-VACUOUS, and it is the trap the first shape of this idea
+// walks into. If "declared" meant "wrote its name into the register during this run", then declared
+// would be a subset of exercised by construction and the comparison would hold no matter how many
+// arms nothing drove. Declared has to be a property of the TEXT. So this parses the gate's own file
+// and takes every string literal handed to an eraseReadings tag, whether or not anything ever calls
+// the line it sits on.
+func eraseDeclaredReadings(t *testing.T) map[string][]string {
+	t.Helper()
+	fileSet := token.NewFileSet()
+	parsed, err := parser.ParseFile(fileSet, eraseGateFile, nil, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parse this gate's own source, %s: %v", eraseGateFile, err)
+	}
+	declared := map[string][]string{}
+	ast.Inspect(parsed, func(node ast.Node) bool {
+		call, isCall := node.(*ast.CallExpr)
+		if !isCall || len(call.Args) == 0 {
+			return true
+		}
+		tag, isSelector := call.Fun.(*ast.SelectorExpr)
+		if !isSelector {
+			return true
+		}
+		if tag.Sel.Name != "name" && tag.Sel.Name != "origin" &&
+			tag.Sel.Name != "declined" && tag.Sel.Name != "at" {
+			return true
+		}
+		if !strings.HasSuffix(eraseRender(fileSet, tag.X), "readings") {
+			return true
+		}
+		literal, isLiteral := call.Args[0].(*ast.BasicLit)
+		if !isLiteral || literal.Kind != token.STRING {
+			t.Errorf("%s:%d: a reading is tagged with something that is not a string literal (%s). The DECLARED set is read out of this file's text, so a name this gate computes at run time is a reading the register cannot see is missing",
+				eraseGateFile, fileSet.Position(call.Pos()).Line, eraseRender(fileSet, call.Args[0]))
+			return true
+		}
+		name, err := strconv.Unquote(literal.Value)
+		if err != nil {
+			t.Errorf("%s:%d: unquote a reading name: %v", eraseGateFile,
+				fileSet.Position(call.Pos()).Line, err)
+			return true
+		}
+		declared[name] = append(declared[name],
+			fmt.Sprintf("%s:%d", eraseGateFile, fileSet.Position(call.Pos()).Line))
+		return true
+	})
+	return declared
+}
+
+// eraseUntaggedArms answers every CASE CLAUSE of the registered functions that carries no reading
+// tag, which is the half that catches an arm written WITHOUT one.
+//
+// WHY CASE CLAUSES AND NOT EVERY BRANCH. An arm of this resolver is a case of a type switch or of a
+// switch on a callee name; a guard is an if. Requiring a tag on every if would put one on
+// `if depth > eraseResolverDepth` and on `if body == nil` and would be noise; requiring one on every
+// case is exact and has no false positives today. The cost is stated: a NEW CLAUSE ADDED INSIDE AN
+// EXISTING CASE -- another name in `case "len", "cap", ...`, another `||` on a condition, another if
+// nested in an arm that already has a tag -- is invisible here.
+func eraseUntaggedArms(t *testing.T) ([]string, int, []string) {
+	t.Helper()
+	fileSet := token.NewFileSet()
+	parsed, err := parser.ParseFile(fileSet, eraseGateFile, nil, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parse this gate's own source, %s: %v", eraseGateFile, err)
+	}
+	tagged := func(body []ast.Stmt) bool {
+		found := false
+		for _, statement := range body {
+			ast.Inspect(statement, func(node ast.Node) bool {
+				call, isCall := node.(*ast.CallExpr)
+				if !isCall {
+					return true
+				}
+				if tag, isSelector := call.Fun.(*ast.SelectorExpr); isSelector &&
+					strings.HasSuffix(eraseRender(fileSet, tag.X), "readings") {
+					found = true
+				}
+				return true
+			})
+		}
+		return found
+	}
+	untagged := []string{}
+	seen := []string{}
+	arms := 0
+	for _, declaration := range parsed.Decls {
+		function, isFunction := declaration.(*ast.FuncDecl)
+		if !isFunction || function.Body == nil {
+			continue
+		}
+		if !slices.Contains(eraseRegisteredReadingFunctions, function.Name.Name) {
+			continue
+		}
+		seen = append(seen, function.Name.Name)
+		ast.Inspect(function.Body, func(node ast.Node) bool {
+			clause, isClause := node.(*ast.CaseClause)
+			if !isClause || len(clause.Body) == 0 {
+				return true
+			}
+			arms += 1
+			if tagged(clause.Body) {
+				return true
+			}
+			untagged = append(untagged, fmt.Sprintf("%s:%d in %s -- %s",
+				eraseGateFile, fileSet.Position(clause.Pos()).Line, function.Name.Name,
+				eraseRender(fileSet, clause)))
+			return true
+		})
+	}
+	slices.Sort(seen)
+	return untagged, arms, seen
+}
+
+// eraseReadingsOver drives one whole derivation and answers the register it filled, together with
+// the fill sites it admitted -- each of which carries the MEMBER reading that decided it.
+func eraseReadingsOver(t *testing.T, fileSet *token.FileSet,
+	sources []eraseSource) (*eraseReadings, []eraseFillSite) {
+
+	t.Helper()
+	helpers := eraseHelpersIn(sources)
+	if len(helpers) == 0 {
+		t.Fatal("no erase helper was derived, so nothing below read anything")
+	}
+	erased, _ := eraseFieldsIn(fileSet, sources, helpers)
+	if len(erased) == 0 {
+		t.Fatal("no erased field was derived, so nothing below read anything")
+	}
+	sites, _, _, readings := eraseFillSitesIn(fileSet, sources, erased)
+	return readings, sites
+}
+
+// TestEveryReadingOfThisGateIsDrivenBySomething is the STANDING check, and it exists because twice
+// on this line a clause was added to this gate, driven by NOTHING, and shipped green.
+//
+// BOTH TIMES THE CHECK THAT FOUND IT WAS A HAND-RUN SWEEP -- delete each clause, run the suite
+// unfiltered, see whether anything notices -- and a sweep is a measurement, not a gate. The round
+// that ran it over seventy-one clauses and found thirty-three undriven closed its own report with
+// the observation that nothing in the suite would tell the NEXT round the same thing. This is that
+// something.
+//
+// THE SHAPE, AND WHY IT IS THIS ONE. Two were on the table: the readings register themselves and the
+// test asserts the registered set equals what the corpora exercise, or the control corpus becomes
+// the authority and a reading with no named row fails. Taken alone each has the same hole, and it is
+// the hole the last round diagnosed in complement 4: a reading nothing takes and nothing names is
+// absent from BOTH sides of the comparison, so the comparison holds. So this is both, with the
+// DECLARED side read out of this file's own SOURCE TEXT rather than out of a run:
+//
+//	DECLARED    every eraseReadings tag written anywhere in erased_field_alias_test.go
+//	EXERCISED   every reading the two control corpora actually took
+//	UNREACHED   the readings named in eraseUnreachedReadings, with the reason for each
+//
+// and the assertion is an EXACT SET in both directions -- DECLARED minus UNREACHED equals EXERCISED,
+// member by member, printed as a diff at the reading's own name. Never that either side is
+// non-empty: an existence assertion is satisfied by twelve readings when there are thirteen, which
+// is the precise mechanism that let this gate ship twelve-of-thirteen in silence.
+//
+// AND THE REAL TREE IS HELD TO THE CONTROL, which is the other carry. Complement 4 over the real
+// tree is asserted only to be non-empty, and the exact reading-by-reading assertion lives in the
+// control corpus -- so a reading exercised ONLY by real source and never modelled in the control was
+// a gap nothing closed. It is closed here: the readings the tree takes must be a SUBSET of the
+// readings the control takes, so a reading that only real source reaches is red at its own name
+// until somebody writes the spelling for it.
+//
+// WHAT THIS CHECK CANNOT SEE, stated because every round on this line found its successor in exactly
+// that blind spot:
+//
+//  1. A CLAUSE ADDED INSIDE AN ARM THAT ALREADY HAS A TAG. The register's unit is the arm. Another
+//     name in `case "len", "cap", ...`, another `||` on a condition, another if nested inside a
+//     tagged case -- none of those is a new reading as far as this check is concerned. R25, the
+//     result qualification of originOfBody's cycle key, is exactly such a sub-expression, and it is
+//     filed in GATES.md rather than registered here.
+//  2. THE FUNCTIONS OUTSIDE eraseRegisteredReadingFunctions, listed there with their names.
+//  3. WHETHER A READING WAS TAKEN ON PURPOSE. The register counts that a reading ANSWERED, not that
+//     answering it decided anything. A peel reached incidentally on the way to another answer counts
+//     as driven, so "driven" here is weaker than "a corpus row asserts what it answers" -- which is
+//     what the two tables in the corpora tests are for, and they are the stronger half.
+//  4. A READING WHOSE NAME IS COMPUTED. The declared set is read out of the text, so a tag whose
+//     argument is not a string literal is refused rather than read -- but that is a refusal, not a
+//     reading of it.
+//  5. AN ARM DELETED OUTRIGHT. Deleting an arm takes its tag with it, so both sides of the
+//     comparison shrink together and this check stays green. That direction is the CORPORA's job
+//     and not this one's: deleting the slice-expression peel leaves alias3 and alias4 answering
+//     something else, which is a failing row with a name on it. The division is worth stating --
+//     THIS CHECK CATCHES AN ARM ADDED WITHOUT A DRIVER, THE CORPUS TABLES CATCH AN ARM REMOVED
+//     FROM UNDER ONE -- and what neither catches is an arm removed together with the only row that
+//     drove it, in one edit.
+func TestEveryReadingOfThisGateIsDrivenBySomething(t *testing.T) {
+	declared := eraseDeclaredReadings(t)
+	if len(declared) == 0 {
+		t.Fatal("this gate's own source declares NO reading at all, so the register read nothing and every assertion below would report clean having compared two empty sets")
+	}
+
+	// ---- one name, one arm ----
+	for name, places := range declared {
+		if len(places) < 2 {
+			continue
+		}
+		t.Errorf("the reading %q is declared at %d places (%v). Two arms answering to one name is one arm's worth of evidence covering both: either could stop being taken with the register still seeing the name",
+			name, len(places), places)
+	}
+
+	// ---- every arm carries a tag ----
+	untagged, arms, functions := eraseUntaggedArms(t)
+	if arms == 0 {
+		t.Fatal("no case clause was found in any registered function, so the totality half of this check compared nothing -- which is what a rename of one of those functions looks like")
+	}
+	if len(functions) != len(eraseRegisteredReadingFunctions) {
+		t.Errorf("the register names %d function(s) and this file declares %d of them (%v). A registered function that no longer exists under that name is a whole family of arms this check silently stopped reading",
+			len(eraseRegisteredReadingFunctions), len(functions), functions)
+	}
+	for _, arm := range untagged {
+		t.Errorf("%s\n\tthis arm carries NO reading tag, so nothing can say whether anything drives it. Every case clause of a registered function answers under a name: wrap what it returns in self.readings.origin(%q, ...) or hand its reason through resolver.readings.name(...)",
+			arm, "what this arm reads")
+	}
+	t.Logf("totality -- %d case clause(s) across %d registered function(s), each carrying a reading tag",
+		arms, len(functions))
+
+	// ---- what the two control corpora actually take ----
+	exercised := map[string]int{}
+	for _, corpus := range []struct {
+		path   string
+		source string
+	}{
+		{"erased_field_alias_control.go", eraseSpellingCorpus},
+		{"erased_field_form_control.go", eraseFormCorpus},
+	} {
+		fileSet, sources := eraseControlCorpus(t, corpus.path, corpus.source)
+		taken, _ := eraseReadingsOver(t, fileSet, sources)
+		for name, times := range taken.taken {
+			exercised[name] += times
+		}
+	}
+
+	// ---- DECLARED minus UNREACHED == EXERCISED, member by member ----
+	undriven := []string{}
+	for name, places := range declared {
+		reason, isUnreached := eraseUnreachedReadings[name]
+		if isUnreached {
+			if strings.TrimSpace(reason) == "" {
+				t.Errorf("the reading %q is recorded as unreached with an EMPTY reason, which is an exemption wearing a justification", name)
+			}
+			if exercised[name] > 0 {
+				t.Errorf("the reading %q is recorded as UNREACHED -- %q -- and the control corpora took it %d time(s). Either the reason is wrong or the corpus reached what it says nothing can",
+					name, reason, exercised[name])
+			}
+			continue
+		}
+		if exercised[name] > 0 {
+			continue
+		}
+		undriven = append(undriven, fmt.Sprintf("%s\n\t\tdeclared at %v", name, places))
+	}
+	slices.Sort(undriven)
+	for _, name := range undriven {
+		t.Errorf("this gate declares the reading %s\n\tand NOTHING in either control corpus takes it. A clause nothing drives is a comment however correct it is. Either write the spelling that drives it into eraseSpellingCorpus or eraseFormCorpus, or record it in eraseUnreachedReadings with the reason no compilable Go reaches it",
+			name)
+	}
+	for name, times := range exercised {
+		if _, isDeclared := declared[name]; isDeclared {
+			continue
+		}
+		t.Errorf("the control corpora took a reading named %q %d time(s) and this file's SOURCE declares no such tag. The declared set is read out of the text on purpose; a name that appears only at run time is a name the register cannot notice the absence of",
+			name, times)
+	}
+	for name := range eraseUnreachedReadings {
+		if _, isDeclared := declared[name]; isDeclared {
+			continue
+		}
+		t.Errorf("eraseUnreachedReadings names %q and this gate declares no reading by that name. A stale row is an exemption waiting for an arm it was never written about",
+			name)
+	}
+
+	// ---- and the REAL TREE is held to the control ----
+	fileSet, sources := eraseSources(t)
+	overTree, treeSites := eraseReadingsOver(t, fileSet, sources)
+	onlyTree := []string{}
+	for name := range overTree.taken {
+		if exercised[name] > 0 {
+			continue
+		}
+		onlyTree = append(onlyTree, name)
+	}
+	slices.Sort(onlyTree)
+	for _, name := range onlyTree {
+		t.Errorf("the reading %q is taken over this package's production source and by NEITHER control corpus. That is the gap complement 4 still has over the real tree: the exact reading-by-reading assertion lives in the control, so a reading only real source reaches is asserted by nothing. Write the spelling for it",
+			name)
+	}
+
+	// ---- THE COMPLEMENT OF THIS NARROWING, PRINTED ----
+	//
+	// "every declared reading is driven" removes nothing by itself; what the check NARROWS is the
+	// set of readings the real tree exercises, down from the set the corpora do. That difference is
+	// the complement, and it is the interesting direction: those readings exist for source this
+	// package does not contain today and would otherwise be the first to rot.
+	control := slices.Sorted(maps_Keys(exercised))
+	notInTree := []string{}
+	for _, name := range control {
+		if overTree.taken[name] > 0 {
+			continue
+		}
+		notInTree = append(notInTree, name)
+	}
+	t.Logf("the register -- %d reading(s) declared in this file's source, %d driven by the control corpora, %d recorded unreached with a reason, %d taken over this package's own production source",
+		len(declared), len(exercised), len(eraseUnreachedReadings), len(overTree.taken))
+
+	// AND WHICH MEMBER READING ADMITTED WHICH SITE, because "the reading answered" and "the reading
+	// decided a member of this class" are different facts and only the second is what the gate is
+	// for. A form walk that stopped deciding one of the four member positions would still answer
+	// everywhere else; this line is where that shows.
+	admitted := map[string]int{}
+	for _, site := range treeSites {
+		admitted[site.reading] += 1
+	}
+	byReading := []string{}
+	for _, reading := range slices.Sorted(maps_Keys(admitted)) {
+		byReading = append(byReading, fmt.Sprintf("%4d  %s", admitted[reading], reading))
+	}
+	t.Logf("the %d fill site(s) of this package, under the MEMBER reading that admitted each:\n\t%s",
+		len(treeSites), strings.Join(byReading, "\n\t"))
+	t.Logf("complement 5 -- the %d reading(s) the corpora drive that this package's own source does NOT reach today, which are the ones a corpus is for:\n\t%s",
+		len(notInTree), strings.Join(notInTree, "\n\t"))
+	if len(notInTree) == 0 {
+		t.Error("complement 5 is EMPTY: every reading of this gate is reached by this package's own production source, so the control corpora narrow nothing and the day a reading stops being reachable from real source nothing would be modelling it")
+	}
+	// AND EACH UNREACHED ROW SAYS WHICH CLAIM IT IS MAKING. "No compilable Go reaches this" and "I
+	// could not find compilable Go that reaches this" are different statements, and a register that
+	// let them share a spelling would quietly promote the second into the first -- which is the
+	// exact correction the round before this one had to make about R25.
+	unreachable, unreached := 0, 0
+	for name, reason := range eraseUnreachedReadings {
+		switch {
+		case strings.HasPrefix(reason, "UNREACHABLE: "):
+			unreachable += 1
+		case strings.HasPrefix(reason, "UNREACHED: "):
+			unreached += 1
+		default:
+			t.Errorf("the unreached row for %q begins with neither UNREACHABLE: nor UNREACHED:. The first says no compilable Go reaches this arm and the second says none was FOUND; a row that does not say which is a claim nobody can check",
+				name)
+		}
+		t.Logf("unreached -- %s\n\t%s", name, reason)
+	}
+	t.Logf("the unreached register -- %d arm(s) argued UNREACHABLE from Go's own grammar or from this gate's own structure, %d recorded UNREACHED because no driver was found, which is the weaker claim",
+		unreachable, unreached)
+
+	// AND THE CLAUSES THIS REGISTER CANNOT SEE, printed on every run so that the blind spot is in
+	// the log next to the clean verdict rather than only in a document.
+	if len(eraseClausesOutsideTheRegister) == 0 {
+		t.Error("eraseClausesOutsideTheRegister is EMPTY, which claims this register sees every clause of this gate. Its unit is the arm; a clause inside an arm that already carries a tag is invisible to it, and at least R25 is one")
+	}
+	for name, what := range eraseClausesOutsideTheRegister {
+		if strings.TrimSpace(what) == "" {
+			t.Errorf("the clause %q is recorded as outside the register with an EMPTY note", name)
+		}
+		t.Logf("outside the register -- %s\n\t%s", name, what)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1240,7 +1909,7 @@ type eraseFormRefusal struct {
 // counted under the reading that decided it, and the gate errors if that complement is empty --
 // because a form nothing counts is a form nothing can miss.
 func eraseFillSitesIn(fileSet *token.FileSet, sources []eraseSource,
-	erased map[string]bool) ([]eraseFillSite, []eraseFormRefusal, map[string]int) {
+	erased map[string]bool) ([]eraseFillSite, []eraseFormRefusal, map[string]int, *eraseReadings) {
 
 	resolver := newEraseResolver(sources)
 	sites := []eraseFillSite{}
@@ -1269,7 +1938,10 @@ func eraseFillSitesIn(fileSet *token.FileSet, sources []eraseSource,
 			// result is the POSITION in the value the binding takes its array from: 0 for every
 			// form but the multi-value assignment, where x.Field is the nth thing one call
 			// answers and the nth result is the only one whose origin is the field's.
-			record := func(scope *eraseScope, field string, value ast.Expr, result int) {
+			// reading is the FORM-WALK reading that decided this binding position was a
+			// member. It is passed in rather than inferred so that the register records it by
+			// being called: a member reading that stops being taken is a diff at its own name.
+			record := func(reading string, scope *eraseScope, field string, value ast.Expr, result int) {
 				sites = append(sites, eraseFillSite{
 					at:          where(value),
 					inside:      scope.name,
@@ -1277,6 +1949,7 @@ func eraseFillSitesIn(fileSet *token.FileSet, sources []eraseSource,
 					field:       field,
 					rhs:         eraseRender(fileSet, value),
 					origin:      resolver.originOfResult(value, result, scope, 0, map[string]bool{}),
+					reading:     reading,
 				})
 			}
 			refuse := func(node ast.Node, form string) {
@@ -1321,24 +1994,25 @@ func eraseFillSitesIn(fileSet *token.FileSet, sources []eraseSource,
 									// this is a REACHABLE form and not a dead arm, and what it is
 									// refused for is that nothing in the outer literal says which
 									// position the element takes.
-									refuse(element, "an element with no key in a composite literal whose other elements have one, which this gate cannot place")
+									refuse(element, resolver.readings.name("an element with no key in a composite literal whose other elements have one, which this gate cannot place"))
 									continue
 								}
 								key, isKey := pair.Key.(*ast.Ident)
 								if !isKey {
-									removed["a keyed element whose key is not an identifier, so it keys a map or an array and binds no field"] += 1
+									removed[resolver.readings.name("a keyed element whose key is not an identifier, so it keys a map or an array and binds no field")] += 1
 									continue
 								}
 								if !erased[key.Name] {
-									removed["a keyed element binding a field no erase of this package reaches"] += 1
+									removed[resolver.readings.name("a keyed element binding a field no erase of this package reaches")] += 1
 									continue
 								}
-								record(scope, key.Name, pair.Value, 0)
+								record(resolver.readings.name("a KEYED element binding a field an erase reaches"),
+									scope, key.Name, pair.Value, 0)
 							}
 							return true
 						}
 						if len(shaped.Elts) == 0 {
-							removed["a composite literal with no elements, which binds nothing"] += 1
+							removed[resolver.readings.name("a composite literal with no elements, which binds nothing")] += 1
 							return true
 						}
 						// POSITIONAL. Nothing in the literal names the fields, so they are read
@@ -1347,23 +2021,24 @@ func eraseFillSitesIn(fileSet *token.FileSet, sources []eraseSource,
 						// the form.
 						shape, isNamed := shapes[shaped]
 						if !isNamed {
-							refuse(shaped, "a POSITIONAL composite literal whose type this gate could not name, so it cannot say which field each element binds")
+							refuse(shaped, resolver.readings.name("a POSITIONAL composite literal whose type this gate could not name, so it cannot say which field each element binds"))
 							return true
 						}
 						if !shape.isStruct {
-							removed["a positional literal of a slice, array or map type, whose elements bind no field"] += 1
+							removed[resolver.readings.name("a positional literal of a slice, array or map type, whose elements bind no field")] += 1
 							return true
 						}
 						for index, element := range shaped.Elts {
 							if index >= len(shape.fields) {
-								refuse(element, "a positional element past the end of the field list this gate read for its type")
+								refuse(element, resolver.readings.name("a positional element past the end of the field list this gate read for its type"))
 								continue
 							}
 							if !erased[shape.fields[index]] {
-								removed["a positional element binding a field no erase of this package reaches"] += 1
+								removed[resolver.readings.name("a positional element binding a field no erase of this package reaches")] += 1
 								continue
 							}
-							record(scope, shape.fields[index], element, 0)
+							record(resolver.readings.name("a POSITIONAL element binding a field an erase reaches"),
+								scope, shape.fields[index], element, 0)
 						}
 					case *ast.AssignStmt:
 						if shaped.Tok != token.ASSIGN && shaped.Tok != token.DEFINE {
@@ -1373,24 +2048,25 @@ func eraseFillSitesIn(fileSet *token.FileSet, sources []eraseSource,
 							// refused rather than assumed harmless.
 							for _, target := range shaped.Lhs {
 								if field, isErased := fieldOf(target); isErased {
-									refuse(shaped, fmt.Sprintf("an operator assignment onto %s, a field an erase reaches", field))
+									refuse(shaped, fmt.Sprintf(resolver.readings.name("an operator assignment onto %s, a field an erase reaches"), field))
 								}
 							}
-							removed["an operator assignment, which writes through a field's array and cannot rebind it"] += 1
+							removed[resolver.readings.name("an operator assignment, which writes through a field's array and cannot rebind it")] += 1
 							return true
 						}
 						if len(shaped.Lhs) == len(shaped.Rhs) {
 							for index, target := range shaped.Lhs {
 								field, isErased := fieldOf(target)
 								if field == "" {
-									removed["a one-to-one assignment onto something that is not a field"] += 1
+									removed[resolver.readings.name("a one-to-one assignment onto something that is not a field")] += 1
 									continue
 								}
 								if !isErased {
-									removed["a one-to-one assignment onto a field no erase of this package reaches"] += 1
+									removed[resolver.readings.name("a one-to-one assignment onto a field no erase of this package reaches")] += 1
 									continue
 								}
-								record(scope, field, shaped.Rhs[index], 0)
+								record(resolver.readings.name("a ONE-TO-ONE assignment onto a field an erase reaches"),
+									scope, field, shaped.Rhs[index], 0)
 							}
 							return true
 						}
@@ -1403,21 +2079,22 @@ func eraseFillSitesIn(fileSet *token.FileSet, sources []eraseSource,
 							for index, target := range shaped.Lhs {
 								field, isErased := fieldOf(target)
 								if field == "" {
-									removed["a multi-value assignment onto something that is not a field"] += 1
+									removed[resolver.readings.name("a multi-value assignment onto something that is not a field")] += 1
 									continue
 								}
 								if !isErased {
-									removed["a multi-value assignment onto a field no erase of this package reaches"] += 1
+									removed[resolver.readings.name("a multi-value assignment onto a field no erase of this package reaches")] += 1
 									continue
 								}
-								record(scope, field, shaped.Rhs[0], index)
+								record(resolver.readings.name("a MULTI-VALUE assignment onto a field an erase reaches, at its own result position"),
+									scope, field, shaped.Rhs[0], index)
 							}
 							return true
 						}
-						refuse(shaped, "an assignment whose two sides have different lengths and whose right side is not a single expression")
+						refuse(shaped, resolver.readings.name("an assignment whose two sides have different lengths and whose right side is not a single expression"))
 					case *ast.RangeStmt:
 						if shaped.Tok == token.DEFINE || shaped.Tok == token.ILLEGAL {
-							removed["a range that declares its own variables or binds none, which binds no field"] += 1
+							removed[resolver.readings.name("a range that declares its own variables or binds none, which binds no field")] += 1
 							return true
 						}
 						bound := false
@@ -1427,18 +2104,18 @@ func eraseFillSitesIn(fileSet *token.FileSet, sources []eraseSource,
 							}
 							if field, isErased := fieldOf(target); isErased {
 								bound = true
-								refuse(shaped, fmt.Sprintf("a range binding %s, a field an erase reaches, once per iteration", field))
+								refuse(shaped, fmt.Sprintf(resolver.readings.name("a range binding %s, a field an erase reaches, once per iteration"), field))
 							}
 						}
 						if !bound {
-							removed["a range binding with =, onto targets no erase of this package reaches"] += 1
+							removed[resolver.readings.name("a range binding with =, onto targets no erase of this package reaches")] += 1
 						}
 					case *ast.IncDecStmt:
 						if field, isErased := fieldOf(shaped.X); isErased {
-							refuse(shaped, fmt.Sprintf("an increment or decrement of %s, a field an erase reaches", field))
+							refuse(shaped, fmt.Sprintf(resolver.readings.name("an increment or decrement of %s, a field an erase reaches"), field))
 							return true
 						}
-						removed["an increment or decrement, which cannot rebind a slice field"] += 1
+						removed[resolver.readings.name("an increment or decrement, which cannot rebind a slice field")] += 1
 					}
 					return true
 				})
@@ -1448,7 +2125,7 @@ func eraseFillSitesIn(fileSet *token.FileSet, sources []eraseSource,
 	}
 	slices.SortFunc(sites, func(a, b eraseFillSite) int { return strings.Compare(a.at, b.at) })
 	slices.SortFunc(refusals, func(a, b eraseFormRefusal) int { return strings.Compare(a.at, b.at) })
-	return sites, refusals, removed
+	return sites, refusals, removed, resolver.readings
 }
 
 // eraseShape is what one type NAME is, as far as a composite literal is concerned: whether it is a
@@ -1486,6 +2163,8 @@ type eraseResolver struct {
 	// spelled x.M() whose receiver is a concrete type of this package is a callee whose body is
 	// already parsed here, so admitting it unopened was a false statement about this gate's reach.
 	methods map[string]map[string]*ast.FuncDecl
+	// the register every reading below writes its own name into as it answers.
+	readings *eraseReadings
 }
 
 const eraseResolverDepth = 8
@@ -1497,6 +2176,7 @@ func newEraseResolver(sources []eraseSource) *eraseResolver {
 		underlying: map[string]ast.Expr{},
 		structs:    map[string]*eraseShape{},
 		methods:    map[string]map[string]*ast.FuncDecl{},
+		readings:   newEraseReadings(),
 	}
 	for _, source := range sources {
 		for _, declaration := range source.parsed.Decls {
@@ -1761,9 +2441,10 @@ type eraseBinding struct {
 	scope *eraseScope
 	// eraseOriginParameter or eraseOriginReceiver when local is false.
 	kind eraseOriginKind
-	// a LOCAL of scope, together with every value that scope ever assigns it.
+	// a LOCAL of scope, together with every value that scope ever assigns it AND THE RESULT
+	// POSITION each of those values was taken from.
 	local  bool
-	values []ast.Expr
+	values []eraseAssignment
 }
 
 // eraseBindingOf walks the scope chain from the INSIDE OUT and answers the first scope that binds
@@ -1771,7 +2452,7 @@ type eraseBinding struct {
 //
 // The order is the whole point: a closure parameter shadows a same-named local of the function
 // enclosing it, and resolving the outer one instead is how an alias got admitted.
-func eraseBindingOf(inside *eraseScope, name string) (eraseBinding, bool) {
+func eraseBindingOf(readings *eraseReadings, inside *eraseScope, name string) (eraseBinding, bool) {
 	for scope := inside; scope != nil; scope = scope.outer {
 		if eraseParameterNames(scope)[name] {
 			return eraseBinding{scope: scope, kind: eraseOriginParameter}, true
@@ -1779,7 +2460,7 @@ func eraseBindingOf(inside *eraseScope, name string) (eraseBinding, bool) {
 		if eraseReceiverName(scope) == name {
 			return eraseBinding{scope: scope, kind: eraseOriginReceiver}, true
 		}
-		if values := eraseAssignmentsTo(scope, name); len(values) > 0 {
+		if values := eraseAssignmentsTo(readings, scope, name); len(values) > 0 {
 			return eraseBinding{scope: scope, local: true, values: values}, true
 		}
 	}
@@ -1830,8 +2511,8 @@ func (self *eraseResolver) declaredTypeNameOf(value ast.Expr, inside *eraseScope
 			if written := eraseDeclaredTypeOfName(scope, shaped.Name); written != nil {
 				return eraseTypeNameOf(written)
 			}
-			for _, assigned := range eraseAssignmentsTo(scope, shaped.Name) {
-				if name := self.declaredTypeNameOf(assigned, scope, depth+1); name != "" {
+			for _, assigned := range eraseAssignmentsTo(self.readings, scope, shaped.Name) {
+				if name := self.declaredTypeNameOf(assigned.value, scope, depth+1); name != "" {
 					return name
 				}
 			}
@@ -1905,43 +2586,57 @@ func (self *eraseResolver) originOf(value ast.Expr, inside *eraseScope, depth in
 	seen map[string]bool) eraseOrigin {
 
 	if depth > eraseResolverDepth {
-		return eraseOrigin{kind: eraseOriginUndecided, what: "the resolver ran out of depth"}
+		return self.readings.origin("the resolver's own DEPTH LIMIT, which refuses rather than answering",
+			eraseOrigin{kind: eraseOriginUndecided, what: "the resolver ran out of depth"})
 	}
 	switch shaped := value.(type) {
 	case *ast.ParenExpr:
-		return self.originOf(shaped.X, inside, depth+1, seen)
+		return self.readings.origin("the parenthesis peel",
+			self.originOf(shaped.X, inside, depth+1, seen))
 	case *ast.StarExpr:
-		return self.originOf(shaped.X, inside, depth+1, seen)
+		return self.readings.origin("the dereference peel",
+			self.originOf(shaped.X, inside, depth+1, seen))
 	case *ast.TypeAssertExpr:
-		return self.originOf(shaped.X, inside, depth+1, seen)
+		return self.readings.origin("the type-assertion peel",
+			self.originOf(shaped.X, inside, depth+1, seen))
 	case *ast.SliceExpr:
 		// a reslice is the SAME array. This is one of the four forms a spelling-keyed gate
 		// walks straight past.
-		return self.originOf(shaped.X, inside, depth+1, seen)
+		return self.readings.origin("the slice-expression peel",
+			self.originOf(shaped.X, inside, depth+1, seen))
 	case *ast.IndexExpr:
-		return self.originOf(shaped.X, inside, depth+1, seen)
+		return self.readings.origin("the index peel",
+			self.originOf(shaped.X, inside, depth+1, seen))
 	case *ast.UnaryExpr:
 		if shaped.Op == token.AND {
-			return self.originOf(shaped.X, inside, depth+1, seen)
+			return self.readings.origin("the address-of peel",
+				self.originOf(shaped.X, inside, depth+1, seen))
 		}
-		return eraseOrigin{kind: eraseOriginFresh, what: "a computed value"}
+		return self.readings.origin("a unary operator that is not address-of, which computes a value of its own",
+			eraseOrigin{kind: eraseOriginFresh, what: "a computed value"})
 	case *ast.BasicLit, *ast.CompositeLit, *ast.FuncLit, *ast.BinaryExpr:
-		return eraseOrigin{kind: eraseOriginFresh, what: "a literal"}
+		return self.readings.origin("a literal, a composite literal, a function literal or a binary expression",
+			eraseOrigin{kind: eraseOriginFresh, what: "a literal"})
 	case *ast.SelectorExpr:
 		if base, isIdentifier := eraseUnparen(shaped.X).(*ast.Ident); isIdentifier {
 			// THE INNERMOST SCOPE THAT BINDS THE BASE decides, not the declaration the statement
 			// happens to be written inside.
-			if binding, isBound := eraseBindingOf(inside, base.Name); isBound && !binding.local {
-				return eraseOrigin{kind: binding.kind, what: base.Name + "." + shaped.Sel.Name}
+			if binding, isBound := eraseBindingOf(self.readings, inside, base.Name); isBound && !binding.local {
+				return self.readings.origin("the SELECTOR arm, which answers the base's own binding and names the field",
+					eraseOrigin{kind: binding.kind, what: base.Name + "." + shaped.Sel.Name})
 			}
 		}
-		return self.originOf(shaped.X, inside, depth+1, seen)
+		return self.readings.origin("the selector PEEL, onto a base no scope of the chain binds as a parameter or the receiver",
+			self.originOf(shaped.X, inside, depth+1, seen))
 	case *ast.Ident:
-		return self.originOfIdent(shaped, inside, depth, seen)
+		return self.readings.origin("the identifier arm",
+			self.originOfIdent(shaped, inside, depth, seen))
 	case *ast.CallExpr:
-		return self.originOfCall(shaped, 0, inside, depth, seen)
+		return self.readings.origin("the call arm",
+			self.originOfCall(shaped, 0, inside, depth, seen))
 	}
-	return eraseOrigin{kind: eraseOriginUndecided, what: fmt.Sprintf("%T", value)}
+	return self.readings.origin("the REFUSAL of an expression form this gate has no peel for",
+		eraseOrigin{kind: eraseOriginUndecided, what: fmt.Sprintf("%T", value)})
 }
 
 // originOfResult is originOf at a RESULT POSITION, which is what the multi-value assignment form
@@ -1954,41 +2649,53 @@ func (self *eraseResolver) originOfResult(value ast.Expr, result int, inside *er
 	depth int, seen map[string]bool) eraseOrigin {
 
 	if result == 0 {
-		return self.originOf(value, inside, depth, seen)
+		return self.readings.origin("the result-position reading AT RESULT 0, which is originOf itself",
+			self.originOf(value, inside, depth, seen))
 	}
 	switch shaped := eraseUnparen(value).(type) {
 	case *ast.CallExpr:
-		return self.originOfCall(shaped, result, inside, depth, seen)
+		return self.readings.origin("the result-position reading of a CALL",
+			self.originOfCall(shaped, result, inside, depth, seen))
 	case *ast.IndexExpr, *ast.TypeAssertExpr:
 		// the comma-ok forms, v, ok := m[k] and v, ok := x.(T). Result 1 is a bool and carries
 		// no array at all.
-		return eraseOrigin{kind: eraseOriginFresh, what: "the ok of a comma-ok form"}
+		return self.readings.origin("the ok of a COMMA-OK form",
+			eraseOrigin{kind: eraseOriginFresh, what: "the ok of a comma-ok form"})
 	case *ast.UnaryExpr:
 		if shaped.Op == token.ARROW {
-			return eraseOrigin{kind: eraseOriginFresh, what: "the ok of a channel receive"}
+			return self.readings.origin("the ok of a CHANNEL RECEIVE",
+				eraseOrigin{kind: eraseOriginFresh, what: "the ok of a channel receive"})
 		}
 	}
-	return eraseOrigin{kind: eraseOriginUndecided,
-		what: fmt.Sprintf("result %d of a %T, a form this gate has no reading for", result, value)}
+	return self.readings.origin("the UNDECIDED default of the result-position reading",
+		eraseOrigin{kind: eraseOriginUndecided,
+			what: fmt.Sprintf("result %d of a %T, a form this gate has no reading for", result, value)})
 }
 
 func (self *eraseResolver) originOfIdent(name *ast.Ident, inside *eraseScope, depth int,
 	seen map[string]bool) eraseOrigin {
 
 	if name.Name == "nil" {
-		return eraseOrigin{kind: eraseOriginFresh, what: "nil"}
+		return self.readings.origin("nil, which is no array at all",
+			eraseOrigin{kind: eraseOriginFresh, what: "nil"})
 	}
 	// THE INNERMOST SCOPE THAT BINDS IT, which is Go's own rule and was this gate's own hole: a
 	// site inside a closure used to be resolved against the enclosing declaration, so a closure
 	// PARAMETER holding the caller's array was answered by whatever same-named local the frame
 	// outside happened to have.
-	binding, isBound := eraseBindingOf(inside, name.Name)
+	binding, isBound := eraseBindingOf(self.readings, inside, name.Name)
 	if !isBound {
-		return eraseOrigin{kind: eraseOriginUndecided,
-			what: fmt.Sprintf("%q is neither a parameter, the receiver, nor a local this gate found an assignment for, in any scope enclosing the statement", name.Name)}
+		return self.readings.origin("the REFUSAL of a name no scope of the chain binds",
+			eraseOrigin{kind: eraseOriginUndecided,
+				what: fmt.Sprintf("%q is neither a parameter, the receiver, nor a local this gate found an assignment for, in any scope enclosing the statement", name.Name)})
+	}
+	if binding.kind == eraseOriginReceiver && !binding.local {
+		return self.readings.origin("a name bound as the RECEIVER of some scope of the chain",
+			eraseOrigin{kind: binding.kind, what: name.Name})
 	}
 	if !binding.local {
-		return eraseOrigin{kind: binding.kind, what: name.Name}
+		return self.readings.origin("a name bound as a PARAMETER of some scope of the chain",
+			eraseOrigin{kind: binding.kind, what: name.Name})
 	}
 	// KEYED BY THE SCOPE AND NOT BY THE FUNCTION NAME ALONE. Two methods of the same name on two
 	// types are two bodies, and now that a method call is opened they can both be on one
@@ -1996,22 +2703,26 @@ func (self *eraseResolver) originOfIdent(name *ast.Ident, inside *eraseScope, de
 	// "fresh" having read nothing. A literal's scope carries its own name for the same reason.
 	key := binding.scope.name + "." + name.Name
 	if seen[key] {
-		return eraseOrigin{kind: eraseOriginFresh, what: "a cycle, already resolved"}
+		return self.readings.origin("the SCOPE-qualified cycle key of a local",
+			eraseOrigin{kind: eraseOriginFresh, what: "a cycle, already resolved"})
 	}
 	seen[key] = true
 	// a LOCAL: every value it is ever assigned, resolved IN THE SCOPE THAT DECLARES IT. The most
 	// alias-y answer wins, because a local that holds the caller's array on ONE path holds it.
 	worst := eraseOrigin{kind: eraseOriginFresh, what: "a fresh array"}
-	for _, value := range binding.values {
-		origin := self.originOf(value, binding.scope, depth+1, seen)
+	for _, assigned := range binding.values {
+		// AT THE RESULT POSITION THE LOCAL WAS BOUND AT, which is the fifth defect this line
+		// carried open for a round: `first, second := twoOut(x)` hands `second` result 1, and
+		// resolving the call as a whole answered result 0 -- an array that local never receives.
+		origin := self.originOfResult(assigned.value, assigned.result, binding.scope, depth+1, seen)
 		if origin.kind == eraseOriginParameter {
-			return origin
+			return self.readings.origin("a LOCAL whose assignment reaches a parameter, which is the alias-y answer winning", origin)
 		}
 		if origin.kind == eraseOriginUndecided || origin.kind == eraseOriginOpaque {
 			worst = origin
 		}
 	}
-	return worst
+	return self.readings.origin("a LOCAL answered by every value its own scope assigns it", worst)
 }
 
 func (self *eraseResolver) originOfCall(call *ast.CallExpr, result int, inside *eraseScope,
@@ -2024,7 +2735,8 @@ func (self *eraseResolver) originOfCall(call *ast.CallExpr, result int, inside *
 			// the destination of one of the two copy spellings this coupling actually uses. It
 			// is a conversion like any other: peel it.
 			if len(call.Args) == 1 {
-				return self.originOf(call.Args[0], inside, depth+1, seen)
+				return self.readings.origin("a conversion written as a TYPE LITERAL, which is how []byte(nil) is spelled",
+					self.originOf(call.Args[0], inside, depth+1, seen))
 			}
 		}
 	}
@@ -2037,7 +2749,8 @@ func (self *eraseResolver) originOfCall(call *ast.CallExpr, result int, inside *
 		}
 		// a qualified call, or a method reached through an INTERFACE or a foreign type. This is
 		// the open edge this gate discloses: admitted, and named in complement 3.
-		return eraseOrigin{kind: eraseOriginOpaque, what: eraseRender(token.NewFileSet(), call.Fun)}
+		return self.readings.origin("the OPAQUE answer for a callee whose Fun is not a bare identifier and whose body this gate does not have",
+			eraseOrigin{kind: eraseOriginOpaque, what: eraseRender(token.NewFileSet(), call.Fun)})
 	}
 	if result == 0 {
 		switch callee.Name {
@@ -2046,29 +2759,36 @@ func (self *eraseResolver) originOfCall(call *ast.CallExpr, result int, inside *
 			// origin of an append is the origin of its first argument. append(T(nil), x...) is
 			// fresh; append(callersSlice, x...) is the caller's.
 			if len(call.Args) == 0 {
-				return eraseOrigin{kind: eraseOriginFresh, what: "append of nothing"}
+				return self.readings.origin("append with NO arguments at all",
+					eraseOrigin{kind: eraseOriginFresh, what: "append of nothing"})
 			}
-			return self.originOf(call.Args[0], inside, depth+1, seen)
+			return self.readings.origin("append's DESTINATION deciding the append",
+				self.originOf(call.Args[0], inside, depth+1, seen))
 		case "make", "new":
-			return eraseOrigin{kind: eraseOriginFresh, what: callee.Name}
+			return self.readings.origin("the make and new arm",
+				eraseOrigin{kind: eraseOriginFresh, what: callee.Name})
 		case "len", "cap", "copy", "int", "uint", "byte", "string", "uint16", "uint32", "uint64":
-			return eraseOrigin{kind: eraseOriginFresh, what: callee.Name}
+			return self.readings.origin("the BUILTIN arm, over the builtins that answer a value rather than an array of their argument",
+				eraseOrigin{kind: eraseOriginFresh, what: callee.Name})
 		}
 		if self.types[callee.Name] && len(call.Args) == 1 {
 			// a conversion this package declares. It renames the type and keeps the array,
 			// which is the second of the four forms a spelling-keyed gate walks past.
-			return self.originOf(call.Args[0], inside, depth+1, seen)
+			return self.readings.origin("a conversion to a type THIS PACKAGE DECLARES",
+				self.originOf(call.Args[0], inside, depth+1, seen))
 		}
 	}
 	declared, isDeclared := self.functions[callee.Name]
 	if !isDeclared || declared.Body == nil {
-		return eraseOrigin{kind: eraseOriginOpaque, what: callee.Name}
+		return self.readings.origin("the OPAQUE answer for a function this package does not declare",
+			eraseOrigin{kind: eraseOriginOpaque, what: callee.Name})
 	}
 	// ONE HOP INTO THE CALLEE. Whatever it returns at this result position is resolved against
 	// ITS parameters, and a return rooted at one of them is mapped back onto the matching
 	// argument here. cloneBytes is decided by this arm and not by its name: it returns `out`, a
 	// local assigned from make, so the array it answers is fresh.
-	return self.originOfBody(declared, callee.Name, result, call.Args, nil, inside, depth, seen)
+	return self.readings.origin("ONE HOP into a function this package declares",
+		self.originOfBody(declared, callee.Name, result, call.Args, nil, inside, depth, seen))
 }
 
 // originOfMethodCall opens a call spelled x.M(...) when M is a method THIS PACKAGE DECLARES on a
@@ -2099,23 +2819,26 @@ func (self *eraseResolver) originOfMethodCall(call *ast.CallExpr, selector *ast.
 
 	owner := self.declaredTypeNameOf(selector.X, inside, 0)
 	if owner == "" {
-		return eraseOrigin{}, false
+		return self.readings.declined("a receiver whose declared type this gate could not name")
 	}
 	shape, isStruct := self.structs[owner]
 	if !isStruct || !shape.isStruct {
-		return eraseOrigin{}, false
+		return self.readings.declined("a receiver whose declared type is not a struct this package declares")
 	}
 	name := fmt.Sprintf("(%s).%s", owner, selector.Sel.Name)
 	declared, isDeclared := self.methods[owner][selector.Sel.Name]
 	if !isDeclared || declared.Body == nil {
 		promoted, from, isPromoted := self.promotedMethod(owner, selector.Sel.Name)
 		if !isPromoted {
-			return eraseOrigin{}, false
+			return self.readings.declined("a method neither declared on the receiver's own type nor promoted from a struct it embeds")
 		}
 		declared = promoted
 		name = fmt.Sprintf("(%s).%s promoted from (%s)", owner, selector.Sel.Name, from)
+		return self.readings.origin("ONE HOP into a method PROMOTED from an embedded struct",
+			self.originOfBody(declared, name, result, call.Args, selector.X, inside, depth, seen)), true
 	}
-	return self.originOfBody(declared, name, result, call.Args, selector.X, inside, depth, seen), true
+	return self.readings.origin("ONE HOP into a method this package declares on a concrete type of its own",
+		self.originOfBody(declared, name, result, call.Args, selector.X, inside, depth, seen)), true
 }
 
 // promotedMethod answers the method one type gets from a struct it EMBEDS, and the type that
@@ -2177,61 +2900,76 @@ func (self *eraseResolver) originOfBody(declared *ast.FuncDecl, name string, res
 
 	key := fmt.Sprintf("call:%s:%d", name, result)
 	if seen[key] {
-		return eraseOrigin{kind: eraseOriginFresh, what: "a recursive callee, already resolved"}
+		return self.readings.origin("the RESULT-QUALIFIED cycle key of a callee",
+			eraseOrigin{kind: eraseOriginFresh, what: "a recursive callee, already resolved"})
 	}
 	seen[key] = true
 	callee := eraseScopeOf(declared)
 	worst := eraseOrigin{kind: eraseOriginFresh, what: name + " answers a fresh array"}
-	returned, forwarded := eraseReturnExpressionsAt(declared, result)
-	for _, value := range returned {
-		origin := self.originOf(value, callee, depth+1, seen)
+	returned, forwarded := eraseReturnExpressionsAt(self.readings, declared, result)
+	for _, returnedAt := range returned {
+		// AT THE RESULT POSITION THE RETURNED VALUE WAS BOUND AT. A plain `return a, b` binds
+		// each result from its own expression and carries position 0; a NAMED result assigned by
+		// `out, err = f()` carries the position it was assigned at, which is the same defect
+		// eraseAssignmentsTo carried and is closed in the same place.
+		origin := self.originOfResult(returnedAt.value, returnedAt.result, callee, depth+1, seen)
 		switch origin.kind {
 		case eraseOriginReceiver:
 			if receiver == nil {
 				// a plain function has no receiver, so a receiver-rooted return out of one
 				// is a reading this gate cannot map back onto anything here.
-				return eraseOrigin{kind: eraseOriginUndecided,
-					what: fmt.Sprintf("%s answers receiver state and this gate called it as a function", name)}
+				return self.readings.origin("a callee answering RECEIVER state that this gate called as a plain function",
+					eraseOrigin{kind: eraseOriginUndecided,
+						what: fmt.Sprintf("%s answers receiver state and this gate called it as a function", name)})
 			}
-			return self.originOf(receiver, inside, depth+1, seen)
+			return self.readings.origin("a callee answering its RECEIVER's own state, mapped back onto the receiver expression",
+				self.originOf(receiver, inside, depth+1, seen))
 		case eraseOriginParameter:
 			at := eraseParameterIndex(declared, strings.Split(origin.what, ".")[0])
 			if at < 0 || at >= len(arguments) {
-				return eraseOrigin{kind: eraseOriginUndecided,
-					what: fmt.Sprintf("%s answers its own parameter %q and this gate could not map it back onto an argument",
-						name, origin.what)}
+				return self.readings.origin("a callee answering a parameter this gate could not map back onto an argument",
+					eraseOrigin{kind: eraseOriginUndecided,
+						what: fmt.Sprintf("%s answers its own parameter %q and this gate could not map it back onto an argument",
+							name, origin.what)})
 			}
-			return self.originOf(arguments[at], inside, depth+1, seen)
+			return self.readings.origin("a callee answering its OWN PARAMETER, mapped back onto the matching argument",
+				self.originOf(arguments[at], inside, depth+1, seen))
 		case eraseOriginUndecided, eraseOriginOpaque:
-			worst = eraseOrigin{kind: origin.kind, what: name + ": " + origin.what}
+			worst = self.readings.origin("a callee answering UNDECIDED or OPAQUE, carried out under the callee's name",
+				eraseOrigin{kind: origin.kind, what: name + ": " + origin.what})
 		}
 	}
 	// A FORWARDED MULTI-VALUE RETURN, `return g()` out of a function with several results. The
 	// results cannot be split apart syntactically, so the same result position is asked of g.
 	// Without this arm a forwarding body answered "fresh" having read nothing, which is the
 	// silent admit this gate exists to refuse.
-	for _, value := range forwarded {
-		origin := self.originOfResult(value, result, callee, depth+1, seen)
+	for _, forwardedAt := range forwarded {
+		origin := self.originOfResult(forwardedAt.value, forwardedAt.result, callee, depth+1, seen)
 		switch origin.kind {
 		case eraseOriginParameter:
 			at := eraseParameterIndex(declared, strings.Split(origin.what, ".")[0])
 			if at < 0 || at >= len(arguments) {
-				return eraseOrigin{kind: eraseOriginUndecided,
-					what: fmt.Sprintf("%s forwards its own parameter %q and this gate could not map it back onto an argument",
-						name, origin.what)}
+				return self.readings.origin("a FORWARDED return answering a parameter this gate could not map back onto an argument",
+					eraseOrigin{kind: eraseOriginUndecided,
+						what: fmt.Sprintf("%s forwards its own parameter %q and this gate could not map it back onto an argument",
+							name, origin.what)})
 			}
-			return self.originOf(arguments[at], inside, depth+1, seen)
+			return self.readings.origin("a FORWARDED return answering the callee's own parameter, mapped back onto the matching argument",
+				self.originOf(arguments[at], inside, depth+1, seen))
 		case eraseOriginReceiver:
 			if receiver == nil {
-				return eraseOrigin{kind: eraseOriginUndecided,
-					what: fmt.Sprintf("%s forwards receiver state and this gate called it as a function", name)}
+				return self.readings.origin("a FORWARDED return answering receiver state out of a plain function",
+					eraseOrigin{kind: eraseOriginUndecided,
+						what: fmt.Sprintf("%s forwards receiver state and this gate called it as a function", name)})
 			}
-			return self.originOf(receiver, inside, depth+1, seen)
+			return self.readings.origin("a FORWARDED return answering the callee's RECEIVER state, mapped back onto the receiver expression",
+				self.originOf(receiver, inside, depth+1, seen))
 		case eraseOriginUndecided, eraseOriginOpaque:
-			worst = eraseOrigin{kind: origin.kind, what: name + " forwards: " + origin.what}
+			worst = self.readings.origin("a FORWARDED return answering UNDECIDED or OPAQUE, carried out under the callee's name",
+				eraseOrigin{kind: origin.kind, what: name + " forwards: " + origin.what})
 		}
 	}
-	return worst
+	return self.readings.origin("a callee this gate opened and found no caller-rooted answer in", worst)
 }
 
 // ---------------------------------------------------------------------------
@@ -2341,6 +3079,17 @@ func eraseTypeNameOf(value ast.Expr) string {
 	return ""
 }
 
+// eraseAssignment is one value a local -- or a NAMED RESULT -- is assigned, together with the RESULT
+// POSITION it takes its array from.
+//
+// THE POSITION IS THE WHOLE POINT. `first, second := twoOut(x)` gives BOTH targets the same one
+// expression on the right, and only the position tells second's array from first's. A reading that
+// dropped it decided a local by an array it never receives, which is the fifth defect of this line.
+type eraseAssignment struct {
+	value  ast.Expr
+	result int
+}
+
 // eraseAssignmentsTo answers every value a local is ever assigned inside one scope, including the
 // range and the type-switch forms, so that a local standing in front of a parameter is not a hole
 // in the derivation.
@@ -2353,12 +3102,11 @@ func eraseTypeNameOf(value ast.Expr) string {
 // safe one here; and when such a value is then resolved against the outer scope, the shadowing name
 // is not bound there and the site comes out UNDECIDED, which is refused rather than admitted.
 //
-// AND ONE DEFECT OF THIS READING IS NAMED HERE RATHER THAN LEFT SILENT, AND IS DELIBERATELY NOT
-// FIXED BY THE ROUND THAT FOUND IT.
+// AND THE FIFTH DEFECT OF THIS LINE WAS THE MULTI-VALUE ARM OF THIS READING, AND IT IS CLOSED HERE.
 //
-// The multi-value arm below records the ONE expression on the right for EVERY target on the left,
-// so the RESULT POSITION is lost. A local bound at result 1 of a two-result call is therefore
-// decided by the origin of result 0 -- an array it never receives:
+// It recorded the ONE expression on the right for EVERY target on the left, so the RESULT POSITION
+// was lost: a local bound at result 1 of a two-result call was decided by the origin of result 0 --
+// an array it never receives.
 //
 //	func twoOut(x []byte) ([]byte, []byte) { return copyOf(x), x }
 //
@@ -2370,23 +3118,23 @@ func eraseTypeNameOf(value ast.Expr) string {
 //		return h
 //	}
 //
-// REPRODUCED AND NOT REASONED ABOUT: driven through this resolver over exactly that corpus, the site
-// at `h.Secret = second` comes out **"a fresh array"**. It is an alias admitted in silence, which is
-// the thing this gate exists to refuse.
+// Driven through this resolver over exactly that corpus, `h.Secret = second` came out "a fresh
+// array" -- an alias admitted in silence, which is the thing this gate exists to refuse. It was
+// measured LATENT rather than live: with every local bound at a result position other than 0 forced
+// to have no assignment at all, the gate over this package answered the SAME twenty fill sites and
+// stayed green, so nothing in connect/mls resolved through such a local.
 //
-// THE FILL-SITE WALK HAS THIS RIGHT and only the local reading does not: the walk passes the target
-// INDEX and resolves through originOfResult, so `first, h.Secret = twoOut(x)` is decided correctly
-// as the caller's. It is a local standing in front of the field that loses the position, and the fix
-// is to carry the result position alongside each value here and resolve through originOfResult.
+// THE REPAIR IS THE ONE THE ROUND THAT FOUND IT NAMED, and it was small for the reason it gave: the
+// FILL-SITE WALK already had this right -- it passes the target INDEX and resolves through
+// originOfResult -- so the position only had to be carried alongside each value here. Every
+// assignment is now a value AND the result position it takes its array from, and originOfIdent
+// resolves through originOfResult rather than originOf. eraseReturnExpressionsAt carries the same
+// pair for the same reason: a NAMED result assigned by `out, err = f()` had the identical hole.
 //
-// AND IT IS LATENT RATHER THAN LIVE TODAY, measured rather than assumed. The query is this reading
-// itself, made to refuse: with every local bound at a result position other than 0 forced to have NO
-// assignment at all -- so that any site resolving through one comes out UNDECIDED and is refused --
-// the gate over this package answers the SAME twenty fill sites, 5 parameter / 12 fresh / 0 receiver
-// / 3 opaque / **0 undecided**, and stays green. No fill site in connect/mls resolves through such a
-// local. The defect is an OPEN one of this gate, stated so that it is not a silent one.
-func eraseAssignmentsTo(scope *eraseScope, name string) []ast.Expr {
-	values := []ast.Expr{}
+// It is driven by alias24/copy24 of the spelling corpus, which differ only in WHICH result of a
+// two-result callee holds the caller's array; before the repair alias24 answered "a fresh array".
+func eraseAssignmentsTo(readings *eraseReadings, scope *eraseScope, name string) []eraseAssignment {
+	values := []eraseAssignment{}
 	body := scope.body()
 	if body == nil {
 		return values
@@ -2398,7 +3146,11 @@ func eraseAssignmentsTo(scope *eraseScope, name string) []ast.Expr {
 			if len(shaped.Lhs) == len(shaped.Rhs) {
 				for at, target := range shaped.Lhs {
 					if identifier, isIdentifier := target.(*ast.Ident); isIdentifier && identifier.Name == name {
-						values = append(values, shaped.Rhs[at])
+						values = append(values, eraseAssignment{
+							value: shaped.Rhs[at],
+							result: readings.at(
+								"the ONE-TO-ONE form of a local's assignments, where each target takes its own expression whole", 0),
+						})
 					}
 				}
 				return true
@@ -2406,13 +3158,18 @@ func eraseAssignmentsTo(scope *eraseScope, name string) []ast.Expr {
 			// AND THE MULTI-VALUE FORM, `a, err := f()`, which is not a corner: it is how
 			// every decode in this package binds the bytes it just read, and a resolver that
 			// did not know it reported those locals UNDECIDED. The array comes out of the one
-			// call on the right, so that call is what the local's origin is resolved through.
+			// call on the right AT THIS TARGET'S OWN POSITION, which is what the fifth defect
+			// of this line lost.
 			if len(shaped.Rhs) != 1 {
 				return true
 			}
-			for _, target := range shaped.Lhs {
+			for at, target := range shaped.Lhs {
 				if identifier, isIdentifier := target.(*ast.Ident); isIdentifier && identifier.Name == name {
-					values = append(values, shaped.Rhs[0])
+					values = append(values, eraseAssignment{
+						value: shaped.Rhs[0],
+						result: readings.at(
+							"the MULTI-VALUE form of a local's assignments, at THIS target's own result position", at),
+					})
 				}
 			}
 		case *ast.ValueSpec:
@@ -2421,12 +3178,18 @@ func eraseAssignmentsTo(scope *eraseScope, name string) []ast.Expr {
 			}
 			for at, declared := range shaped.Names {
 				if declared.Name == name {
-					values = append(values, shaped.Values[at])
+					values = append(values, eraseAssignment{
+						value:  shaped.Values[at],
+						result: readings.at("a VAR DECLARATION binding the local", 0),
+					})
 				}
 			}
 		case *ast.RangeStmt:
 			if identifier, isIdentifier := shaped.Value.(*ast.Ident); isIdentifier && identifier.Name == name {
-				values = append(values, shaped.X)
+				values = append(values, eraseAssignment{
+					value:  shaped.X,
+					result: readings.at("a RANGE binding the local, once per iteration, out of the ranged array", 0),
+				})
 			}
 		}
 		return true
@@ -2448,9 +3211,11 @@ func eraseAssignmentsTo(scope *eraseScope, name string) []ast.Expr {
 // caller-side mapping below a name that is a parameter of the literal rather than of this
 // function. The NAMED-result reading below is the deliberate exception: a deferred literal that
 // assigns a named result really does decide what this function returns.
-func eraseReturnExpressionsAt(function *ast.FuncDecl, at int) ([]ast.Expr, []ast.Expr) {
-	values := []ast.Expr{}
-	forwarded := []ast.Expr{}
+func eraseReturnExpressionsAt(readings *eraseReadings, function *ast.FuncDecl,
+	at int) ([]eraseAssignment, []eraseAssignment) {
+
+	values := []eraseAssignment{}
+	forwarded := []eraseAssignment{}
 	if function == nil || function.Body == nil || function.Type == nil ||
 		function.Type.Results == nil {
 		return values, forwarded
@@ -2471,7 +3236,12 @@ func eraseReturnExpressionsAt(function *ast.FuncDecl, at int) ([]ast.Expr, []ast
 	// a NAMED result is resolved through its name, so a body that assigns it and returns bare is
 	// not a hole.
 	if names[at] != "" {
-		values = append(values, eraseAssignmentsTo(eraseScopeOf(function), names[at])...)
+		for _, assigned := range eraseAssignmentsTo(readings, eraseScopeOf(function), names[at]) {
+			values = append(values, eraseAssignment{
+				value:  assigned.value,
+				result: readings.at("the NAMED-result reading of a bare return", assigned.result),
+			})
+		}
 	}
 	eraseInspectScope(function.Body, func(node ast.Node) bool {
 		statement, isReturn := node.(*ast.ReturnStmt)
@@ -2479,11 +3249,18 @@ func eraseReturnExpressionsAt(function *ast.FuncDecl, at int) ([]ast.Expr, []ast
 			return true
 		}
 		if len(statement.Results) == len(names) {
-			values = append(values, statement.Results[at])
+			values = append(values, eraseAssignment{
+				value: statement.Results[at],
+				result: readings.at(
+					"a return whose expressions match the callee's result list one for one", 0),
+			})
 			return true
 		}
 		if len(statement.Results) == 1 && len(names) > 1 {
-			forwarded = append(forwarded, statement.Results[0])
+			forwarded = append(forwarded, eraseAssignment{
+				value:  statement.Results[0],
+				result: readings.at("a return that FORWARDS a multi-value call whole", at),
+			})
 		}
 		return true
 	})
