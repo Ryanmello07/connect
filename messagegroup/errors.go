@@ -302,3 +302,19 @@ var (
 	// section 5.12 step 1 orders discarded together.
 	ErrProvisionalEpochWraps = errors.New("messagegroup: the X-Wing wraps of a provisional epoch are installed once")
 )
+
+// ---------------------------------------------------------------------------
+// the epoch keys door, spec A section 5.2 seen from the message server's side
+// ---------------------------------------------------------------------------
+
+var (
+	// Fires when any accessor of an EpochKeys is reached after Destroy, and when one is reached
+	// on a value newEpochKeys never made.
+	//
+	// ONE SENTINEL FOR TWO CONDITIONS, which is ErrProvisionalEpochDestroyed's reasoning applied
+	// to the sibling type: a caller's question is the same in both cases -- "is there anything
+	// here" -- and it matches it with one errors.Is. The alternative to this refusal is a caller
+	// that macs write_auth under a nil key, which the server answers with an auth failure that
+	// looks exactly like a rotated epoch.
+	ErrEpochKeysDestroyed = errors.New("messagegroup: this epoch keys value has been destroyed and answers nothing")
+)

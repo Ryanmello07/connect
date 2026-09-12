@@ -316,6 +316,48 @@ func (self *GroupSession) SenderHandle() ([16]byte, error) {
 	return handle, err
 }
 
+// EpochKeys is this session's write_key and read_key for the epoch it is at, copied out of the
+// loop's own fields into a value the caller owns and destroys.
+//
+// THIS IS THE ONLY DOOR ONTO EITHER KEY, and the reason it is a door rather than two fields is in
+// epochkeys.go's header: the alternative is a second assembly of one preimage, which is the defect
+// this package has already paid for once. Both keys are the MESSAGE SERVER's, not a member's:
+// write_auth on a submit is macced under the first and req_auth on a fetch is macced under the
+// second, and connect/message's ComputeWriteAuth and ComputeRequestAuth are what spend them.
+// Authenticity between MEMBERS is mls's and is not this pair's job at any point -- MASTER section
+// 9.2 says so in as many words, and says that the server holds write_key itself.
+//
+// THE VALUE IS THE CALLER'S AND SO IS THE ERASE. Destroy it, and destroy it in a defer: this
+// session's own copies are erased at the next AdvanceEpoch and at Close, and neither of those
+// reaches a value this method already handed out.
+//
+// The copies are taken INSIDE the posted command, which is where they have to be taken: the two
+// fields are written and zeroized by the loop goroutine, so a copy made off the loop is a read
+// racing a write rather than a copy of anything in particular.
+//
+// THE self.closing CHECK BELOW IS UNREACHABLE, and it is written anyway, in the shape the six
+// siblings of this file and the two of seal.go use. Measured rather than asserted: run exits the
+// moment a command sets closing, and Close's command is the only one that sets it, so no second
+// command can ever observe the flag -- every later caller is refused by do's own send, which sees
+// stopped closed. Deleting this clause survives an unfiltered run of this package, and so does
+// deleting Epoch's and SenderHandle's, which is what says the hole is the pattern's and not this
+// method's. It stays because it is what fails closed if run ever stops exiting on the first
+// closing command, and because a door here that alone omitted it would read as a decision.
+func (self *GroupSession) EpochKeys() (*EpochKeys, error) {
+	var keys *EpochKeys
+	var err error
+	if postErr := self.do(func() {
+		if self.closing {
+			err = ErrSessionClosed
+			return
+		}
+		keys = newEpochKeys(self.epoch, self.readKey, self.writeKey)
+	}); postErr != nil {
+		return nil, postErr
+	}
+	return keys, err
+}
+
 // AdvanceEpoch installs the epoch the handle is now at, with a fresh pq_secret.
 //
 // GROUP_HANDLE_KEY DOES NOT MOVE. It was expanded from the epoch zero root ONCE, and what this
