@@ -401,6 +401,83 @@ func (self *GroupSession) AdvanceEpoch(pqSecret []byte) error {
 	return err
 }
 
+// RebindServerNonce replaces the nonce this session macs write_auth under, which the submitting
+// connection chooses afresh at every Hello.
+//
+// WHY THERE IS A SETTER AT ALL. serverNonce was fixed at construction and there was no way to
+// move it, so the first reconnect invalidated every record this session had sealed since: spec A
+// section 5.7 has the server draw a fresh thirty two octet nonce per connection and carry it in
+// HelloResponse, and write_auth is a mac over it. A session that outlived one connection was
+// wrong, and this is S2-2.
+//
+// THE BLAST RADIUS, MEASURED RATHER THAN ASSERTED, because a setter on a key schedule field
+// invites the larger reading. self.serverNonce is read in this package's production source at
+// exactly ONE site -- seal.go's authenticate, which hands it to message.ComputeWriteAuth -- and
+// that call's answer lands in record.WriteAuth and in nothing else. It is not an input to
+// AADHead, to AADBody, to either record aead derivation, to StorageRoot, to DeriveClassKeys, to
+// WriteKey, to ReadKey, to SenderHandle or to StreamKey. So ONE sealed value binds it, a rebind
+// must recompute that one value on every record not yet submitted -- which is ReauthRecord in
+// seal.go -- and NOTHING ALREADY SEALED BECOMES UNOPENABLE: the open path never reads write_auth
+// at all, which openRecordOnLoop's own body is the evidence for. connect/message's
+// ComputeRequestAuth binds the nonce too, and req_auth has no caller in this package.
+//
+// THE SUPERSEDED VALUE IS ERASED BEFORE IT IS OVERWRITTEN AND THE NONCE IS NOT A KEY. Both
+// halves of that are true and the discipline is the file's rather than the value's: spec A hands
+// this nonce to the server in the clear, so nothing here is protecting it, and a field of this
+// type dropped unerased is a drop site that reads exactly like the ones that are protecting
+// something. AdvanceEpoch erases pq_secret in its own body for the same reason and in the same
+// shape, and no property of this package observes either erase.
+//
+// THE REFUSAL IS THE CONSTRUCTOR'S OWN SENTINEL AND THE CONSTRUCTOR'S OWN RULE. An empty or nil
+// nonce is refused with ErrSessionServerNonce, which is what NewGroupSession refuses an empty one
+// with; and a nonce of any non-empty WIDTH is accepted here because the constructor accepts one.
+// Two doors onto one field with two rules is two rules, and a reader meeting a thirty one octet
+// nonce would have to derive which door it came through. MASTER section 7 and spec A section 5.7
+// both fix the width at thirty two and this package checks neither -- the disagreement is real,
+// is not this method's to rule, and is open item K1-2.
+//
+// THERE IS NO GETTER, and that is a narrowing rather than an omission. A caller that rebinds
+// already holds the nonce: it came out of HelloResponse in the same call that prompted the
+// rebind, so a getter answers a question nobody asks. What it would cost is precise --
+// keysource_test.go's reproduction is handed server_nonce as one of its three INJECTED values,
+// and a getter is the one thing that would let a fixture hand it the nonce the session holds
+// instead, at which point the third input stops being independent and the subject starts agreeing
+// with itself. noncerebind_test.go derives that class off the syntax tree and prints its
+// complement.
+//
+// THE self.closing CHECK BELOW IS UNREACHABLE, in the shape and for the reason EpochKeys's
+// comment measures: run returns on the first command that sets closing and commands is
+// unbuffered, so no second command observes the flag and every later caller is refused by do's
+// own send. It is written anyway because it fails closed, and no property here claims it is
+// driven -- a closed session's refusal comes back out of do.
+//
+// The noinline directive is this package's erase helper class, reached through the zeroize
+// below: that store lands in an array this call does not hold the only reference to.
+//
+//go:noinline
+func (self *GroupSession) RebindServerNonce(serverNonce []byte) error {
+	var err error
+	if postErr := self.do(func() {
+		if self.closing {
+			err = ErrSessionClosed
+			return
+		}
+		if len(serverNonce) == 0 {
+			err = fmt.Errorf("%w: write_auth is a mac over it", ErrSessionServerNonce)
+			return
+		}
+		// a COPY, and erased before it is overwritten, in this body, for AdvanceEpoch's
+		// reason. The argument is the CALLER'S buffer: a session that retained it would seal
+		// under whatever that buffer became after this call returned.
+		replacement := append([]byte(nil), serverNonce...)
+		zeroize(self.serverNonce)
+		self.serverNonce = replacement
+	}); postErr != nil {
+		return postErr
+	}
+	return err
+}
+
 // TrackSender installs a receiver ratchet for one peer's ladder in one retention class.
 //
 // headIndex is the ladder position this receiver starts at and it is the CALLER'S state, never a
