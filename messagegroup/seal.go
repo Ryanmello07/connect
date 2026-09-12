@@ -453,6 +453,87 @@ func (self *GroupSession) openRecordOnLoop(record *message.Record) ([]byte, []by
 	return headPlain, bodyPlain, nil
 }
 
+// ReauthRecord recomputes one already sealed record's write_auth under this session's CURRENT
+// write_key and CURRENT server_nonce, and touches nothing else.
+//
+// WHAT IT IS, IN ONE SENTENCE, BECAUSE THE NAME INVITES A LARGER READING. It is spec A section
+// 5.7's "every queued record MUST be re-MAC'd against the new connection's nonce before
+// submission", and it is nothing more. Every other input message.ComputeWriteAuth takes is
+// already on the record: the header, ct_head and the server attachment. Nothing is re-encrypted,
+// no stream index is consumed, no ratchet moves, and RecordId, Header, CtHead and CtBody come
+// back byte-identical -- which noncerebind_test.go holds as a property over message.Record's own
+// field set rather than over a list, so a sixth field added there next month is in the class with
+// no edit here.
+//
+// WHY IT EXISTS AT ALL is RebindServerNonce's blast radius read from the other end: write_auth is
+// the one sealed value the nonce binds, so a rebind leaves every record already in the outbox
+// carrying a mac the new connection will refuse, and this is the repair for exactly those.
+//
+// AND WHAT IT REFUSES, BECAUSE THE SAME SECTION RULES THE NEIGHBOURING CASE DIFFERENTLY. Section
+// 5.7's outbox rule has two clauses and they prescribe two different costs: the nonce case is
+// re-MAC'd, and the epoch case -- REASON_EPOCH_STALE -- is "discarded and re-sealed at the new
+// epoch, consuming a fresh stream_index". A RE-MAC OF A RECORD WHOSE EPOCH HAS PASSED IS
+// WELL-FORMED, CHEAP AND WRONG: the tag would be taken under write_key[n+1] over a header naming
+// epoch n, which no server verifies and which no round trip in this package would notice, because
+// the record agrees with itself perfectly. So it is refused here. The refusal is the whole of what
+// this method does about the epoch case; the re-seal needs a stream_index the durable reserver
+// allocates and an outbox nothing in connect owns, and that is open item K1-3.
+//
+// EVERY REFUSAL IS TAKEN BEFORE THE MAC, and that ordering is not tidiness. message.ComputeWriteAuth
+// PANICS on a short key and on an empty nonce rather than answering an error, so a refusal that
+// arrived as a recovered panic would be a refusal taken after the damage -- and on a closed
+// session, whose writeKey zeroizeOnLoop has already erased, that is exactly the panic waiting on
+// the other side of the door. On a refusal the caller's record is untouched, which is
+// OpenRecord's own rule one level over: a half-applied re-auth hands an outbox a record it
+// believes is fresh.
+//
+// The group id goes through subtle.ConstantTimeCompare and the epoch through ==, which is
+// openRecordOnLoop's own split and guardrail G8's reason: G8 bans bytes.Equal in a FILE rather
+// than in a kind of function, so every comparison of OCTETS here goes one way whether or not the
+// octets are secret, and an epoch is a u64 and not octets.
+//
+// THE self.closing CHECK BELOW IS UNREACHABLE, in the shape and for the reason EpochKeys's
+// comment measures. It is written anyway because it fails closed, and no property claims it is
+// driven: a closed session's refusal comes back out of do.
+func (self *GroupSession) ReauthRecord(record *message.Record) error {
+	var err error
+	if postErr := self.do(func() {
+		if self.closing {
+			err = ErrSessionClosed
+			return
+		}
+		err = self.reauthRecordOnLoop(record)
+	}); postErr != nil {
+		return postErr
+	}
+	return err
+}
+
+// reauthRecordOnLoop is ReauthRecord's body. The caller is the loop goroutine.
+//
+// The two keyed inputs are read off the session HERE, on the loop, and never handed in: write_key
+// is written and zeroized by this goroutine, and server_nonce is written by it too, so a body
+// that took either as a parameter would be taking a value some other goroutine read.
+func (self *GroupSession) reauthRecordOnLoop(record *message.Record) error {
+	if record == nil {
+		return message.ErrRecordNil
+	}
+	header := &record.Header
+	if subtle.ConstantTimeCompare(header.GroupId[:], self.groupId[:]) != 1 {
+		return fmt.Errorf("%w: this record names group %x and this session is keyed for %x",
+			ErrRecordNotForThisSession, header.GroupId, self.groupId)
+	}
+	if header.Epoch != self.epoch {
+		return fmt.Errorf("%w: this record is at epoch %d and this session is at %d -- section 5.7 discards an epoch stale record and re-seals it at the new epoch consuming a fresh stream_index, and a re-mac of it would be a tag under write_key[n+1] over a header naming epoch n (open item K1-3)",
+			ErrRecordNotForThisSession, header.Epoch, self.epoch)
+	}
+	// and this is the ONLY statement that writes anything, which is what "one field moves"
+	// means when it is read off the source rather than off an assertion.
+	record.WriteAuth = message.ComputeWriteAuth(self.writeKey, self.serverNonce,
+		header, record.CtHead, header.ServerAttachment)
+	return nil
+}
+
 // ---------------------------------------------------------------------------
 // the body padder, open item M1-7
 // ---------------------------------------------------------------------------

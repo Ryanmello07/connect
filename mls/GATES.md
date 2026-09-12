@@ -413,7 +413,7 @@ grep -rnE '(if|for|case) .*\.Name|\.Type\.(In|Out|Kind|Elem|NumIn|NumOut|IsVaria
 Their recall against the derivation is measured on every run and stated here, and the sites they do
 not reach are named in the test log:
 
-**gates-recall: 99/170**
+**gates-recall: 101/172**
 
 **That fraction is a MEASUREMENT and not a claim.** These patterns were fitted against the tree as
 it stands, which is instance-derived by construction — which is exactly why the number is published
@@ -589,6 +589,8 @@ Each row carries one verdict:
 | `messagegroup/epoch_test.go` `epochOctetAnsweringMethodsIn` | shape | `i < method.Type.NumOut()` | DRIVER — walks the member's own results. |
 | `messagegroup/epoch_test.go` `epochOctetAnsweringMethodsIn` | shape | `method.Type.Out(i) == errorType` | DRIVER — skips one RESULT, the error, and never a member. |
 | `messagegroup/epoch_test.go` `epochTypeCarriesOctets` | shape | `epochTypeCarriesOctets(carrier.Field(i).Type, seen)` | DRIVER — the reachability walk descends into every field and removes none. |
+| `messagegroup/noncerebind_test.go` `noncerebindCopyOctetsInto` | shape | `field.Kind() != reflect.Slice \|\| field.Type().Elem().Kind() != reflect.Uint8 \|\| field.IsNil()` | DRIVER — the snapshot builder for the re-auth's one-field property, and it removes nobody: it walks the record's OWN fields, copies the ones that carry octets so the snapshot is octets rather than a window onto the record, and recurses into a struct field so the header's slices are reached too. Every field of message.Record still reaches `noncerebindMovedFields`, and the class that property is stated over is `noncerebindRecordFields`, which admits all of them. The nil arm is why a field that moved between nil and empty is still reported. |
+| `messagegroup/noncerebind_test.go` `noncerebindMovedFields` | shape | `j < inner.NumField()` | DRIVER — walks the header's own fields so a difference inside it is reported as `Header.BodyHash` rather than as `Header`; it removes nobody, and a header that differs in no named member is still reported, as `Header` itself, on the `named == 0` arm. |
 | `messagegroup/ratchet_test.go` `TestNoFieldOfAStreamKeyIsSomethingACallerCanWriteThrough` | shape | `field.Type.Kind()` | NARROWING/refusal — every field's kind is judged and the default arm reports, so a shape nobody wrote a case for fails rather than passing. |
 | `messagegroup/seal_test.go` `TestBodyHashIsTheHashOfTheSealedBodyAndIsNotInTheBodyAad` | name | `strings.Contains(strings.ToLower(field.Name), "hash")` | NARROWING/refusal — a name-shaped predicate that REPORTS the members it selects. Nothing is removed from any rule by it. |
 | `mls/caller_arrays_test.go` `groupAnswerDeclaresStorage` | shape | `len(byteStoragePathsOf(method.Type.Out(at), name)) != 0` | DRIVER — walks the member's own results. |

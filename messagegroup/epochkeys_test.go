@@ -901,9 +901,9 @@ func TestAnEpochKeysHoldsNoWindowOntoTheSessionItCameFrom(t *testing.T) {
 //
 //	git grep -c 'func (self \*GroupSession)' -- 'messagegroup/*.go' | grep -v _test
 //
-// and it answers seal.go:5 and session.go:14 on this commit -- eighteen members before k1 task 3
-// and nineteen after it. A reading that answered the same numbers with the door absent would be a
-// reading of something else.
+// and it answers seal.go:7 and session.go:14 on this commit -- eighteen members before k1 task 3,
+// nineteen after it and twenty one after task 4's pair. A reading that answered the same numbers
+// with the door absent would be a reading of something else.
 func TestTheEpochKeysDoorJoinsTheDerivedClassOfGroupSessionMethods(t *testing.T) {
 	_, sources := messagegroupProductionSources(t)
 	perFile := map[string][]string{}
@@ -937,16 +937,16 @@ func TestTheEpochKeysDoorJoinsTheDerivedClassOfGroupSessionMethods(t *testing.T)
 	if !slices.Contains(all, "EpochKeys") {
 		t.Fatal("no method named EpochKeys is declared on *GroupSession, so the door this file tests is not in the class the loop gate holds")
 	}
-	if len(all) != 19 {
-		t.Errorf("%d methods are declared on *GroupSession and k1 task 3's commit makes it 19; the number moves by one per method and Task 4's ReauthRecord and its on-loop body are the next two to move it",
+	if len(all) != 21 {
+		t.Errorf("%d methods are declared on *GroupSession and k1 task 4's commit makes it 21; the number moves by one per method, and a method that arrived without moving it arrived without a thought about which file it belongs in",
 			len(all))
 	}
 	if got := len(perFile["session.go"]); got != 14 {
 		t.Errorf("session.go declares %d methods on *GroupSession and k1 task 3's commit makes it 14, which is the per-file half of the same count: the door belongs beside Epoch and AdvanceEpoch and not in seal.go",
 			got)
 	}
-	if got := len(perFile["seal.go"]); got != 5 {
-		t.Errorf("seal.go declares %d methods on *GroupSession and neither the epoch keys door nor k1 task 3's setter touches that file, so a change here is a method that landed in the wrong one",
+	if got := len(perFile["seal.go"]); got != 7 {
+		t.Errorf("seal.go declares %d methods on *GroupSession and k1 task 4's commit makes it 7: the re-auth is a record method and belongs beside SealRecord and OpenRecord, not beside the epoch keys door",
 			got)
 	}
 }

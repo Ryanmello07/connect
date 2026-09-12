@@ -27,6 +27,7 @@
 package messagegroup
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"go/ast"
@@ -34,9 +35,12 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/urnetwork/connect/message"
 )
 
 // A second nonce, distinct from testServerNonce() in both its octets and its length, so a case
@@ -280,10 +284,10 @@ func noncerebindWhere(fileSet *token.FileSet, path string, declaration string, a
 //
 //	git grep -n 'func (self \*GroupSession) [A-Z]' -- 'messagegroup/*.go' | grep -v _test
 //
-// and R6 clause (a) beside it: piping that through grep -c 'RebindServerNonce' returns 1, so the
-// answer contains the member this task added rather than merely counting to nine. Task 4's
-// ReauthRecord is the next method to move the number.
-const noncerebindExportedSessionMethods = 9
+// and R6 clause (a) beside it: piping that through grep -c 'RebindServerNonce' returns 1 and
+// through grep -c 'ReauthRecord' returns 1, so the answer contains the two members this slice
+// added rather than merely counting to ten.
+const noncerebindExportedSessionMethods = 10
 
 // Property 4 -- THE NARROWING, AND IT IS THE ONE PLACE IN THIS FILE WHERE AN EMPTINESS IS THE
 // PROPERTY RATHER THAN A DEFECT IN IT.
@@ -359,7 +363,7 @@ func TestNoExportedMethodOfAGroupSessionAnswersTheServerNonce(t *testing.T) {
 		t.Errorf("%d exported methods are declared on *GroupSession and this slice's commits make it %d; the number moves by one per exported method and a method that arrived without moving it arrived without a thought about this narrowing",
 			len(exported), noncerebindExportedSessionMethods)
 	}
-	for _, added := range []string{"RebindServerNonce"} {
+	for _, added := range []string{"RebindServerNonce", "ReauthRecord"} {
 		if !slices.Contains(exported, added) {
 			t.Errorf("no exported method named %s is declared on *GroupSession, so this gate is holding a class that does not contain the members this slice added and would report clean having read some other surface",
 				added)
@@ -522,4 +526,418 @@ func noncerebindCallsTheSetter(parsed *ast.File) bool {
 		return true
 	})
 	return found
+}
+
+// ---------------------------------------------------------------------------
+// The instruments the record-level properties below are observed through
+// ---------------------------------------------------------------------------
+
+// noncerebindSeal is one durable record over fixed plaintexts, and the plaintexts, so a case that
+// compares what came back out of OpenRecord is comparing it against what went in and not against
+// its own earlier answer.
+func noncerebindSeal(t *testing.T, fixture *testSession) (*message.Record, []byte, []byte) {
+	t.Helper()
+	headPlain := []byte("a head that the record layer seals")
+	bodyPlain := []byte("a body that the record layer seals, and it is longer than the head")
+	record, err := fixture.session.SealRecord(message.RetentionDurable, 0, false, headPlain, bodyPlain, 0, nil)
+	if err != nil {
+		t.Fatalf("SealRecord: %v", err)
+	}
+	return record, headPlain, bodyPlain
+}
+
+// noncerebindDeepCopy is a snapshot of a record whose octets are its OWN.
+//
+// The copy is DERIVED off the type and not written as a list of the four slice fields: a snapshot
+// that aliased one of them would be a snapshot that agreed with whatever the subject did to it,
+// which is this project's rule about aliases read from the other direction. A sixth field that is
+// a []byte is copied here with no edit.
+func noncerebindDeepCopy(record *message.Record) *message.Record {
+	copied := *record
+	noncerebindCopyOctetsInto(reflect.ValueOf(&copied).Elem())
+	return &copied
+}
+
+// noncerebindCopyOctetsInto replaces every []byte reachable through this struct's fields, and
+// through any struct field of it, with a copy. A nil slice stays nil, because nil and empty are
+// different values to reflect.DeepEqual and a copy that conflated them would hide a field that
+// moved between them.
+func noncerebindCopyOctetsInto(value reflect.Value) {
+	for i := 0; i < value.NumField(); i += 1 {
+		field := value.Field(i)
+		if !field.CanSet() {
+			continue
+		}
+		if field.Kind() == reflect.Struct {
+			noncerebindCopyOctetsInto(field)
+			continue
+		}
+		if field.Kind() != reflect.Slice || field.Type().Elem().Kind() != reflect.Uint8 || field.IsNil() {
+			continue
+		}
+		fresh := reflect.MakeSlice(field.Type(), field.Len(), field.Len())
+		reflect.Copy(fresh, field)
+		field.Set(fresh)
+	}
+}
+
+// noncerebindRecordFields is every field of message.Record, READ OFF THE TYPE rather than listed.
+//
+// The query beside it, R6 clause (a):
+//
+//	git show HEAD:message/record.go | sed -n '/^type Record struct/,/^}/p'
+//
+// piped through grep -c 'WriteAuth' returns 1. The class is what that block declares and this
+// gate counts it at run time, so a sixth field added to message.Record next month is in the class
+// with no edit here and the gate says which side of the line it landed on.
+func noncerebindRecordFields() []string {
+	typed := reflect.TypeOf(message.Record{})
+	names := []string{}
+	for i := 0; i < typed.NumField(); i += 1 {
+		names = append(names, typed.Field(i).Name)
+	}
+	return names
+}
+
+// noncerebindMovedFields is the members of that class whose value differs between two records.
+//
+// Header is reported by the member of ITS OWN field set that moved -- Header.BodyHash and not
+// Header -- because a gate that said "one of the five moved" would not tell a re-mac from a
+// re-hash. A Header that differs in no named member is still reported, as Header itself, so an
+// unnamed difference cannot be swallowed by the loop that names them.
+func noncerebindMovedFields(before *message.Record, after *message.Record) []string {
+	typed := reflect.TypeOf(message.Record{})
+	beforeValue := reflect.ValueOf(*before)
+	afterValue := reflect.ValueOf(*after)
+	moved := []string{}
+	for i := 0; i < typed.NumField(); i += 1 {
+		name := typed.Field(i).Name
+		if reflect.DeepEqual(beforeValue.Field(i).Interface(), afterValue.Field(i).Interface()) {
+			continue
+		}
+		if beforeValue.Field(i).Kind() != reflect.Struct {
+			moved = append(moved, name)
+			continue
+		}
+		named := 0
+		inner := beforeValue.Field(i).Type()
+		for j := 0; j < inner.NumField(); j += 1 {
+			if reflect.DeepEqual(beforeValue.Field(i).Field(j).Interface(), afterValue.Field(i).Field(j).Interface()) {
+				continue
+			}
+			moved = append(moved, name+"."+inner.Field(j).Name)
+			named += 1
+		}
+		if named == 0 {
+			moved = append(moved, name)
+		}
+	}
+	return moved
+}
+
+// noncerebindEpochKeys is this session's write_key[n] and read_key[n], taken out of Task 2's door.
+//
+// The two come out of EpochKeys and not off the session's own field, which is the whole of why
+// the expected tag below is an independent computation: taking it from the value the sealer used
+// would be comparing the method to itself.
+func noncerebindEpochKeys(t *testing.T, fixture *testSession) ([]byte, []byte) {
+	t.Helper()
+	keys, err := fixture.session.EpochKeys()
+	if err != nil {
+		t.Fatalf("EpochKeys: %v", err)
+	}
+	defer keys.Destroy()
+	writeKey, err := keys.WriteKey()
+	if err != nil {
+		t.Fatalf("WriteKey: %v", err)
+	}
+	readKey, err := keys.ReadKey()
+	if err != nil {
+		t.Fatalf("ReadKey: %v", err)
+	}
+	return append([]byte(nil), writeKey...), append([]byte(nil), readKey...)
+}
+
+// ---------------------------------------------------------------------------
+// Task 3 Property 2 and Task 4 Property 2: one field moves, and the class is
+// message.Record's own field set
+// ---------------------------------------------------------------------------
+
+// A rebind moves write_auth and moves NOTHING ELSE, and the observation is a re-authentication of
+// THE SAME RECORD.
+//
+// THE ROUTE RUNS THROUGH ReauthRecord AND THAT IS STATED RATHER THAN HIDDEN: there is no route on
+// which the nonce is the sole free variable that does not re-auth one record. Sealing a second
+// record instead moves stream_index, which moves record_key[i], which moves both ciphertexts and
+// the handle -- a difference no assertion could attribute to the nonce.
+//
+// AND THE CONTROL THAT MAKES THE OBSERVATION MEAN ANYTHING: a ReauthRecord with NO intervening
+// rebind must leave every field byte-identical, write_auth included. Without it, "the tag changed"
+// is consistent with a re-auth that is simply nondeterministic.
+//
+// THE CLASS IS DERIVED AND THE COMPLEMENT IS PRINTED. The class is every field of message.Record,
+// read off the type; one member moves and the complement is the other four, named on every run.
+// This is the blast-radius measurement of S2-2 held as a standing property rather than written
+// down once in a plan.
+func TestARebindMovesWriteAuthAndMovesNoOtherFieldOfTheRecord(t *testing.T) {
+	fixture := newTestSession(t, "reauth-one-field")
+	record, _, _ := noncerebindSeal(t, fixture)
+	fields := noncerebindRecordFields()
+	if len(fields) < 2 {
+		t.Fatalf("message.Record declares %v, so the complement of a one member subset is empty and this gate would report the same clean run over a re-auth that moved everything",
+			fields)
+	}
+	if !slices.Contains(fields, "WriteAuth") {
+		t.Fatalf("message.Record declares %v and WriteAuth is not among them, so this gate is reading some other type", fields)
+	}
+
+	// the control: a re-auth with no rebind in front of it moves nothing at all.
+	control := noncerebindDeepCopy(record)
+	if err := fixture.session.ReauthRecord(record); err != nil {
+		t.Fatalf("ReauthRecord with no intervening rebind: %v", err)
+	}
+	if moved := noncerebindMovedFields(control, record); len(moved) != 0 {
+		t.Fatalf("a re-auth with NO rebind in front of it moved %v; without this control, a tag that changed after a rebind is consistent with a re-auth that is simply nondeterministic",
+			moved)
+	}
+
+	before := noncerebindDeepCopy(record)
+	if err := fixture.session.RebindServerNonce(noncerebindSecondNonce()); err != nil {
+		t.Fatalf("RebindServerNonce: %v", err)
+	}
+	if moved := noncerebindMovedFields(before, record); len(moved) != 0 {
+		t.Fatalf("the rebind alone moved %v of the record; a session that reached into a record the caller holds would be doing the re-auth's work without being asked",
+			moved)
+	}
+	if err := fixture.session.ReauthRecord(record); err != nil {
+		t.Fatalf("ReauthRecord after the rebind: %v", err)
+	}
+	moved := noncerebindMovedFields(before, record)
+	complement := []string{}
+	for _, name := range fields {
+		if !slices.ContainsFunc(moved, func(one string) bool { return one == name || strings.HasPrefix(one, name+".") }) {
+			complement = append(complement, name)
+		}
+	}
+	t.Logf("message.Record declares %d field(s): %v; a rebind plus a re-auth moved %d of them (%v); the COMPLEMENT is the other %d: %v",
+		len(fields), fields, len(moved), moved, len(complement), complement)
+	if len(complement) == 0 {
+		t.Fatal("every field of message.Record moved across the re-auth, so the complement of this narrowing is empty and 'one field moves' has become 'the record is rebuilt'")
+	}
+	if slices.Equal(moved, []string{"WriteAuth"}) {
+		return
+	}
+	if len(moved) == 0 {
+		t.Error("no field of THE CALLER'S RECORD moved across a rebind and a re-auth; the caller holds the record, so a method that answered a fresh one or that mutated a copy has left the outbox exactly as wrong as it was")
+		return
+	}
+	t.Errorf("a rebind plus a re-auth moved %v of message.Record; write_auth is the ONE sealed value the nonce binds and every other field is the one the seal produced",
+		moved)
+}
+
+// ---------------------------------------------------------------------------
+// Task 4 Properties 1 and 3: the mac the server would verify, under the WRITE
+// key
+// ---------------------------------------------------------------------------
+
+// The re-auth answers the mac the server would verify, and the expected tag is computed here from
+// Task 2's door rather than from the method that produced it.
+//
+// COMPUTING THE EXPECTED TAG FROM THE SESSION'S OWN SealRecord WOULD BE COMPARING THE METHOD TO
+// ITSELF, which is the tautology keysource_test.go's whole gate apparatus exists to prevent one
+// level up. write_key comes out of EpochKeys().WriteKey(), the nonce is the value THIS TEST chose
+// and handed to the setter, and the remaining three inputs are already on the record.
+//
+// Property 3 is the second half and is stated as its own clause rather than folded in, because it
+// names the mutant Property 1's comparison catches: read_key and write_key are both thirty two
+// octets off the same root and a mac under the wrong one is well formed. keysource_test.go
+// explicitly cannot see it -- its exclusions put message.ReadKey outside the reproduction
+// entirely.
+func TestTheReauthAnswersTheMacTheServerWouldVerifyUnderTheWriteKey(t *testing.T) {
+	fixture := newTestSession(t, "reauth-mac")
+	record, _, _ := noncerebindSeal(t, fixture)
+	writeKey, readKey := noncerebindEpochKeys(t, fixture)
+	if bytes.Equal(writeKey, readKey) {
+		t.Fatal("write_key and read_key are the same octets, so the clause below about which one the tag is taken under is a clause about nothing")
+	}
+
+	// the tag the seal already took, under the nonce the constructor was injected with. It is
+	// the control for the comparison after the rebind: without it, an expected tag that matched
+	// would be consistent with a re-auth that never ran.
+	sealed := message.ComputeWriteAuth(writeKey, testServerNonce(), &record.Header, record.CtHead,
+		record.Header.ServerAttachment)
+	if sealed != record.WriteAuth {
+		t.Fatalf("the record as SEALED carries %x and the mac under write_key and the injected nonce is %x; this case cannot say anything about a rebind until the two agree before one",
+			record.WriteAuth, sealed)
+	}
+
+	rebound := noncerebindSecondNonce()
+	handedOver := append([]byte(nil), rebound...)
+	if err := fixture.session.RebindServerNonce(rebound); err != nil {
+		t.Fatalf("RebindServerNonce: %v", err)
+	}
+	// THE CALLER'S BUFFER IS THE CALLER'S. Scribbling over it after the call must change
+	// nothing the session does with it, and a session that retained the slice header rather
+	// than copying it would mac under whatever this argument became. handedOver is what was
+	// actually handed over, and the expected tag below is computed from that.
+	for i := range rebound {
+		rebound[i] ^= 0xFF
+	}
+	if err := fixture.session.ReauthRecord(record); err != nil {
+		t.Fatalf("ReauthRecord: %v", err)
+	}
+	want := message.ComputeWriteAuth(writeKey, handedOver, &record.Header, record.CtHead,
+		record.Header.ServerAttachment)
+	if want == sealed {
+		t.Fatal("the mac under the new nonce equals the mac under the old one, so the two nonces this case rebinds between are not telling the preimage apart and nothing below is an observation")
+	}
+	if record.WriteAuth != want {
+		t.Errorf("after the rebind the record carries write_auth %x and the mac the server would verify -- write_key[n] off EpochKeys, over the nonce this test handed the setter -- is %x",
+			record.WriteAuth, want)
+	}
+	// Property 3: and it is NOT the mac under read_key, which is well formed and which no
+	// assertion about "the tag changed" would tell from the right one.
+	underTheReadKey := message.ComputeWriteAuth(readKey, handedOver, &record.Header, record.CtHead,
+		record.Header.ServerAttachment)
+	if record.WriteAuth == underTheReadKey {
+		t.Errorf("the re-auth took the tag under read_key: the record carries %x, which is the mac under read_key[n] rather than write_key[n]; MASTER section 9.2 has the server hold write_key and authenticate a submit on it, and req_auth is the only thing read_key macs",
+			record.WriteAuth)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Task 4 Property 4: every refusal is taken before the mac, and on a refusal
+// the caller's record is unchanged
+// ---------------------------------------------------------------------------
+
+// Four refusals, each with its own sentinel and each leaving the caller's record exactly as it
+// was.
+//
+// THE "UNCHANGED ON REFUSAL" CLAUSE IS NOT TIDINESS. OpenRecord states the same rule one level
+// over -- "a partial plaintext is never returned beside an error" -- and a half-applied re-auth
+// hands an outbox a record it believes is fresh. And it is why the checks must PRECEDE the
+// ComputeWriteAuth call rather than wrap it: that function panics on a short key and on an empty
+// nonce rather than answering an error, so a refusal arriving as a recovered panic would be a
+// refusal taken after the damage.
+//
+// Every arm runs AFTER a rebind, so a body that did not refuse would move the tag: an arm checked
+// against a session whose nonce had not moved would pass over a re-auth that ran.
+func TestEveryRefusalOfTheReauthComesBeforeTheMacAndLeavesTheRecordUnchanged(t *testing.T) {
+	fixture := newTestSession(t, "reauth-refusals")
+	record, _, _ := noncerebindSeal(t, fixture)
+	if err := fixture.session.RebindServerNonce(noncerebindSecondNonce()); err != nil {
+		t.Fatalf("RebindServerNonce: %v", err)
+	}
+	// the demonstration that a re-auth on this session WOULD move the tag, so each refusal
+	// below is a refusal and not a re-auth that happened to answer what was already there.
+	witness := noncerebindDeepCopy(record)
+	if err := fixture.session.ReauthRecord(witness); err != nil {
+		t.Fatalf("ReauthRecord on the witness: %v", err)
+	}
+	if witness.WriteAuth == record.WriteAuth {
+		t.Fatal("a re-auth on this session did not move write_auth at all, so every unchanged assertion below would hold over a body that ran")
+	}
+
+	for _, refusal := range []struct {
+		name     string
+		spoil    func(record *message.Record)
+		sentinel error
+	}{
+		{
+			name:     "a record whose group id is not this session's",
+			spoil:    func(record *message.Record) { record.Header.GroupId[0] ^= 0xFF },
+			sentinel: ErrRecordNotForThisSession,
+		},
+		{
+			name:     "a record whose epoch is not this session's",
+			spoil:    func(record *message.Record) { record.Header.Epoch += 1 },
+			sentinel: ErrRecordNotForThisSession,
+		},
+	} {
+		spoiled := noncerebindDeepCopy(record)
+		refusal.spoil(spoiled)
+		before := noncerebindDeepCopy(spoiled)
+		err := fixture.session.ReauthRecord(spoiled)
+		if !errors.Is(err, refusal.sentinel) {
+			t.Errorf("ReauthRecord of %s = %v, want %v", refusal.name, err, refusal.sentinel)
+		}
+		if moved := noncerebindMovedFields(before, spoiled); len(moved) != 0 {
+			t.Errorf("ReauthRecord of %s refused and moved %v of the caller's record anyway; a mutant that returns the right error and mutates the record is the one this clause exists for, and a half applied re-auth hands an outbox a record it believes is fresh",
+				refusal.name, moved)
+		}
+	}
+
+	// the nil arm has no record to leave unchanged, and that is said rather than passed over.
+	if err := fixture.session.ReauthRecord(nil); !errors.Is(err, message.ErrRecordNil) {
+		t.Errorf("ReauthRecord(nil) = %v, want %v", err, message.ErrRecordNil)
+	}
+
+	// and the closed arm, on its own session because a close is not undoable. What the refusal
+	// stands in front of is a panic and not a bad mac: zeroizeOnLoop has erased writeKey, and
+	// message.ComputeWriteAuth panics on a key that is not thirty two octets.
+	closing := newTestSession(t, "reauth-closed")
+	closed, _, _ := noncerebindSeal(t, closing)
+	if err := closing.session.RebindServerNonce(noncerebindSecondNonce()); err != nil {
+		t.Fatalf("RebindServerNonce: %v", err)
+	}
+	if err := closing.session.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	before := noncerebindDeepCopy(closed)
+	if err := closing.session.ReauthRecord(closed); !errors.Is(err, ErrSessionClosed) {
+		t.Errorf("ReauthRecord on a closed session = %v, want %v", err, ErrSessionClosed)
+	}
+	if moved := noncerebindMovedFields(before, closed); len(moved) != 0 {
+		t.Errorf("ReauthRecord on a closed session moved %v of the caller's record", moved)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Task 4 Property 5: a rebind and a re-auth change nothing about opening
+// ---------------------------------------------------------------------------
+
+// This is the "nothing already sealed becomes unopenable" finding held as a property instead of
+// asserted in prose, and it is the clause that makes the blast-radius claim checkable by someone
+// who does not believe the greps.
+//
+// THE SECOND TRACK IS THE INSTRUMENT AND NOT A CONVENIENCE. A receiver ratchet consumes the rung
+// it opens -- consumeLocked drops it from the window and the head moves past it -- so one ladder
+// opens one stream index exactly once, and "OpenRecord on the SAME record, before and after"
+// cannot be asked of a ladder that has already answered it. ReceiverRatchets.Track replaces, so
+// TrackSender at head 0 installs a fresh ladder over the same class key and the same leaf, which
+// is the view a peer opening this record derives. Both opens are compared against the plaintexts
+// that went IN, so a route that opened nothing is not green.
+func TestARebindAndAReauthChangeNothingAboutOpening(t *testing.T) {
+	fixture := newTestSession(t, "reauth-open")
+	fixture.trackOwn(t)
+	record, headPlain, bodyPlain := noncerebindSeal(t, fixture)
+
+	beforeHead, beforeBody, err := fixture.session.OpenRecord(record)
+	if err != nil {
+		t.Fatalf("OpenRecord before the rebind: %v", err)
+	}
+	if !bytes.Equal(beforeHead, headPlain) || !bytes.Equal(beforeBody, bodyPlain) {
+		t.Fatalf("the record did not open to what was sealed before the rebind: head %q body %q; nothing below is about a rebind",
+			beforeHead, beforeBody)
+	}
+
+	if err := fixture.session.RebindServerNonce(noncerebindSecondNonce()); err != nil {
+		t.Fatalf("RebindServerNonce: %v", err)
+	}
+	if err := fixture.session.ReauthRecord(record); err != nil {
+		t.Fatalf("ReauthRecord: %v", err)
+	}
+
+	fixture.trackOwn(t)
+	afterHead, afterBody, err := fixture.session.OpenRecord(record)
+	if err != nil {
+		t.Fatalf("OpenRecord after the rebind and the re-auth: %v; the nonce binds write_auth and NOTHING the open path reads, so a record that stopped opening is a re-auth that touched a ciphertext",
+			err)
+	}
+	if !bytes.Equal(afterHead, beforeHead) {
+		t.Errorf("the head opened to %q before the rebind and %q after it", beforeHead, afterHead)
+	}
+	if !bytes.Equal(afterBody, beforeBody) {
+		t.Errorf("the body opened to %q before the rebind and %q after it", beforeBody, afterBody)
+	}
 }
