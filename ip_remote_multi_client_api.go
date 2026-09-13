@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net/netip"
 	"slices"
 	"sync"
 	"time"
@@ -124,6 +125,11 @@ type apiWindowClientTransport struct {
 	current  apiWindowPlatformTransport
 	settings *PlatformTransportSettings
 	auth     ClientAuth
+	// One change counter for this client's extender addresses across every
+	// transport generation (K1). Each transport bumps it, and so does a
+	// migration swap, so a watcher subscribed to it never has to notice that
+	// the transport under it was replaced.
+	extenderIpsMonitor *MonitorValue[uint64]
 	// Initial setup owns the transport before the provide secret is committed.
 	// Live policy migration must not replace that transport until setup returns.
 	initializing bool
@@ -240,8 +246,9 @@ type ApiMultiClientGenerator struct {
 	transportCreation apiTransportCreationLifecycle
 	retirementOnce    sync.Once
 	retirements       *lifecycleAdmission
-	// injectable for deterministic make-before-break tests
-	newPlatformTransport func(
+	// Injectable lifecycle barriers for deterministic ownership tests.
+	beforeRetirementWaitForTest func()
+	newPlatformTransport        func(
 		client *Client,
 		auth *ClientAuth,
 		targetMode TransportMode,
@@ -480,6 +487,9 @@ func (self *ApiMultiClientGenerator) CloseAndWait(ctx context.Context) error {
 
 	retirements := self.retirementLifecycle()
 	retirements.close()
+	if self.beforeRetirementWaitForTest != nil {
+		self.beforeRetirementWaitForTest()
+	}
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -764,66 +774,24 @@ func (self *ApiMultiClientGenerator) NewClientArgsForDestinationContext(ctx cont
 }
 
 func (self *ApiMultiClientGenerator) RemoveClientArgs(args *MultiClientGeneratorClientArgs) {
-	// Distinguish a window eviction from a shutdown-caused teardown: every
-	// channel teardown calls remove, but when the generator's ctx is done
-	// the whole device/process is going away. What happens next depends on
-	// whether an identity store is configured:
-	// - store configured (the proxy case): the identities must SURVIVE —
-	//   both in the persisted snapshot and as live network clients — so a
-	//   replacement container can reuse them (PROXYDRAIN1.md §3.5). Skip
-	//   everything.
-	// - no store (plain sdk apps, the default): nothing will ever reuse
-	//   these window clients, so keep the historical best-effort delete —
-	//   otherwise the platform-client rows leak on every app shutdown and
-	//   linger until server-side idle reap.
-	// Window evictions happen while the ctx is live and remove for real.
-	select {
-	case <-self.ctx.Done():
-		if self.identityState.hasStore() {
-			return
+	// Args that never reached a generated Client still own a platform identity.
+	// Admit their asynchronous removal before launch so CloseAndWait cannot
+	// cancel the API underneath it. If close already won, retain the historical
+	// bounded best effort: no owner can join a producer admitted after close.
+	retirements := self.retirementLifecycle()
+	retirementAdmitted := retirements.start()
+	go HandleError(func() {
+		if retirementAdmitted {
+			defer retirements.finish()
 		}
-		// one shot on a Background context (the lifecycle ctx is closed, so
-		// posting on it can never leave the process), mirroring the contract
-		// manager's after-close cleanup; the server's idle client reap
-		// remains the backstop if the attempt fails
-		go HandleError(func() {
-			removeCtx, removeCancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer removeCancel()
-			HttpPostWithStrategy(
-				removeCtx,
-				self.clientStrategy,
-				fmt.Sprintf("%s/network/remove-client", self.apiUrl),
-				&RemoveNetworkClientArgs{
-					ClientId: args.ClientId,
-				},
-				self.api.ByJwt(),
-				&RemoveNetworkClientResult{},
-				NewNoopApiCallback[*RemoveNetworkClientResult](),
-			)
-		})
-		return
-	default:
-	}
-
-	// The identity is being torn down for real (window eviction, expired
-	// args), unless a newer channel has already replaced it under the same
-	// client id. InstanceId is the generation token: stale asynchronous
-	// cleanup must neither erase the replacement from the persisted snapshot
-	// nor send remove-client for the replacement's still-live server row.
-	instanceId := Id{}
-	if args.ClientAuth != nil {
-		instanceId = args.ClientAuth.InstanceId
-	}
-	if !self.identityState.RemoveIfCurrent(args.ClientId, instanceId) {
-		return
-	}
-
-	removeNetworkClient := &RemoveNetworkClientArgs{
-		ClientId: args.ClientId,
-	}
-
-	self.api.RemoveNetworkClient(removeNetworkClient, NewApiCallback(func(result *RemoveNetworkClientResult, err error) {
-	}))
+		retireTimeout := self.clientStrategy.settings.RequestTimeout
+		if retireTimeout < 30*time.Second {
+			retireTimeout = 30 * time.Second
+		}
+		removeCtx, removeCancel := context.WithTimeout(context.Background(), retireTimeout)
+		defer removeCancel()
+		self.removeClientArgsAndWait(removeCtx, args)
+	})
 }
 
 // removeClientArgsAndWait is the joined form used by the generated Client's
@@ -967,6 +935,12 @@ func (self *ApiMultiClientGenerator) NewClientContext(
 			return
 		}
 	}
+	// the counter is installed on the per-client settings before the first
+	// transport is built, so every generation this client ever gets -- the
+	// first and every migration replacement, which reuse these settings --
+	// publishes its extender addresses through the same monitor (K1)
+	extenderIpsMonitor := NewMonitorValue[uint64](0)
+	settings.ExtenderIpsMonitor = extenderIpsMonitor
 	transport, _, policyVersion := self.createPlatformTransport(client, args.ClientAuth, settings)
 	auth := *args.ClientAuth
 	self.transportLock.Lock()
@@ -977,11 +951,12 @@ func (self *ApiMultiClientGenerator) NewClientContext(
 		self.transportIdle = make(chan struct{})
 	}
 	self.transports[client] = &apiWindowClientTransport{
-		current:       transport,
-		settings:      settings,
-		auth:          auth,
-		initializing:  true,
-		policyVersion: policyVersion,
+		current:            transport,
+		settings:           settings,
+		auth:               auth,
+		initializing:       true,
+		policyVersion:      policyVersion,
+		extenderIpsMonitor: extenderIpsMonitor,
 	}
 	self.transportLock.Unlock()
 	// Enable return traffic for this client and block until the platform has
@@ -1222,7 +1197,9 @@ func (self *ApiMultiClientGenerator) MigrateClientTransport(
 					self.transportLock.Unlock()
 					if !swapped {
 						next.Close()
+						return
 					}
+					state.noteExtenderIpsChanged()
 					return
 				}
 				// Keep the old transport: it is still a valid route, and the
@@ -1259,12 +1236,56 @@ func (self *ApiMultiClientGenerator) MigrateClientTransport(
 			next.Close()
 			return
 		}
+		// the addresses a watcher reads come from the current transport, so
+		// the replacement itself is a change even when neither transport moved
+		state.noteExtenderIpsChanged()
 		// Only now break the old route. For the interval between next becoming
 		// connected and this close, RouteManager can carry traffic over both.
 		if !brokeBeforeMake {
 			current.Close()
 		}
 	})
+}
+
+// Bumps the per-client change counter, which is how a transport swap reaches
+// a watcher subscribed across generations. A state built by a test fixture
+// without a counter changes nothing.
+func (self *apiWindowClientTransport) noteExtenderIpsChanged() {
+	if self.extenderIpsMonitor == nil {
+		return
+	}
+	self.extenderIpsMonitor.Update(func(count uint64) uint64 {
+		return count + 1
+	})
+}
+
+// ClientExtenderIps implements MultiClientGeneratorWithExtenderIps: the
+// extenders carrying this client's live platform transport, with the change
+// channel armed immediately before the read (K1). A client with no transport
+// -- removed, or a fixture that never installed one -- reports no addresses
+// and no channel, which parks its watcher until the client itself ends.
+func (self *ApiMultiClientGenerator) ClientExtenderIps(client *Client) ([]netip.Addr, <-chan struct{}) {
+	var transport apiWindowPlatformTransport
+	var extenderIpsMonitor *MonitorValue[uint64]
+	func() {
+		self.transportLock.Lock()
+		defer self.transportLock.Unlock()
+		if state := self.transports[client]; state != nil {
+			transport = state.current
+			extenderIpsMonitor = state.extenderIpsMonitor
+		}
+	}()
+	if extenderIpsMonitor == nil {
+		return nil, nil
+	}
+	// subscribe, then read: a change in between would otherwise close a
+	// channel nobody holds and the watcher would sit on a stale set
+	_, change := extenderIpsMonitor.Get()
+	source, ok := transport.(interface{ ExtenderIps() []netip.Addr })
+	if !ok {
+		return nil, change
+	}
+	return source.ExtenderIps(), change
 }
 
 func (self *ApiMultiClientGenerator) FixedDestinationSize() (int, bool) {
