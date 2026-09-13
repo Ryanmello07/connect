@@ -131,6 +131,32 @@
 // inventory, and a case in seal_test.go holds it so that the day it stops being true this
 // paragraph is what fails.
 //
+// TWO CHANGES TO THIS PACKAGE'S EXPORTED SURFACE ARRIVED WITH THE 2026-09-13 RULING, and they are
+// recorded in this inventory because that is where this package says what it is: a renamed
+// sentinel and a widened signature are invisible in a diff of behaviour, and a caller outside this
+// directory meets them as a compile error with no explanation attached.
+//
+// ONE SENTINEL WAS RENAMED, WHICH IS A BREAKING CHANGE AND COSTS NOTHING. ErrRetentionClassUnruled
+// is now ErrRetentionClassUnknown, and the message moved with the name: it used to say that one
+// class alone could be sealed pending a ruling on which record key seals ct_head, and what it says
+// now is that the value in hand names no retention class at all. A sentinel still named Unruled
+// for something ruled on 2026-09-13 is the pre-amendment trap this corpus keeps filing, so the
+// name moved rather than only the text. The blast radius is measured rather than assumed:
+// grep -rn ErrRetentionClassUnruled --include=*.go over connect and over sdk answers one line, the
+// paragraph in errors.go that describes the retraction. errors.go carries the whole reasoning
+// beside the declaration; this entry is so that a reader of the inventory learns the surface
+// changed without having to read errors.go to find out.
+//
+// FOUR NAMES WERE INVENTED HERE AND NO DOCUMENT OF THE CORPUS DECLARES ANY OF THEM: InstallEphRoot,
+// the session's own eph_root field, senderLadderKey's eph window, and TrackSender's ephWindow
+// parameter. The seal lift cannot be implemented without a delivery channel for eph_root, MASTER
+// invariant I4 forbids deriving one, and no section gives it a shape -- so this package chose one,
+// which is what RebindServerNonce did for the server nonce and is the same judgement. All four are
+// UN-SPECIFIED and each says so at its own declaration; the register that owes the ruling is
+// SPEC-LEDGER.md's open item 188, filed 2026-09-13 and not ruled, and this directory's OPENITEMS.md
+// points at it rather than opening a competing row. The spec-side filing is not this package's to
+// make and is not made from here.
+//
 // What lands here next is the rest of section 5: the DELIVERY of pq_secret rather than the sampler,
 // which is here, the device wrap, and the epoch fan-out and its snapshot. The joining member was on
 // this list and is not any more. Nothing in this package logs a failure and carries on, and no

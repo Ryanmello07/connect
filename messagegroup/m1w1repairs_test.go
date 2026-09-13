@@ -751,7 +751,7 @@ func TestEveryRetentionClassOfOneSessionReservesInOneStream(t *testing.T) {
 		t.Fatalf("this session built %d ladders, so nothing here could observe two of them sharing a counter", len(ladders))
 	}
 	if len(refused) != 0 {
-		t.Errorf("a session holding an eph_root refused a ladder for %#x; since ledger item 152 was ruled every retention byte the wire admits has a class key, and a refusal here is a class this session cannot seal at all", refused)
+		t.Errorf("a session holding an eph_root refused a ladder for %#x; since ledger item 152 was ruled 2026-09-13 every retention byte the wire admits has a class key, and a refusal here is a class this session cannot seal at all", refused)
 	}
 	t.Logf("%d ladders, one per accepted retention byte, all on one stream key", len(ladders))
 	// ONE stream, whole and entire. It is compared as a value rather than field by field, so a

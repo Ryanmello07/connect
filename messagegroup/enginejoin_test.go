@@ -1761,39 +1761,153 @@ func TestTheOpenItemThisPackageCitesIsFiledWhereItSaysItIs(t *testing.T) {
 			engineJoinOpenItemsFile, err)
 	}
 	register := strings.ReplaceAll(string(source), "\r\n", "\n")
-	for _, owed := range []string{
-		"MG-1",
-		"GroupEngine.JoinFromWelcome",
-		"TestAWelcomeFromAnAttackerJoinsAndTheOnlyThingItGetsWrongIsWhoTheGroupIs",
-		"SPEC-LEDGER.md",
-	} {
+
+	// THE ROWS, DERIVED OFF THE FILE'S OWN HEADINGS rather than listed here. A row added to the
+	// register and cited from nowhere, and a number cited from production source with no row,
+	// are the two halves of the same defect and this reads both off the subject.
+	filed := []string{}
+	for _, line := range strings.Split(register, "\n") {
+		heading, isHeading := strings.CutPrefix(strings.TrimSpace(line), "## "+engineJoinOpenItemPrefix)
+		if !isHeading {
+			continue
+		}
+		number, _, _ := strings.Cut(heading, " ")
+		if number = strings.TrimSpace(number); number != "" {
+			filed = append(filed, engineJoinOpenItemPrefix+number)
+		}
+	}
+	slices.Sort(filed)
+	if len(filed) == 0 {
+		t.Fatalf("%s carries no row at all, so both directions below are held over nothing. The heading shape this reads is \"## %sN\"",
+			engineJoinOpenItemsFile, engineJoinOpenItemPrefix)
+	}
+
+	// WHAT EACH ROW OWES, which is the file's own rule: the item, the surface it is about, the
+	// case that reproduces it, and the register that owes it a number.
+	for _, row := range engineJoinOpenItemRows {
+		if !slices.Contains(filed, row.item) {
+			t.Errorf("%s has no row for %s, and the table here says what that row must carry. A row deleted without its obligation being closed is the failure this gate is for",
+				engineJoinOpenItemsFile, row.item)
+			continue
+		}
+		for _, owed := range row.owes {
+			if !strings.Contains(register, owed) {
+				t.Errorf("%s's %s row does not mention %q. The row has to carry the item, the surface it is about, the case that reproduces it, and the register that owes it a number",
+					engineJoinOpenItemsFile, row.item, owed)
+			}
+		}
+	}
+
+	// AND THE POINTER SECTION, which is the OTHER state a debt of this package can be in: the
+	// ledger has already numbered it, so there is no row here and there must still be something
+	// that names the symbols. doc.go says this file points at that number; this is what makes
+	// that sentence true rather than decorative.
+	for _, owed := range engineJoinLedgerPointer {
 		if !strings.Contains(register, owed) {
-			t.Errorf("%s does not mention %q. The row has to carry the item, the surface it is about, the case that reproduces it, and the register that owes it a number",
+			t.Errorf("%s does not mention %q. Four symbols of this package are declared by no document and are filed in the spec ledger rather than here; doc.go says this file points at them, and a pointer that names neither the symbol nor the number points at nothing",
 				engineJoinOpenItemsFile, owed)
 		}
 	}
 
-	// AND THE PRODUCTION SOURCE HAS TO CITE IT, which is the half that goes red if somebody removes
-	// the obligation from the interface and leaves the document behind. An open item nothing cites
-	// is a file nobody opens.
-	citations := []string{}
+	// AND THE PRODUCTION SOURCE HAS TO CITE EVERY ROW, which is the half that goes red if somebody
+	// removes the obligation from the interface and leaves the document behind. An open item
+	// nothing cites is a file nobody opens.
+	cited := map[string][]string{}
 	for path, prose := range engineJoinProductionProse(t) {
-		if strings.Contains(prose, strings.ToLower(engineJoinOpenItem)) {
-			citations = append(citations, path)
+		for _, item := range engineJoinItemsNamedIn(prose) {
+			if !slices.Contains(cited[item], path) {
+				cited[item] = append(cited[item], path)
+			}
 		}
 	}
-	slices.Sort(citations)
-	t.Logf("%s is cited from %d production file(s) %v and filed in %s",
-		engineJoinOpenItem, len(citations), citations, engineJoinOpenItemsFile)
-	if len(citations) == 0 {
-		t.Errorf("no production prose of this package cites %s. The obligation belongs at the surface a caller uses, and a register nothing points at is a register nobody reads",
-			engineJoinOpenItem)
+	citedItems := []string{}
+	for item := range cited {
+		citedItems = append(citedItems, item)
+		slices.Sort(cited[item])
+	}
+	slices.Sort(citedItems)
+	uncited := []string{}
+	for _, item := range filed {
+		if len(cited[item]) == 0 {
+			uncited = append(uncited, item)
+		}
+	}
+	t.Logf("register: %d row(s) %v; production source cites %d %v", len(filed), filed, len(citedItems), citedItems)
+	t.Logf("complement: %d filed row(s) that no production file cites, %v", len(uncited), uncited)
+	for _, item := range uncited {
+		t.Errorf("no production prose of this package cites %s, which %s files. The obligation belongs at the surface a caller uses, and a register nothing points at is a register nobody reads",
+			item, engineJoinOpenItemsFile)
+	}
+	for _, item := range citedItems {
+		if !slices.Contains(filed, item) {
+			t.Errorf("production source cites %s at %v and %s has no row for it. A number that names nothing is worse than no number: it reads as though somebody decided something",
+				item, cited[item], engineJoinOpenItemsFile)
+		}
 	}
 }
 
-// The item and the register it is filed in, each spelled once. A wrong spelling fails the read
-// above rather than quietly holding nothing.
+// engineJoinItemsNamedIn answers every item of this register named in one file's prose.
+//
+// Read off the text rather than matched against a list, so a number cited before its row exists is
+// found by the half of the gate above that looks for one.
+func engineJoinItemsNamedIn(prose string) []string {
+	prefix := strings.ToLower(engineJoinOpenItemPrefix)
+	named := []string{}
+	for index := 0; index+len(prefix) <= len(prose); index += 1 {
+		if !strings.HasPrefix(prose[index:], prefix) {
+			continue
+		}
+		end := index + len(prefix)
+		for end < len(prose) && '0' <= prose[end] && prose[end] <= '9' {
+			end += 1
+		}
+		if end == index+len(prefix) {
+			continue
+		}
+		if item := strings.ToUpper(prose[index:end]); !slices.Contains(named, item) {
+			named = append(named, item)
+		}
+	}
+	return named
+}
+
+// The register, the shape of an item in it, and what each row owes, each spelled once. A wrong
+// spelling fails the read above rather than quietly holding nothing.
 const (
-	engineJoinOpenItem      = "MG-1"
-	engineJoinOpenItemsFile = "OPENITEMS.md"
+	engineJoinOpenItemPrefix = "MG-"
+	engineJoinOpenItemsFile  = "OPENITEMS.md"
 )
+
+// What each row of the register must carry, by the file's own rule.
+var engineJoinOpenItemRows = []struct {
+	item string
+	owes []string
+}{
+	{
+		item: "MG-1",
+		owes: []string{
+			"GroupEngine.JoinFromWelcome",
+			"TestAWelcomeFromAnAttackerJoinsAndTheOnlyThingItGetsWrongIsWhoTheGroupIs",
+			"SPEC-LEDGER.md",
+		},
+	},
+	{
+		item: "MG-2",
+		owes: []string{
+			"SealRecord",
+			"eph_window",
+			"TestEverySealableClassRoundTripsAndTheWrapItemOneEightyFiveRefusesDoesNot",
+			"SPEC-LEDGER.md",
+		},
+	},
+}
+
+// The symbols the seal lift invented, which the spec ledger has already numbered and which this
+// directory therefore points at instead of re-filing.
+var engineJoinLedgerPointer = []string{
+	"InstallEphRoot",
+	"senderLadderKey",
+	"TrackSender",
+	"ephRoot",
+	"item 188",
+}

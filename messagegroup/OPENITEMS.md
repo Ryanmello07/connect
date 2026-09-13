@@ -21,6 +21,31 @@ Two rules, borrowed from `mls/UNOBSERVED.md` because they are the same two rules
 
 ---
 
+## Filed in the ledger and not here
+
+Four symbols this package **invented** for the 2026-09-13 seal lift, because `eph_root[n]` cannot be
+derived (MASTER invariant **I4**), its carrier is m1 Task 14's device wrap and that does not exist,
+and **no section of the corpus declares a route into a `GroupSession`**:
+
+| symbol | where |
+|---|---|
+| `GroupSession.InstallEphRoot(ephRoot []byte) error` | `session.go` |
+| the unexported `ephRoot []byte` field on `GroupSession` | `session.go` |
+| `senderLadderKey{RetentionWire byte; EphWindow uint64}` | `session.go` |
+| `TrackSender`'s `ephWindow uint64` parameter | `session.go` |
+
+They are **kept**, on `RebindServerNonce`'s precedent, and each carries its own un-specified status
+in the prose beside its declaration. **They get no row of their own here because the ledger has
+already assigned them one: `SPEC-LEDGER.md` open item 188, filed 2026-09-13, FILED AND NOT RULED.**
+
+That is this file's migration rule applied rather than bent — a row here is a debt *with no number*,
+and once a number exists the source cites the number and this file loses the row. What is recorded
+here is the pointer alone, so that a reader of connect's open items meets the four names, learns
+that no document declares them, and is sent to the register that owes the ruling.
+
+---
+
+
 ## MG-1 — `GroupEngine.JoinFromWelcome` states an anchoring obligation and nothing performs it
 
 **Status: OPEN. The obligation is stated; the mechanism is a ruling and is not this package's.**

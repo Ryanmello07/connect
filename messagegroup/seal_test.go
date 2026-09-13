@@ -624,7 +624,7 @@ func TestASessionWithNoEphRootRefusesExactlyTheEphWireBytes(t *testing.T) {
 		t.Errorf("a session with no eph_root refused %#x, want exactly the eph bytes %#x", refusedWire, wantRefused)
 	}
 	if !bytes.Equal(sealedWire, wantSealed) {
-		t.Errorf("a session with no eph_root sealed %#x, want exactly the non eph bytes %#x; ledger item 152 is ruled and the blanket class refusal is lifted in full, so PERMANENT and MEDIA seal here",
+		t.Errorf("a session with no eph_root sealed %#x, want exactly the non eph bytes %#x; ledger item 152 is ruled 2026-09-13 and the blanket class refusal is lifted in full, so PERMANENT and MEDIA seal here",
 			sealedWire, wantSealed)
 	}
 	t.Logf("no eph_root: %d wire bytes seal %#x; complement is the %d eph bytes %#x, refused with ErrNoEphRoot",
@@ -969,7 +969,7 @@ func TestNoPlaintextIsReturnedBesideAnError(t *testing.T) {
 			copy.Header.SenderHandle[0] ^= 0xFF
 			return &copy
 		}},
-		{name: "a class M1-6 has not ruled", make: func() *message.Record {
+		{name: "another class, whose sender ladder this session tracks no ratchet on", make: func() *message.Record {
 			copy := *record
 			copy.Header.RetentionClass = message.RetentionPermanent
 			return &copy

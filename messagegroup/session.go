@@ -128,6 +128,9 @@ type GroupSession struct {
 	// this one cannot be re-derived at all, so the drop is the whole of what stops epoch n's
 	// ephemeral ladder being used to seal an epoch n+1 record -- a record no other member could
 	// open, and one whose key would outlive the epoch that promised to destroy it.
+	//
+	// No document declares this field or the door that fills it: ledger open item 188, filed
+	// 2026-09-13 and not ruled.
 	ephRoot []byte
 
 	// one sender ladder per (retention class wire byte, eph window), and one table of the
@@ -149,6 +152,10 @@ type GroupSession struct {
 //
 // For every class but EPH the window is zero on every record -- master section 8's presence rule
 // -- so this key collapses to the wire byte for them with no special case anywhere.
+//
+// No document declares this key's shape either: ledger open item 188, filed 2026-09-13 and not
+// ruled, names it beside InstallEphRoot as one of the four symbols the seal lift needed and the
+// corpus does not have.
 type senderLadderKey struct {
 	RetentionWire byte
 	EphWindow     uint64
@@ -518,6 +525,13 @@ func (self *GroupSession) RebindServerNonce(serverNonce []byte) error {
 // number read off a record header: NewReceiverRatchet walks one expansion per index below it, so
 // a peer that could choose this number could choose how much work this session does. The walk is
 // bounded by maxLadderWalk in any case, which is the second half of the same argument.
+//
+// ephWindow IS THIS PACKAGE'S OWN PARAMETER AND NO SPECIFICATION PUBLISHES A PARAMETER LIST FOR
+// THIS METHOD AT ALL. A ladder is identified by the class key it is rooted at, and for an EPH class
+// that key is a function of the window, so a receiver naming a ladder has to name the window too.
+// Measured against the corpus: no file under docs/specs names TrackSender, m1's plan writes it with
+// its parameters elided, and the one document that spelled a list -- a PLAN, not a spec -- had four
+// where this has five. That is ledger open item 188, filed 2026-09-13 and not ruled.
 func (self *GroupSession) TrackSender(leaf uint32, class message.RetentionClass, ephBucket uint8,
 	ephWindow uint64, headIndex uint64) error {
 
@@ -589,6 +603,17 @@ func (self *GroupSession) trackSenderOnLoop(leaf uint32, class message.Retention
 //
 // The value is COPIED, because the caller drew it and may erase its own array, and the copy is
 // what this session erases at the drop.
+//
+// NO DOCUMENT OF THE CORPUS DECLARES THIS METHOD, and that is recorded here rather than left for
+// a second implementer to discover. Spec A section 5.2 publishes GroupSession's method block and
+// there is no installer in it; section 5.11's device wrap is the carrier the corpus does name and
+// it does not exist in any tree. The seal lift of 2026-09-13 is unimplementable without a channel,
+// so this package built the smallest one and says so: it is ledger open item 188, FILED 2026-09-13
+// and NOT RULED, and it names three siblings with this method -- the ephRoot field this fills,
+// senderLadderKey's window, and TrackSender's ephWindow parameter, each of which says so where it
+// is declared. RebindServerNonce is the precedent and the
+// judgement is the same. If a ruling publishes an installer, this name moves to whatever that
+// document calls it.
 //
 // The noinline directive is this package's erase helper class, reached through the zeroize
 // below: that store lands in an array this call is not the only holder of.

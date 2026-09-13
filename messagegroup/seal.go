@@ -113,7 +113,7 @@ import (
 // value -- but its key lifetime is pinned to this reading rather than to the sent_at inside it.
 // Section 5.2 fixes this signature with no sent_at parameter in it, so closing that gap is a
 // signature change to a published block rather than something this file may do; it is recorded
-// here and in this package's OPENITEMS.md rather than papered over.
+// here and as open item MG-2 in this package's OPENITEMS.md rather than papered over.
 func (self *GroupSession) SealRecord(class message.RetentionClass, ephBucket uint8, isCommit bool,
 	headPlain []byte, bodyPlain []byte, expireAt uint64,
 	serverAttachment *message.ServerAttachment) (*message.Record, error) {
