@@ -7,12 +7,27 @@
 // character; the two agree, and the block below is theirs:
 //
 //	aad_body = "URmessage/v1/aad/body" ‖ u16(alg_id) ‖ LP(group_id) ‖ LP(sender_handle)
-//	         ‖ u64(epoch) ‖ u64(stream_index) ‖ u8(retention_class)
+//	         ‖ u64(epoch) ‖ u64(stream_index) ‖ u8(retention_class) ‖ u64(eph_window)
 //
 //	aad_head = "URmessage/v1/aad/head" ‖ u16(alg_id) ‖ LP(group_id) ‖ LP(sender_handle)
 //	         ‖ u64(epoch) ‖ u64(stream_index) ‖ u8(is_commit) ‖ u8(retention_class)
-//	         ‖ u8(size_bucket) ‖ u64(expire_at) ‖ LP(body_hash) ‖ LP(blob_id)
-//	         ‖ LP(H(server_attachment))
+//	         ‖ u64(eph_window) ‖ u8(size_bucket) ‖ u64(expire_at) ‖ LP(body_hash)
+//	         ‖ LP(blob_id) ‖ LP(H(server_attachment))
+//
+// u64(eph_window) was added to both blocks on 2026-09-13 (ledger 152 / 183, m1 open item
+// M1-27), immediately after u8(retention_class) in each, which is the field it qualifies.
+// It is UNCONDITIONAL and eight octets wide on every record of every class: master
+// section 8's presence rule is a zero VALUE off eph 1..5 and never a zero LENGTH, for the
+// reason LP(blob_id) is written on every record that has no blob — a conditional here is
+// the one thing the preimage builders in this package have never had.
+//
+// What the aad terms buy is NOT the window's integrity, and a reader who concludes it is
+// will draw the wrong boundary around the next change. The KEY DERIVATION is what stops a
+// window or bucket downgrade: K_eph[n][b][t] takes both, so an altered window yields a key
+// nobody holds. The write_auth term is what makes the SERVER's plus or minus one window
+// check a check on macd bytes. These two terms cost no wire octets and bind the ZERO on a
+// non eph record, so a header cannot be spliced across classes — which is the whole of
+// what they are for.
 //
 // Six things about that block are easy to get wrong, and each is worth its own paragraph,
 // because every one of them produces a preimage that encodes, that round trips against
@@ -131,6 +146,11 @@ type BodyBinding struct {
 	// for the preimage by the one function in the system that joins them.
 	RetentionClass RetentionClass
 	EphBucket      uint8
+	// t, the eph ladder's time slice, plaintext on the wire and covered here. It is in
+	// aad_body as well as aad_head because binding the ZERO a non eph record carries is
+	// what stops a body being spliced onto a header of another class, and because the
+	// body is the half whose key the window selects.
+	EphWindow uint64
 }
 
 // BodyBinding projects the six fields aad_body covers out of a full record header.
@@ -147,6 +167,7 @@ func (self *RecordHeader) BodyBinding() BodyBinding {
 		StreamIndex:    self.StreamIndex,
 		RetentionClass: self.RetentionClass,
 		EphBucket:      self.EphBucket,
+		EphWindow:      self.EphWindow,
 	}
 }
 
@@ -174,6 +195,10 @@ func AADBody(algId uint16, binding BodyBinding) ([]byte, error) {
 	writer.WriteUint64(binding.Epoch)
 	writer.WriteUint64(binding.StreamIndex)
 	writer.WriteUint8(retentionWire)
+	// unconditional on every class, and a non eph record writes eight zero octets. Master
+	// section 8 forbids the conditional a reader's instinct puts here; the file comment
+	// says what the conditional costs.
+	writer.WriteUint64(binding.EphWindow)
 	// the writer is sticky: the first failure latches and every later call is a no op, so
 	// this is the one place the build is asked whether it worked.
 	return writer.Bytes()
@@ -232,6 +257,8 @@ func AADHead(algId uint16, h *RecordHeader, serverAttachment []byte) ([]byte, er
 	writer.WriteUint64(h.StreamIndex)
 	writer.WriteUint8(isCommitByte(h.IsCommit))
 	writer.WriteUint8(retentionWire)
+	// unconditional, as in aad_body and for the same reason.
+	writer.WriteUint64(h.EphWindow)
 	writer.WriteUint8(byte(h.SizeBucket))
 	writer.WriteUint64(h.ExpireAt)
 	writer.WriteOpaqueLP(h.BodyHash[:])

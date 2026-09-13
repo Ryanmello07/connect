@@ -80,7 +80,24 @@ type RecordHeader struct {
 	// Meaningful only when the class is eph, and required to be zero otherwise: the
 	// join refuses to encode a non eph class that carries a bucket, so a stray value
 	// here is a refusal rather than a field that is silently dropped.
-	EphBucket  uint8
+	EphBucket uint8
+	// t, the time slice of this record's own K_eph[n][b][t] (master section 8.1).
+	// PLAINTEXT and on the wire, unlike every other key input in the system.
+	//
+	// ALWAYS ENCODED. Zero on permanent, durable, media and eph bucket 0, non zero on
+	// eph buckets 1 through 5 — the presence rule of master section 8, which follows
+	// blob_id's precedent in substance and rejects it on its surface: a fixed width
+	// field's analogue of a zero length term is a zero VALUED term, so no preimage
+	// builder gains a conditional for it and every record carries the eight octets.
+	//
+	// THE SENDER COMPUTES IT, ONCE, as floor(sent_at_ms / (EphBucketSeconds(b) * 1000))
+	// for b in 1..5, origin the unix epoch, off the same wall clock reading it puts in
+	// sent_at. AN OPENER TAKES THIS VALUE AND NEVER RECOMPUTES IT: a window derived from
+	// the opener's own clock would differ from the sender's on every record that crossed
+	// a boundary, and the aead would be the only thing that said so. Ruled 2026-09-13
+	// (ledger 152 / 183, m1 open item M1-27), which is also why the format version is
+	// 0x02 — this field is an ADDITION to a wire format master section 14 froze.
+	EphWindow  uint64
 	SizeBucket SizeBucket
 	// Unix milliseconds, 0 = unset. An advisory upper bound only: it may shorten
 	// retention, never extend it.

@@ -6,13 +6,14 @@
 // EncodeRecord produced it and ParseRecord reads it. The layout is therefore internal to
 // this package, and it is defined here. In encode order:
 //
-//	u8       format_version = 0x01
+//	u8       format_version = 0x02
 //	raw[32]  group_id
 //	raw[16]  sender_handle
 //	u64      epoch
 //	u64      stream_index
 //	u8       is_commit              0 or 1 only; any other value is a decode error
 //	u8       retention_class_wire   the joined byte of master section 8's table
+//	u64      eph_window             t, the eph ladder's time slice; always written
 //	u8       size_bucket
 //	u64      expire_at              unix milliseconds, 0 = unset
 //	raw[32]  body_hash
@@ -21,6 +22,18 @@
 //	LP       ct_head
 //	LP       ct_body                empty, or exactly SizeBucketCtBodyBytes(size_bucket)
 //	raw[32]  write_auth
+//
+// Sixteen elements: master section 8's fifteen RECORD fields, which is every line of that
+// block except record_id, and the format version in front of them. The count is a
+// consequence of the block rather than a number to keep in step with it — section 8 says
+// so in as many words, and says that a reader who counts the block is the check.
+//
+// eph_window sits immediately after retention_class_wire because it is the field that
+// qualifies it, and because master section 8's RECORD listing is normative in its ORDER
+// and this table follows it. Owner decision 60 is the only normative statement of the
+// octet ENCODING, and its amendment of 2026-09-13 states this position and this version
+// bump. It is ALWAYS written, at its full u64 width, on every class: the presence rule is
+// zero VALUED and never zero LENGTH, so no branch here and none in any preimage builder.
 //
 // The rule that generated the table, which is what the next person adding a field needs
 // rather than the table itself: a field whose width is fixed by its go type encodes raw
@@ -75,7 +88,28 @@ import (
 // the rest of the validation at the end: every offset below it is only meaningful under
 // this version, so a v2 record parsed as a v1 record would report whichever field
 // happened to land somewhere illegal instead of the one thing actually wrong with it.
-const recordFormatVersion uint8 = 0x01
+//
+// IT WAS 0x01 UNTIL 2026-09-13 AND THE FIELD THAT MOVED IT IS eph_window. Master section
+// 14 froze this wire format before slice 2, slice 2 is this package and it has shipped,
+// and the owner reopened the freeze deliberately rather than absorbing it; master section
+// 0's ninth amendment carries what that cost. So the version is not decoration. A v1
+// record has eight fewer octets and carries a DIFFERENT FIELD AT EVERY OFFSET PAST
+// retention_class_wire, and a parser that accepted 0x01 and defaulted the window to zero
+// would read size_bucket out of the first octet of expire_at and call the result a
+// record. That silent zero is the failure this constant refuses; the refusal is the
+// version check below and nothing else stands in for it.
+//
+// Whether 0x01 should instead be TOLERATED on the read path for one release is ledger
+// item 182 and is the owner's, filed and not ruled. Refusal is what master section 0
+// assumes and is the safe half of that question, so refusal is what is implemented; it is
+// also the half a later ruling can widen without invalidating anything already written.
+const recordFormatVersion uint8 = 0x02
+
+// The version this one replaced, carried so the refusal can say WHICH old record it met
+// rather than only that the octet was wrong. Nothing encodes it and nothing parses it;
+// master section 0's "nothing already encoded is migrated, because nothing already
+// encoded is retained" is why there is no read path for it at all.
+const recordFormatVersionSuperseded uint8 = 0x01
 
 // The blob id's exact length, from master section 8 and spec A section 5.1. It is the
 // one fixed width field that is a slice rather than an array in go — it is absent on
@@ -112,6 +146,7 @@ func EncodeRecord(r *Record) ([]byte, error) {
 	writer.WriteUint64(header.StreamIndex)
 	writer.WriteUint8(isCommitByte(header.IsCommit))
 	writer.WriteUint8(retentionWire)
+	writer.WriteUint64(header.EphWindow)
 	writer.WriteUint8(byte(header.SizeBucket))
 	writer.WriteUint64(header.ExpireAt)
 	writer.WriteRaw(header.BodyHash[:])
@@ -178,6 +213,10 @@ func decodeRecord(bs []byte) (*Record, error) {
 		return nil, err
 	}
 	if version != recordFormatVersion {
+		if version == recordFormatVersionSuperseded {
+			return nil, fmt.Errorf("%w: 0x%02x carries no eph_window and puts a different field at every offset past retention_class, want 0x%02x",
+				ErrRecordFormatVersion, version, recordFormatVersion)
+		}
 		return nil, fmt.Errorf("%w: 0x%02x, want 0x%02x", ErrRecordFormatVersion, version, recordFormatVersion)
 	}
 
@@ -190,6 +229,7 @@ func decodeRecord(bs []byte) (*Record, error) {
 	header.StreamIndex, _ = reader.ReadUint64()
 	isCommit, _ := reader.ReadUint8()
 	retentionWire, _ := reader.ReadUint8()
+	header.EphWindow, _ = reader.ReadUint64()
 	sizeBucket, _ := reader.ReadUint8()
 	header.ExpireAt, _ = reader.ReadUint64()
 	bodyHash, _ := reader.ReadRaw(len(header.BodyHash))

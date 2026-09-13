@@ -190,13 +190,22 @@ func (self *GroupSession) newRecordBuilderOnLoop(class message.RetentionClass, e
 		recordKey: recordKey,
 		bucket:    bucket,
 		header: message.RecordHeader{
-			GroupId:          self.groupId,
-			SenderHandle:     self.senderHandle,
-			Epoch:            self.epoch,
-			StreamIndex:      streamIndex,
-			IsCommit:         isCommit,
-			RetentionClass:   class,
-			EphBucket:        ephBucket,
+			GroupId:        self.groupId,
+			SenderHandle:   self.senderHandle,
+			Epoch:          self.epoch,
+			StreamIndex:    streamIndex,
+			IsCommit:       isCommit,
+			RetentionClass: class,
+			EphBucket:      ephBucket,
+			// MASTER section 8's presence rule, and it is written out rather than left to
+			// the zero value because the zero is only CORRECT for the classes this
+			// function is allowed to seal. eph_window is floor(sent_at_ms / (bucket
+			// seconds * 1000)) on eph 1..5 and zero everywhere else; the class refusal
+			// above admits durable alone, so zero is this record's window. The day the
+			// refusal lifts for eph, this line is the one that has to take a computed
+			// window and a clock the caller supplies -- and it is a line, not an absence,
+			// so it is reachable by reading the function that builds the header.
+			EphWindow:        0,
 			SizeBucket:       bucket,
 			ExpireAt:         expireAt,
 			ServerAttachment: attachmentBytes,

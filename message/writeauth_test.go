@@ -238,6 +238,7 @@ func writeAuthKatEphInput() writeAuthInput {
 		IsCommit:         true,
 		RetentionClass:   RetentionEph,
 		EphBucket:        5,
+		EphWindow:        pinnedEphWindow,
 		SizeBucket:       SizeBucketBlob,
 		ExpireAt:         0x0000018F5CD3A600,
 		BlobId:           aadRamp(0xd0, 32),
@@ -264,7 +265,10 @@ func writeAuthKatOrdinaryInput() writeAuthInput {
 		StreamIndex:    0xFFFFFFFFFFFFFFFF,
 		IsCommit:       false,
 		RetentionClass: RetentionDurable,
-		SizeBucket:     SizeBucket256,
+		// the presence rule's zero half: written whole, at full width, on a class that has
+		// no window of its own
+		EphWindow:  0,
+		SizeBucket: SizeBucket256,
 	}
 	copy(header.GroupId[:], aadRamp(0x21, 32))
 	copy(header.SenderHandle[:], aadRamp(0x80, 16))
@@ -294,6 +298,7 @@ func TestWriteAuthPreimageIsPinnedToItsExactBytes(t *testing.T) {
 		"00000000ffffffff" + // u64(stream_index)
 		"01" + // u8(is_commit): set
 		"15" + // u8(retention_class): eph bucket 5, the joined byte and not the go tag 3
+		"00000000000002c5" + // u64(eph_window): 709, immediately after the class it qualifies
 		"05" + // u8(size_bucket): the blob rung
 		"0000018f5cd3a600" + // u64(expire_at): unix milliseconds
 		"00000020" + "4f2a647f68974755b85ecf83f409dac55f94d5446953429f2fb2e37194d71612" + // LP(H(ct_head)), 96 octets in
@@ -301,7 +306,7 @@ func TestWriteAuthPreimageIsPinnedToItsExactBytes(t *testing.T) {
 		"00000020" + "d0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeef" + // LP(blob_id)
 		"00000020" + "5f78c33274e43fa9de5659265c1d917e25c03722dcb0b8d27db8d5feaa813953" // LP(H(de ad be ef))
 
-	const wantEphLength = 18 + 36 + 36 + 20 + 8 + 8 + 1 + 1 + 1 + 8 + 36 + 36 + 36 + 36
+	const wantEphLength = 18 + 36 + 36 + 20 + 8 + 8 + 1 + 1 + 8 + 1 + 8 + 36 + 36 + 36 + 36
 
 	const wantOrdinary = "55526d6573736167652f76312f7772697465" + // the same label
 		"00000008" + "3031323334353637" + // LP(server_nonce): eight octets, and the prefix says so
@@ -311,6 +316,7 @@ func TestWriteAuthPreimageIsPinnedToItsExactBytes(t *testing.T) {
 		"ffffffffffffffff" + // u64(stream_index): the top of the range
 		"00" + // u8(is_commit): clear
 		"01" + // u8(retention_class): durable, a class that carries no bucket
+		"0000000000000000" + // u64(eph_window): the zero a non eph record carries, written whole
 		"00" + // u8(size_bucket): the 256 B rung
 		"0000000000000000" + // u64(expire_at): unset
 		"00000020" + "65ab12a8ff3263fbc257e5ddf0aa563c64573d0bab1f1115b9b107834cfa6971" + // LP(H(ca fe ba be))
@@ -318,7 +324,7 @@ func TestWriteAuthPreimageIsPinnedToItsExactBytes(t *testing.T) {
 		"00000000" + // LP(blob_id): absent, and still four octets
 		"00000020" + "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" // LP(H("")), the absent attachment
 
-	const wantOrdinaryLength = 18 + 12 + 36 + 20 + 8 + 8 + 1 + 1 + 1 + 8 + 36 + 36 + 4 + 36
+	const wantOrdinaryLength = 18 + 12 + 36 + 20 + 8 + 8 + 1 + 1 + 8 + 1 + 8 + 36 + 36 + 4 + 36
 
 	for _, vector := range []struct {
 		name   string
@@ -351,7 +357,7 @@ func TestWriteAuthPreimageIsPinnedToItsExactBytes(t *testing.T) {
 }
 
 // The tags themselves, pinned. HMAC-SHA-256 of the two preimages above under the write key of
-// the storage root 00 01 … 1f, computed with openssl.
+// the storage root 00 01 … 1f, computed outside this module.
 //
 //	write_key  = 9902690f…1a4738b9, the vector pinned further up
 //	write_auth = HMAC-SHA-256(write_key, the preimage the vector above pins)
@@ -360,9 +366,16 @@ func TestWriteAuthPreimageIsPinnedToItsExactBytes(t *testing.T) {
 // bytes are right; this says the mac is HMAC-SHA-256 over exactly those bytes under exactly
 // that key, taken whole rather than truncated, and it is the value a second implementation
 // checks itself against without reading any of this package.
+// Both moved on 2026-09-13 and the reason is worth a line, because a moved KAT is the shape
+// a retuned fixture takes. eph_window added eight octets to every preimage, so every tag over
+// one changes; the OLD values are not wrong about the old preimage and they are not what this
+// package computes any more. They were recomputed the way the originals were -- HMAC-SHA-256
+// of the hand built preimage hexadecimal above, under the write key the vector further up
+// pins, by a program that imports nothing from this module -- and not by printing what
+// ComputeWriteAuth answered.
 const (
-	writeAuthKatEphTagHex      = "23b4d42f3a3886b3a5779067e1ef9be103bee7c8f40a1eb3de81b1877a8c70f1"
-	writeAuthKatOrdinaryTagHex = "69554354a4c482577cdec47fd4bbc5d6dfca667e95aa082a96abacbfe545099e"
+	writeAuthKatEphTagHex      = "2bb60432d54b16ef555e709156551a0bccfc69a113d46625a774a7a28606dc9f"
+	writeAuthKatOrdinaryTagHex = "06b5f63d5c89015115920c6455b0358c54b5257d2e01302551edb8bc24774f0f"
 )
 
 func TestWriteAuthTagIsPinnedToItsExactBytes(t *testing.T) {
@@ -573,6 +586,7 @@ var writeAuthMutators = map[string]func(*writeAuthInput){
 		in.header.EphBucket = 0
 	},
 	"EphBucket":        func(in *writeAuthInput) { in.header.EphBucket++ },
+	"EphWindow":        func(in *writeAuthInput) { in.header.EphWindow++ },
 	"SizeBucket":       func(in *writeAuthInput) { in.header.SizeBucket = SizeBucket1K },
 	"ExpireAt":         func(in *writeAuthInput) { in.header.ExpireAt = 0x0000018F5CD3A600 },
 	"BodyHash":         func(in *writeAuthInput) { in.header.BodyHash[0] ^= 0xFF },

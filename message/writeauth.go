@@ -8,8 +8,9 @@
 //
 //	write_auth = MAC(write_key, "URmessage/v1/write" ‖ LP(server_nonce) ‖ LP(group_id)
 //	           ‖ LP(sender_handle) ‖ u64(epoch) ‖ u64(stream_index) ‖ u8(is_commit)
-//	           ‖ u8(retention_class) ‖ u8(size_bucket) ‖ u64(expire_at)
-//	           ‖ LP(H(ct_head)) ‖ LP(body_hash) ‖ LP(blob_id) ‖ LP(H(server_attachment)))
+//	           ‖ u8(retention_class) ‖ u64(eph_window) ‖ u8(size_bucket)
+//	           ‖ u64(expire_at) ‖ LP(H(ct_head)) ‖ LP(body_hash) ‖ LP(blob_id)
+//	           ‖ LP(H(server_attachment)))
 //
 //	req_auth   = MAC(read_key, "URmessage/v1/req" ‖ LP(server_nonce) ‖ u8(op)
 //	           ‖ LP(request_bytes))
@@ -26,6 +27,16 @@
 // zero octets; and LP(H(server_attachment)) is the hash of the attachment with no carve out
 // for the absent case, so an ordinary record contributes LP(SHA-256("")) and not an empty
 // field.
+//
+// u64(eph_window) was added on 2026-09-13 (ledger 152 / 183, m1 open item M1-27),
+// immediately after u8(retention_class), the field it qualifies, and unconditional at its
+// full width on every class exactly as in both aads. THIS IS THE LOAD BEARING ONE OF THE
+// THREE PLACEMENTS, and the reason is master invariant I6: the SERVER ACTS ON THIS FIELD.
+// Spec B section 5.1 check 3 and section 7.1 refuse an eph 1..5 record whose window is
+// more than one window from the window its own arrival stamp falls in, and the term here
+// is the whole of what makes that a check on a value the mac covers rather than on a field
+// anyone in the path may rewrite. The aad terms are defence in depth and the key
+// derivation is what stops a downgrade; neither substitutes for this one.
 //
 // Five things are this file's own.
 //
@@ -273,6 +284,9 @@ func writeAuthPreimage(serverNonce []byte, h *RecordHeader, ctHead []byte, serve
 	writer.WriteUint64(h.StreamIndex)
 	writer.WriteUint8(isCommitByte(h.IsCommit))
 	writer.WriteUint8(retentionWire)
+	// unconditional on every class, and a non eph record writes eight zero octets, for the
+	// reason LP(blob_id) below is written on a record that has no blob.
+	writer.WriteUint64(h.EphWindow)
 	writer.WriteUint8(byte(h.SizeBucket))
 	writer.WriteUint64(h.ExpireAt)
 	writer.WriteOpaqueLP(ctHeadHash[:])

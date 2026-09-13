@@ -95,6 +95,7 @@ func aadKatEphHeader() RecordHeader {
 		IsCommit:         true,
 		RetentionClass:   RetentionEph,
 		EphBucket:        5,
+		EphWindow:        pinnedEphWindow,
 		SizeBucket:       SizeBucketBlob,
 		ExpireAt:         0x0000018F5CD3A600,
 		BlobId:           aadRamp(0xd0, 32),
@@ -117,7 +118,10 @@ func aadKatOrdinaryHeader() RecordHeader {
 		StreamIndex:    0xFFFFFFFFFFFFFFFF,
 		IsCommit:       false,
 		RetentionClass: RetentionDurable,
-		SizeBucket:     SizeBucket256,
+		// the presence rule's zero: a durable record carries the field and carries it as
+		// eight zero octets, which is what the vectors below pin
+		EphWindow:  0,
+		SizeBucket: SizeBucket256,
 	}
 	copy(header.GroupId[:], aadRamp(0x21, 32))
 	copy(header.SenderHandle[:], aadRamp(0x80, 16))
@@ -143,7 +147,8 @@ func TestAADBodyIsPinnedToItsExactBytes(t *testing.T) {
 		"00000010" + "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf" + // LP(sender_handle)
 		"0000000000000001" + // u64(epoch)
 		"00000000ffffffff" + // u64(stream_index)
-		"15" // u8(retention_class): eph bucket 5, the joined byte and not the go tag 3
+		"15" + // u8(retention_class): eph bucket 5, the joined byte and not the go tag 3
+		"00000000000002c5" // u64(eph_window): 709, straight after the class it qualifies
 
 	const wantOrdinary = "55526d6573736167652f76312f6161642f626f6479" + // the same label
 		"0021" + // u16(alg_id)
@@ -151,11 +156,13 @@ func TestAADBodyIsPinnedToItsExactBytes(t *testing.T) {
 		"00000010" + "808182838485868788898a8b8c8d8e8f" + // LP(sender_handle)
 		"0000000100000000" + // u64(epoch): the first value that does not fit in 32 bits
 		"ffffffffffffffff" + // u64(stream_index): the top of the range
-		"01" // u8(retention_class): durable, a class that carries no bucket
+		"01" + // u8(retention_class): durable, a class that carries no bucket
+		"0000000000000000" // u64(eph_window): the ZERO a non eph record carries, and still eight octets
 
 	// twenty one label octets, two for alg_id, thirty six and twenty for the two length
-	// prefixed handles, sixteen for the two counters and one for the class
-	const wantLength = 21 + 2 + 36 + 20 + 8 + 8 + 1
+	// prefixed handles, sixteen for the two counters, one for the class and eight for the
+	// window it qualifies
+	const wantLength = 21 + 2 + 36 + 20 + 8 + 8 + 1 + 8
 
 	for _, vector := range []struct {
 		name   string
@@ -192,13 +199,14 @@ func TestAADHeadIsPinnedToItsExactBytes(t *testing.T) {
 		"00000000ffffffff" + // u64(stream_index)
 		"01" + // u8(is_commit)
 		"15" + // u8(retention_class): eph bucket 5
+		"00000000000002c5" + // u64(eph_window): 709
 		"05" + // u8(size_bucket): the blob rung
 		"0000018f5cd3a600" + // u64(expire_at): unix milliseconds
 		"00000020" + "b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecf" + // LP(body_hash)
 		"00000020" + "d0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeef" + // LP(blob_id)
 		"00000020" + "5f78c33274e43fa9de5659265c1d917e25c03722dcb0b8d27db8d5feaa813953" // LP(H(de ad be ef))
 
-	const wantLength = 21 + 2 + 36 + 20 + 8 + 8 + 1 + 1 + 1 + 8 + 36 + 36 + 36
+	const wantLength = 21 + 2 + 36 + 20 + 8 + 8 + 1 + 1 + 8 + 1 + 8 + 36 + 36 + 36
 	if len(want) != 2*wantLength {
 		t.Fatalf("the vector is %d bytes and the block adds up to %d", len(want)/2, wantLength)
 	}
@@ -236,13 +244,14 @@ func TestAnAbsentAttachmentHashesTheEmptyStringAndAnAbsentBlobIdIsStillWritten(t
 		"ffffffffffffffff" + // u64(stream_index)
 		"00" + // u8(is_commit): clear
 		"01" + // u8(retention_class): durable
+		"0000000000000000" + // u64(eph_window): the zero of a non eph record, written whole
 		"00" + // u8(size_bucket): the 256 B rung
 		"0000000000000000" + // u64(expire_at): unset
 		"00000020" + "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f" + // LP(body_hash)
 		"00000000" + // LP(blob_id): absent, and still four octets
 		"00000020" + "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" // LP(SHA-256(""))
 
-	const wantLength = 21 + 2 + 36 + 20 + 8 + 8 + 1 + 1 + 1 + 8 + 36 + 4 + 36
+	const wantLength = 21 + 2 + 36 + 20 + 8 + 8 + 1 + 1 + 8 + 1 + 8 + 36 + 4 + 36
 	if len(want) != 2*wantLength {
 		t.Fatalf("the vector is %d bytes and the block adds up to %d", len(want)/2, wantLength)
 	}
@@ -339,13 +348,14 @@ func TestAADHeadHashesTheWholeOfARealisticAttachment(t *testing.T) {
 		"0000000000000003" + // u64(stream_index)
 		"01" + // u8(is_commit): set, the only record kind that carries an EpochAttachment
 		"01" + // u8(retention_class): durable
+		"0000000000000000" + // u64(eph_window): a commit is durable, so the field is zero and still written
 		"02" + // u8(size_bucket): the 4 KiB rung, the third rung any vector here pins
 		"0000000000000000" + // u64(expire_at): unset
 		"00000020" + "606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f" + // LP(body_hash)
 		"00000000" + // LP(blob_id): absent off the blob rung, and still four octets
 		"00000020" + "e929aff882de8ed3c8aa90dd6bba457e3d22fb0b725909f19afc2c596d3b1ea5" // LP(H(the 136 octet attachment))
 
-	const wantLength = 21 + 2 + 36 + 20 + 8 + 8 + 1 + 1 + 1 + 8 + 36 + 4 + 36
+	const wantLength = 21 + 2 + 36 + 20 + 8 + 8 + 1 + 1 + 8 + 1 + 8 + 36 + 4 + 36
 	if len(want) != 2*wantLength {
 		t.Fatalf("the vector is %d octets and the block adds up to %d", len(want)/2, wantLength)
 	}
@@ -464,8 +474,14 @@ func aadBaseInput() aadInput {
 		IsCommit:       false,
 		RetentionClass: RetentionEph,
 		EphBucket:      2,
-		SizeBucket:     SizeBucket256,
-		ExpireAt:       0,
+		// a window the wire can carry, non zero so that its own mutation below is a real
+		// change and so that the zero is the OTHER vector's job. The builders validate no
+		// field, so this window not belonging to bucket 2 costs nothing here -- and it is
+		// the one literal the vectors' 00000000000002c5 is the hexadecimal of, held to the
+		// ruling's arithmetic in codec_test.go rather than to anything in this file
+		EphWindow:  pinnedEphWindow,
+		SizeBucket: SizeBucket256,
+		ExpireAt:   0,
 	}
 	copy(header.GroupId[:], aadRamp(0x01, 32))
 	copy(header.SenderHandle[:], aadRamp(0xa0, 16))
@@ -506,6 +522,7 @@ var aadHeaderMutators = map[string]func(*aadInput){
 		in.header.EphBucket = 0
 	},
 	"EphBucket":  func(in *aadInput) { in.header.EphBucket++ },
+	"EphWindow":  func(in *aadInput) { in.header.EphWindow++ },
 	"SizeBucket": func(in *aadInput) { in.header.SizeBucket = SizeBucket1K },
 	"ExpireAt":   func(in *aadInput) { in.header.ExpireAt = 0x0000018F5CD3A600 },
 	"BodyHash":   func(in *aadInput) { in.header.BodyHash[0] ^= 0xFF },
@@ -899,6 +916,7 @@ func aadHeadReadBack(t testing.TB, what string, preimage []byte, algId uint16, h
 	streamIndex, _ := reader.ReadUint64()
 	isCommit, _ := reader.ReadUint8()
 	retentionWire, _ := reader.ReadUint8()
+	ephWindow, _ := reader.ReadUint64()
 	sizeBucket, _ := reader.ReadUint8()
 	expireAt, _ := reader.ReadUint64()
 	bodyHash, _ := reader.ReadOpaqueLP()
@@ -935,6 +953,7 @@ func aadHeadReadBack(t testing.TB, what string, preimage []byte, algId uint16, h
 		{name: "stream_index", got: streamIndex, want: h.StreamIndex},
 		{name: "is_commit", got: isCommit, want: isCommitByte(h.IsCommit)},
 		{name: "retention_class", got: retentionWire, want: wantRetentionWire},
+		{name: "eph_window", got: ephWindow, want: h.EphWindow},
 		{name: "size_bucket", got: sizeBucket, want: byte(h.SizeBucket)},
 		{name: "expire_at", got: expireAt, want: h.ExpireAt},
 		{name: "body_hash", got: hex.EncodeToString(bodyHash), want: hex.EncodeToString(h.BodyHash[:])},
@@ -958,6 +977,7 @@ func aadBodyReadBack(t testing.TB, what string, preimage []byte, algId uint16, b
 	epoch, _ := reader.ReadUint64()
 	streamIndex, _ := reader.ReadUint64()
 	retentionWire, _ := reader.ReadUint8()
+	ephWindow, _ := reader.ReadUint64()
 	if err := reader.Done(); err != nil {
 		t.Errorf("%s: aad_body does not read back as master section 8's block: %v", what, err)
 		return
@@ -978,6 +998,7 @@ func aadBodyReadBack(t testing.TB, what string, preimage []byte, algId uint16, b
 		{name: "epoch", got: epoch, want: binding.Epoch},
 		{name: "stream_index", got: streamIndex, want: binding.StreamIndex},
 		{name: "retention_class", got: retentionWire, want: wantRetentionWire},
+		{name: "eph_window", got: ephWindow, want: binding.EphWindow},
 	} {
 		if field.got != field.want {
 			t.Errorf("%s: aad_body reads back %s as %v, want %v", what, field.name, field.got, field.want)

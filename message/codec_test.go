@@ -72,7 +72,7 @@ import (
 // The offset the first length prefixed field begins at: the sum of the fixed width
 // fields at the top of codec.go's table, written as that sum so a reader can check it
 // against the table term by term rather than against a number.
-const recordFixedRegionBytes = 1 + 32 + 16 + 8 + 8 + 1 + 1 + 1 + 8 + 32
+const recordFixedRegionBytes = 1 + 32 + 16 + 8 + 8 + 1 + 1 + 8 + 1 + 8 + 32
 
 // The four length prefixes of a record whose four variable fields are all empty, and that
 // plus the trailing mac, which is everything after the fixed region on such a record.
@@ -97,6 +97,7 @@ type rawRecord struct {
 	streamIndex      uint64
 	isCommit         uint8
 	retentionWire    uint8
+	ephWindow        uint64
 	sizeBucket       uint8
 	expireAt         uint64
 	bodyHash         []byte
@@ -119,6 +120,7 @@ func (self rawRecord) encode(t testing.TB) []byte {
 	writer.WriteUint64(self.streamIndex)
 	writer.WriteUint8(self.isCommit)
 	writer.WriteUint8(self.retentionWire)
+	writer.WriteUint64(self.ephWindow)
 	writer.WriteUint8(self.sizeBucket)
 	writer.WriteUint64(self.expireAt)
 	writer.WriteRaw(self.bodyHash)
@@ -160,6 +162,7 @@ func rawRecordFields(r *Record, retentionWire byte) rawRecord {
 		streamIndex:      r.Header.StreamIndex,
 		isCommit:         isCommitByte(r.Header.IsCommit),
 		retentionWire:    retentionWire,
+		ephWindow:        r.Header.EphWindow,
 		sizeBucket:       byte(r.Header.SizeBucket),
 		expireAt:         r.Header.ExpireAt,
 		bodyHash:         r.Header.BodyHash[:],
@@ -322,11 +325,14 @@ func ctBodyFiller(n int) []byte {
 	return filler
 }
 
-// The three 64 bit fields, as one assignment.
+// The four 64 bit fields, as one assignment. eph_window joined them on 2026-09-13 and is
+// the reason there are four: it is a u64 in the fixed region like the other three, so a
+// swap between it and expire_at is exactly what the cross below exists to see.
 type u64Triple struct {
 	epoch       uint64
 	streamIndex uint64
 	expireAt    uint64
+	ephWindow   uint64
 }
 
 // The boundaries every 64 bit field is exercised over: zero, one, the last value that
@@ -337,7 +343,7 @@ func u64Boundaries() []uint64 {
 	return []uint64{0, 1, 0xFFFFFFFF, 0x100000000, 0xFFFFFFFFFFFFFFFF}
 }
 
-// The boundaries rotated across the three fields, which is the axis the main corpus
+// The boundaries rotated across the four fields, which is the axis the main corpus
 // crosses with everything else. Rotation rather than one value in all three, because
 // three fields holding the same number is three fields a swapped encode order round trips
 // through unharmed.
@@ -349,21 +355,24 @@ func u64Rotations() []u64Triple {
 			epoch:       boundaries[i],
 			streamIndex: boundaries[(i+1)%len(boundaries)],
 			expireAt:    boundaries[(i+2)%len(boundaries)],
+			ephWindow:   boundaries[(i+3)%len(boundaries)],
 		})
 	}
 	return rotations
 }
 
-// Every boundary against every boundary in all three fields. This is its own axis rather
-// than part of the main cross product because crossing 125 assignments with six rungs,
-// nine classes and four flags is a hundred thousand records and most of a minute for a
-// property that is about the three fields alone.
+// Every boundary against every boundary in all four fields. This is its own axis rather
+// than part of the main cross product because crossing 625 assignments with six rungs,
+// nine classes and four flags is half a million records for a property that is about the
+// four fields alone.
 func u64Crosses() []u64Triple {
 	crosses := []u64Triple{}
 	for _, epoch := range u64Boundaries() {
 		for _, streamIndex := range u64Boundaries() {
 			for _, expireAt := range u64Boundaries() {
-				crosses = append(crosses, u64Triple{epoch: epoch, streamIndex: streamIndex, expireAt: expireAt})
+				for _, ephWindow := range u64Boundaries() {
+					crosses = append(crosses, u64Triple{epoch: epoch, streamIndex: streamIndex, expireAt: expireAt, ephWindow: ephWindow})
+				}
 			}
 		}
 	}
@@ -417,7 +426,7 @@ func recordCorpus(t testing.TB) []corpusEntry {
 	// the three 64 bit fields fully crossed, on the smallest record the ladder admits.
 	smallest := sortedByteKeys(buckets)[0]
 	for _, triple := range u64Crosses() {
-		name := fmt.Sprintf("u64 epoch=%d stream=%d expire=%d", triple.epoch, triple.streamIndex, triple.expireAt)
+		name := fmt.Sprintf("u64 epoch=%d stream=%d expire=%d window=%d", triple.epoch, triple.streamIndex, triple.expireAt, triple.ephWindow)
 		entries = append(entries, corpusEntry{
 			name:   name,
 			record: corpusRecord(classes[probeRetentionWire], smallest, buckets[smallest], false, true, false, 0, triple),
@@ -447,6 +456,7 @@ func corpusRecord(
 			IsCommit:       isCommit,
 			RetentionClass: pair.class,
 			EphBucket:      pair.bucket,
+			EphWindow:      triple.ephWindow,
 			SizeBucket:     SizeBucket(sizeBucket),
 			ExpireAt:       triple.expireAt,
 		},
@@ -603,6 +613,8 @@ func headerDifference(left *RecordHeader, right *RecordHeader) string {
 		return "retention_class"
 	case left.EphBucket != right.EphBucket:
 		return "eph_bucket"
+	case left.EphWindow != right.EphWindow:
+		return "eph_window"
 	case left.SizeBucket != right.SizeBucket:
 		return "size_bucket"
 	case left.ExpireAt != right.ExpireAt:
@@ -716,19 +728,73 @@ func TestEncodedBytesAreTheLayoutTheTableStates(t *testing.T) {
 	}
 }
 
+// The instant the pinned eph vector's window is computed from, in unix milliseconds. It is
+// the same number that vector's expire_at carries -- 2024-05-09T10:08:45.568Z -- which is
+// convenient rather than meaningful: the two fields are independent, and what matters is
+// that the instant is written down so the window beside it can be recomputed rather than
+// copied.
+const pinnedEphSentAtMs uint64 = 0x0000018F5CD3A600
+
+// The window that instant falls in on the eph bucket 5 rung, written out as the number the
+// wire carries. TestThePinnedEphWindowIsTheRulingsArithmetic recomputes it from the ruling's
+// own formula and from record.go's ladder, so this literal is held against an arithmetic
+// statement rather than against the encoder that consumes it.
+const pinnedEphWindow uint64 = 709
+
+// The pinned window is what the 2026-09-13 ruling's formula answers, and not a number taken
+// off the encoder.
+//
+// THIS IS WHAT MAKES THE VECTOR EVIDENCE. A golden vector generated by the encoder it checks
+// proves nothing, and the two vectors below defend against that in two different ways: the
+// OCTET POSITIONS are defended by being written out by hand from owner decision 60's list,
+// field by field, with each line naming its field; the VALUE in the new field is defended
+// here, by recomputing it. floor(sent_at_ms / (eph_bucket_seconds[b] * 1000)) for b = 5 is
+// master section 8.1's own arithmetic, the seconds come from record.go's ladder rather than
+// from a 2419200 written down twice, and a ladder that moved would move this answer and fail
+// here rather than agreeing with a vector nobody can check.
+func TestThePinnedEphWindowIsTheRulingsArithmetic(t *testing.T) {
+	const bucket = 5
+	seconds := EphBucketSeconds(bucket)
+	if seconds <= 0 {
+		t.Fatalf("eph bucket %d answers %d seconds, so the window arithmetic below has no divisor", bucket, seconds)
+	}
+	want := pinnedEphSentAtMs / (uint64(seconds) * 1000)
+	if want != pinnedEphWindow {
+		t.Errorf("floor(%d / (%d * 1000)) is %d and the vector pins %d", pinnedEphSentAtMs, seconds, want, pinnedEphWindow)
+	}
+	// and the two neighbouring instants land in the two neighbouring windows, which is what
+	// says the divisor is the rung's and not some other number that happens to agree here
+	lower := uint64(seconds) * 1000 * pinnedEphWindow
+	if lower/(uint64(seconds)*1000) != pinnedEphWindow {
+		t.Errorf("the first millisecond of window %d does not fall in it", pinnedEphWindow)
+	}
+	if (lower-1)/(uint64(seconds)*1000) != pinnedEphWindow-1 {
+		t.Errorf("the millisecond before window %d falls in window %d, want %d",
+			pinnedEphWindow, (lower-1)/(uint64(seconds)*1000), pinnedEphWindow-1)
+	}
+}
+
 // One record, pinned to its exact bytes.
 //
 // The layout comparison above is written in this file beside the encoder, so a
 // permutation applied to both at once passes it. This is the anchor that does not move
 // with the code: a hexadecimal string, and the record it is the encoding of.
+//
+// The eph_window line is the one added on 2026-09-13. It sits between retention_class_wire
+// and size_bucket, which is owner decision 60's amended position, and it is eight octets
+// big endian -- 0x2c5 is 709 -- which is decision 60's generating rule applied to a u64: a
+// field whose width is fixed by its go type encodes raw at that width. A builder that wrote
+// it little endian produces c502000000000000 here, and one that wrote it after size_bucket
+// produces the same octets one position later; neither survives this string.
 func TestOneRecordIsPinnedToItsExactBytes(t *testing.T) {
-	const want = "01" + // format_version
+	const want = "02" + // format_version: 0x02 since the eph_window field was added, and 0x01 is refused
 		"0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20" + // group_id
 		"a0a1a2a3a4a5a6a7a8a9aaabacadaeaf" + // sender_handle
 		"0000000000000001" + // epoch
 		"00000000ffffffff" + // stream_index
 		"01" + // is_commit
 		"15" + // retention_class_wire: eph bucket 5
+		"00000000000002c5" + // eph_window: 709, big endian in eight octets, straight after the class
 		"05" + // size_bucket: the blob rung
 		"0000018f5cd3a600" + // expire_at
 		"b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecf" + // body_hash
@@ -745,6 +811,7 @@ func TestOneRecordIsPinnedToItsExactBytes(t *testing.T) {
 			IsCommit:       true,
 			RetentionClass: RetentionEph,
 			EphBucket:      5,
+			EphWindow:      pinnedEphWindow,
 			SizeBucket:     SizeBucketBlob,
 			ExpireAt:       0x0000018F5CD3A600,
 			BlobId: []byte{
@@ -768,6 +835,12 @@ func TestOneRecordIsPinnedToItsExactBytes(t *testing.T) {
 		record.WriteAuth[i] = byte(0xf0 + i)
 	}
 
+	// the layout's own arithmetic, term by term: a field written at the wrong width moves
+	// the total even when every octet it wrote looks plausible
+	const wantLength = 1 + 32 + 16 + 8 + 8 + 1 + 1 + 8 + 1 + 8 + 32 + (4 + 32) + (4 + 4) + (4 + 8) + (4 + 0) + 32
+	if len(want) != 2*wantLength {
+		t.Fatalf("the vector is %d octets and the layout adds up to %d", len(want)/2, wantLength)
+	}
 	got := mustEncode(t, "the pinned record", &record)
 	if hex.EncodeToString(got) != want {
 		t.Fatalf("the pinned record encodes to\n%s\nwant\n%s", hex.EncodeToString(got), want)
@@ -800,13 +873,14 @@ func TestOneRecordIsPinnedToItsExactBytes(t *testing.T) {
 // than a constant so that a body written at the wrong offset lands on bytes that are not
 // the ones it should have.
 func TestOneRecordWithABodyIsPinnedToItsExactBytes(t *testing.T) {
-	const want = "01" + // format_version
+	const want = "02" + // format_version
 		"2122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40" + // group_id
 		"808182838485868788898a8b8c8d8e8f" + // sender_handle
 		"0000000100000000" + // epoch: the first value that does not fit in 32 bits
 		"ffffffffffffffff" + // stream_index: the top of the range
 		"00" + // is_commit: clear
 		"01" + // retention_class_wire: durable, a class that carries no bucket
+		"0000000000000000" + // eph_window: the ZERO a non eph record carries, and it is still eight octets
 		"00" + // size_bucket: the 256 B rung
 		"0000000000000000" + // expire_at: unset
 		"4142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f60" + // body_hash
@@ -833,8 +907,11 @@ func TestOneRecordWithABodyIsPinnedToItsExactBytes(t *testing.T) {
 			IsCommit:       false,
 			RetentionClass: RetentionDurable,
 			EphBucket:      0,
-			SizeBucket:     SizeBucket256,
-			ExpireAt:       0,
+			// the presence rule's other half, and it is a VALUE and not an absence: a
+			// durable record carries eight zero octets here rather than nothing at all
+			EphWindow:  0,
+			SizeBucket: SizeBucket256,
+			ExpireAt:   0,
 		},
 	}
 	for i := range record.Header.GroupId {
@@ -861,6 +938,10 @@ func TestOneRecordWithABodyIsPinnedToItsExactBytes(t *testing.T) {
 		record.CtBody[i] = byte(i)
 	}
 
+	const wantLength = 1 + 32 + 16 + 8 + 8 + 1 + 1 + 8 + 1 + 8 + 32 + (4 + 0) + (4 + 0) + (4 + 16) + (4 + 272) + 32
+	if len(want) != 2*wantLength {
+		t.Fatalf("the vector is %d octets and the layout adds up to %d", len(want)/2, wantLength)
+	}
 	got := mustEncode(t, "the pinned record with a body", &record)
 	if hex.EncodeToString(got) != want {
 		t.Fatalf("the pinned record with a body encodes to\n%s\nwant\n%s", hex.EncodeToString(got), want)

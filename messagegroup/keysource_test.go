@@ -179,6 +179,11 @@ const (
 	// it is a keyed octet by the definition this file opens with.
 	keySourceDurableClassCode byte = 0x01
 	keySourceDurableWire      byte = 0x01
+	// MASTER section 8's eph_window on a durable record: zero, and PRESENT. Written as its
+	// own transcribed constant rather than read off the header, for the reason every other
+	// value in this block is: the reproduction is held against MASTER and not against what
+	// the record layer put in the field.
+	keySourceDurableEphWindow uint64 = 0
 	// MASTER's size ladder, the 256 octet rung: the bucket TAG and the octet count it names. The
 	// count fixes octet_length(ct_body), so it is on the same side of the same line.
 	keySourceSizeBucketCode byte = 0x00
@@ -203,7 +208,16 @@ type keySourceShape struct {
 	// the JOINED wire byte of MASTER section 8's table and never the go tag, which is the value
 	// both aads and the write_auth preimage carry.
 	retentionWire byte
-	sizeBucket    byte
+	// t, the eph ladder's time slice, PLAINTEXT on the wire and carried by both aads and by
+	// the write_auth preimage, immediately after the retention octet it qualifies. RULED
+	// 2026-09-13 and transcribed here that day. This fixture's records are DURABLE, so the
+	// value is the presence rule's zero -- and the zero is exactly why it belongs in the
+	// shape rather than being left out: a builder that wrote the field only for an eph
+	// record produces a preimage eight octets shorter than this one on every record this
+	// reproduction sees, which is the conditional MASTER section 8 forbids, observed from
+	// the outside.
+	ephWindow  uint64
+	sizeBucket byte
 	// the octet length of the rung the padded body fills, which is what fixes
 	// octet_length(ct_body) at rung + 16.
 	rungBytes  int
@@ -290,6 +304,7 @@ func reproduceRecordFromTheExporterOutput(t *testing.T, mlsSecret []byte, pqSecr
 		keySourceU64(shape.epoch),
 		keySourceU64(shape.streamIndex),
 		[]byte{shape.retentionWire},
+		keySourceU64(shape.ephWindow),
 	)
 
 	// LP(plaintext) into a buffer exactly the rung, tail zero. Open item M1-7's scheme, whose
@@ -315,6 +330,7 @@ func reproduceRecordFromTheExporterOutput(t *testing.T, mlsSecret []byte, pqSecr
 		keySourceU64(shape.streamIndex),
 		[]byte{keySourceIsCommitByte(shape.isCommit)},
 		[]byte{shape.retentionWire},
+		keySourceU64(shape.ephWindow),
 		[]byte{shape.sizeBucket},
 		keySourceU64(shape.expireAt),
 		keySourceLP(bodyHash[:]),
@@ -336,6 +352,7 @@ func reproduceRecordFromTheExporterOutput(t *testing.T, mlsSecret []byte, pqSecr
 		keySourceU64(shape.streamIndex),
 		[]byte{keySourceIsCommitByte(shape.isCommit)},
 		[]byte{shape.retentionWire},
+		keySourceU64(shape.ephWindow),
 		[]byte{shape.sizeBucket},
 		keySourceU64(shape.expireAt),
 		keySourceLP(ctHeadHash[:]),
@@ -430,6 +447,14 @@ func keySourceShapeOf(t *testing.T, record *message.Record, leaf uint32,
 		t.Fatalf("the durable row of MASTER section 8's table carries eph bucket 0 and the record carries %d",
 			header.EphBucket)
 	}
+	// MASTER section 8's presence rule: the window is zero on permanent, durable and media
+	// and on eph bucket 0. These records are durable, so a non zero one is a record this
+	// transcription is not written for, and saying so here is what keeps the zero below from
+	// being an assumption.
+	if header.EphWindow != 0 {
+		t.Fatalf("MASTER section 8 puts eph_window at zero on a durable record and this one carries %d",
+			header.EphWindow)
+	}
 	if byte(header.SizeBucket) != keySourceSizeBucketCode {
 		t.Fatalf("this reproduction is written for the %#02x rung of MASTER's ladder and the record carries %#02x",
 			keySourceSizeBucketCode, byte(header.SizeBucket))
@@ -441,6 +466,7 @@ func keySourceShapeOf(t *testing.T, record *message.Record, leaf uint32,
 		streamIndex:   header.StreamIndex,
 		isCommit:      header.IsCommit,
 		retentionWire: keySourceDurableWire,
+		ephWindow:     keySourceDurableEphWindow,
 		sizeBucket:    keySourceSizeBucketCode,
 		rungBytes:     keySourceRungBytes,
 		expireAt:      header.ExpireAt,
