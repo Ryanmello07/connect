@@ -332,7 +332,7 @@ func TestTheHeadCannotBeSealedBeforeTheBodyHashIsBound(t *testing.T) {
 	var builder *recordBuilder
 	var err error
 	if postErr := fixture.session.do(func() {
-		builder, err = fixture.session.newRecordBuilderOnLoop(message.RetentionDurable, 0, false,
+		builder, err = fixture.session.newRecordBuilderOnLoop(message.RetentionDurable, 0, 0, false,
 			len(bodyPlain), 0, nil)
 	}); postErr != nil {
 		t.Fatalf("post the builder command: %v", postErr)
@@ -535,7 +535,7 @@ func TestAnyMemberCanWriteARecordAttributedToAnotherLeaf(t *testing.T) {
 	if fixture.handle.OwnLeafIndex() == otherLeaf {
 		t.Fatalf("this device owns leaf %d, which is the leaf this case forges", otherLeaf)
 	}
-	if err := fixture.session.TrackSender(otherLeaf, message.RetentionDurable, 0, 0); err != nil {
+	if err := fixture.session.TrackSender(otherLeaf, message.RetentionDurable, 0, 0, 0); err != nil {
 		t.Fatalf("TrackSender for a leaf this device does not own: %v", err)
 	}
 	record := repairForgeRecord(t, fixture.session, otherLeaf, 0,
@@ -618,14 +618,24 @@ func repairForgeRecord(t *testing.T, session *GroupSession, leaf uint32, streamI
 	return record
 }
 
-// OpenRecord's two refusals were dead to the suite: deleting either left everything green, because
-// the only case that could produce a non-DURABLE or a blob record drives SealRecord, and SealRecord
-// refuses both. The report's claim "Non-DURABLE is refused pending M1-6 on both arms" was held on
+// OpenRecord's refusals were dead to the suite: deleting one left everything green, because the
+// only case that could produce a non-DURABLE or a blob record drives SealRecord, and SealRecord
+// refused both. The report's claim "Non-DURABLE is refused pending M1-6 on both arms" -- M1-6 was
+// ruled 2026-09-07 and reversed 2026-09-13, and that claim predates both -- was held on
 // the seal arm only, and that test's own comment names the hazard: "a refusal tested on one arm is
 // a refusal tested on half of itself".
 //
 // The other arm is writable, in about thirty lines, from exported symbols -- so it is written.
-func TestOpenRecordRefusesTheClassesAndTheBlobRungSealRecordRefuses(t *testing.T) {
+//
+// WHAT THIS CASE ASKS CHANGED WITH THE 2026-09-13 RULING AND THE SHAPE DID NOT. It used to assert
+// that OpenRecord refuses a PERMANENT and a MEDIA record with the blanket class sentinel. Ledger
+// item 152 is ruled and that refusal is lifted in full, so those two are no longer refusals at
+// all and asserting them would be asserting the reversed rule. What remains on this arm is the
+// blob rung, which is still task 20's, and what ARRIVES on it is the two refusals the ruling
+// created: an EPH record at a session holding no eph_root, and an EPH record whose window is more
+// than one ahead of this opener's clock. Both are reached the same way this case always reached
+// the class arm -- by moving one header field of a record that opens as built.
+func TestOpenRecordRefusesTheBlobRungAndTheTwoEphValuesTheRulingCreated(t *testing.T) {
 	fixture := newTestSession(t, "open-refusals")
 	fixture.trackOwn(t)
 	genuine := repairForgeRecord(t, fixture.session, fixture.handle.OwnLeafIndex(), 0,
@@ -636,26 +646,41 @@ func TestOpenRecordRefusesTheClassesAndTheBlobRungSealRecordRefuses(t *testing.T
 		t.Fatalf("the control record does not open: %v", err)
 	}
 
-	for _, one := range []struct {
-		name  string
-		class message.RetentionClass
-	}{
-		{"permanent", message.RetentionPermanent},
-		{"media", message.RetentionMedia},
-	} {
-		unruled := *genuine
-		unruled.Header.RetentionClass = one.class
-		if _, _, err := fixture.session.OpenRecord(&unruled); !errors.Is(err, ErrRetentionClassUnruled) {
-			t.Errorf("OpenRecord of a %s record answered %v, want ErrRetentionClassUnruled; open item M1-6 has not ruled which record key seals ct_head and the seal arm refuses it",
-				one.name, err)
-		}
-	}
-
 	blob := *genuine
 	blob.Header.SizeBucket = message.SizeBucketBlob
 	blob.Header.BlobId = make([]byte, 32)
 	if _, _, err := fixture.session.OpenRecord(&blob); !errors.Is(err, ErrBlobRecordUnsupported) {
 		t.Errorf("OpenRecord of a record on the blob rung answered %v, want ErrBlobRecordUnsupported", err)
+	}
+
+	// an EPH record at a session that holds no eph_root, and WHERE that refusal lives is worth
+	// writing down because it is not where a reader would guess. OpenRecord never derives a
+	// class key: it reads a receiver ratchet the caller installed earlier, so a session with no
+	// eph_root has no eph ratchet to find and the refusal it meets on this path is
+	// ErrNoReceiverRatchet. ErrNoEphRoot is what TrackSender answers, which is the call that
+	// would have derived the key -- so the eph_root requirement on the OPEN side is a
+	// requirement on installing the ladder, and both halves are asserted rather than one.
+	noRoot := *genuine
+	noRoot.Header.RetentionClass = message.RetentionEph
+	noRoot.Header.EphBucket = 1
+	noRoot.Header.EphWindow = ephWindowNow(t, 1)
+	if _, _, err := fixture.session.OpenRecord(&noRoot); !errors.Is(err, ErrNoReceiverRatchet) {
+		t.Errorf("OpenRecord of an EPH record at a session with no eph ladder answered %v, want ErrNoReceiverRatchet", err)
+	}
+	if err := fixture.session.TrackSender(fixture.handle.OwnLeafIndex(), message.RetentionEph, 1,
+		ephWindowNow(t, 1), 0); !errors.Is(err, ErrNoEphRoot) {
+		t.Errorf("TrackSender of an eph ladder at a session with no eph_root answered %v, want ErrNoEphRoot", err)
+	}
+
+	// and the same record with a window far in the future, at a session that DOES hold a root,
+	// which is the refusal spec A section 5.3 requires an opener to make.
+	fixture.installEphRoot(t)
+	ahead := *genuine
+	ahead.Header.RetentionClass = message.RetentionEph
+	ahead.Header.EphBucket = 1
+	ahead.Header.EphWindow = 1 << 40
+	if _, _, err := fixture.session.OpenRecord(&ahead); !errors.Is(err, ErrEphWindowAhead) {
+		t.Errorf("OpenRecord of an EPH record a trillion windows in the future answered %v, want ErrEphWindowAhead", err)
 	}
 }
 
@@ -675,13 +700,23 @@ func TestOpenRecordRefusesTheClassesAndTheBlobRungSealRecordRefuses(t *testing.T
 //
 // The class of ladders is DERIVED and not listed, which the wave 1 case did not do. The three
 // class names it wrote out were the three that had class keys at the time; a class ruled onto a
-// class key later -- which is exactly what item 152 does to EPH -- would have been outside a gate
-// nobody would have remembered to widen. So this walks every wire byte connect/message accepts,
-// asks the session for the ladder, and judges every one it gets. A class the session refuses
-// carries the one refusal MASTER invariant I4 allows, and that refusal is checked too: a session
-// that started answering something else for eph would be a class key this ruling never saw.
+// class key later -- which is exactly what item 152 did to EPH on 2026-09-13 -- would have been
+// outside a gate nobody would have remembered to widen. So this walks every wire byte
+// connect/message accepts, asks the session for the ladder, and judges every one it gets.
+//
+// AND THAT DAY ARRIVED, WHICH IS WHY THIS CASE NOW REFUSES A REFUSAL. It used to record the eph
+// bytes as expected refusals and REQUIRE at least one, on the reading that "MASTER invariant I4
+// keeps the eph classes out of ClassKeys, so a session cannot build a ladder for one". I4 is
+// untouched -- eph_root is still not derived from storage_root and ClassKeys still has three
+// fields -- but the conclusion never followed from it: a session that HOLDS an eph_root builds
+// the eph ladders from EphKey, and ledger item 152's ruling of 2026-09-13 is what put that call
+// there. So this case
+// installs one and requires EVERY accepted byte to build, with the empty refusal set asserted
+// rather than assumed. A session's refusal to build an eph ladder is now about a VALUE it was
+// never handed, and TestASessionWithNoEphRootRefusesExactlyTheEphWireBytes is what holds that.
 func TestEveryRetentionClassOfOneSessionReservesInOneStream(t *testing.T) {
 	fixture := newTestSession(t, "one-counter-per-sender")
+	fixture.installEphRoot(t)
 	type ladder struct {
 		wire   byte
 		stream StreamKey
@@ -698,15 +733,9 @@ func TestEveryRetentionClassOfOneSessionReservesInOneStream(t *testing.T) {
 				// not a legal retention byte at all, so there is no ladder to ask for
 				continue
 			}
-			ratchet, buildErr := fixture.session.senderRatchetOnLoop(class, wire)
-			if errors.Is(buildErr, ErrRetentionClassUnruled) {
-				// MASTER invariant I4: the eph classes deliberately have no class key,
-				// so a session cannot build a ladder for one. It is recorded rather
-				// than skipped, so this gate can say it saw the refusal it expects.
-				refused = append(refused, wire)
-				continue
-			}
+			ratchet, buildErr := fixture.session.senderRatchetOnLoop(class, wire, bucket, 0)
 			if buildErr != nil {
+				refused = append(refused, wire)
 				err = fmt.Errorf("wire %#02x (class %d bucket %d): %w", wire, class, bucket, buildErr)
 				return
 			}
@@ -721,9 +750,10 @@ func TestEveryRetentionClassOfOneSessionReservesInOneStream(t *testing.T) {
 	if len(ladders) < 2 {
 		t.Fatalf("this session built %d ladders, so nothing here could observe two of them sharing a counter", len(ladders))
 	}
-	if len(refused) == 0 {
-		t.Error("no accepted retention byte was refused a class key; MASTER invariant I4 keeps the eph classes out of ClassKeys, so a run that met none of them was not walking the whole wire byte class")
+	if len(refused) != 0 {
+		t.Errorf("a session holding an eph_root refused a ladder for %#x; since ledger item 152 was ruled every retention byte the wire admits has a class key, and a refusal here is a class this session cannot seal at all", refused)
 	}
+	t.Logf("%d ladders, one per accepted retention byte, all on one stream key", len(ladders))
 	// ONE stream, whole and entire. It is compared as a value rather than field by field, so a
 	// field added to StreamKey later is inside this assertion without anybody widening it.
 	for _, built := range ladders[1:] {

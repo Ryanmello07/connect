@@ -41,14 +41,29 @@
 //
 // THREE DECISIONS THIS FILE TAKES, AND SAYS IT IS TAKING.
 //
-// (a) WHICH record_key SEALS THE HEAD. MASTER section 8.1 says "ct_head is always under the
-// durable class" and section 5.3 hands both aead derivations one record_key[i]. For a DURABLE
-// record the two readings coincide; for every other class they do not. Open item M1-6 rules it.
-// Until then a class other than DURABLE is REFUSED, with a sentinel naming the item -- a refusal
-// and not a guess, because a PERMANENT or an EPH record sealed under the wrong reading is wire
-// visible and unrecoverable after the A6 freeze. That refusal blocks wave 2's tasks 14 and 15,
-// which is why M1-6 sits under "blocking CP3b" and not under the format freeze, and no exemption
-// is carved here for either of them: four exemptions is a refusal that has become a sentence.
+// (a) WHICH record_key SEALS THE HEAD -- RULED 2026-09-13, AND THE BLANKET CLASS REFUSAL THIS
+// FILE CARRIED IS LIFTED IN FULL. ct_head is keyed under the RECORD'S OWN class key, whatever
+// that class is, exactly as ct_body is: head and body take ONE ladder at ONE position, separated
+// only by their HKDF labels "rec/v1/head" and "rec/v1/body" (MASTER I7). Ledger items 152 and
+// 128, spec A revision A-25, and it REVERSES the ruling of 2026-09-07.
+//
+// WHAT THIS FILE USED TO SAY, because a reversal that erases what it reverses leaves the next
+// reader unable to reconstruct it. It said: "MASTER section 8.1 says ct_head is always under the
+// durable class and section 5.3 hands both aead derivations one record_key[i] ... Open item M1-6
+// rules it. Until then a class other than DURABLE is REFUSED, with a sentinel naming the item."
+// M1-6 was ruled on 2026-09-07 and that sentence was stale from that day; on 2026-09-13 the
+// ruling itself was reversed. Its premise -- "the head is always retained, so it is keyed by the
+// class that is always retained" -- is false for exactly one class and it is the class the whole
+// question was about: spec B section 7.2 sets ct_head = NULL for EPH(1..5) at prune_after, so an
+// EPH head is not always retained. Spec A section 5.3: "THE REFUSAL IS NOW LIFTED IN FULL ...
+// SealRecord and OpenRecord may seal and open EVERY retention class."
+//
+// WHAT REPLACES IT IS NOT NOTHING, and the two replacements are refusals about VALUES rather
+// than about classes. A session that holds no eph_root cannot derive K_eph at all and refuses
+// with ErrNoEphRoot. And the eph_root DEVICE WRAP is refused outright with
+// ErrEphWrapWindowUnruled -- ledger open item 185, spec A section 5.11: "A builder MUST NOT
+// PUBLISH THAT RECORD UNTIL IT IS [ruled]". That refusal REPLACES the lifted one for exactly one
+// record and is not a survival of it.
 //
 // (b) HOW THE BODY IS PADDED, and how the reader recovers its length. Section 5.1 fixes
 // octet_length(ct_body) at size_bucket_bytes[b] + 16 exactly, so the plaintext is padded to
@@ -82,9 +97,23 @@ import (
 //
 // It runs on the session's loop goroutine, like every other method that touches session state.
 //
-// The class is refused unless it is DURABLE. See decision (a) at the top of this file; the
-// refusal names open item M1-6 and is the only thing standing between an unruled reading of
-// MASTER section 8.1 and a wire visible record nobody can re-derive.
+// EVERY RETENTION CLASS IS SEALED. See decision (a) at the top of this file: the blanket refusal
+// of every class but DURABLE was lifted in full on 2026-09-13 when ledger item 152 was ruled and
+// ct_head became the record's own class key's. What is still refused is the eph_root device
+// wrap, whose own eph_window value is ledger open item 185 and is not ruled, and an EPH record of
+// any bucket when this session holds no eph_root to derive K_eph from.
+//
+// THE EPH WINDOW IS READ OFF THIS SESSION'S CLOCK EXACTLY ONCE, HERE, ON THE SEAL PATH ONLY.
+// MASTER section 8.1 makes eph_window the SENDER's computation from the same wall clock reading
+// it puts in sent_at; sent_at lives inside headPlain, which is opaque to this layer, so the one
+// thing this layer can do is take one reading from the injected nowMs and use it for the window.
+// A CALLER THAT BUILDS headPlain WITH A sent_at FROM A DIFFERENT READING can straddle a bucket
+// boundary between the two, in which case the record is still perfectly self consistent -- the
+// window is on the wire, in both AADs and in write_auth, and the key is derived from the wire
+// value -- but its key lifetime is pinned to this reading rather than to the sent_at inside it.
+// Section 5.2 fixes this signature with no sent_at parameter in it, so closing that gap is a
+// signature change to a published block rather than something this file may do; it is recorded
+// here and in this package's OPENITEMS.md rather than papered over.
 func (self *GroupSession) SealRecord(class message.RetentionClass, ephBucket uint8, isCommit bool,
 	headPlain []byte, bodyPlain []byte, expireAt uint64,
 	serverAttachment *message.ServerAttachment) (*message.Record, error) {
@@ -116,13 +145,19 @@ func (self *GroupSession) sealRecordOnLoop(class message.RetentionClass, ephBuck
 	isCommit bool, headPlain []byte, bodyPlain []byte, expireAt uint64,
 	serverAttachment *message.ServerAttachment) (*message.Record, error) {
 
-	if class != message.RetentionDurable {
-		return nil, fmt.Errorf("%w: this record names class %d bucket %d", ErrRetentionClassUnruled, class, ephBucket)
-	}
-	if expireAt != 0 && expireAt <= uint64(self.nowMs()) {
+	// ONE CLOCK READING PER RECORD, taken here and used for both things this body asks the
+	// time for. Two readings would let expire_at be judged against one instant and the window
+	// computed from another, which is a record that can be refused as expired in a window it
+	// was never in.
+	nowMs := self.nowMs()
+	if expireAt != 0 && expireAt <= uint64(nowMs) {
 		return nil, fmt.Errorf("%w: expire_at %d is not after now", ErrRecordExpired, expireAt)
 	}
-	builder, err := self.newRecordBuilderOnLoop(class, ephBucket, isCommit, len(bodyPlain), expireAt, serverAttachment)
+	ephWindow, err := self.sealEphWindowOnLoop(class, ephBucket, nowMs, serverAttachment)
+	if err != nil {
+		return nil, err
+	}
+	builder, err := self.newRecordBuilderOnLoop(class, ephBucket, ephWindow, isCommit, len(bodyPlain), expireAt, serverAttachment)
 	if err != nil {
 		return nil, err
 	}
@@ -137,6 +172,96 @@ func (self *GroupSession) sealRecordOnLoop(class message.RetentionClass, ephBuck
 		return nil, err
 	}
 	return headSealed.authenticate()
+}
+
+// sealEphWindowOnLoop answers this record's eph_window, and refuses the one record whose value
+// is not ruled.
+//
+// MASTER SECTION 8'S PRESENCE RULE, AS AN ANSWER RATHER THAN AS A BRANCH SOMEWHERE ELSE. The
+// field is ALWAYS present and its VALUE carries the absence: zero on PERMANENT, DURABLE, MEDIA
+// and EPH(0), the bucket's own window on EPH(1..5). Every one of those four zeros comes out of
+// this one function, so no preimage builder and no codec half gains a conditional for the rule
+// -- which is the whole reason the rule is a zero VALUE and not a zero LENGTH.
+//
+// EPH(0) IS A ZERO THAT IS COMPUTED AND NOT A CLASS THAT IS SKIPPED. EphWindowAt answers 0 for
+// bucket 0 without dividing, because master section 8.1 makes t = 0 "BY DEFINITION" there -- the
+// transient rung is never persisted, so it has one window for the life of eph_root[n]. That
+// arrives here through the ladder's own answer rather than through a bucket == 0 test, which is
+// what keeps this function and message.EphBucketSeconds from drifting.
+//
+// THE eph_root DEVICE WRAP IS REFUSED, AND THE REFUSAL REPLACES THE LIFTED ONE RATHER THAN
+// SURVIVING IT. Ledger open item 185, filed 2026-09-13 (second pass of that date) and not ruled;
+// spec A section 5.11 states it as an instruction to a builder rather than as a note: "AND THE
+// eph_root WRAP'S OWN eph_window VALUE IS NOT RULED. A builder MUST NOT PUBLISH THAT RECORD
+// UNTIL IT IS." Three landed sentences cannot all be satisfied by it -- the presence rule makes
+// the field non zero on EPH(1..5) and that record is EPH(5); requirement S19 and spec B section
+// 5.1 check 3 refuse an implausible window with no carve out for a wrap anywhere; and the
+// formula divides sent_at, which a wrap head does not have because a wrap carries no MLS frame
+// (section 5.11 part 5). So this function does not pick whichever value compiles. It refuses.
+//
+// WHAT THE REFUSAL IS KEYED ON, and it is derived from what makes that record that record rather
+// than from a flag a caller passes. An eph_root device wrap is, by spec A section 5.11's own
+// table, an EPH class record carrying a WrapTag server attachment; the pq_secret device wrap is
+// the same attachment on a PERMANENT record and is UNAFFECTED, because PERMANENT carries the
+// presence rule's zero and item 185 is about a value only an EPH record has to have. The
+// attachment is read through the same presence rule connect/message computes rather than through
+// the Kind tag alone, so an attachment whose tag and whose body disagree is caught here as well
+// as at the encoder.
+//
+// The caller is the loop goroutine.
+func (self *GroupSession) sealEphWindowOnLoop(class message.RetentionClass, ephBucket uint8,
+	nowMs int64, serverAttachment *message.ServerAttachment) (uint64, error) {
+
+	if class != message.RetentionEph {
+		// the presence rule's three non-eph zeros. The value is computed by the same
+		// sentence that computes the other three rather than returned early with a
+		// literal somewhere else.
+		return 0, nil
+	}
+	if isEphRootDeviceWrap(serverAttachment) {
+		return 0, fmt.Errorf("%w: this record is EPH bucket %d and carries a wrap tag", ErrEphWrapWindowUnruled, ephBucket)
+	}
+	window, err := EphWindowAt(ephBucket, nowMs)
+	if err != nil {
+		return 0, err
+	}
+	return window, nil
+}
+
+// ephLadderWindow is the window that ROOTS a record's ladder, which is not always the window the
+// record carries.
+//
+// The rule is one sentence and it is about class keys rather than about fields: a ladder is
+// rooted at record_key[0] = HKDF-Expand(class_key, ...), and only the EPH class key is a function
+// of the window -- K_eph[n][b][t] takes t, while K_perm, K_durable and K_media take none. So for
+// every other class the answer is zero however the field reads, and the ladder tables collapse to
+// what they were before the field existed.
+//
+// THE ONLY INPUT THIS CHANGES IS A LYING ONE. MASTER section 8's presence rule makes eph_window
+// zero on every non-EPH record, so a well formed record answers the same either way; what it
+// decides is where a TAMPERED one fails. With this, it fails in the AEAD, which is what binds the
+// field -- it is in both aads for exactly that reason. Without it, it would miss the ratchet
+// table and be refused as an untracked sender, which reports the wrong thing about the wrong
+// field.
+func ephLadderWindow(class message.RetentionClass, ephWindow uint64) uint64 {
+	if class == message.RetentionEph {
+		return ephWindow
+	}
+	return 0
+}
+
+// isEphRootDeviceWrap says whether an attachment makes its record a device wrap.
+//
+// It asks BOTH halves of connect/message's own presence rule -- the declared tag and the body
+// that is actually set -- because this refusal runs before EncodeServerAttachment is called and
+// is therefore in front of the check that makes the two agree. An attachment that carried a
+// WrapTag body under some other tag would otherwise walk past item 185's refusal and be caught
+// two calls later as a tag mismatch, which is a different sentence about a different problem.
+func isEphRootDeviceWrap(serverAttachment *message.ServerAttachment) bool {
+	if serverAttachment == nil {
+		return false
+	}
+	return serverAttachment.Kind == message.AttachmentWrap || serverAttachment.Wrap != nil
 }
 
 // recordBuilder is the first stage: the header as far as it can be filled before anything is
@@ -159,7 +284,7 @@ type recordBuilder struct {
 // through here, and seal_test.go walks the call graph to say so rather than trusting this
 // sentence.
 func (self *GroupSession) newRecordBuilderOnLoop(class message.RetentionClass, ephBucket uint8,
-	isCommit bool, bodyLength int, expireAt uint64,
+	ephWindow uint64, isCommit bool, bodyLength int, expireAt uint64,
 	serverAttachment *message.ServerAttachment) (*recordBuilder, error) {
 
 	// (c): the encoder's answer and not a second nil check. A nil attachment and an
@@ -177,7 +302,7 @@ func (self *GroupSession) newRecordBuilderOnLoop(class message.RetentionClass, e
 	if err != nil {
 		return nil, err
 	}
-	ratchet, err := self.senderRatchetOnLoop(class, retentionWire)
+	ratchet, err := self.senderRatchetOnLoop(class, retentionWire, ephBucket, ephWindow)
 	if err != nil {
 		return nil, err
 	}
@@ -197,15 +322,17 @@ func (self *GroupSession) newRecordBuilderOnLoop(class message.RetentionClass, e
 			IsCommit:       isCommit,
 			RetentionClass: class,
 			EphBucket:      ephBucket,
-			// MASTER section 8's presence rule, and it is written out rather than left to
-			// the zero value because the zero is only CORRECT for the classes this
-			// function is allowed to seal. eph_window is floor(sent_at_ms / (bucket
-			// seconds * 1000)) on eph 1..5 and zero everywhere else; the class refusal
-			// above admits durable alone, so zero is this record's window. The day the
-			// refusal lifts for eph, this line is the one that has to take a computed
-			// window and a clock the caller supplies -- and it is a line, not an absence,
-			// so it is reachable by reading the function that builds the header.
-			EphWindow:        0,
+			// MASTER section 8's presence rule, carried as a VALUE the caller of this
+			// function computed rather than as a zero this one writes.
+			//
+			// It was literally "EphWindow: 0" until the seal refusal lifted, with a
+			// comment saying that the day eph became sealable this line was the one that
+			// had to take a computed window. That day was 2026-09-13 and this is that
+			// line. sealEphWindowOnLoop answers zero on PERMANENT, DURABLE, MEDIA and
+			// EPH(0) -- the presence rule's four zero cases -- and the bucket's own
+			// window on EPH(1..5), so the presence rule is still stated by a value and
+			// still by no branch in any preimage builder.
+			EphWindow:        ephWindow,
 			SizeBucket:       bucket,
 			ExpireAt:         expireAt,
 			ServerAttachment: attachmentBytes,
@@ -340,6 +467,57 @@ func (self *recordHeadSealed) authenticate() (*message.Record, error) {
 	return record, nil
 }
 
+// refuseAheadEphWindowOnLoop is spec A section 5.3's opener rule, and the whole of it is that it
+// is ASYMMETRIC.
+//
+//	An opener MUST refuse an EPH(1..5) record whose eph_window is more than one window AHEAD
+//	of its own clock, with a typed error separable by errors.Is from every AEAD failure ... A
+//	window behind the opener's own is NOT a refusal in any amount.
+//
+// WHY AHEAD IS A REFUSAL. The opener can derive ANY window's key from eph_root[n] -- an
+// HKDF-Expand takes whatever t it is handed, and EphKey is the evidence for that sentence -- so
+// a far future window is not a record the opener cannot read, it is a record the opener CAN read
+// and should not: honouring it keeps the record openable long past its timer, for every record a
+// hostile sender or a hostile server puts in front of this client, with master section 12.4's
+// required user facing string false and nothing anywhere reporting it. The server side check of
+// requirement S19 is the only other thing standing there, and a client that trusts the server to
+// have made it is a client that has made the server a participant in its own confidentiality.
+//
+// WHY BEHIND IS NOT. A record from a closed window is a record whose key the opener either still
+// holds or has destroyed on schedule; the first opens, the second is a gap with reason expired.
+// Neither is this refusal's business, and a refusal that fired on them would refuse the ordinary
+// case -- a record that sat in a queue, or arrived over a slow link, or was fetched after an
+// offline stretch. There is no lower bound here, in any amount, deliberately.
+//
+// PLUS ONE AND NOT PLUS TWO. Master section 9.2 fixes the tolerance at one window in either
+// direction on the server's side and gives the reason in this field's unit: the sender computes
+// from sent_at and the opener sees arrival, which is the skew spec B section 7.1's one hour
+// grace already absorbs, while two windows is a doubling of the shortest bucket's guarantee.
+//
+// EPH(0) IS NOT SUBJECT TO IT. Bucket 0's window is 0 by definition and is never computed from a
+// clock, so there is no "own window" to be ahead of; EphWindowAt answers 0 for it and the
+// comparison below is 0 against 0. That falls out of the ladder's answer rather than out of a
+// bucket == 0 test.
+//
+// THE ARITHMETIC IS WRITTEN SO IT CANNOT WRAP. window - own is computed only after window > own
+// is known, so the u64 subtraction has no negative case and own + 1 is never formed.
+//
+// The caller is the loop goroutine.
+func (self *GroupSession) refuseAheadEphWindowOnLoop(header *message.RecordHeader) error {
+	if header.RetentionClass != message.RetentionEph {
+		return nil
+	}
+	own, err := EphWindowAt(header.EphBucket, self.nowMs())
+	if err != nil {
+		return err
+	}
+	if own < header.EphWindow && 1 < header.EphWindow-own {
+		return fmt.Errorf("%w: the record names window %d, this opener is in window %d, and bucket %d admits one",
+			ErrEphWindowAhead, header.EphWindow, own, header.EphBucket)
+	}
+	return nil
+}
+
 // OpenRecord is the only consumer, and it never trusts a field the record's own authentication
 // does not cover.
 //
@@ -393,9 +571,8 @@ func (self *GroupSession) openRecordOnLoop(record *message.Record) ([]byte, []by
 	if subtle.ConstantTimeCompare(header.GroupId[:], self.groupId[:]) != 1 || header.Epoch != self.epoch {
 		return nil, nil, fmt.Errorf("%w: group %x epoch %d", ErrRecordNotForThisSession, header.GroupId, header.Epoch)
 	}
-	if header.RetentionClass != message.RetentionDurable {
-		return nil, nil, fmt.Errorf("%w: this record names class %d bucket %d",
-			ErrRetentionClassUnruled, header.RetentionClass, header.EphBucket)
+	if err := self.refuseAheadEphWindowOnLoop(&header); err != nil {
+		return nil, nil, err
 	}
 	if header.SizeBucket == message.SizeBucketBlob {
 		return nil, nil, fmt.Errorf("%w: blob %x", ErrBlobRecordUnsupported, header.BlobId)
@@ -422,7 +599,25 @@ func (self *GroupSession) openRecordOnLoop(record *message.Record) ([]byte, []by
 	if subtle.ConstantTimeCompare(bodyHash[:], header.BodyHash[:]) != 1 {
 		return nil, nil, fmt.Errorf("%w: the header's body_hash is not the hash of this ct_body", ErrRecordAeadOpen)
 	}
-	ratchetKey := ReceiverRatchetKey{SenderHandle: header.SenderHandle, RetentionWire: retentionWire}
+	// THE WINDOW IN THE RATCHET KEY IS THE RECORD'S OWN AND NEVER THIS OPENER'S. An EPH
+	// ladder is rooted at EphKey(eph_root, bucket, window), so the key that opens this record
+	// is the one derived from the value on the wire -- which is what "an opener takes the wire
+	// value and never recomputes it" means once it reaches a table lookup. The refusal above is
+	// the ONLY thing on this path that consults a clock, and it decides whether to open at all
+	// rather than what to open with.
+	//
+	// IT GOES THROUGH ephLadderWindow AND NOT STRAIGHT OFF THE HEADER, which matters only for
+	// a record that is lying. On a non-EPH class the class key is not a function of the window
+	// at all, so the ladder is the same ladder whatever the field says; a tampered non-zero
+	// window on a DURABLE record must therefore reach the AEAD and fail there, because the
+	// window is in BOTH aads and that is the thing being tested. Keying the table on the raw
+	// field would have made it miss the ratchet instead and refuse with "no receiver ratchet
+	// is tracked", which is a true sentence about the wrong subject.
+	ratchetKey := ReceiverRatchetKey{
+		SenderHandle:  header.SenderHandle,
+		RetentionWire: retentionWire,
+		EphWindow:     ephLadderWindow(header.RetentionClass, header.EphWindow),
+	}
 	recordKey, err := self.receivers.PeekFor(ratchetKey, header.StreamIndex)
 	if err != nil {
 		return nil, nil, err

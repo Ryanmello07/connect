@@ -236,13 +236,87 @@ var (
 	// and may only shorten retention, so a value in the past is a record the server is entitled
 	// to prune before anyone reads it -- which is a caller's mistake and not a policy.
 	ErrRecordExpired = errors.New("messagegroup: a record's expire_at has already passed")
-	// Fires when a retention class other than DURABLE reaches SealRecord. MASTER section 8.1
-	// says ct_head is always under the durable class and section 5.3 hands both aead
-	// derivations one record_key[i]; for a DURABLE record the two readings coincide and for
-	// every other class they do not. Open item M1-6 rules it. Until then this is a refusal and
-	// never a guess, because a PERMANENT or an EPH record sealed under the wrong reading is
-	// wire visible and unrecoverable after the A6 freeze.
-	ErrRetentionClassUnruled = errors.New("messagegroup: only the durable retention class is sealed until open item M1-6 rules which record key seals ct_head")
+	// Fires when a value reaches the sealer or the opener that is not a retention class at
+	// all -- a RetentionClass is a uint8 and the four the design has are 0 through 3, so
+	// every other value of the type arrives here.
+	//
+	// IT IS NO LONGER THE BLANKET CLASS REFUSAL AND ITS NAME CHANGED WITH ITS MEANING. It was
+	// ErrRetentionClassUnruled, and its message said that one class alone could be sealed,
+	// pending m1 open item M1-6's ruling -- ruled 2026-09-07, reversed 2026-09-13 -- on which
+	// record key seals ct_head. That message is
+	// DESCRIBED and not quoted, for doc.go's reason: this package holds an inventory gate over
+	// its own production prose, and a retracted sentence reproduced verbatim is a sentence the
+	// gate keeps finding. M1-6 was ruled on 2026-09-07 and the message was stale from that day;
+	// the ruling was then REVERSED on 2026-09-13 (ledger items 152 and 128, spec A revision
+	// A-25) and the refusal it named was lifted in full -- ct_head takes the record's OWN class
+	// key, exactly as ct_body does, so head and body take one ladder at one position and there
+	// is nothing left for a class to be unruled about. A sentinel still named Unruled for a
+	// ruled item is the pre-amendment comment trap this corpus keeps filing, so the name moved
+	// with the text rather than only the text.
+	ErrRetentionClassUnknown = errors.New("messagegroup: this value names no retention class this package can key a record under")
+	// Fires when a record reaches the sealer or the opener that needs K_eph and this session
+	// holds no eph_root.
+	//
+	// eph_root[n] is thirty two octets of fresh CSPRNG drawn at the commit that opens epoch n
+	// (master invariant I4): it is not derivable from storage_root, from the exporter or from
+	// anything else this session holds, so a session that was not handed one cannot seal or
+	// open an EPH record of any bucket, bucket 0 included. It is a REFUSAL and never a default,
+	// for the reason NewGroupSession refuses an empty pq_secret rather than defaulting it: a
+	// root of thirty two zero octets would derive a perfectly good ladder that both ends of one
+	// implementation agree on and that is the same for every group in the world.
+	ErrNoEphRoot = errors.New("messagegroup: this session holds no eph_root, so it can neither seal nor open an ephemeral record")
+	// Fires when an eph_root that is not thirty two octets reaches a derivation or the
+	// installer. Master section 8.1 fixes the width; a short one expands to a well formed key
+	// that no peer reproduces.
+	ErrEphRootLength = errors.New("messagegroup: an eph_root is not the thirty two octets MASTER section 8.1 fixes")
+	// Fires when a bucket that names no rung of the eph ladder reaches EphKey or the window
+	// arithmetic. The ladder has six rungs, 0 through 5, and RetentionClassOf refuses every
+	// wire byte outside 0x10..0x15, so this is unreachable through a parsed record and is a
+	// programmer error marker -- which is exactly what the 2026-09-13 sentinel ruling separated
+	// it from bucket 0 in order to be able to say.
+	ErrEphBucketOffLadder = errors.New("messagegroup: this bucket names no rung of the eph ladder")
+	// Fires when the window arithmetic is handed a clock reading before the unix epoch. Master
+	// section 8.1 makes t "a count of whole buckets since that origin", and a negative reading
+	// is a clock wrong by decades rather than a window.
+	ErrEphWindowSentAt = errors.New("messagegroup: a sent_at before the unix epoch has no eph window")
+	// Fires when an opener meets an EPH(1..5) record whose eph_window is more than ONE window
+	// AHEAD of the window the opener's own clock falls in.
+	//
+	// THE REFUSAL IS ASYMMETRIC AND THE ASYMMETRY IS THE WHOLE CLIENT SIDE DEFENCE. Spec A
+	// section 5.3: an opener can derive ANY window's key from eph_root[n], because HKDF-Expand
+	// takes whatever t it is handed, so a client that honoured a far future window would keep
+	// the record openable long past its timer -- for every record a hostile sender or a hostile
+	// server put in front of it, with master section 12.4's required user facing string false
+	// and nothing anywhere reporting it. A window BEHIND the opener's own is NOT a refusal in
+	// any amount: the opener derives the key for the wire window and either still holds it or
+	// has destroyed it on schedule, and a destroyed one is a gap with reason expired.
+	//
+	// IT IS ITS OWN SENTINEL AND NOT AN AEAD FAILURE, which section 5.3 requires in as many
+	// words -- separable by errors.Is from every AEAD failure. A caller renders it as a gap
+	// with reason malformed (section 7.4), and it cannot do that if the only thing it can tell
+	// is that a tag did not verify.
+	ErrEphWindowAhead = errors.New("messagegroup: this record's eph_window is more than one window ahead of this opener's clock")
+	// Fires when the eph_root device wrap reaches the sealer, and it REPLACES the blanket class
+	// refusal for exactly one record rather than surviving it.
+	//
+	// LEDGER OPEN ITEM 185, filed 2026-09-13 (second pass of that date) and NOT RULED. Spec A
+	// section 5.11 states it as an instruction rather than as a note: "AND THE eph_root WRAP'S
+	// OWN eph_window VALUE IS NOT RULED. A builder MUST NOT PUBLISH THAT RECORD UNTIL IT IS."
+	// Three landed sentences cannot all be satisfied by it. Master section 8's presence rule
+	// makes eph_window non zero on EPH(1..5) and that record is EPH(5). Spec A requirement S19,
+	// spec B section 5.1 check 3 and spec B section 7.1 all refuse an EPH(1..5) record whose
+	// window differs from its arrival window by more than one, with NO carve out for a wrap
+	// anywhere. And the value's own formula divides sent_at, while section 5.11 part 5 states
+	// that a wrap head's plaintext is not stated at all -- a wrap carries no MLS frame, so it
+	// has no sent_at to divide. A builder writing 0 is refused by the server and the epoch fan
+	// out stops with no device ever obtaining eph_root[k]; a builder computing from its own
+	// publication clock is equally conforming on the text as it stands. So this is a refusal
+	// and not a guess, and what is owed is one sentence from the owner: what eph_window an
+	// EPH(1..5) record that is NOT keyed under K_eph carries, and whether S19 applies to it.
+	//
+	// The pq_secret device wrap is unaffected and seals normally: it is PERMANENT and carries
+	// the presence rule's zero.
+	ErrEphWrapWindowUnruled = errors.New("messagegroup: the eph_root device wrap's own eph_window is ledger open item 185 and is not ruled, so this record is not published")
 	// Fires when a stage of the seal chain is reached with the value the previous stage owed it
 	// missing. Section 5.2's title is "Construction order is a type, not a convention" and the
 	// staging types are unexported, so the order IS a type to every other package; inside this

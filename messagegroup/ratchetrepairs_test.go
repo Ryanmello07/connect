@@ -411,8 +411,8 @@ func senderRatchetWedgeSites(t *testing.T) int {
 // OUT OF A RECEIVER'S WINDOW.
 //
 // THIS CASE RULES NOTHING. Open item M1-25 asks whether transients get a counter of their own and
-// it is not this commit's to answer -- giving them one re-opens the same collision for EPH heads
-// on the day item 152 rules them onto this root. What is owed here is that the hazard is
+// it is not this commit's to answer -- giving them one re-opens the same collision for EPH heads,
+// which ledger item 152 ruled onto this root on 2026-09-13. What is owed here is that the hazard is
 // EXECUTABLE, because the alternative -- a comment claiming it -- is the thing this project has
 // been burned by: a sentence in a header cannot go red.
 //
@@ -424,10 +424,18 @@ func senderRatchetWedgeSites(t *testing.T) int {
 // there is exactly one more than the window can hold, and the second durable record is
 // ErrOutOfWindow, which section 5.5 turns into a gap entry the message never comes back from.
 //
-// The eph ladder is driven through the reserver rather than through a session, because the eph
-// classes have no class key at all (MASTER invariant I4) and SealRecord refuses every class but
-// DURABLE until M1-6 is ruled. What the transients spend is the COUNTER, and that is the part
-// this case is about; which key they would be sealed under is item 152's.
+// The eph ladder is driven through the reserver rather than through a session, because what the
+// transients spend is the COUNTER and that is the part this case is about, and driving it through
+// the reserver keeps the case about the counter whatever key the records would take. The sentence
+// that stood here gave a second reason that is no longer true: it said the eph classes had no
+// class key at all, citing MASTER invariant I4, and that the sealer admitted one class pending
+// M1-6 -- ruled 2026-09-07, reversed 2026-09-13. It is DESCRIBED and not quoted, for the reason
+// doc.go gives about its own retraction --
+// this package holds an inventory gate over prose, and a retracted sentence reproduced verbatim
+// is a sentence somebody's grep finds. The half of it that was never true is the first clause: I4
+// keeps eph_root out of ClassKeys and has never meant the eph classes have no key. M1-6 was ruled
+// 2026-09-07 and reversed 2026-09-13, ledger item 152 was ruled with it, and a session holding an
+// eph_root now seals every class.
 func TestTransientsOnTheSharedCounterStarveADurableReceiverWindow(t *testing.T) {
 	const windowSize = DefaultRecordWindowSize
 	reserver := newStreamIndexMemory()
@@ -838,10 +846,12 @@ func TestASharedCounterDividesAClassesOutOfOrderWindowByTheClassCount(t *testing
 	classKeys := DeriveClassKeys(StorageRoot(keyScheduleKatInputs()))
 	stream := streamKeyNamed("every class key, one counter")
 	// k IS THE NUMBER OF CLASS KEYS AND IS READ OFF ClassKeys, not written down beside a
-	// hard-coded 3. A fourth class key -- which is what item 152 adds if it rules the eph
-	// classes onto this root -- makes the divisor 4 here without anybody remembering to change
-	// it, and a case that went on dividing by 3 would report a cost that is not the one being
-	// paid. The watched ladder is the durable one, because that is the class SealRecord seals.
+	// hard-coded 3. A fourth FIELD there would make the divisor 4 here without anybody
+	// remembering to change it, and a case that went on dividing by 3 would report a cost
+	// that is not the one being paid. Ledger item 152's ruling of 2026-09-13 put the eph
+	// classes on this root and did NOT add a field: eph_root is not derived from storage_root
+	// (MASTER invariant I4) and EphKey takes it as an argument, so ClassKeys still has three
+	// and the divisor is still read rather than typed.
 	ladderKeys := reflect.ValueOf(*classKeys)
 	if ladderKeys.NumField() < 2 {
 		t.Fatalf("ClassKeys declares %d field(s), so nothing here could share a counter", ladderKeys.NumField())

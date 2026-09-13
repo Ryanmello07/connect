@@ -142,21 +142,52 @@ const aeadTagBytes = 16
 // reader has to recognise.
 var sizeBucketBodyBytes = [...]int{256, 1024, 4096, 16384, 65536}
 
-// Seconds per eph bucket. Bucket 0 is the transient rung and is never persisted: it has
-// no window, and it answers the same negative as a bucket that is not on the ladder at
-// all.
-var ephBucketWindowSeconds = [...]int{noLadderValue, 3600, 28800, 86400, 604800, 2419200}
-
-// What both ladders answer for a rung that names no length and no window.
+// Seconds per eph bucket.
 //
-// Negative rather than zero, and one value rather than two. Negative because every
-// plausible use of the answer — make([]byte, n), a length equality check, now + n —
-// fails loudly on a negative and silently on a zero, and both a zero length body and a
-// zero second window are things a caller could mistake for real. One value because the
-// two cases it covers, "this rung has no inline body" and "this is not a rung at all",
-// mean the same thing to a caller: there is nothing here to size or to expire. Giving
-// them separate negatives would invite a switch that handles one and falls through on
-// the other. Callers test for a negative, never for this exact number.
+// BUCKET 0 ANSWERS ZERO AND AN OFF LADDER BUCKET ANSWERS A NEGATIVE, and the two must not
+// be one value. Ruled 2026-09-13, m1 open item M1-27, and the paragraph that rules it is
+// restated character for character inside the wire block of master section 8, spec A
+// section 5.1 and spec B section 3.1:
+//
+//	The bucket-0 answer and the off-ladder answer MUST DIFFER. EphBucketSeconds MUST
+//	answer 0 for bucket 0 -- the true retention window of a rung that is never stored --
+//	and a NEGATIVE for 6..255, which is not a bucket at all.
+//
+// Zero is not a sentinel here, it is the answer: bucket 0 is the transient rung, which is
+// never persisted, so the length of time it is retained for is nought seconds. The
+// negative is a programmer error marker for a value that is not a bucket at all, and it
+// is unreachable through a parsed record because RetentionClassOf refuses every wire byte
+// outside 0x10..0x15. That asymmetry -- one a real window a caller may act on, the other
+// a value no record can carry -- is the whole of why they must not share an answer.
+var ephBucketWindowSeconds = [...]int{ephTransientSeconds, 3600, 28800, 86400, 604800, 2419200}
+
+// The retention window of the transient rung, in seconds.
+//
+// It is a named constant rather than a bare 0 in the table above so that the table reads
+// as six windows rather than as five windows and a hole, and so that the ruling's own
+// word for it is at the value. A caller that divides by this to get a window is the
+// caller the ruling is about: bucket 0's window is 0 BY DEFINITION and is never computed
+// (master section 8.1), so there is no division to do and a divisor of zero is what says
+// so.
+const ephTransientSeconds = 0
+
+// What both ladders answer for a value that is not a rung of them at all.
+//
+// Negative rather than zero, because every plausible use of the answer -- make([]byte, n),
+// a length equality check, now + n -- fails loudly on a negative and silently on a zero.
+// Callers test for a negative, never for this exact number.
+//
+// IT NO LONGER COVERS TWO MEANINGS, and the paragraph it replaces argued that it should.
+// That paragraph read: "One value because the two cases it covers, 'this rung has no
+// inline body' and 'this is not a rung at all', mean the same thing to a caller: there is
+// nothing here to size or to expire. Giving them separate negatives would invite a switch
+// that handles one and falls through on the other." The owner ruled the other way on
+// 2026-09-13 for the eph ladder, and the reason the argument failed there is that bucket 0
+// IS a rung, with a real retention window of nought seconds, while bucket 6 is not a rung
+// at all -- so the two do not mean the same thing to a caller, and a caller holding the
+// shared answer could not ask which of them it had met. The size ladder is untouched: the
+// blob rung genuinely has no inline body to size, which is the same thing as "not a rung
+// of this ladder" for every use a caller has, and no ruling asks it to split.
 const noLadderValue = -1
 
 // Body bytes for a rung, excluding the 16 byte aead tag. Negative for the blob rung,
@@ -180,8 +211,25 @@ func SizeBucketCtBodyBytes(b SizeBucket) int {
 	return body + aeadTagBytes
 }
 
-// The retention window of an eph bucket, in seconds. Negative for bucket 0, the
-// transient rung that is never persisted, and for any bucket off the ladder.
+// EphBucketSeconds is the retention window of an eph bucket, in seconds.
+//
+// THREE ANSWERS AND NOT TWO. A positive for buckets 1 through 5, which is the rung's own
+// window and the divisor of master section 8.1's eph_window arithmetic. ZERO for bucket 0,
+// the transient rung: it is never persisted, so nought seconds is its true window and not
+// a marker for the absence of one. A NEGATIVE for 6 through 255, which name no rung at
+// all. Ruled 2026-09-13 (m1 open item M1-27); before that ruling bucket 0 and bucket 6
+// both answered -1 and no caller could ask which of them it had met.
+//
+// THE SIGNATURE DOES NOT MOVE AND THAT IS DELIBERATE. Spec A section 12.1 and spec B
+// section 12.1 both publish this name as "func EphBucketSeconds(bucket uint8) int",
+// character for character, as one of the handful of symbols the message server links; a
+// second return value here would be a divergence between two read only documents made by
+// this package on its own authority. The distinction the ruling asks for is therefore
+// carried in the VALUE, which is exactly what the ruling's own wording asks for, and what
+// holds a caller to it is that the three answers are three different arithmetic
+// situations rather than a flag: a caller that conflates zero with the negative either
+// divides by zero on a bucket that is not a bucket or refuses the transient rung, and
+// neither is a program that runs.
 func EphBucketSeconds(bucket uint8) int {
 	if len(ephBucketWindowSeconds) <= int(bucket) {
 		return noLadderValue

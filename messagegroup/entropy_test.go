@@ -143,6 +143,17 @@ var entropyRefusalProbes = map[string]func(t *testing.T, random io.Reader) error
 		_, err := NewPqSecret(random)
 		return err
 	},
+	// eph_root's draw, and the row landed because the class above went and found it: this
+	// gate failed on the commit that declared NewEphRoot, naming it as a member with no
+	// probe. That is the whole reason the class is derived off the syntax tree -- MASTER
+	// section 8.1 calls a derived eph_root "the most easily broken property here", and a
+	// draw that silently accepted a nil or an exhausted source would answer thirty two zero
+	// octets that every member of the group agrees on.
+	"NewEphRoot": func(t *testing.T, random io.Reader) error {
+		t.Helper()
+		_, err := NewEphRoot(random)
+		return err
+	},
 	"XwingGenerateKey": func(t *testing.T, random io.Reader) error {
 		t.Helper()
 		_, err := XwingGenerateKey(random)

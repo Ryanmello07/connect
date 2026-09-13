@@ -62,6 +62,11 @@ const (
 // The leaf every multi-value vector above is taken at.
 const recordKeyKatLeaf uint32 = 3
 
+// The eph window the probes below derive at: a value with octets set above the first, so a
+// derivation that wrote the window at a width shorter than eight octets, or in the other byte
+// order, answers a different key here rather than the same one.
+const recordKeyKatEphWindow uint64 = 0x0102030405060708
+
 // The class key the vectors hang off, derived through the package rather than pasted, so a
 // change to the class expansion is a failure here and not a silently stale constant.
 func recordKeyKatClassKey() []byte {
@@ -504,6 +509,19 @@ var recordKeyOneWayProbes = map[string]func(secret []byte) [][]byte{
 		return [][]byte{RecordKeyZero(secret, recordKeyKatLeaf), RecordKeyZero(secret, 0)}
 	},
 	"RecordKeyNext": func(secret []byte) [][]byte { return [][]byte{RecordKeyNext(secret)} },
+	// EphKey's probe answers FOUR rungs and not one, because this derivation has three
+	// inputs where every other row has one: the root, the bucket and the window. Two
+	// buckets at one window and two windows at one bucket are what say the info binds both
+	// -- a build that dropped either from the info would answer two identical strings here
+	// and the walk below would see a rung that leads back to another.
+	"EphKey": func(secret []byte) [][]byte {
+		return [][]byte{
+			EphKey(secret, 0, 0),
+			EphKey(secret, 1, 0),
+			EphKey(secret, 1, 1),
+			EphKey(secret, 5, recordKeyKatEphWindow),
+		}
+	},
 	"RecordAeadHead": func(secret []byte) [][]byte {
 		key, nonce := RecordAeadHead(secret)
 		return [][]byte{key, nonce}
@@ -619,7 +637,7 @@ var recordKeyOneWayProbes = map[string]func(secret []byte) [][]byte{
 			return nil
 		}
 		defer fixture.session.Close()
-		if err := fixture.session.TrackSender(fixture.handle.OwnLeafIndex(), message.RetentionDurable, 0, 0); err != nil {
+		if err := fixture.session.TrackSender(fixture.handle.OwnLeafIndex(), message.RetentionDurable, 0, 0, 0); err != nil {
 			return nil
 		}
 		handle, err := fixture.session.SenderHandle()
@@ -648,7 +666,7 @@ var recordKeyOneWayProbes = map[string]func(secret []byte) [][]byte{
 			return nil
 		}
 		defer fixture.session.Close()
-		if err := fixture.session.TrackSender(fixture.handle.OwnLeafIndex(), message.RetentionDurable, 0, 0); err != nil {
+		if err := fixture.session.TrackSender(fixture.handle.OwnLeafIndex(), message.RetentionDurable, 0, 0, 0); err != nil {
 			return nil
 		}
 		record, err := fixture.session.SealRecord(message.RetentionDurable, 0, false,

@@ -415,7 +415,7 @@ func TestCloseIsIdempotentStopsTheLoopAndErasesEveryKey(t *testing.T) {
 	if _, _, err := fixture.session.OpenRecord(record); !errors.Is(err, ErrSessionClosed) {
 		t.Errorf("opening after Close answered %v, want ErrSessionClosed", err)
 	}
-	if err := fixture.session.TrackSender(0, message.RetentionDurable, 0, 0); !errors.Is(err, ErrSessionClosed) {
+	if err := fixture.session.TrackSender(0, message.RetentionDurable, 0, 0, 0); !errors.Is(err, ErrSessionClosed) {
 		t.Errorf("tracking after Close answered %v, want ErrSessionClosed", err)
 	}
 	if err := fixture.session.AdvanceEpoch(testPqSecret()); !errors.Is(err, ErrSessionClosed) {

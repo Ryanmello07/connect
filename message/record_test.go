@@ -436,8 +436,15 @@ func TestSizeBucketCtBodyIsTheBodyPlusTheAeadTag(t *testing.T) {
 }
 
 // The eph ladder, pinned by value for the same cross spec reason as the size ladder,
-// with bucket 0 held to the transient rung's contract: it is never persisted, so it has
-// no window a caller could turn into an expiry.
+// with bucket 0 held to the transient rung's contract: it is never persisted, so its
+// retention window is nought seconds -- a real window and not the absence of one.
+//
+// THE BUCKET 0 ASSERTION WAS INVERTED BY THE 2026-09-13 RULING AND IS RECORDED RATHER
+// THAN QUIETLY SWAPPED. It read "if seconds := EphBucketSeconds(0); 0 <= seconds" --
+// that is, bucket 0 had to be NEGATIVE, the same answer as an off ladder bucket, which
+// is exactly what m1 open item M1-27 was filed about: two meanings under one sentinel,
+// so no caller could ask which of the two it had met. Master section 8, spec A section
+// 5.1 and spec B section 3.1 now all carry one paragraph saying they MUST DIFFER.
 func TestEphBucketSecondsLadderIsPinned(t *testing.T) {
 	wantSeconds := []int{1: 3600, 2: 28800, 3: 86400, 4: 604800, 5: 2419200}
 	for bucket := 1; bucket < len(wantSeconds); bucket++ {
@@ -445,12 +452,23 @@ func TestEphBucketSecondsLadderIsPinned(t *testing.T) {
 			t.Errorf("eph bucket %d is %d seconds, want %d", bucket, seconds, wantSeconds[bucket])
 		}
 	}
-	if seconds := EphBucketSeconds(0); 0 <= seconds {
-		t.Errorf("eph bucket 0 is the transient rung and is never persisted, but it reports a window of %d seconds", seconds)
+	// THE DISTINGUISHABILITY FIRST, because that is the property and the two literals are
+	// only its consequence: a table that swapped them would satisfy both literal checks
+	// below read one at a time, and this is the assertion that cannot be satisfied by any
+	// single answer at all.
+	transient := EphBucketSeconds(0)
+	offLadder := EphBucketSeconds(uint8(len(wantSeconds)))
+	if transient == offLadder {
+		t.Errorf("eph bucket 0 and eph bucket %d both answer %d; the transient rung has a real retention window of nought seconds and a bucket off the ladder is not a bucket at all, and a caller holding one answer cannot ask which of them it met",
+			len(wantSeconds), transient)
+	}
+	// and each on its own side, which is the half that says WHICH way round they differ
+	if transient != 0 {
+		t.Errorf("eph bucket 0 answers %d seconds; master section 8 rules it 0 -- the true retention window of a rung that is never stored", transient)
 	}
 	for bucket := len(wantSeconds); bucket <= 0xFF; bucket++ {
 		if seconds := EphBucketSeconds(uint8(bucket)); 0 <= seconds {
-			t.Errorf("eph bucket %d is not on the ladder but reports a window of %d seconds", bucket, seconds)
+			t.Errorf("eph bucket %d is not on the ladder but reports a window of %d seconds; master section 8 rules 6..255 a NEGATIVE", bucket, seconds)
 		}
 	}
 	// strictly increasing, so a swap of two rungs is a failure twice over rather than a
@@ -474,7 +492,7 @@ func TestEphBucketSecondsLadderIsPinned(t *testing.T) {
 // a transient that gets stored for an hour is the one thing the transient rung promises
 // never to do.
 var masterEphWindowSeconds = map[byte]int{
-	0x10: neverPersisted,
+	0x10: transientRungSeconds,
 	0x11: 3600,
 	0x12: 28800,
 	0x13: 86400,
@@ -482,9 +500,14 @@ var masterEphWindowSeconds = map[byte]int{
 	0x15: 2419200,
 }
 
-// What the table above says about the transient rung: no window at all, because the
-// record is never stored to have one.
-const neverPersisted = -1
+// What the table above says about the transient rung: nought seconds, because the record
+// is never stored and nought is how long a thing that is never stored is kept for.
+//
+// It was neverPersisted = -1 until the ruling of 2026-09-13, where -1 was the same answer
+// an off ladder bucket gave and the two could not be told apart. Master section 8, spec A
+// section 5.1 and spec B section 3.1 now carry one paragraph: 0 for bucket 0, a negative
+// for 6..255.
+const transientRungSeconds = 0
 
 func TestEveryEphWireByteCarriesTheWindowMasterSection8Names(t *testing.T) {
 	for _, value := range masterWireBytes() {
@@ -506,12 +529,6 @@ func TestEveryEphWireByteCarriesTheWindowMasterSection8Names(t *testing.T) {
 			continue
 		}
 		seconds := EphBucketSeconds(bucket)
-		if want == neverPersisted {
-			if 0 <= seconds {
-				t.Errorf("0x%02x is the transient rung and is never persisted, and it reports a window of %d seconds", wire, seconds)
-			}
-			continue
-		}
 		if seconds != want {
 			t.Errorf("a record written as 0x%02x expires after %d seconds, want the %d of master section 8", wire, seconds, want)
 		}
@@ -538,9 +555,15 @@ func TestEphLadderCoversExactlyTheBucketsTheWireAdmits(t *testing.T) {
 	for bucket := 0; bucket <= 0xFF; bucket++ {
 		onTheWire := wireBuckets[uint8(bucket)]
 		seconds := EphBucketSeconds(uint8(bucket))
-		// bucket 0 is on the wire and has no window on purpose; it is the one rung
-		// where the two answers legitimately differ
+		// bucket 0 is on the wire and its window is nought on purpose -- it is never
+		// persisted -- so it is the one rung where "on the wire" and "has a positive
+		// window" legitimately disagree. It is checked, not skipped: the ruling of
+		// 2026-09-13 makes the nought an ANSWER, so there is something to assert here
+		// where before there was only an absence.
 		if bucket == 0 {
+			if seconds != 0 {
+				t.Errorf("eph bucket 0 is on the wire and answers %d seconds, want the 0 master section 8 rules for the transient rung", seconds)
+			}
 			continue
 		}
 		if onTheWire && seconds <= 0 {

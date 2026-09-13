@@ -259,18 +259,36 @@ func RecordKeyNext(recordKey []byte) []byte {
 //
 //	key_head | nonce_head = HKDF-Expand(record_key[i], "rec/v1/head", 56)
 //
-// The contradiction this function does not resolve, stated where a reader meets it. MASTER
-// section 8.1 says one line after the ladder that "ct_head is always under the durable class,
-// since it is always retained", while spec A section 5.3 gives this function and RecordAeadBody
-// the SAME record_key[i] argument. For a DURABLE record the two coincide and nothing at this
-// layer can tell them apart; for a PERMANENT, MEDIA or EPH record they are two rungs of two
-// different class ladders. WHICH rung each half takes is open item M1-6 and is not answered
-// here. That a record has ONE stream_index no longer needs answering: the owner's ruling of
-// 2026-09-07 -- shape A1 -- makes the counter class blind, so the index belongs to the SENDER
-// and to no ladder, and what M1-6 still owes is the pairing rather than the number. This
-// derivation is exactly what section 5.3 declares -- one record key in,
-// the head's material out -- and task 11 is where the ruling binds, because SealRecord is what
-// states which key it passes to each.
+// THE ARGUMENT IS THE RECORD'S OWN LADDER, AT THE RECORD'S OWN POSITION, FOR EVERY CLASS. Ruled
+// 2026-09-13 (ledger items 152 and 128, spec A revision A-25), and it REVERSES the ruling of
+// 2026-09-07. ct_head is keyed under the record's own class key exactly as ct_body is, so head
+// and body take ONE ladder at ONE position and are separated only by their HKDF labels,
+// "rec/v1/head" against "rec/v1/body" -- which is what MASTER invariant I7's "distinct keys and
+// distinct AADs" has always meant and is why one position is safe.
+//
+// WHAT THIS COMMENT SAID UNTIL THEN, because a reversal that erases what it reverses leaves the
+// next reader unable to reconstruct it, and because what it said is the reading a builder would
+// otherwise transcribe. It called this a contradiction the function does not resolve: MASTER
+// section 8.1 said one line after the ladder that ct_head is always under the durable class since
+// it is always retained, while spec A section 5.3 gave this function and RecordAeadBody the same
+// record_key[i]; for a DURABLE record the two coincide, and for a PERMANENT, MEDIA or EPH record
+// they were two rungs of two different class ladders, with WHICH rung each half takes left to
+// m1 open item M1-6 -- ruled 2026-09-07, reversed 2026-09-13.
+// That reading is GONE. Its premise -- the head is always retained -- is false
+// for exactly one class and it is the class the question was about: spec B section 7.2 sets
+// ct_head = NULL for EPH(1..5) at prune_after.
+//
+// THE SIGNATURE STILL CANNOT EXPRESS IT AND THE CALL SITE STILL BINDS IT. This function takes a
+// thirty two octet secret and so does RecordAeadBody, so nothing here can check that the two were
+// handed the same rung of the right ladder; SealRecord and OpenRecord are where that is decided
+// and seal.go's decision (a) is where it is argued. What a caller can now get wrong in silence is
+// the INVERSE of what it was: passing the durable ladder's record_key to this function for a
+// non-DURABLE record is a working program that seals an EPH header under a key nothing destroys.
+//
+// The class blind counter is untouched and is still needed. Ruling A1 of 2026-09-07 -- ledger
+// items 143 and 169 -- makes i = stream_index in every ladder over one counter per
+// (group_id, sender_handle), and its load bearing case is the device wrap's classless shared
+// root, which this reversal does not reach.
 func RecordAeadHead(recordKey []byte) (key []byte, nonce []byte) {
 	return recordAeadMaterial(recordKey, recordAeadHeadInfo)
 }

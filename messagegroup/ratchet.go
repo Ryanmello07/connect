@@ -782,16 +782,26 @@ func (self *ReceiverRatchet) pruneLocked() {
 }
 
 // ReceiverRatchetKey is what one receiver ratchet is tracked under: the handle the server routes
-// on and the retention class wire byte the record carries.
+// on, the retention class wire byte the record carries, and the eph window it names.
 //
 // The retention byte and not the parsed class, because section 5.1 encodes the class and the eph
 // bucket in ONE octet -- 0x10 given a bucket, for the eph classes -- and a table keyed on the
 // parsed class alone would put two eph buckets on one ladder. It is the wire byte for a second
 // reason too: connect/message declares the parsed type, and this package does not put a
 // production call across that boundary until task 11.
+//
+// AND THE WINDOW, FOR THE SAME REASON ONE LEVEL IN, SINCE 2026-09-13. A ratchet is rooted at a
+// CLASS KEY, and an EPH record's class key is EphKey(eph_root, bucket, window): two windows of
+// one bucket are two class keys and therefore two ladders, exactly as two buckets are. A table
+// keyed on the byte alone would walk a record written in window t+1 up the ladder rooted at
+// window t's key, derive a rung nothing else in the system holds, and report an AEAD failure
+// that says nothing about which of the two values disagreed. For every class but EPH the window
+// is zero on every record -- master section 8's presence rule is a zero VALUE, on every
+// non-EPH class -- so this field collapses to nothing for them with no special case anywhere.
 type ReceiverRatchetKey struct {
 	SenderHandle  [16]byte
 	RetentionWire byte
+	EphWindow     uint64
 }
 
 // ReceiverRatchets is the table of one group's receiver ratchets, and the owner of the bound that

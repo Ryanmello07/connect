@@ -67,14 +67,19 @@
 // quoted its own retracted sentence would be a file that fails its own gate forever or teaches the
 // gate to ignore quotation marks. Neither is worth a verbatim.
 //
-// WHAT IS GENUINELY HAND-CARRIED, three values and each named with what would replace it. pq_secret,
-// whose value the test draws with NewPqSecret and hands to both sides: it is a KEY on the seal and
-// open path -- the ikm of every storage_root this session extracts -- it is the one such value with
-// NO PRODUCTION DRIVER anywhere in this package, and its delivery channel is m1 task 14, gated on
-// ledger item 152. group_handle_key, which a PRODUCTION function computes at epoch zero and which
-// no channel carries to a joiner: open item M1-2. And the Welcome itself, handed over as a VALUE IN
-// ONE PROCESS, which is ledger 44a's named, gated, test-only hand-off. Three hand-offs and no
-// test-only key SOURCE: nothing on this path mints a key some way the product would not.
+// WHAT IS GENUINELY HAND-CARRIED, FOUR values now and each named with what would replace it.
+// pq_secret, whose value the test draws with NewPqSecret and hands to both sides: it is a KEY on
+// the seal and open path -- the ikm of every storage_root this session extracts -- it is the one
+// such value with NO PRODUCTION DRIVER anywhere in this package, and its delivery channel is m1
+// task 14, whose blocker ledger item 152 was RULED 2026-09-13 and whose remaining blocker is
+// M1-52. eph_root, which arrived on the same ruling of 2026-09-13 and is the same shape one step
+// further out: MASTER invariant I4 makes it fresh CSPRNG at a commit and forbids deriving it, so
+// there is nothing for this package to compute, and InstallEphRoot is the door a committer or the
+// eph_root device wrap hands it through. group_handle_key, which a PRODUCTION function computes at
+// epoch zero and which no channel carries to a joiner: open item M1-2. And the Welcome itself,
+// handed over as a VALUE IN ONE PROCESS, which is ledger 44a's named, gated, test-only hand-off.
+// Four hand-offs and no test-only key SOURCE: nothing on this path mints a key some way the
+// product would not.
 //
 // NEITHER SIDE KEEPS A SESSION ACROSS AN ADD, and this is stated symmetrically because it was
 // stated one-sidedly. The FOUNDER's own handle moves to epoch 1 the moment MergePendingCommit
@@ -94,12 +99,23 @@
 // owing, and open item MG-1 in this directory's OPENITEMS.md files the mechanism. This package
 // must not invent one: which identity a joiner should expect is a design ruling.
 //
-// IT SEALS ONLY THE DURABLE retention class, because MASTER section 8.1 and section 5.3 disagree
-// about which record_key seals ct_head and open item M1-6 has not ruled -- so the permanent, media
-// and eph classes are refused rather than guessed at. It reaches no message server: every task of
-// wave 1 stops at a *Record in memory, and the submit path belongs to sdk plans that do not exist.
-// And its stream index reserver is an INTERFACE with no durable implementation anywhere, so a run
-// over this package's test fake proves the record layer and not the client.
+// IT SEALS AND OPENS EVERY RETENTION CLASS THE WIRE ADMITS, all nine bytes of the alphabet, and
+// the sentence that stood here claimed the reverse -- that only one class could be sealed,
+// because two documents disagreed about which record key seals ct_head and the item that would
+// settle it had not been ruled. It is DESCRIBED and not quoted, for the reason the retraction
+// four paragraphs up gives: TestTheInventoryDoesNotDenyWhatThisPackageProves reads this file for
+// the denial, and a file that quoted its own retracted sentence would be a file that fails its own
+// gate forever or teaches the gate to ignore quotation marks. M1-6 was ruled 2026-09-07, which
+// lifted the refusal for the permanent and media classes and left it standing for the eph ones
+// under ledger item 152; on 2026-09-13 the owner ruled 152 and REVERSED M1-6's ruling with it --
+// ct_head takes the record's OWN class key, head and body take one ladder at one position, and
+// spec A section 5.3 says the refusal is now lifted in full. What is refused now is two VALUES
+// rather than any class: an EPH record at a session holding no eph_root, and the eph_root device
+// wrap, whose own eph_window is ledger open item 185 and is not ruled. It reaches no message
+// server: every task of wave 1 stops at a *Record in memory, and the submit path belongs to sdk
+// plans that do not exist. And its stream index reserver is an INTERFACE with no durable
+// implementation anywhere, so a run over this package's test fake proves the record layer and not
+// the client.
 //
 // AND THE RECORD LAYER HAS NO SENDER AUTHENTICATION AT ALL, which belongs in this inventory
 // because it is the absence a reader is least likely to guess from what is here. Every key a

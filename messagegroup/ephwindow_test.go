@@ -17,12 +17,16 @@
 // the wire: the octets really move, the codec really reads them back, and the record built out
 // of the mutated octets really fails the aead.
 //
-// WHAT THIS FILE CANNOT SEE. The records are DURABLE, because SealRecord refuses every other
-// class until m1 open item M1-6's successor lands, so the window under test is the presence
-// rule's ZERO and the mutation moves it OFF zero. That is the case worth having anyway --
-// binding the zero is what stops a header being spliced across classes, which is the aad
-// term's stated job -- but it is not the eph case, and no test anywhere in this module can be
-// the eph case until sealing one is allowed.
+// WHAT THIS FILE DOES NOT SEE, AND IT IS NOW A CHOICE RATHER THAN A WALL. The records here are
+// DURABLE, so the window under test is the presence rule's ZERO and the mutation moves it OFF
+// zero. That is the case worth having on its own terms -- binding the zero is what stops a
+// header being spliced across classes, which is the aad term's stated job. The sentence that
+// stood here said the eph case was unreachable: "SealRecord refuses every other class until m1
+// open item M1-6's successor lands ... no test anywhere in this module can be the eph case until
+// sealing one is allowed." That successor landed on 2026-09-13 -- ledger item 152 ruled, M1-6's
+// 2026-09-07 ruling reversed -- and the eph case is reachable now. ephkey_test.go is where it is
+// taken, on the ladder rather than on the wire: this file's subject is the octets moving, and a
+// DURABLE record moves the same octets.
 package messagegroup
 
 import (

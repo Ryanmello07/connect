@@ -497,10 +497,24 @@ type testSession struct {
 // newTestSession founds a group and opens a session over it.
 func newTestSession(t *testing.T, name string) *testSession {
 	t.Helper()
+	return newTestSessionAtClock(t, name, testClock())
+}
+
+// newTestSessionAtClock is newTestSession with the injected clock supplied by the caller.
+//
+// IT IS NOT A TIMING SENSITIVE SEAM AND IT MUST NOT BECOME ONE. doc.go's inventory says this
+// package has no timing sensitive test in it and takes the time as an injected nowMs func() int64
+// for exactly that reason; a caller that hands in a closure over a variable it sets itself is
+// still fully deterministic, which is the difference between "the clock moved" and "the test
+// slept". What it buys is the one property a fixed clock cannot observe at all: that an opener
+// takes the record's own eph_window off the wire and never recomputes one, which is only visible
+// when the two would differ.
+func newTestSessionAtClock(t *testing.T, name string, nowMs func() int64) *testSession {
+	t.Helper()
 	engine := newTestEngine(t)
 	handle := engine.createGroup(t, name)
 	reserver := newStreamIndexMemory()
-	session, err := NewGroupSession(handle, testPqSecret(), nil, reserver, testClock(), testServerNonce())
+	session, err := NewGroupSession(handle, testPqSecret(), nil, reserver, nowMs, testServerNonce())
 	if err != nil {
 		t.Fatalf("NewGroupSession: %v", err)
 	}
@@ -512,9 +526,56 @@ func newTestSession(t *testing.T, name string) *testSession {
 // a case seal and open in one session.
 func (self *testSession) trackOwn(t *testing.T) {
 	t.Helper()
-	if err := self.session.TrackSender(self.handle.OwnLeafIndex(), message.RetentionDurable, 0, 0); err != nil {
-		t.Fatalf("TrackSender: %v", err)
+	self.trackOwnLadder(t, message.RetentionDurable, 0, 0)
+}
+
+// trackOwnLadder is trackOwn for any class key: the class, the bucket and the WINDOW, because an
+// EPH ladder is rooted at EphKey(eph_root, bucket, window) and two windows of one bucket are two
+// ladders.
+func (self *testSession) trackOwnLadder(t *testing.T, class message.RetentionClass, bucket uint8,
+	window uint64) {
+
+	t.Helper()
+	if err := self.session.TrackSender(self.handle.OwnLeafIndex(), class, bucket, window, 0); err != nil {
+		t.Fatalf("TrackSender(class %d bucket %d window %d): %v", class, bucket, window, err)
 	}
+}
+
+// testEphRoot is the eph_root a fixture installs.
+//
+// IT IS A FIXED VALUE AND NOT A DRAW, deliberately, for the reason testPqSecret is: a fixture
+// that drew one would make every case that compares two derivations depend on entropy. It is a
+// KEY VALUE the test supplies and NewEphRoot is the production function that draws the real one,
+// so this is not a test-only key SOURCE -- the same distinction the pq_secret paragraph in this
+// file's header draws, and eph_root has the same standing: no production caller of NewEphRoot
+// exists in this package, and its carrier is the eph_root device wrap of m1 task 14.
+func testEphRoot() []byte {
+	root := make([]byte, EphRootBytes)
+	for i := range root {
+		root[i] = byte(0xE0 + i)
+	}
+	return root
+}
+
+// installEphRoot hands this session the epoch's eph_root, which is what any EPH record needs
+// before it can be sealed or opened at all.
+func (self *testSession) installEphRoot(t *testing.T) {
+	t.Helper()
+	if err := self.session.InstallEphRoot(testEphRoot()); err != nil {
+		t.Fatalf("InstallEphRoot: %v", err)
+	}
+}
+
+// ephWindowNow is the window this fixture's clock falls in for one bucket, computed the way the
+// sealer computes it rather than written out, so a case that wants "the current window" and a
+// sealer that wrote one cannot disagree.
+func ephWindowNow(t *testing.T, bucket uint8) uint64 {
+	t.Helper()
+	window, err := EphWindowAt(bucket, testClock()())
+	if err != nil {
+		t.Fatalf("EphWindowAt(bucket %d): %v", bucket, err)
+	}
+	return window
 }
 
 // ---------------------------------------------------------------------------

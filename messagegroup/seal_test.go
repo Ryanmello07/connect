@@ -517,7 +517,8 @@ func TestBodyHashIsTheHashOfTheSealedBodyAndIsNotInTheBodyAad(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Property 5 and 6: the rung, the codec, and the class M1-6 has not ruled
+// Property 5 and 6: the rung, the codec, and the classes M1-6's reversal admits
+// (M1-6 ruled 2026-09-07, REVERSED 2026-09-13 together with ledger item 152)
 // ---------------------------------------------------------------------------
 
 // The record EncodeRecord refuses is the record SealRecord refuses, held by CALLING EncodeRecord
@@ -554,39 +555,80 @@ func TestASealedRecordIsExactlyItsRungAndIsOneTheCodecAccepts(t *testing.T) {
 	}
 }
 
-// Property 6: every class other than DURABLE is refused with the M1-6 sentinel, on BOTH arms of
-// the two arm switch.
+// Property 6, REPLACED BY ITS OWN SUBJECT'S REVERSAL: a session that holds no eph_root refuses
+// exactly the eph wire bytes and nothing else.
 //
-// The eph arm is on the CP3b path since 2026-09-13's ruling -- the eph_root device wrap is
-// EPH(5) -- so a refusal tested on one arm is a refusal tested on half of itself. No exemption is
-// carved for either: four record kinds is a refusal that has become a sentence.
-func TestOnlyTheDurableClassIsSealedUntilM16IsRuled(t *testing.T) {
-	fixture := newTestSession(t, "m1-6")
-	for _, refused := range []struct {
-		class  message.RetentionClass
-		bucket uint8
-	}{
-		{class: message.RetentionPermanent},
-		{class: message.RetentionMedia},
-		{class: message.RetentionEph, bucket: 0},
-		{class: message.RetentionEph, bucket: 1},
-		{class: message.RetentionEph, bucket: 5},
-	} {
-		record, err := fixture.session.SealRecord(refused.class, refused.bucket, false,
+// WHAT THIS CASE USED TO BE, because the sentence it asserted is the one that was overturned. It
+// was TestOnlyTheDurableClassIsSealedUntilM16IsRuled, and it required PERMANENT, MEDIA and every
+// EPH bucket to be refused with the blanket class sentinel, on the reading that MASTER section
+// 8.1 and spec A section 5.3 disagreed about which record key seals ct_head. M1-6 was ruled on
+// 2026-09-07 and its ruling was REVERSED on 2026-09-13 (ledger items 152 and 128, spec A revision
+// A-25): ct_head takes the record's OWN class key, head and body take one ladder at one position,
+// and spec A section 5.3 says in as many words that "THE REFUSAL IS NOW LIFTED IN FULL". Keeping
+// this case would have been keeping the rule that was overturned.
+//
+// WHAT REPLACES IT IS THE HALF OF THE OLD REFUSAL THAT SURVIVED AS A DIFFERENT SENTENCE. The eph
+// classes are still not sealable by a session that holds no eph_root -- not because a class is
+// unruled, but because K_eph has an input that is neither derived nor defaulted (MASTER I4). The
+// SPLIT is what this case pins, and it pins both halves of it and their complement rather than
+// one side: exactly the eph bytes refuse, exactly the non-eph bytes seal.
+func TestASessionWithNoEphRootRefusesExactlyTheEphWireBytes(t *testing.T) {
+	fixture := newTestSession(t, "no-eph-root")
+	refusedWire := []byte{}
+	sealedWire := []byte{}
+	for candidate := 0; candidate <= 0xFF; candidate += 1 {
+		wire := byte(candidate)
+		class, bucket, wireErr := message.RetentionClassOf(wire)
+		if wireErr != nil {
+			continue
+		}
+		record, err := fixture.session.SealRecord(class, bucket, false,
 			[]byte("head"), []byte("body"), 0, nil)
-		if !errors.Is(err, ErrRetentionClassUnruled) {
-			t.Errorf("sealing class %d bucket %d answered %v, want ErrRetentionClassUnruled: a record sealed under an unruled reading of MASTER section 8.1 is wire visible and unrecoverable after the A6 freeze",
-				refused.class, refused.bucket, err)
-		}
-		if record != nil {
-			t.Errorf("sealing class %d bucket %d answered a record beside its error", refused.class, refused.bucket)
+		switch {
+		case err == nil:
+			sealedWire = append(sealedWire, wire)
+			if record == nil {
+				t.Errorf("wire %#02x sealed and answered no record", wire)
+			}
+		case errors.Is(err, ErrNoEphRoot):
+			refusedWire = append(refusedWire, wire)
+			if record != nil {
+				t.Errorf("wire %#02x was refused and answered a record beside its error", wire)
+			}
+		default:
+			t.Errorf("wire %#02x answered %v, which is neither a sealed record nor the one refusal a session with no eph_root owes", wire, err)
 		}
 	}
-	// and the durable class is sealed, so the refusal above is a refusal rather than a sealer
-	// that refuses everything.
-	if _, err := fixture.session.SealRecord(message.RetentionDurable, 0, false, []byte("head"), []byte("body"), 0, nil); err != nil {
-		t.Fatalf("the durable class is refused too, so every case above is satisfied by a sealer that does nothing: %v", err)
+	// CLASS: the eph half is derived off connect/message's own split, never off a list of
+	// bytes. SCOPE: all 256 octets, offered to RetentionClassOf, whose acceptances are the
+	// alphabet. Both halves are named and both are pinned, because "some refused and some
+	// sealed" is satisfied by twelve readings when there are thirteen.
+	wantRefused, wantSealed := []byte{}, []byte{}
+	for candidate := 0; candidate <= 0xFF; candidate += 1 {
+		wire := byte(candidate)
+		class, _, wireErr := message.RetentionClassOf(wire)
+		if wireErr != nil {
+			continue
+		}
+		if class == message.RetentionEph {
+			wantRefused = append(wantRefused, wire)
+		} else {
+			wantSealed = append(wantSealed, wire)
+		}
 	}
+	if len(wantRefused) == 0 || len(wantSealed) == 0 {
+		t.Fatalf("the wire alphabet split into %d eph and %d non eph bytes, so one half of this case read nothing",
+			len(wantRefused), len(wantSealed))
+	}
+	if !bytes.Equal(refusedWire, wantRefused) {
+		t.Errorf("a session with no eph_root refused %#x, want exactly the eph bytes %#x", refusedWire, wantRefused)
+	}
+	if !bytes.Equal(sealedWire, wantSealed) {
+		t.Errorf("a session with no eph_root sealed %#x, want exactly the non eph bytes %#x; ledger item 152 is ruled and the blanket class refusal is lifted in full, so PERMANENT and MEDIA seal here",
+			sealedWire, wantSealed)
+	}
+	t.Logf("no eph_root: %d wire bytes seal %#x; complement is the %d eph bytes %#x, refused with ErrNoEphRoot",
+		len(sealedWire), sealedWire, len(refusedWire), refusedWire)
 }
 
 // ---------------------------------------------------------------------------
@@ -697,7 +739,7 @@ func TestARecordSealedByOneSessionOpensInASecondOneOverTheSameEpoch(t *testing.T
 		t.Fatalf("the second session: %v", err)
 	}
 	defer receiver.Close()
-	if err := receiver.TrackSender(fixture.handle.OwnLeafIndex(), message.RetentionDurable, 0, 0); err != nil {
+	if err := receiver.TrackSender(fixture.handle.OwnLeafIndex(), message.RetentionDurable, 0, 0, 0); err != nil {
 		t.Fatalf("TrackSender at the receiver: %v", err)
 	}
 	for index := range 3 {

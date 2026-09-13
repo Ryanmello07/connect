@@ -1240,6 +1240,14 @@ var typesTheEraseClassReachesThatOweNoErase = map[string]string{
 		"none of this process's storage; it is in this class only because the field reading resolves the bare " +
 		"name Reader to the decoder this package declares, which is a collision across two packages and not a " +
 		"byte slice anybody could erase",
+	"senderLadderKey": "the retention class wire byte and the eph window one of a session's own sender " +
+		"ladders is held under. It is ReceiverRatchetKey one row up read from the sending side, and the " +
+		"same two sentences answer it: the retention byte is one octet of the cleartext header of every " +
+		"record, and the eph window is a u64 that MASTER section 8's presence rule puts on the wire IN " +
+		"THE CLEAR beside it -- ruled 2026-09-13, and the plaintext of it is the whole reason an opener " +
+		"can take the sender's window rather than recompute one. Neither half is anything an attacker " +
+		"lacks. The key material is in the SenderRatchet the key points at, and that type is a member of " +
+		"this class in its own right and erases what it holds",
 	"StreamKey": "the group and the sender handle a reservation belongs to, which is what spec B's " +
 		"schema, spec B's Q7 and the shipped message server all key the stream index counter by. Both are " +
 		"in the CLEARTEXT header of every record: the server keys its rows on the group id and routes on " +

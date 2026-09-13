@@ -115,9 +115,43 @@ type GroupSession struct {
 	windowSize    int
 	retainedBound int
 
-	// one sender ladder per retention class wire byte, and one table of the receivers'.
-	senders   map[byte]*SenderRatchet
+	// eph_root[n], or nil.
+	//
+	// IT IS NOT DERIVED AND IT CANNOT BE. Master invariant I4 and section 8.1 make it thirty
+	// two octets of fresh CSPRNG drawn at the commit that opens epoch n, never a function of
+	// storage_root, so unlike every other key in this struct it is not something installEpoch
+	// can produce -- it is a value that has to arrive. InstallEphRoot is the door and
+	// ErrNoEphRoot is what an EPH record meets when nobody has used it.
+	//
+	// IT IS DROPPED AND ERASED AT EVERY EPOCH INSTALL, which is not the same discipline as the
+	// keys beside it. Those are re-derived from the new root, so dropping them is bookkeeping;
+	// this one cannot be re-derived at all, so the drop is the whole of what stops epoch n's
+	// ephemeral ladder being used to seal an epoch n+1 record -- a record no other member could
+	// open, and one whose key would outlive the epoch that promised to destroy it.
+	ephRoot []byte
+
+	// one sender ladder per (retention class wire byte, eph window), and one table of the
+	// receivers'.
+	senders   map[senderLadderKey]*SenderRatchet
 	receivers *ReceiverRatchets
+}
+
+// senderLadderKey is what one of this session's own sender ladders is held under.
+//
+// THE WINDOW IS IN THE KEY AND IT IS NOT DECORATION. record_key[0] binds the CLASS KEY, so one
+// ladder per class key is the rule, and for the EPH classes the class key is
+// EphKey(eph_root, bucket, window) -- a function of the window as much as of the bucket. A map
+// keyed on the wire byte alone would hand a record written in window t+1 the ladder rooted at
+// window t's key: a record that encodes a window nothing can derive its key from, that this
+// session would happily seal, and that no member of the group including the sender could ever
+// open again. It is the same failure ReceiverRatchetKey's own comment describes for two buckets
+// on one ladder, one level further in.
+//
+// For every class but EPH the window is zero on every record -- master section 8's presence rule
+// -- so this key collapses to the wire byte for them with no special case anywhere.
+type senderLadderKey struct {
+	RetentionWire byte
+	EphWindow     uint64
 }
 
 // NewGroupSession opens a session over one group handle at the handle's current epoch.
@@ -190,7 +224,7 @@ func NewGroupSession(handle GroupHandle, pqSecret []byte, groupHandleKeyEpoch0 [
 		pqSecret:      append([]byte(nil), pqSecret...),
 		windowSize:    DefaultRecordWindowSize,
 		retainedBound: DefaultRetainedRecordKeys,
-		senders:       map[byte]*SenderRatchet{},
+		senders:       map[senderLadderKey]*SenderRatchet{},
 	}
 	self.groupId = [32]byte(groupId)
 	self.ownLeaf = handle.OwnLeafIndex()
@@ -485,7 +519,7 @@ func (self *GroupSession) RebindServerNonce(serverNonce []byte) error {
 // a peer that could choose this number could choose how much work this session does. The walk is
 // bounded by maxLadderWalk in any case, which is the second half of the same argument.
 func (self *GroupSession) TrackSender(leaf uint32, class message.RetentionClass, ephBucket uint8,
-	headIndex uint64) error {
+	ephWindow uint64, headIndex uint64) error {
 
 	var err error
 	if postErr := self.do(func() {
@@ -493,7 +527,7 @@ func (self *GroupSession) TrackSender(leaf uint32, class message.RetentionClass,
 			err = ErrSessionClosed
 			return
 		}
-		err = self.trackSenderOnLoop(leaf, class, ephBucket, headIndex)
+		err = self.trackSenderOnLoop(leaf, class, ephBucket, ephWindow, headIndex)
 	}); postErr != nil {
 		return postErr
 	}
@@ -502,13 +536,17 @@ func (self *GroupSession) TrackSender(leaf uint32, class message.RetentionClass,
 
 // trackSenderOnLoop is TrackSender's body. The caller is the loop goroutine.
 func (self *GroupSession) trackSenderOnLoop(leaf uint32, class message.RetentionClass,
-	ephBucket uint8, headIndex uint64) error {
+	ephBucket uint8, ephWindow uint64, headIndex uint64) error {
 
 	retentionWire, err := message.RetentionClassWire(class, ephBucket)
 	if err != nil {
 		return err
 	}
-	classKey, err := self.classKeyOnLoop(class)
+	// the ladder's window and not the argument, so a caller that passed a window with a
+	// non-EPH class tracks the ratchet under the key the opener will actually form rather
+	// than under one nothing ever looks up. seal.go's ephLadderWindow carries the rule.
+	ladderWindow := ephLadderWindow(class, ephWindow)
+	classKey, err := self.classKeyOnLoop(class, ephBucket, ladderWindow)
 	if err != nil {
 		return err
 	}
@@ -519,8 +557,63 @@ func (self *GroupSession) trackSenderOnLoop(leaf uint32, class message.Retention
 	self.receivers.Track(ReceiverRatchetKey{
 		SenderHandle:  SenderHandle(self.groupHandleKey, leaf),
 		RetentionWire: retentionWire,
+		EphWindow:     ladderWindow,
 	}, ratchet)
 	return nil
+}
+
+// InstallEphRoot gives this session the eph_root of the epoch it is at.
+//
+// WHY THERE IS A SETTER AT ALL, AND WHY IT IS NOT A CONSTRUCTOR ARGUMENT. eph_root[n] is the one
+// key in this session that no derivation of this package can produce: master invariant I4 makes
+// it thirty two octets of fresh CSPRNG drawn at the commit that opens epoch n, deliberately NOT
+// a function of storage_root, and MASTER section 8.1 calls a derivation from storage_root "the
+// most easily broken property here" because it would compile, pass every test that does not
+// look for it, and make every expired message recoverable forever. So it has to ARRIVE. A
+// committer draws it with NewEphRoot; a joining or a catching up member gets it out of the
+// eph_root device wrap, which is m1 task 14's and does not exist. It is a setter rather than a
+// constructor parameter because a session is constructed before it has committed anything, and
+// because a required argument with no carrier would have made every existing caller supply a
+// value it does not have -- which is the placeholder hazard, arriving in the shape of a
+// constructor.
+//
+// WHAT IT IS NOT: a default. A session that was never handed one refuses to seal or open any
+// EPH record, of any bucket, with ErrNoEphRoot. Thirty two zero octets would derive a perfectly
+// good ladder that both ends of one implementation agree on and that is identical in every group
+// in the world, which is exactly the failure NewGroupSession refuses an empty pq_secret to avoid.
+//
+// IT IS SCOPED TO THE EPOCH THIS SESSION IS AT. installEpochOnLoop drops and erases the value on
+// every epoch change, so a caller that advances an epoch and does not install that epoch's root
+// meets ErrNoEphRoot rather than epoch n-1's ladder -- and the drop is what stops an EPH record
+// of epoch n+1 being sealed under a key epoch n promised to destroy.
+//
+// The value is COPIED, because the caller drew it and may erase its own array, and the copy is
+// what this session erases at the drop.
+//
+// The noinline directive is this package's erase helper class, reached through the zeroize
+// below: that store lands in an array this call is not the only holder of.
+//
+//go:noinline
+func (self *GroupSession) InstallEphRoot(ephRoot []byte) error {
+	var err error
+	if postErr := self.do(func() {
+		if self.closing {
+			err = ErrSessionClosed
+			return
+		}
+		if len(ephRoot) != EphRootBytes {
+			err = fmt.Errorf("%w: %d octets, and it is the root of every ephemeral key of this epoch",
+				ErrEphRootLength, len(ephRoot))
+			return
+		}
+		// erased before it is overwritten, in this body, for installEpochOnLoop's reason.
+		replacement := append([]byte(nil), ephRoot...)
+		zeroize(self.ephRoot)
+		self.ephRoot = replacement
+	}); postErr != nil {
+		return postErr
+	}
+	return err
 }
 
 // installEpochOnLoop derives every key of the epoch the handle is at.
@@ -593,24 +686,44 @@ func (self *GroupSession) installEpochOnLoop(groupHandleKeyEpoch0 []byte) error 
 	zeroize(self.writeKey)
 	zeroize(self.readKey)
 	zeroize(self.groupHandleKey)
+	// eph_root is ERASED AND DROPPED and is the one field here that is not replaced. Every
+	// other key of the epoch is re-derived two lines below from the new root; this one cannot
+	// be derived at all, so there is nothing to put back and a caller that wants epoch n+1's
+	// ephemeral ladder installs that epoch's root through InstallEphRoot. Carrying the old
+	// value across would seal an epoch n+1 record under epoch n's key -- unopenable by every
+	// other member, and alive past the epoch that promised to destroy it.
+	zeroize(self.ephRoot)
+	self.ephRoot = nil
 	self.groupHandleKey = handleKey
 	self.storageRoot = root
 	self.classKeys = DeriveClassKeys(root)
 	self.writeKey = message.WriteKey(root)
 	self.readKey = message.ReadKey(root)
 	self.senderHandle = SenderHandle(self.groupHandleKey, self.ownLeaf)
-	self.senders = map[byte]*SenderRatchet{}
+	self.senders = map[senderLadderKey]*SenderRatchet{}
 	return nil
 }
 
-// classKeyOnLoop is the class key one retention class seals under.
+// classKeyOnLoop is the class key one record seals under.
 //
-// The eph classes are deliberately absent from ClassKeys -- MASTER invariant I4 -- so they are a
-// refusal here rather than a fourth field, and the refusal is the same one SealRecord makes for
-// every class that is not DURABLE.
+// FOUR CLASSES AND FOUR ANSWERS SINCE 2026-09-13. Three are looked up in ClassKeys, which
+// expands them from the storage root; the fourth is DERIVED here, because the eph classes are
+// deliberately absent from that struct -- MASTER invariant I4, and spec A section 5.3 says a
+// field for eph_root there "would make the wrong thing the easy thing". What this used to do
+// for an EPH class was refuse, alongside PERMANENT and MEDIA, under the blanket refusal that
+// ledger item 152 held -- and 152 was RULED 2026-09-13, so the refusal is lifted in full and
+// what is left in its place is a refusal about the VALUE: a session with no eph_root cannot
+// derive one.
+//
+// IT TAKES THE BUCKET AND THE WINDOW BECAUSE THE EPH CLASS KEY IS A FUNCTION OF BOTH.
+// K_eph[n][b][t] keys on b and on t, so "the class key of this class" is not a well formed
+// question for EPH without them, and the window is the RECORD'S OWN eph_window field rather
+// than anything this method reads.
 //
 // The caller is the loop goroutine.
-func (self *GroupSession) classKeyOnLoop(class message.RetentionClass) ([]byte, error) {
+func (self *GroupSession) classKeyOnLoop(class message.RetentionClass, ephBucket uint8,
+	ephWindow uint64) ([]byte, error) {
+
 	if self.classKeys == nil {
 		return nil, ErrSessionClosed
 	}
@@ -621,15 +734,29 @@ func (self *GroupSession) classKeyOnLoop(class message.RetentionClass) ([]byte, 
 		return self.classKeys.Durable, nil
 	case message.RetentionMedia:
 		return self.classKeys.Media, nil
+	case message.RetentionEph:
+		// the ONE branch that derives rather than looks up, and the one that can fail on
+		// state rather than on its argument. eph_root is not in ClassKeys and never will
+		// be -- master invariant I4, and spec A section 5.3 says a field for it "would make
+		// the wrong thing the easy thing" -- so the absence of a fourth field is what sends
+		// this branch to a value that had to arrive from outside.
+		if len(self.ephRoot) == 0 {
+			return nil, fmt.Errorf("%w: this record is EPH bucket %d window %d",
+				ErrNoEphRoot, ephBucket, ephWindow)
+		}
+		return EphKey(self.ephRoot, ephBucket, ephWindow), nil
 	}
-	return nil, fmt.Errorf("%w: retention class %d has no class key at all", ErrRetentionClassUnruled, class)
+	return nil, fmt.Errorf("%w: retention class %d", ErrRetentionClassUnknown, class)
 }
 
 // senderRatchetOnLoop is this session's own ladder for one retention class, built on first use.
 //
-// THE LADDER IS PER CLASS AND THE COUNTER IS NOT, which is ruling A1 as it lands on this file.
-// The map below is keyed by the retention wire byte because record_key[0] binds the CLASS KEY, so
-// each class is a different ladder and always was. The stream those ladders reserve in carries
+// THE LADDER IS PER CLASS KEY AND THE COUNTER IS NOT, which is ruling A1 as it lands on this
+// file. The map below is keyed by the retention wire byte AND THE EPH WINDOW because
+// record_key[0] binds the CLASS KEY, so each class key is a different ladder and always was --
+// and since 2026-09-13 an EPH record's class key is EphKey(eph_root, bucket, window), which
+// moves at every window boundary. senderLadderKey's own comment carries what keying on the byte
+// alone would have cost. The stream those ladders reserve in carries
 // only the group and this session's sender_handle -- no class -- because that is the counter spec
 // B's schema, spec B's Q7 and the shipped message server all keep. A stream key that carried the
 // class would make this client the only party in the system counting per class, and the server
@@ -640,11 +767,14 @@ func (self *GroupSession) classKeyOnLoop(class message.RetentionClass) ([]byte, 
 // StreamKey's comment for the ruling and SenderRatchet.Next for the shape.
 //
 // The caller is the loop goroutine.
-func (self *GroupSession) senderRatchetOnLoop(class message.RetentionClass, retentionWire byte) (*SenderRatchet, error) {
-	if ratchet, isBuilt := self.senders[retentionWire]; isBuilt {
+func (self *GroupSession) senderRatchetOnLoop(class message.RetentionClass, retentionWire byte,
+	ephBucket uint8, ephWindow uint64) (*SenderRatchet, error) {
+
+	ladder := senderLadderKey{RetentionWire: retentionWire, EphWindow: ephLadderWindow(class, ephWindow)}
+	if ratchet, isBuilt := self.senders[ladder]; isBuilt {
 		return ratchet, nil
 	}
-	classKey, err := self.classKeyOnLoop(class)
+	classKey, err := self.classKeyOnLoop(class, ephBucket, ephWindow)
 	if err != nil {
 		return nil, err
 	}
@@ -655,7 +785,7 @@ func (self *GroupSession) senderRatchetOnLoop(class message.RetentionClass, rete
 	if err != nil {
 		return nil, err
 	}
-	self.senders[retentionWire] = ratchet
+	self.senders[ladder] = ratchet
 	return ratchet, nil
 }
 
@@ -682,13 +812,15 @@ func (self *GroupSession) zeroizeOnLoop() {
 	zeroize(self.readKey)
 	zeroize(self.groupHandleKey)
 	zeroize(self.pqSecret)
+	zeroize(self.ephRoot)
 	self.classKeys = nil
 	self.storageRoot = nil
 	self.writeKey = nil
 	self.readKey = nil
 	self.groupHandleKey = nil
 	self.pqSecret = nil
-	self.senders = map[byte]*SenderRatchet{}
+	self.ephRoot = nil
+	self.senders = map[senderLadderKey]*SenderRatchet{}
 }
 
 // The exporter label and length MASTER section 7 derives mls_secret at.

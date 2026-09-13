@@ -65,8 +65,10 @@
 // (2) A path this record does not take. These are three records on the DURABLE class, on the
 // 256 octet rung, at the first three rungs of one sender's ladder, in EPOCH ZERO of a one
 // member group, with no attachment and no blob id. A key source reached only from the
-// permanent, media or eph classes is outside the observation -- and unreachable today for a
-// second reason, since SealRecord refuses every class but durable until M1-6 is ruled. So is
+// permanent, media or eph classes is outside the observation. It became REACHABLE on 2026-09-13,
+// when M1-6's ruling of 2026-09-07 was reversed and SealRecord began sealing every class -- which
+// widens what this file COULD cover and not what it does, and the three records it rebuilds are
+// deliberately unchanged so that the reproduction is the same reproduction. So is
 // one reached only by the blob rung, or only by a receiver walking a skipped key window. What
 // covers those is that they are the same four derivations under other arguments, which is a
 // structural argument and not this file's measurement.
@@ -103,9 +105,12 @@
 // sharing of one.
 //
 // SO IF THIS FILE DISAGREES WITH THE PACKAGE, ONE OF THE TWO IS WRONG, AND WHICH ONE IS A
-// RULING QUESTION RATHER THAN A FIXTURE TO RETUNE. M1-6, M1-7 and M1-8 are all open over
-// values this reproduction spells out, and a ruling that moves one of them moves this file
-// too -- as an edit somebody makes deliberately, with the ruling in hand.
+// RULING QUESTION RATHER THAN A FIXTURE TO RETUNE. M1-7 and M1-8 are still open over values this
+// reproduction spells out, and a ruling that moves one of them moves this file too -- as an edit
+// somebody makes deliberately, with the ruling in hand. M1-6 is the worked example: ruled
+// 2026-09-07, REVERSED 2026-09-13, and the rulings of that date cost this file three transcribed
+// blocks -- both aads and the write_auth preimage each gained a u64 term -- which is exactly the
+// deliberate edit this paragraph describes, made with the ruling in hand.
 //
 // RFC 5869 is the one thing taken from elsewhere in the test tree rather than transcribed
 // again: keyScheduleReferenceExtract and keyScheduleReferenceExpand are already written out

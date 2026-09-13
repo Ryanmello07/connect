@@ -1145,7 +1145,7 @@ func TestADurableRecordSealedByTheFounderOpensAtTheJoiner(t *testing.T) {
 	if record == nil {
 		t.Fatal("the founder's SealRecord answered no record and no error")
 	}
-	if err := chain.joinerSession.TrackSender(chain.founder.OwnLeafIndex(), message.RetentionDurable, 0, 0); err != nil {
+	if err := chain.joinerSession.TrackSender(chain.founder.OwnLeafIndex(), message.RetentionDurable, 0, 0, 0); err != nil {
 		t.Fatalf("the joiner's TrackSender over the founder's leaf: %v", err)
 	}
 	gotHead, gotBody, err := chain.joinerSession.OpenRecord(record)
@@ -1169,7 +1169,7 @@ func TestADurableRecordSealedByTheFounderOpensAtTheJoiner(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the joiner's SealRecord: %v", err)
 	}
-	if err := chain.founderSession.TrackSender(chain.joined.OwnLeafIndex(), message.RetentionDurable, 0, 0); err != nil {
+	if err := chain.founderSession.TrackSender(chain.joined.OwnLeafIndex(), message.RetentionDurable, 0, 0, 0); err != nil {
 		t.Fatalf("the founder's TrackSender over the joiner's leaf: %v", err)
 	}
 	_, gotBack, err := chain.founderSession.OpenRecord(answer)
@@ -1541,6 +1541,23 @@ var engineJoinInventoryClaims = []engineJoinInventoryClaim{
 			"none of the four " + "is a KEY", "pq_secret is " + "not a key",
 		},
 	},
+	{
+		// the claim ledger item 152's ruling of 2026-09-13 created, and the one whose
+		// DENIAL was sitting in doc.go unchallenged until this commit. The seal lift is
+		// exactly the kind of widening an inventory sentence goes stale under: the code
+		// starts doing more, and the paragraph that says what it does not do is the last
+		// thing anybody edits. The denials below are the shapes the retracted sentence
+		// took, normalised the way this gate normalises, so a rewrite that reintroduced
+		// any of them is red rather than merely wrong.
+		proves: "this package seals and opens every retention class the wire admits, the six eph buckets included",
+		heldBy: "TestEverySealableClassRoundTripsAndTheWrapItemOneEightyFiveRefusesDoesNot",
+		owes:   []string{"IT SEALS AND OPENS " + "EVERY RETENTION CLASS THE WIRE ADMITS"},
+		denials: []string{
+			"it seals only the " + "durable", "only the durable " + "retention class is sealed",
+			"the permanent, media " + "and eph classes are refused",
+			"seals the durable class " + "alone",
+		},
+	},
 }
 
 // TestTheInventoryDoesNotDenyWhatThisPackageProves is finding 3's property, and it is the reason an
@@ -1640,8 +1657,9 @@ func engineJoinNormalise(text string) string {
 // it -- NewPqSecret is a production function and is what draws the real one, so this is not a
 // test-only key SOURCE -- but that NOTHING IN PRODUCTION CALLS IT. There is no driver.
 //
-// DO NOT BUILD ONE HERE. Its delivery channel is m1 task 14, which is gated on ledger item 152,
-// which is an owner ruling. This case records the absence so it stays visible, and it goes RED the
+// DO NOT BUILD ONE HERE. Its delivery channel is m1 task 14, whose blocker ledger item 152 was
+// RULED 2026-09-13 and whose remaining blocker is M1-52, which is an owner ruling and is not this
+// package's. This case records the absence so it stays visible, and it goes RED the
 // day a production driver lands -- at which point the right move is to delete this case and say
 // where the value comes from, not to widen it.
 func TestNoProductionDeclarationOfThisPackageDrawsAPqSecret(t *testing.T) {
@@ -1678,7 +1696,7 @@ func TestNoProductionDeclarationOfThisPackageDrawsAPqSecret(t *testing.T) {
 		t.Fatalf("this package declares no %s, so this gate read nothing: the sampler it is about is gone and the sentence in doc.go is about a function that does not exist",
 			engineJoinPqSecretSampler)
 	}
-	t.Logf("production call site(s) of %s: %d %v -- the one test-only key VALUE on the seal and open path has no production driver, and its delivery is m1 task 14 gated on ledger item 152",
+	t.Logf("production call site(s) of %s: %d %v -- the one test-only key VALUE on the seal and open path has no production driver, and its delivery is m1 task 14, whose ledger item 152 was ruled 2026-09-13 and whose remaining blocker is M1-52",
 		engineJoinPqSecretSampler, len(drivers), drivers)
 	if len(drivers) != 0 {
 		t.Errorf("%s is now called from production at %v. That is not a failure of this package -- it is the carrier landing -- and what it means is that this case and doc.go's hand-carried paragraph are both stale. Say where the value comes from and delete this case",
@@ -1726,7 +1744,8 @@ func engineJoinTestFunctionNames(t *testing.T) map[string]bool {
 // something. This gate is what keeps the citation from becoming one.
 //
 // WHY THE ITEM IS IN THIS DIRECTORY AND NOT IN THE SPEC LEDGER, which is where every other number
-// this package cites lives -- M1-4, M1-6, M1-8, M1-15, M1-20, S2-3, J1-1. It was raised in a commit
+// this package cites lives -- M1-4, M1-15, M1-20, S2-3, J1-1, and M1-6, which was ruled
+// 2026-09-07 and reversed 2026-09-13. It was raised in a commit
 // to THIS repository, and the ledger is in another one; a number minted here against that register
 // would collide with whatever it assigns next. So the row is filed where the code that cites it
 // lives, it says in its own text that a ledger number is owed, and it migrates when one exists.

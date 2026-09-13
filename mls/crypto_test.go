@@ -7863,6 +7863,14 @@ var entropyRefusalsHeldOutsideThisPackage = map[string]string{
 	"NewPqSecret":      "TestEveryEntropyTakingFunctionOfThisPackageRefusesANilSource",
 	"XwingGenerateKey": "TestEveryEntropyTakingFunctionOfThisPackageRefusesANilSource",
 	"XwingEncapsulate": "TestEveryEntropyTakingFunctionOfThisPackageRefusesANilSource",
+	// eph_root's draw, landed with the seal lift of 2026-09-13. It is the entropy source
+	// MASTER section 8.1 is most emphatic about -- "the most easily broken property here",
+	// because a derivation from storage_root would compile, pass every test not looking for
+	// it, and make every expired message recoverable forever -- so a draw of it that
+	// silently accepted a nil or an exhausted reader is exactly what this row exists to
+	// stop. The gate over there failed on the commit that declared it, which is how the row
+	// got written.
+	"NewEphRoot": "TestEveryEntropyTakingFunctionOfThisPackageRefusesANilSource",
 }
 
 func TestNoEntropyTakingFunctionLivesWhereThisGateCannotCallIt(t *testing.T) {

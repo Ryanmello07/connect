@@ -901,9 +901,16 @@ func TestAnEpochKeysHoldsNoWindowOntoTheSessionItCameFrom(t *testing.T) {
 //
 //	git grep -c 'func (self \*GroupSession)' -- 'messagegroup/*.go' | grep -v _test
 //
-// and it answers seal.go:7 and session.go:14 on this commit -- eighteen members before k1 task 3,
-// nineteen after it and twenty one after task 4's pair. A reading that answered the same numbers
-// with the door absent would be a reading of something else.
+// and it answers seal.go:9 and session.go:15 on this commit -- eighteen members before k1 task 3,
+// nineteen after it, twenty one after task 4's pair, and twenty four after the seal lift of
+// 2026-09-13 added InstallEphRoot to session.go and sealEphWindowOnLoop and
+// refuseAheadEphWindowOnLoop to seal.go. A reading that answered the same numbers with the door
+// absent would be a reading of something else.
+//
+// THE THREE THAT LANDED WITH THE LIFT ARE WHERE THIS GATE SAYS THEY BELONG. InstallEphRoot is
+// epoch state -- it sits beside AdvanceEpoch and installEpochOnLoop, which is the body that drops
+// it -- and the other two are record methods, beside SealRecord and OpenRecord, which is the
+// same per-file judgement the door itself was held to.
 func TestTheEpochKeysDoorJoinsTheDerivedClassOfGroupSessionMethods(t *testing.T) {
 	_, sources := messagegroupProductionSources(t)
 	perFile := map[string][]string{}
@@ -937,16 +944,16 @@ func TestTheEpochKeysDoorJoinsTheDerivedClassOfGroupSessionMethods(t *testing.T)
 	if !slices.Contains(all, "EpochKeys") {
 		t.Fatal("no method named EpochKeys is declared on *GroupSession, so the door this file tests is not in the class the loop gate holds")
 	}
-	if len(all) != 21 {
-		t.Errorf("%d methods are declared on *GroupSession and k1 task 4's commit makes it 21; the number moves by one per method, and a method that arrived without moving it arrived without a thought about which file it belongs in",
+	if len(all) != 24 {
+		t.Errorf("%d methods are declared on *GroupSession and the 2026-09-13 seal lift makes it 24; the number moves by one per method, and a method that arrived without moving it arrived without a thought about which file it belongs in",
 			len(all))
 	}
-	if got := len(perFile["session.go"]); got != 14 {
-		t.Errorf("session.go declares %d methods on *GroupSession and k1 task 3's commit makes it 14, which is the per-file half of the same count: the door belongs beside Epoch and AdvanceEpoch and not in seal.go",
+	if got := len(perFile["session.go"]); got != 15 {
+		t.Errorf("session.go declares %d methods on *GroupSession and the seal lift makes it 15, which is the per-file half of the same count: the door belongs beside Epoch and AdvanceEpoch and not in seal.go, and so does InstallEphRoot",
 			got)
 	}
-	if got := len(perFile["seal.go"]); got != 7 {
-		t.Errorf("seal.go declares %d methods on *GroupSession and k1 task 4's commit makes it 7: the re-auth is a record method and belongs beside SealRecord and OpenRecord, not beside the epoch keys door",
+	if got := len(perFile["seal.go"]); got != 9 {
+		t.Errorf("seal.go declares %d methods on *GroupSession and the seal lift makes it 9: the re-auth, the window the sealer writes and the ahead refusal the opener makes are all record methods and belong beside SealRecord and OpenRecord, not beside the epoch keys door",
 			got)
 	}
 }

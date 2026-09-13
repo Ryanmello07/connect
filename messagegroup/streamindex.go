@@ -87,8 +87,8 @@
 // is open item M1-25 and it is NOT ruled here. The hazard is executable rather than asserted:
 // TestTransientsOnTheSharedCounterStarveADurableReceiverWindow drives it. Nothing here
 // forecloses a separate transient counter and nothing here grants one; giving transients their
-// own counter re-opens this very collision for EPH heads on the day item 152 rules them onto
-// this root.
+// own counter re-opens this very collision for EPH heads, which ledger item 152 ruled onto this
+// root on 2026-09-13 -- so that day has arrived and the hazard is live rather than prospective.
 package messagegroup
 
 // StreamIndexReserver is the durable sink a sender ratchet allocates its stream indices from.
@@ -148,8 +148,8 @@ package messagegroup
 // That is open item M1-25, and under A1 it carries a second half the file comment above states:
 // the transients share the one counter, so they also spend the receiver's out of order window.
 // Nothing here forecloses a separate transient counter, and an implementation that wants one
-// adds a key rather than changing a method -- but see the file comment for why granting one is
-// item 152's and not this file's.
+// adds a key rather than changing a method -- but see the file comment for the collision it
+// would re-open for EPH heads, which ledger item 152 ruled onto this root on 2026-09-13.
 type StreamIndexReserver interface {
 	// Reserve allocates the next stream index of this stream, records that this device is
 	// about to encrypt at it, and returns it only after that record is durable. The error is

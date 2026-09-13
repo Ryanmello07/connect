@@ -77,3 +77,72 @@ carries it, and the reproduction above fails the day the behaviour changes.
 A `SPEC-LEDGER.md` number, assigned by whoever owns that register. This row is the placeholder that
 lets `engine.go` cite something rather than nothing, and it is replaced by that number the moment
 one exists.
+
+---
+
+## MG-2 — `SealRecord` reads its own clock for `eph_window` and the caller reads a second one for `sent_at`
+
+**Status: OPEN. The gap is real, the closure is a change to a published signature, and this package
+may not make one on its own authority.**
+
+### The property
+
+MASTER §8.1 and Spec A §5.3 make `eph_window` the **sender's** computation *"from the same
+wall-clock reading it puts in `sent_at`"*:
+
+```
+t = floor(sent_at_ms / (eph_bucket_seconds[b] * 1000))     for b in 1..5
+```
+
+*The same reading.* One instant, used twice: once inside `ct_head`'s plaintext as `sent_at`, and
+once in the clear as `eph_window`.
+
+This package cannot do that. `sealRecordOnLoop` takes exactly one reading — `self.nowMs()`, the
+injected clock — and uses it for `expire_at`'s refusal and for the window. `sent_at` is not
+this layer's: it lives inside `headPlain`, which is an opaque `[]byte` argument, and Spec A §5.2
+publishes `SealRecord`'s signature with **no `sentAt` parameter in it**:
+
+```go
+func (self *GroupSession) SealRecord(
+    class RetentionClass, ephBucket uint8, isCommit bool,
+    headPlain []byte, bodyPlain []byte, expireAt uint64,
+    serverAttachment *ServerAttachment,
+) (*Record, error)
+```
+
+So a caller that builds `headPlain` from its own clock read and then calls `SealRecord` has made
+**two** readings, and if they straddle a bucket boundary the record's `sent_at` and its
+`eph_window` name two different windows.
+
+### What it costs, measured rather than feared
+
+Less than it sounds, and the honest statement of it is the useful one. The record stays internally
+consistent: `eph_window` is on the wire, in both AADs and in the `write_auth` preimage, and the key
+is `EphKey(eph_root, bucket, the wire value)` — so it seals, it opens, and every implementation
+agrees. What moves is the record's **key lifetime**, which is pinned to the sealer's reading rather
+than to the `sent_at` a reader will see. The straddle window is one clock read wide and the
+consequence is at most one bucket, which is inside the ±1 the server's own check (Spec A **S19**,
+Spec B §5.1 check 3) already allows against *arrival*. It is a discrepancy, not an incompatibility.
+
+### Reproduction
+
+`TestEverySealableClassRoundTripsAndTheWrapItemOneEightyFiveRefusesDoesNot` in `ephkey_test.go`
+asserts that the window the sealer writes equals `EphWindowAt(bucket, the fixture clock)` — that is,
+that the window comes from **this** clock. There is no case, and can be no case at this layer, that
+the window comes from the `sent_at` inside `headPlain`: nothing here parses that plaintext.
+
+### What a ruling would have to choose between
+
+1. **Add `sentAtMs int64` to `SealRecord`** and derive the window from it — the only shape that
+   makes the specification's "the same reading" literally true. It is a change to a signature
+   Spec A §5.2 publishes in a Go block, so it is a spec edit and not a code edit.
+2. **State that the sealer's own clock is the sender's clock** and that `sent_at` is required to be
+   consistent with it, moving the obligation to the caller in writing. Costs nothing here and makes
+   the corpus say what the code does.
+3. **Leave it**, on the measurement above, and record the discrepancy where a second implementer
+   will meet it. That is what this row is.
+
+### What is owed elsewhere
+
+A `SPEC-LEDGER.md` number and one sentence from the owner. Option 1 is the only one that touches
+this package's code, and it touches a published signature, which is why nothing is chosen here.

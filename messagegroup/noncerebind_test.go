@@ -286,8 +286,13 @@ func noncerebindWhere(fileSet *token.FileSet, path string, declaration string, a
 //
 // and R6 clause (a) beside it: piping that through grep -c 'RebindServerNonce' returns 1 and
 // through grep -c 'ReauthRecord' returns 1, so the answer contains the two members this slice
-// added rather than merely counting to ten.
-const noncerebindExportedSessionMethods = 10
+// added rather than merely counting to a number.
+//
+// It was ten until the seal lift of 2026-09-13 added InstallEphRoot, which is the eleventh: a
+// setter for eph_root, the one key of a session that no derivation can produce. It answers no
+// octets at all -- it takes them -- so it joins the exported class this count pins and does not
+// join the octet answering subset the ban is over.
+const noncerebindExportedSessionMethods = 11
 
 // Property 4 -- THE NARROWING, AND IT IS THE ONE PLACE IN THIS FILE WHERE AN EMPTINESS IS THE
 // PROPERTY RATHER THAN A DEFECT IN IT.
