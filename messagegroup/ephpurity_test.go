@@ -272,6 +272,17 @@ func TestEphKeyIsAFunctionOfItsThreeArgumentsOverDrawnInputs(t *testing.T) {
 		t.Fatal("no distribution is configured, so nothing was drawn from anything")
 	}
 	rungs := ephPurityLadder(t)
+	// TWO RUNGS, because the bucket sensitivity guard below compares the oracle against itself at
+	// the NEXT rung and a one rung ladder has none. MEASURED with the ladder cut to a single rung:
+	// that guard reported "the oracle answered something DIFFERENT at the next rung ... for only 0
+	// of 600" and blamed the ORACLE for a ladder that cannot be walked. A gate that names the wrong
+	// cause is a gate the next reader deletes, so the real cause is asserted here instead -- and it
+	// is a Fatal rather than an `if` around the guard, because silently skipping a liveness check
+	// is the vacuity this whole block exists to refuse.
+	if len(rungs) < 2 {
+		t.Fatalf("the ladder names %d rung(s) and the bucket sensitivity guard below needs two, because it compares the oracle with itself one rung along. With one rung that guard fires and blames the oracle; this Fatal names the ladder, which is what actually moved",
+			len(rungs))
+	}
 	source := ephPuritySource(t)
 
 	for _, distribution := range ephPurityDistributions {
@@ -323,8 +334,10 @@ func TestEphKeyIsAFunctionOfItsThreeArgumentsOverDrawnInputs(t *testing.T) {
 			if !bytes.Equal(answer, ephPurityOracle(other, bucket, window)) {
 				rootLive += 1
 			}
+			// unconditional, like the other two: the two rung Fatal above is what makes
+			// nextRung != bucket true, rather than an `if` here that would silently skip.
 			nextRung := rungs[(slices.Index(rungs, bucket)+1)%len(rungs)]
-			if nextRung != bucket && !bytes.Equal(answer, ephPurityOracle(root, nextRung, window)) {
+			if !bytes.Equal(answer, ephPurityOracle(root, nextRung, window)) {
 				bucketLive += 1
 			}
 		}
