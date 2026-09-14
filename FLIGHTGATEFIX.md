@@ -4123,9 +4123,10 @@ for lack of evidence; each has a measurement against it.
 The lane rule, `ReliableLaneProvenRecovery`. It withholds a firing until a
 later same-lane acknowledgement proves it. Measured on the relay
 queue-inflation cell and the storm cells at twenty repetitions per state,
-it wedges transfers. Pooled over three cells and two independently built
-arms, runs over 100 seconds were 0 of 80 with it off and 5 of 80 with it
-on, Fisher two-sided 0.116 on the relay cell alone and 0.059 pooled. The
+it wedges transfers. Pooled over four cells and three independently built
+arms, and counting a wedge by mechanism rather than by duration alone, 0 of
+120 runs with it off and 8 of 120 with it on, Fisher two-sided 0.0069; by
+the plain over-100-seconds proxy, 1 of 120 against 8 of 120 at 0.036. The
 worst was 712.8 seconds on a link carrying nothing worse than 1 per cent
 loss, with 142 of 143 windows dead, 11 timeout writes against 1,146
 deferrals, and the run failed. The mechanism is sound where its release
@@ -4172,29 +4173,49 @@ where the 2 s floor was binding. The conclusion that survives is narrower
 and still worth acting on, that the relay routinely stalls for longer than
 the sender's timer will ever wait once the floor binds.
 
-### 36.12 Not yet measured
+### 36.12 What was outstanding, and how it closed
 
-Three things are outstanding and this section is not complete without
-saying so.
+This subsection listed three open items when §36 was written. All three are
+now settled and the resolutions are recorded here rather than the list
+being deleted, because two of them changed a number.
 
-The wedge classification fold-in. The relay cell and the loss storm cell
-are being re-measured on an arm carrying §34.2's receive-queue drop
-counter, both lane-rule states, twenty repetitions each, so that every
-wedged run can be classified as the receiver deadlock or the proof-chain
-mode from its own counters rather than by inference. On the runs in so far
-every wedge reads zero drops with a write-to-defer ratio far below one,
-which is the proof-chain signature, but the sample is partial.
+The wedge classification fold-in: complete, campaign
+`flightgate-drop-20260913`, one hundred scenario-runs on a third
+independently built arm carrying §34.2's receive-queue drop counter. Every
+wedge is the proof-chain mode. The drop counter fired zero times in all one
+hundred runs, so the receiver deadlock the reproduction stream built is
+real but is not this phenomenon.
 
-The clean re-run of the forced-direct rule-off block. Two short in-process
-test runs overlapped three of its twenty repetitions, which breaks the
-host-idle rule this program measures under. The verdict in §36.4 does not
-turn on those three, but the block is being re-run and the verdict should
-be re-read against it.
+It also changed how the wedge is counted, and that is worth carrying. The
+rule-off state produced one run of 100.9 seconds, the first this program
+had seen, and it is not a wedge: write-to-defer ratio 1.38, 110.9 recovery
+writes a second, and data moving in most of its windows. A sender writing
+as hard as it can on a bad link is slow, not stalled. The 100-second
+threshold was always standing in for a mechanism, so the count now uses the
+mechanism: a run over 100 seconds with a ratio below 1 and at least 80 per
+cent of its windows dead. Classified that way across four cells and three
+arms the separation is exact, every wedge sitting at a ratio of 0.01 to
+0.25 and a dead fraction of 0.90 to 0.99.
 
-The full-suite verification of connect and server main. Neither has been
-run yet. Connect main `b8f72dd` has had a build check and a reading of the
-affected tests but no test run; the server merge has not been made. Both
-are queued behind the campaign.
+| Counting | rule off | rule on | Fisher two-sided |
+| --- | ---: | ---: | ---: |
+| by mechanism | 0 of 120 | 8 of 120 | 0.0069 |
+| by the 100-second proxy | 1 of 120 | 8 of 120 | 0.036 |
+
+That supersedes the 5 of 80 against 0 of 80 at 0.059 that §36.10 and
+`FLIGHTGATE-REPORT.md` were written against; §36.10 now carries the final
+figure and the report still needs correcting. The finding moves from suggestive to
+significant; its direction and mechanism are unchanged.
+
+The clean re-run of the forced-direct rule-off block: not needed, and
+dropped rather than left queued. The contamination biases both halves of
+that verdict conservatively. Extra host load slows the rule-off runs, which
+pushes a comparison that already favours neither toward the rule-on state,
+and extra load makes a wedge more likely rather than less, so zero wedges
+under it is the conservative reading. A re-run could only confirm a null.
+
+The full-suite verification of connect and server main: complete and green.
+§36.13 carries the run.
 
 ### 36.13 The deterministic tests this program added
 
@@ -4334,13 +4355,31 @@ candidate.
 `TestDeliveredBytesRingIsNotRetainedWhenOff` skips only when the delivered
 bytes bound is on by default. It ships off, so this test runs.
 
-Red status is not yet established and this inventory will not pretend
-otherwise. Connect main `b8f72dd` has had a build check but no test run;
-the full race suite is queued behind the measurement campaign, and the
-three `net_http_plain_websocket_test.go` tests are named for it because the
-merge resolution there took the other side. Two tests carry comments
-predicting red on the tree they were written against,
+Nothing is red. Verified on 2026-09-13, 14:12 to 14:59, against connect
+main `4206043` and server main `1c16ef52`, with the race detector on and
+without `-short`, so every `-short` skip above actually ran.
+
+| Run | Result |
+| --- | --- |
+| connect build | exit 0 |
+| the three `net_http_plain_websocket_test.go` tests, alone, under `-race` | all pass, both address families each |
+| connect full race suite, whole module | every package ok; the main package 1,372.9 s |
+| server `connect/perfvar`, serialised | ok, 1,389.5 s |
+
+Two of these answer questions this section had left open. The three
+websocket tests were named because the merge took the other side of that
+conflict, where the dial seam is always installed rather than installed
+only when a resolver or dialer is configured; all three pass, including the
+injected-dialer row that asserts the dialer receives exactly `"tcp"`, so
+the family narrowing the merged path applies ahead of an injected dialer
+did not change what that dialer sees. And the two tests whose comments
+predict red on the tree they were written against,
 `TestTunInjectFromReaderGoroutineDoesNotDeadlock` and row 1 of the lane
-recovery contract, and whether either is red on the shipped tree is exactly
-what that run will say. This subsection should be amended with the result
-rather than left as it stands.
+recovery contract, both pass on the shipped tree: row 1's bound is asserted
+only for an arm that reads lanes, which the shipped default is not.
+
+One caveat on the timing rather than the result. Another session was
+running a race suite in the proxy repository throughout, on a host carrying
+32 GB of swap, so the wall times above are upper bounds. Nothing failed, so
+the contention cost time and not correctness; had anything timed out it
+would have needed re-running before being reported as a defect.
