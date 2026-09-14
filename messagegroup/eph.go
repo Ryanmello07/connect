@@ -113,6 +113,17 @@ func NewEphRoot(random io.Reader) ([]byte, error) {
 // t a function of WHEN the key is derived rather than of WHICH record it is for, and the two
 // differ on every record that crossed a bucket boundary between being sealed and being read.
 //
+// HOW FAR THAT SENTENCE IS ACTUALLY HELD, because it is asserted by two gates and neither is
+// total. ephkey_test.go's five known answers are computed outside this module and kill any clock
+// that changes the derived octets IN THE BINARY THEY RUN IN; the reference-graph gate beside them
+// walks the control flow and names, in its own header, every shape it is known not to see. The gap
+// between the two is one class and it is filed rather than papered over: a clock bound LATER than
+// the test binary -- an exported setter written by a composition root's init, a build-tag file, a
+// plugin -- changes this function's output in the shipped binary with every gate in this tree
+// green. Open item MG-3 in this directory's OPENITEMS.md carries the reproduction and what a
+// ruling would have to choose between. NOTHING IN THIS PACKAGE INSTALLS SUCH A HOOK and the row
+// exists so that the absence is a measured claim instead of an assumption.
+//
 // BOTH REFUSALS ARE PANICS CARRYING A SENTINEL, because spec A section 5.3 publishes this
 // signature with no error in it and RecordKeyZero already set that precedent for the same
 // reason: nothing here is reachable from the network, both inputs are this member's own, and a

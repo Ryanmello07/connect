@@ -227,6 +227,114 @@ func TestTheWindowArithmeticIsThreeAnswersOverTheLaddersThree(t *testing.T) {
 // P5: EphKey reads no clock
 // ---------------------------------------------------------------------------
 
+// WHY THIS LINE STOPS HERE, WHAT EACH ROUND CLOSED, AND WHICH HALF OF THE PROPERTY IS DEFENDED BY
+// WHAT. Written because three rounds of gate and counter-gate is the point at which a reader is
+// owed the argument rather than another clause, and because the argument that was going to be
+// written here DOES NOT REPRODUCE and the corrected one is narrower.
+//
+// THREE ROUNDS, EACH REPAIR REAL AND EACH BEATEN BY THE NEXT ATTACKER.
+//
+//	round 1  a boolean table keyed on import path        beaten by a clock added to a package the
+//	                                                     table itself rowed false
+//	round 2  a parsed cross package call graph           beaten by five shapes: a package level
+//	                                                     var, an init, a bound func value, and two
+//	                                                     more that were edges the walk never drew
+//	round 3  a graph over DECLARATIONS, edges that are   beaten by six shapes: a name collision on
+//	         references rather than calls, and the       Expand, fmt.Stringer dispatch with no call
+//	         boundary complement asserted both ways      site, a dot import, a linkname, a generic
+//	                                                     instantiation, an injected hook
+//
+// Round 3's gate is kept in full and none of it is thrown away. Its strength is taken from the
+// round 3 review rather than re-derived here, and it is worth stating because what follows is a
+// correction and not a demolition: that review re-planted all eight earlier shapes and measured
+// every one of them red, each named by the graph at the plant's own file and line; it moved the
+// boundary complement up and down and got a red both ways, and emptied it and got a Fatal; and it
+// broke eighteen fail closed guards one at a time and each named itself. What follows is not a
+// claim that the gate is complete. It is the reason the arms race is stopped anyway, and the exact
+// size of what stopping it leaves open.
+//
+// THE OBSERVATION THAT ENDS THE RACE. Every escaping shape any attacker has produced, across all
+// three rounds, was VALUE NEUTRAL BY CONSTRUCTION -- each was written so the clock could not reach
+// the derived key, as `if <clock> < 0 { return nil }`. That is not an accident of style. EphKey is
+// a pure function of (eph_root, bucket, window) whose output is pinned by five known answers
+// computed OUTSIDE this module, from MASTER section 8.1 and RFC 5869 alone, plus the info octets.
+// So the property a reader cares about splits in two, and the halves are defended by different
+// things:
+//
+//	(1) EPHKEY'S OUTPUT DOES NOT DEPEND ON A CLOCK -- defended CRYPTOGRAPHICALLY, by
+//	    TestEphKeyIsMasterSection81sDerivationAndNotThisPackagesOpinionOfIt above. This is the half
+//	    that matters, and it is at a level where being wrong is visible in octets.
+//	(2) EPHKEY'S CONTROL FLOW TOUCHES NO CLOCK -- defended by the graph gate below, which is strong
+//	    and is NOT total. This half is hygiene.
+//
+// AND HERE IS THE CORRECTION, MEASURED ON THIS COMMIT RATHER THAN TAKEN ON ANYBODY'S WORD. The
+// sentence this comment was going to carry -- "a clock read that actually influences the derived
+// key changes the octets, and the known answers kill it" -- is FALSE as written. Five value
+// CHANGING plants were made in EphKey. Four died and one did not:
+//
+//	V1   window recomputed inside EphKey from time.Now().UnixMilli()   KAT RED, 4 of 5 vectors;
+//	                                                                   bucket 0's window is 0 by
+//	                                                                   definition and cannot move
+//	V2   the PRK stirred with the instant inside EphKey                KAT RED, 5 of 5
+//	V3   the info stirred with the instant in ephLabelledInfo, one     KAT RED, 5 of 5 and the info
+//	     hop inside the closure                                        octet vector as well
+//	V4b  the clock behind a fmt.Stringer in connect/mls/syntax,        CLOCK GATE GREEN, BOTH IMPORT
+//	     reached by fmt.Sprint -- the shape the graph cannot see       PINS GREEN, KAT RED 5 of 5
+//	V5b  the clock injected as a func(uint8) byte, written by an       CLOCK GATE GREEN, BOTH IMPORT
+//	     init in a package only a composition root links               PINS GREEN, KAT PASS
+//
+// V4b is the case the argument needs and it holds: the gate is blind to that shape and the known
+// answers are not. V5b is the case that breaks it. It IS value changing -- a test that installs the
+// hook and calls EphKey prints 8a425dfc... where MASTER section 8.1's known answer for (bucket 1,
+// window 0) is 8b1a9428... -- and the whole of ./messagegroup/ passes over it. The reason is not
+// subtle: the hook is NIL in the binary the known answers run in, so in THAT binary EphKey really
+// is pure, and the clock exists only in a binary this suite never builds.
+//
+// SO THE HONEST FORM OF (1) IS NARROWER: a clock read that influences the derived key IN THE BINARY
+// THE KNOWN ANSWERS RUN IN changes the octets and they kill it. A clock bound LATER than the test
+// binary -- an exported setter, an init in a package only the production composition root links, a
+// build tag selected file, a plugin, a linker substitution -- changes the derived key in the shipped
+// binary and leaves every gate in this tree green. That residue is filed as MG-3 in this directory's
+// OPENITEMS.md. It is not closed here and nothing in this file pretends it is.
+//
+// WHAT THE GATE BELOW CANNOT SEE, named rather than reassured about. Each is a measured escape and
+// not a worry, and none of them is chased on this commit:
+//
+//	a name collision  the boundary pin asks whether a callee's NAME resolves to SOME declaration in
+//	                  scope, not whether this walk could FOLLOW it. A method named Expand, or Bytes,
+//	                  or Suite, or Len resolves and the pin stays silent. The round 3 review
+//	                  measured 1,211 distinct names in scope that make it silent; that number is
+//	                  taken from that review and was not re-derived here.
+//	fmt dispatch      a callee the standard library dispatches into has NO call site in this module,
+//	                  so the graph has no edge of any kind to it. The same hole exists for every
+//	                  stdlib interface this module implements -- error, sort.Interface,
+//	                  json.Marshaler -- and only fmt.Stringer has ever been tried.
+//	a dot import      clause 1 keys on an *ast.SelectorExpr's qualifier and a dot import has none,
+//	                  so `import . "time"` names no clock reader at all. The import manifest catches
+//	                  this one; the gate below does not.
+//	go:linkname       a linkname to runtime's monotonic clock compiles, links and answers a real
+//	                  count under go1.26.5 with CGO off. The import manifest catches it through
+//	                  "unsafe"; the graph does not.
+//	generics          a call through a type parameter's method set resolves to no declaration this
+//	                  walk reads.
+//	reflection        reflect.Value.Call has no callee name at all. Never tried against this gate.
+//	promotion         a method promoted from an embedded field is called by the outer type's name,
+//	                  and the walk draws no edge to the embedded declaration.
+//	late binding      V5b above, and it is the only one of these that reaches past the gate into
+//	                  the known answers as well.
+//
+// AND WHAT REACH THE TWO IMPORT PINS ACTUALLY HAVE, because that is what decides whether the blind
+// spots matter. messagegroup's TestThisPackageIsBuiltFromExactlyTheseImports is this directory only.
+// mls's TestTheCryptoIsBuiltFromExactlyThesePackages globs <root>/*.go over {".", "../message",
+// "../messagegroup"} and DOES NOT DESCEND, so connect/mls/syntax -- which this gate reads, and which
+// EphKey's closure reaches through NewWriter, WriteRaw, WriteUint8, WriteUint64 and Bytes -- is in
+// neither pin. That is why V4b's clock could sit in mls/syntax importing "time" with both pins green.
+//
+//	query for every KAT row above: plant the edit, then
+//	go test -count=1 -run TestEphKeyIsMasterSection81sDerivationAndNotThisPackagesOpinionOfIt -v
+//	./messagegroup/ beside
+//	go test -count=1 -run TestEphKeyReachesNoClockSourceInThisPackage ./messagegroup/
+
 // The import paths that answer the current instant. THIS IS THE ONLY LITERAL LEFT IN THIS
 // DERIVATION, and where it sits is the whole repair.
 //
@@ -303,6 +411,65 @@ var ephKeyExternalReach = []string{
 //	query: the "boundary: N call name(s)" line of the same run.
 var ephKeyUnresolvedNames = []string{
 	"AppendUint64", "Error", "append", "int", "len", "make", "panic", "string", "uint16",
+}
+
+// The declarations of clause 2's own shape, func() int64, in EVERY package in scope OTHER than
+// this one.
+//
+// IT IS EMPTY, AND IT IS PINNED RATHER THAN PRINTED, WHICH IS FINDING F5 OF THE ROUND 3 REVIEW.
+// The commit that introduced the cross package half of clause 2 logged this set and asserted it
+// against nothing, so the line read "class, clause 2, cross package: 0, []" on every run and said
+// the same thing whether the widening worked or had been deleted. That is the exact defect that
+// commit was repairing one clause over -- a complement printed and answering to nobody -- and an
+// EMPTY printed complement is the tell, because nothing about it can ever change visibly.
+//
+// Pinning it is the half that can: the day connect/message, connect/mls or connect/mls/syntax
+// declares a func() int64, this goes red on that commit and someone reads why, instead of the
+// number moving 0 -> 1 inside a passing log line.
+//
+// WHAT PINNING IT STILL DOES NOT DO, measured and not argued: it does not make the WIDENING
+// load bearing. Narrow clause 2's collection back to the calling package and this set is empty
+// either way, so the baseline stays green -- the round 3 review measured that as MG14 and this
+// commit did not disturb it. The widening is kept because the class it states is the module and
+// not this directory, and it is recorded here as defending nothing measurable TODAY rather than
+// left to read as though it defended something.
+//
+//	query: go test -run TestEphKeyReachesNoClockSourceInThisPackage -v ./messagegroup/, the
+//	"class, clause 2, cross package: N" line.
+var ephClockShapeElsewhere = []string{}
+
+// The complement of clause 2's narrowing: the declarations in scope that BIND A FUNCTION, that
+// take no argument and answer exactly one value, and whose one result is not int64.
+//
+// THIS IS WHAT NARROWING BY THE TYPE func() int64 REMOVED, named member by member. Clause 2's
+// class is two declarations; this is the thirteen that are one result spelling away from it and
+// are outside it, and every one of them would hold a clock as readily as a func() int64 would.
+// The round 3 review's B9 lives here exactly: a hook of type func() uint64, installed from a
+// composition root, is invisible to clause 2 and was measured green against every gate in this
+// tree. So was the same shape typed func() byte, re-measured on this commit.
+//
+// The members carry their result spelling and NOT their file and line, so that an edit anywhere
+// above them does not move this pin; the failure message prints the positions.
+//
+// The tax is the same one ephKeyExternalReach and ephKeyUnresolvedNames already pay: a method
+// added to mls's crypto or group interfaces is a red test on the commit that adds it. That is the
+// price of a boundary that cannot move in silence.
+//
+//	query: the "complement, clause 2: N func binding declaration(s)" line of the same run.
+var ephClockShapeNearMisses = []string{
+	"messagegroup.Close -> error",
+	"messagegroup.Epoch -> uint64",
+	"messagegroup.EpochAuthenticator -> other",
+	"messagegroup.GroupId -> other",
+	"messagegroup.MemberCount -> int",
+	"messagegroup.MergePendingCommit -> error",
+	"messagegroup.OwnLeafIndex -> uint32",
+	"messagegroup.Suite -> uint16",
+	"mls.HashSize -> int",
+	"mls.KeySize -> int",
+	"mls.LeafCount -> LeafCount",
+	"mls.NonceSize -> int",
+	"mls.Suite -> CipherSuite",
 }
 
 // One production .go file of one package of this module, with the import qualifiers THAT FILE
@@ -492,6 +659,98 @@ func ephIsClockShape(expr ast.Expr) bool {
 	}
 	name, isIdent := function.Results.List[0].Type.(*ast.Ident)
 	return isIdent && name.Name == "int64"
+}
+
+// ephNiladicResult answers the spelling of a func type's single result when it has no parameters
+// and exactly one result, and "" otherwise.
+//
+// It exists so the COMPLEMENT of clause 2 can be computed off the same reading clause 2 itself is
+// made from. Clause 2 narrows by a type, and what a narrowing by type removes is every other type
+// -- so the removed set is read here rather than described, and the result spelling travels with
+// each member because the spelling IS the difference between being in the class and not.
+func ephNiladicResult(expr ast.Expr) string {
+	function, isFunction := expr.(*ast.FuncType)
+	if !isFunction {
+		return ""
+	}
+	if function.Params != nil && 0 < len(function.Params.List) {
+		return ""
+	}
+	if function.Results == nil || len(function.Results.List) != 1 {
+		return ""
+	}
+	switch result := function.Results.List[0].Type.(type) {
+	case *ast.Ident:
+		return result.Name
+	case *ast.SelectorExpr:
+		return "pkg." + result.Sel.Name
+	case *ast.StarExpr:
+		return "pointer"
+	}
+	return "other"
+}
+
+// ephFuncBoundDeclarations reads, over every package in scope, every NAMED declaration whose
+// written type is a func type -- exactly the two places clause 2 looks, a package level var or
+// const with an explicit type and an *ast.Field -- and splits them into the ones clause 2 puts in
+// its class and the ones it declines.
+//
+// The two readings are deliberately one function. Clause 2's class and clause 2's complement have
+// to be computed off one traversal or they are two claims about two sets and nothing says they
+// partition anything; the caller asserts that they do.
+func ephFuncBoundDeclarations(graph *ephModuleGraph) (shaped []string, declined []string, nearMiss []string, nearMissAt []string) {
+	for _, importPath := range graph.order {
+		pkg := graph.packages[importPath]
+		short := importPath
+		if index := strings.LastIndex(short, "/"); 0 <= index {
+			short = short[index+1:]
+		}
+		for _, file := range pkg.files {
+			record := func(names []*ast.Ident, declaredType ast.Expr) {
+				if _, isFunction := declaredType.(*ast.FuncType); !isFunction {
+					return
+				}
+				for _, name := range names {
+					if name.Name == "_" {
+						continue
+					}
+					at := fmt.Sprintf("%s.%s (%s:%d)", short, name.Name, file.path,
+						graph.fileSet.Position(name.Pos()).Line)
+					if ephIsClockShape(declaredType) {
+						shaped = append(shaped, at)
+						continue
+					}
+					declined = append(declined, at)
+					if result := ephNiladicResult(declaredType); result != "" {
+						nearMiss = append(nearMiss, fmt.Sprintf("%s.%s -> %s", short, name.Name, result))
+						nearMissAt = append(nearMissAt, at)
+					}
+				}
+			}
+			for _, declaration := range file.parsed.Decls {
+				general, isGeneral := declaration.(*ast.GenDecl)
+				if !isGeneral || (general.Tok != token.VAR && general.Tok != token.CONST) {
+					continue
+				}
+				for _, spec := range general.Specs {
+					if values, isValues := spec.(*ast.ValueSpec); isValues && values.Type != nil {
+						record(values.Names, values.Type)
+					}
+				}
+			}
+			ast.Inspect(file.parsed, func(node ast.Node) bool {
+				if field, isField := node.(*ast.Field); isField {
+					record(field.Names, field.Type)
+				}
+				return true
+			})
+		}
+	}
+	slices.Sort(shaped)
+	slices.Sort(declined)
+	slices.Sort(nearMiss)
+	slices.Sort(nearMissAt)
+	return shaped, slices.Compact(declined), slices.Compact(nearMiss), slices.Compact(nearMissAt)
 }
 
 // ephWalkBody records every edge out of ONE DECLARATION of this module -- a function body, or the
@@ -938,6 +1197,27 @@ func TestEphKeyReachesNoClockSourceInThisPackage(t *testing.T) {
 	slices.Sort(elsewhereShaped)
 	t.Logf("class, clause 2, cross package: %d declaration(s) of the clock shape elsewhere in scope, %v",
 		len(elsewhereShaped), elsewhereShaped)
+	if !slices.Equal(elsewhereShaped, ephClockShapeElsewhere) {
+		t.Errorf("the declarations of the clock shape func() int64 outside this package are %v, and ephClockShapeElsewhere pins %v. This set was printed and asserted against nothing, which is the defect the pin two logs above it exists for; a member arriving here is a clock shaped slot in a package EphKey's closure already walks",
+			elsewhereShaped, ephClockShapeElsewhere)
+	}
+	// and what clause 2's narrowing REMOVED, read off the same traversal as the class itself.
+	// An empty complement is the tell -- it is the one answer that says nothing whether the
+	// narrowing is wide, narrow or absent -- so it is Fatal, and the members are named.
+	shapedEverywhere, declinedEverywhere, nearMisses, nearMissesAt := ephFuncBoundDeclarations(graph)
+	if len(declinedEverywhere) == 0 {
+		t.Fatal("no declaration in scope binds a function of any type other than func() int64, so the complement of clause 2 is empty and this gate cannot say what narrowing by that one type cost. mls declares Extract, Expand and Hash as func typed interface members, so an empty answer here is a traversal that read no *ast.Field rather than a module with nothing outside the clock shape")
+	}
+	if len(shapedEverywhere) != len(self.clockShapeAt)+len(elsewhereShaped) {
+		t.Errorf("the class read for the complement is %d declaration(s) and the class clause 2 reports is %d; the two are computed off one traversal so that they partition the func binding declarations of this module, and a disagreement means they do not",
+			len(shapedEverywhere), len(self.clockShapeAt)+len(elsewhereShaped))
+	}
+	t.Logf("complement, clause 2: %d func binding declaration(s) in scope are outside the shape func() int64, of which %d take no argument and answer exactly one value, %v",
+		len(declinedEverywhere), len(nearMisses), nearMisses)
+	if !slices.Equal(nearMisses, ephClockShapeNearMisses) {
+		t.Errorf("the niladic single result declarations clause 2 declines are %v, and ephClockShapeNearMisses pins %v. Each is one result spelling away from the clock shape and would hold a clock exactly as a func() int64 would, so the set is pinned rather than counted; the positions are %v",
+			nearMisses, ephClockShapeNearMisses, nearMissesAt)
+	}
 	t.Logf("vertices from file scope: %d package level var/const declaration(s) in scope are nodes of this graph",
 		len(valueNodes))
 

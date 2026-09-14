@@ -171,3 +171,96 @@ the window comes from the `sent_at` inside `headPlain`: nothing here parses that
 
 A `SPEC-LEDGER.md` number and one sentence from the owner. Option 1 is the only one that touches
 this package's code, and it touches a published signature, which is why nothing is chosen here.
+---
+
+## MG-3 — a clock bound AFTER the test binary changes `EphKey`'s output and no gate in this tree sees it
+
+**Status: OPEN, and FILED NOT RULED. Measured on 2026-09-13 while closing the clock gate line. The
+mechanism that would close it is a rule about how this module may be composed, which is not this
+package's to invent.**
+
+### The property
+
+`EphKey` must be a pure function of `(eph_root, bucket, window)`. Two gates are supposed to hold
+that between them:
+
+1. `TestEphKeyIsMasterSection81sDerivationAndNotThisPackagesOpinionOfIt` pins five known answers
+   computed outside this module from MASTER §8.1 and RFC 5869. It defends the **output**.
+2. `TestEphKeyReachesNoClockSourceInThisPackage` walks the reference graph. It defends the
+   **control flow**, and it is explicitly not total — `ephkey_test.go` names what it cannot see.
+
+The argument for stopping the gate/counter-gate race was that (1) backstops (2): a clock the graph
+misses still has to change the derived octets, and the known answers would kill it. **That argument
+is false in one direction and this row is that direction.**
+
+### The reproduction
+
+Three files, all inside this module, none of them touching a published signature:
+
+```go
+// messagegroup/atkhook.go
+var ephHook func(uint8) byte
+func SetEphHook(hook func(uint8) byte) { ephHook = hook }
+
+// messagegroup/eph.go, inside EphKey after refuseOffLadderBucket(bucket)
+stirred := append([]byte(nil), ephRoot...)
+if ephHook != nil {
+    stirred[0] ^= ephHook(bucket)
+}
+return keyScheduleExpand(stirred, ephLabelledInfo(bucket, window), ephKeyBytes)
+
+// atkroot/install.go -- a leaf package nothing in the module imports
+func init() {
+    messagegroup.SetEphHook(func(uint8) byte { return byte(time.Now().UnixMilli()%255) + 1 })
+}
+```
+
+Measured at `e17cfad` plus the repair that carries this row:
+
+| gate | result |
+|---|---|
+| `TestEphKeyReachesNoClockSourceInThisPackage` | **green** |
+| `TestThisPackageIsBuiltFromExactlyTheseImports` | **green** — no new import here |
+| `mls`'s `TestTheCryptoIsBuiltFromExactlyThesePackages` | **green** |
+| `TestEphKeyIsMasterSection81sDerivationAndNotThisPackagesOpinionOfIt` | **green** |
+| the whole of `./messagegroup/` | **green** |
+| a test in `atkroot` that installs the hook and calls `EphKey` | `EphKey(root,1,0)` = `8a425dfc…`, and MASTER §8.1's known answer is `8b1a9428…` |
+
+So the plant **is** value-changing, in the only binary that matters, and every gate in this tree is
+green over it. The known answers cannot see it because `ephHook` is **nil in the binary they run
+in**: `messagegroup`'s test binary never links a composition root, so in that binary `EphKey` really
+is pure.
+
+### What this is not
+
+It is **not** a shipped defect. No such hook exists; `EphKey` takes `window uint64` as an argument
+and reads no clock, and `git grep` finds no setter of this shape in the package. The row is about
+the **class of defect no gate here would catch**, and it is filed because the commit that stops the
+clock-gate race would otherwise be claiming a backstop it does not have.
+
+### The narrowing that WAS taken, and exactly how far it reaches
+
+The clause-2 complement pin added beside the gate (`ephClockShapeNearMisses`) names every
+declaration in scope that binds a function, takes no argument and answers exactly one value whose
+type is not `int64` — thirteen of them today. A hook declared `func() byte` lands in that set and
+turns the gate **red**. A hook declared `func(uint8) byte` — one parameter — does not, which is the
+form reproduced above. **The pin catches one spelling of this shape and the shape itself is open.**
+
+### What a ruling would have to choose between
+
+1. **Ban late binding into the derivation by construction** — a gate asserting that no declaration
+   `EphKey`'s closure reads is a function-typed value writable from outside its own package. It is
+   the level, but it is a rule over composition and it would bind `mls` and `connect/message` too.
+2. **Move the known answers to where composition happens** — require the composition root's own
+   test binary to re-run the five vectors, so that whatever it installs is in the binary that
+   checks them. Cheap, and it puts the check where the defect can exist.
+3. **State the precondition in writing** — say in the corpus that `EphKey`'s purity is asserted
+   over a binary with no injected state, and make that a review obligation rather than a gate.
+   Costs nothing and is honest; catches nothing.
+
+### What is owed elsewhere
+
+A `SPEC-LEDGER.md` number and one sentence from the owner. Option 2 is the only one that could be
+done inside this repository without a rule that binds other packages, and it is not this package's
+to impose on a composition root it does not own.
+

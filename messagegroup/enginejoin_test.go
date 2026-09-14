@@ -1900,6 +1900,15 @@ var engineJoinOpenItemRows = []struct {
 			"SPEC-LEDGER.md",
 		},
 	},
+	{
+		item: "MG-3",
+		owes: []string{
+			"EphKey",
+			"TestEphKeyIsMasterSection81sDerivationAndNotThisPackagesOpinionOfIt",
+			"TestEphKeyReachesNoClockSourceInThisPackage",
+			"SPEC-LEDGER.md",
+		},
+	},
 }
 
 // The symbols the seal lift invented, which the spec ledger has already numbered and which this
