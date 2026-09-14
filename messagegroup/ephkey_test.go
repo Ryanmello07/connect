@@ -113,6 +113,31 @@ const (
 	ephKeyKatRootBName = "B"
 )
 
+// THE WALL CLOCK INSTANT THE PRODUCTION SHAPED ROWS ARE COMPUTED FOR, written down so the next
+// reader RECOMPUTES those rows rather than trusting them.
+//
+// 1767225600000 unix milliseconds is 2026-01-01T00:00:00Z. Every production shaped window below is
+// MASTER section 8's own sender formula at this one instant and at no other:
+//
+//	t = floor(1767225600000 / (eph_bucket_seconds[b] * 1000))
+//
+//	b = 0  ->       0   BY DEFINITION -- section 8.1 says bucket 0's window is never computed, so
+//	                    its production row IS the window 0 row this table already carried, and
+//	                    there are ten new rows rather than twelve
+//	b = 1  ->  490896   hourly
+//	b = 2  ->   61362   eight hourly
+//	b = 3  ->   20454   daily
+//	b = 4  ->    2922   weekly
+//	b = 5  ->     730   four weekly
+//
+// THE FIVE DIVISIONS ARE NOT THIS FILE'S WORD FOR THEMSELVES. testdata/eph-window-kat.txt carries
+// sent_at_ms 1767225600000 as a row for every rung, with exactly these five answers, and that table
+// is pinned by digest in TWO repositories and was computed from section 8's sentence outside both.
+// So the windows below are already known answers before they are used as inputs here, and
+// TestTheKnownAnswersCarryTheWindowAProductionSenderComputesAtTheStatedInstant asserts the join
+// rather than leaving it to a reader comparing two files by eye.
+const ephKeyKatProductionInstantMs int64 = 1767225600000
+
 // One known answer: which root, which rung, which window, and the thirty two octets MASTER
 // section 8.1 and RFC 5869 say EphKey must answer for them.
 type ephKeyKnownAnswer struct {
@@ -146,6 +171,54 @@ var ephKeyKnownAnswers = []ephKeyKnownAnswer{
 	{ephKeyKatRootBName, 4, 0, "6122a152ef28d50d3ef87aa025601392da55b50fe6c36157d781c3e8bbf27b6b"},
 	{ephKeyKatRootBName, 5, 0, "0cfe9b5eb5b15efc09ba3588014bb83baaa79c917307429ab24cdf31f6d13285"},
 	{ephKeyKatRootBName, 5, 0x0102030405060708, "560bd241edd4a2d044b5f677dbffef08783d053e37ebe51c1037c85533470a0f"},
+
+	// THE PRODUCTION SHAPED ROWS, and the hole they are the repair for.
+	//
+	// Of the seventeen rows above, FIFTEEN carry a window below 1000 and twelve carry window 0.
+	// The only large one is 0x0102030405060708, which is there to say the field is eight octets
+	// and big endian and is a window no sender will compute this era. So the window dimension of
+	// that table was clustered at the origin, and a clock read conditioned on the band a REAL
+	// sender computes in walked past all seventeen of them:
+	//
+	//	W5   if window > 1000 && window < 1000000 { <the mls/syntax clock> }
+	//	     -- measured on 4289bf7 with the seventeen row table: KAT GREEN, ALL SEVENTEEN ROWS,
+	//	        and the whole of ./messagegroup/ ok. EphKey(root A, 1, 490896) answered
+	//	        d29277d96652ea628c76426481673d01430b7f52e846098b30109952be6ff735 where the clock
+	//	        free derivation is 8ac265f11137ffb100589c82cf9546f6c7944d33a9b29867a600609eeb5e1f67.
+	//
+	// That band is not exotic. It is every window a 2020s-2030s sender computes for buckets 1, 2,
+	// 3 and 4 -- hourly, eight hourly, daily and weekly -- and the rows below are those windows at
+	// one stated instant, under both roots. They are derived and not copied: the program at the
+	// head of this block was re-run for these ten, in python from RFC 5869 section 2.3 written out
+	// by hand and section 8.1's formula, reading no .go file, and the SEVENTEEN existing answers
+	// were re-derived in the same program and diffed mechanically against this table -- identical,
+	// 17 of 17, plus ephKeyKatRootTwo itself.
+	//
+	// WHAT THEY DO NOT REACH, because the measurement said so rather than a reader hoping:
+	//
+	//	bucket 0  its production window is 0 by definition, so its production row is the window 0
+	//	          row already above and it can never enter the band.
+	//	bucket 5  its production window is 730 at this instant, which is BELOW the band. Four
+	//	          weekly windows do not exceed 1000 until 2046-09-27, so a clock conditioned on
+	//	          this band is invisible at bucket 5 for another twenty years -- to this table and
+	//	          to ephpurity_test.go's drawn oracle alike. The row is carried anyway because it
+	//	          is the honest production point for that rung and because the NEXT reader needs
+	//	          the rung's real window pinned, not because it kills W5.
+	//
+	// And the class is still not closed, which is the thing this corpus has twice published a
+	// sentence too wide about. Ten windows of 2^64 is ten windows of 2^64. A clock on one unpinned
+	// window is still green here; what kills THAT is a measure and not a point, and it is
+	// ephpurity_test.go.
+	{ephKeyKatRootAName, 1, 490896, "8ac265f11137ffb100589c82cf9546f6c7944d33a9b29867a600609eeb5e1f67"},
+	{ephKeyKatRootAName, 2, 61362, "5f029eb9c7cf1320ddeb0ba8dda3cf8a5ea428e22236781c4375014b6cf30f86"},
+	{ephKeyKatRootAName, 3, 20454, "6e833c94ac88d0005970a4b2e1f6963eab63af969e19411aa42b099e80402ee8"},
+	{ephKeyKatRootAName, 4, 2922, "f40b1b738251cfb9ea5d59146050571a44a27337c1bd23b53293242ec6395b36"},
+	{ephKeyKatRootAName, 5, 730, "1d638c1307dec24ba07622e57b65269655a362329cbab9fc283f3c0b5ae1ee4d"},
+	{ephKeyKatRootBName, 1, 490896, "c70e29820c10270d48d1a97015237a1b4997fca045691fe269d912fee21d864b"},
+	{ephKeyKatRootBName, 2, 61362, "12a3cb6c68b9b7514b8b317c8ebc7e02a42adadd201767b098b9e58c97db12a3"},
+	{ephKeyKatRootBName, 3, 20454, "7a108b8e9b4730688e9739e4cbef67c275efb7c1312a98461fc48efb8f313ad2"},
+	{ephKeyKatRootBName, 4, 2922, "123f94eaf7c35b5c2f89503dee3fe170a7d0d0f0dc3dcf28441fb7574ff2cbde"},
+	{ephKeyKatRootBName, 5, 730, "50292ed67580c6637aab68ef6b36506c165a7323e53a6889007c82c61d606cac"},
 }
 
 // ephKeyKatRoots is the two roots the table stands under, by the name its rows use.
@@ -172,7 +245,7 @@ func ephKeyKatRoots(t *testing.T) map[string][]byte {
 	return roots
 }
 
-// TestEphKeyIsMasterSection81sDerivationAndNotThisPackagesOpinionOfIt holds all seventeen.
+// TestEphKeyIsMasterSection81sDerivationAndNotThisPackagesOpinionOfIt holds all twenty seven.
 func TestEphKeyIsMasterSection81sDerivationAndNotThisPackagesOpinionOfIt(t *testing.T) {
 	roots := ephKeyKatRoots(t)
 	if len(ephKeyKnownAnswers) == 0 {
@@ -216,7 +289,7 @@ func TestEphKeyIsMasterSection81sDerivationAndNotThisPackagesOpinionOfIt(t *test
 // are for. Each was broken alone on the commit that added this test and each named itself.
 //
 // WHAT IT DOES NOT ASSERT, because the domain will not allow it: the root and the window
-// dimensions. Two roots of 2^256 and five windows of 2^64 are not a complement anybody prints.
+// dimensions. Two roots of 2^256 and ten windows of 2^64 are not a complement anybody prints.
 // They are logged as the sample they are, and the head of P5 below carries what that costs.
 func TestTheKnownAnswersCoverEveryRungOfTheLadderUnderBothRoots(t *testing.T) {
 	roots := ephKeyKatRoots(t)
@@ -286,12 +359,141 @@ func TestTheKnownAnswersCoverEveryRungOfTheLadderUnderBothRoots(t *testing.T) {
 
 	// half three: the two dimensions that are a SAMPLE, reported as one rather than asserted as
 	// coverage. These numbers are what the sentence at the head of P5 is allowed to say.
+	//
+	// THE COVERED COUNT IS COMPUTED AND NOT RESTATED. This line used to print
+	// `the bucket dimension is %d of %d` with len(rungs) on BOTH sides -- the same value twice, a
+	// number that cannot be wrong, in the file that refuses exactly that everywhere else. Measured
+	// under the coordinated removal of bucket 4's rows from both roots it printed "6 of 6" in the
+	// same run the assertion above went red at `COMPLEMENT: 1 rung(s) [4]`. It could never produce
+	// a false green -- the Errorf is the net and it fires -- but a printed tautology in the run
+	// where the property is broken is the shape this file elsewhere names as the defect. It now
+	// counts the rungs carried under EVERY root, so a dropped row moves it.
+	coveredEverywhere := []uint8{}
+	for _, rung := range rungs {
+		underAll := true
+		for _, name := range slices.Sorted(maps.Keys(roots)) {
+			if !slices.Contains(carried[name], rung) {
+				underAll = false
+			}
+		}
+		if underAll {
+			coveredEverywhere = append(coveredEverywhere, rung)
+		}
+	}
 	slices.Sort(windows)
 	t.Logf("sample: %d roots of 2^256, %d windows of 2^64 %v; the bucket dimension is %d of %d and is the only one of the three that is COMPLETE",
-		len(roots), len(windows), windows, len(rungs), len(rungs))
+		len(roots), len(windows), windows, len(coveredEverywhere), len(rungs))
 	if len(roots) < 2 {
 		t.Errorf("the known answers stand under %d root(s); ONE root is what let plant P4 condition on the fixture's first octet and pass every gate in this tree", len(roots))
 	}
+}
+
+// TestTheKnownAnswersCarryTheWindowAProductionSenderComputesAtTheStatedInstant is the WINDOW
+// dimension's repair, and it is the only thing in this file that makes the stated instant load
+// bearing rather than a sentence in a comment.
+//
+// -- CLASS: the rungs of the eph ladder, read off message.EphBucketSeconds.
+// -- SCOPE: ephKeyKnownAnswers, under every root it stands under.
+// -- PROPERTY: for every rung, the window a sender computes at ephKeyKatProductionInstantMs is a
+//
+//	row of this table under EVERY root; the complement -- the (root, rung) pairs carrying no
+//	production shaped row -- is empty, asserted as a NUMBER and printed with its members.
+//
+// WHY THIS AND NOT "there are ten new rows". A row is a hex string and a reader cannot tell by
+// looking whether its window is the one a sender computes or a digit somebody fumbled. This gate
+// recomputes the windows from the instant through the shipped sender and joins them to the table,
+// so "2026-01-01T00:00:00Z" in the comment above is a claim that FAILS when it stops being true --
+// and the five divisions it recomputes are themselves pinned, at that same instant, by the shared
+// window table testdata/eph-window-kat.txt in two repositories.
+//
+// THE SECOND HALF IS THE ONE THE CORPUS WAS MISSING, and it is printed with its complement rather
+// than asserted as coverage, because it is a sample: how many of this table's rows carry a window
+// inside 1000 < t < 1000000, the band plant W5 fires in and the band every 2020s-2030s sender
+// computes in for buckets 1 through 4. Before this commit the answer was ZERO of seventeen, and
+// the plant was green on every gate in this tree. It is asserted non empty; it is NOT asserted to
+// be coverage of the band, because ten points of 2^64 is coverage of nothing and the sentence this
+// file stands behind does not claim it. What covers a band rather than sampling it is a measure
+// over drawn inputs, and that is ephpurity_test.go.
+func TestTheKnownAnswersCarryTheWindowAProductionSenderComputesAtTheStatedInstant(t *testing.T) {
+	roots := ephKeyKatRoots(t)
+	if len(ephKeyKnownAnswers) == 0 {
+		t.Fatal("the known answer table has no rows, so every production window is missing and an empty table would otherwise report as carrying all of them")
+	}
+	rungs := []uint8{}
+	for candidate := 0; candidate <= 0xFF; candidate += 1 {
+		if 0 <= message.EphBucketSeconds(uint8(candidate)) {
+			rungs = append(rungs, uint8(candidate))
+		}
+	}
+	if len(rungs) == 0 {
+		t.Fatal("message.EphBucketSeconds named no rung at all, so the class this gate is measured against is empty and the empty complement below would mean nothing")
+	}
+
+	carried := map[string]bool{}
+	for _, one := range ephKeyKnownAnswers {
+		carried[fmt.Sprintf("%s/%d/%d", one.root, one.bucket, one.window)] = true
+	}
+
+	missing, production := []string{}, map[uint8]uint64{}
+	for _, rung := range rungs {
+		window, err := EphWindowAt(rung, ephKeyKatProductionInstantMs)
+		if err != nil {
+			t.Fatalf("EphWindowAt(bucket %d, %d) refused, so this gate cannot say what a sender computes for that rung at the stated instant: %v",
+				rung, ephKeyKatProductionInstantMs, err)
+		}
+		production[rung] = window
+		for _, name := range slices.Sorted(maps.Keys(roots)) {
+			if !carried[fmt.Sprintf("%s/%d/%d", name, rung, window)] {
+				missing = append(missing, fmt.Sprintf("(root %s, bucket %d, window %d)", name, rung, window))
+			}
+		}
+	}
+	t.Logf("class: %d rung(s) x %d root(s) = %d production shaped point(s) at sent_at_ms %d; the table carries %d of them; COMPLEMENT: %d %v",
+		len(rungs), len(roots), len(rungs)*len(roots), ephKeyKatProductionInstantMs,
+		len(rungs)*len(roots)-len(missing), len(missing), missing)
+	if len(missing) != 0 {
+		t.Errorf("%d production shaped point(s) are not rows of this table: %v. A rung whose REAL window is unpinned is a rung a window conditioned clock hides on, which is what plant W5 did on buckets 1, 2, 3 and 4 with every gate in this tree green",
+			len(missing), missing)
+	}
+
+	// the band, and the complement printed with the reason each member sits outside it
+	inBand, outOfBand := []uint8{}, []uint8{}
+	for _, rung := range rungs {
+		if ephPurityBandLow < production[rung] && production[rung] < ephPurityBandHigh {
+			inBand = append(inBand, rung)
+		} else {
+			outOfBand = append(outOfBand, rung)
+		}
+	}
+	rowsInBand := 0
+	for _, one := range ephKeyKnownAnswers {
+		if ephPurityBandLow < one.window && one.window < ephPurityBandHigh {
+			rowsInBand += 1
+		}
+	}
+	t.Logf("band: %d of this table's %d row(s) carry a window inside %d < t < %d; COMPLEMENT: %d row(s) outside it",
+		rowsInBand, len(ephKeyKnownAnswers), ephPurityBandLow, ephPurityBandHigh, len(ephKeyKnownAnswers)-rowsInBand)
+	t.Logf("band: at this instant the production window is inside it for rung(s) %v; COMPLEMENT: %d rung(s) %v, whose production windows are %v",
+		inBand, len(outOfBand), outOfBand, ephKeyKatWindowsOf(production, outOfBand))
+	if rowsInBand == 0 {
+		t.Errorf("no row of this table carries a window inside %d < t < %d, which is where every window a 2020s-2030s sender computes for buckets 1 through 4 lives; that is the exact clustering plant W5 walked past",
+			ephPurityBandLow, ephPurityBandHigh)
+	}
+	if len(inBand) == 0 || len(outOfBand) == 0 {
+		t.Errorf("the band splits the ladder into %d rung(s) inside and %d outside; this file's prose says four and two, and a split that collapsed either way would make the line above print a complement nobody measured",
+			len(inBand), len(outOfBand))
+	}
+}
+
+// ephKeyKatWindowsOf reads the windows of a set of rungs out of a computed map, so the complement
+// above prints its members' VALUES and not only their names. A complement whose members are named
+// but whose values are not is a complement a reader cannot check.
+func ephKeyKatWindowsOf(production map[uint8]uint64, rungs []uint8) []uint64 {
+	windows := []uint64{}
+	for _, rung := range rungs {
+		windows = append(windows, production[rung])
+	}
+	return windows
 }
 
 // TestEphKeyRefusesEveryOffLadderBucketAndAcceptsTheTransientRung is P6 where it bites in
@@ -430,7 +632,7 @@ func TestTheWindowArithmeticIsThreeAnswersOverTheLaddersThree(t *testing.T) {
 //
 // THE 2026-09-13 REPAIR IS NOT A FOURTH ROUND ON THE GATE. Nothing below the class derivation is
 // touched: no clause was added to the graph, no boundary moved, no pin widened. What changed is
-// the TABLE the argument leans on -- five vectors to seventeen, one root to two, three of six
+// the TABLE the argument leans on -- five vectors to twenty seven, one root to two, three of six
 // rungs to six of six -- and the two sentences that overstated what a table of five could hold.
 // The gate's blind spots are the same eight they were, and they are still named below.
 //
@@ -510,6 +712,13 @@ func TestTheWindowArithmeticIsThreeAnswersOverTheLaddersThree(t *testing.T) {
 //	     table carries                                                 ./messagegroup/ ok. SURVIVES
 //	P7   V4b's clock, fired only `if window == 42`, a window the       KAT PASS. The whole of
 //	     table does not carry                                          ./messagegroup/ ok. SURVIVES
+//	W5   V4b's clock, fired only on 1000 < window < 1000000 -- the      KAT GREEN at 4289bf7, all
+//	     PRODUCTION BAND, every window a 2020s-2030s sender computes    seventeen rows, and the
+//	     for buckets 1, 2, 3 and 4 (2026: 490896 / 61362 / 20454 /      whole of ./messagegroup/ ok.
+//	     2922). Bucket 5's is 730 and is spared until 2046.             KAT RED on this commit, 8
+//	                                                                   rows, and the purity oracle
+//	                                                                   red at 394 of 600 production
+//	                                                                   shaped draws
 //
 // P6 and P7 were confirmed VALUE CHANGING by a probe that compared EphKey against the clock free
 // derivation of the same inputs and was deleted before every suite measurement, not asserted to be
@@ -526,9 +735,11 @@ func TestTheWindowArithmeticIsThreeAnswersOverTheLaddersThree(t *testing.T) {
 // sentence EXCLUDES, and both exclusions are measured above rather than feared:
 //
 //	an influence conditional on a ROOT or a WINDOW the table does not carry. The table pins 2 roots
-//	of 2^256 and 5 windows of 2^64. Those are samples, nothing makes them more, and P6 and P7 are
-//	each about a dozen lines. Widening killed the two plants that existed; it did not close the
-//	class, and no finite table can.
+//	of 2^256 and 10 windows of 2^64. Those are samples, nothing makes them more, and P6 and P7 are
+//	each about a dozen lines. Widening killed the plants that existed each time; it did not close
+//	the class, and no finite table can. What NARROWS it -- in proportion to a condition's measure
+//	rather than at a list of points -- is the drawn differential in ephpurity_test.go, and the row
+//	below says exactly how much of this exclusion that oracle takes and how much it leaves.
 //
 //	an influence bound LATER than the binary the known answers run in -- an exported setter, an
 //	init in a package only the production composition root links, a build tag selected file, a
@@ -568,6 +779,18 @@ func TestTheWindowArithmeticIsThreeAnswersOverTheLaddersThree(t *testing.T) {
 //	                  answers BY CONSTRUCTION -- the hook is nil in the binary they run in, at every
 //	                  point of the input space, so no width of table reaches it.
 //
+// WHAT THE PURITY ORACLE ADDS TO THAT LIST, and it is one thing and not eight. ephpurity_test.go
+// compares EphKey against an expansion that shares no declaration with it, over DRAWN inputs, so it
+// is blind to every shape above in exactly the way the known answers are blind to them: it sees a
+// VALUE and never a reference, so a name collision or a dot import or a linkname is invisible to it
+// unless the clock behind it changes an octet. What it adds is on the other axis. Where the known
+// answers pin points and are blind between them, the oracle covers a condition in proportion to its
+// MEASURE -- so the root exclusion, which no table of two roots reaches, dies 600 of 600 on drawn
+// roots, and the production window band dies 394 of 600 on production shaped draws. Measured, not
+// argued, and the row that says where it stops is W4: one (bucket, window) pair, 0 of 600 on both
+// draws, 0 of 27 rows, the graph gate green and an unfiltered ./messagegroup/ run green. Late
+// binding is untouched by any of it.
+//
 // WHETHER ANY OF THE OTHER SEVEN REACHES PAST THE GATE INTO THE KNOWN ANSWERS IS NOT A PROPERTY OF
 // THE SHAPE. It is a property of what the clock is CONDITIONED ON, and that is the row this block
 // was missing until 2026-09-13. Until then the late binding row read "the only one of these that
@@ -579,8 +802,20 @@ func TestTheWindowArithmeticIsThreeAnswersOverTheLaddersThree(t *testing.T) {
 //
 //	the clock read is ...                          graph can follow      graph cannot follow
 //	unconditional, or bucket conditional           gate RED and KAT RED  KAT RED  (V4b, P3, Pu)
-//	conditional on an unsampled root or window     gate RED  (P1)        NOTHING  (P6, P7)
+//	conditional on an unsampled root or window     gate RED  (P1)        ORACLE, in proportion to
+//	                                                                     the condition's MEASURE
+//	                                                                     under a drawn input --
+//	                                                                     W1 600/600, W5 394/600
+//	                                                                     production shaped; W4,
+//	                                                                     one point of 2^64, is
+//	                                                                     still NOTHING
 //	bound after the test binary                    gate RED              NOTHING  (V5b, MG-3)
+//
+// THE BOTTOM RIGHT CELL IS UNMOVED AND THE MIDDLE RIGHT ONE IS NARROWED AND NOT CLOSED. That is the
+// whole of what 2026-09-13's second pass added, and the distinction is the one this line has twice
+// published a sentence too wide about: a measure covers a CONDITION in proportion to how often it
+// fires under the draw, so a condition that fires on almost every input dies at the first point and
+// a condition that fires on one point of 2^64 is not reached by any draw a test can afford.
 //
 // WIDENING THE TABLE MOVED ONE CELL. Before 2026-09-13 the middle right cell held P3 and P4 as
 // well, because bucket 3 and every non fixture root were unsampled; they are sampled now, so those

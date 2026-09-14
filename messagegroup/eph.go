@@ -115,22 +115,36 @@ func NewEphRoot(random io.Reader) ([]byte, error) {
 //
 // HOW FAR THAT SENTENCE IS ACTUALLY HELD, because it is asserted by two gates and neither is
 // total, and because the two earlier versions of this paragraph both said MORE than was true.
-// ephkey_test.go carries seventeen known answers computed outside this module, over two eph_roots
-// and every rung of the ladder. They kill a clock read whose influence on the derived octets is
-// UNCONDITIONAL, or depends on the BUCKET ALONE, in the binary they run in. The bucket clause is
-// the only one of the three arguments that is total: every rung message.EphBucketSeconds names is
-// a row under both roots, and the complement of that coverage is asserted empty rather than
-// described. Beside them the reference-graph gate walks the control flow and names, in its own
-// header, every shape it is known not to see.
+// ephkey_test.go carries twenty seven known answers computed outside this module, over two
+// eph_roots and every rung of the ladder. They kill a clock read whose influence on the derived
+// octets is UNCONDITIONAL, or depends on the BUCKET ALONE, in the binary they run in. That sentence
+// is unchanged by the 2026-09-13 widening from seventeen rows to twenty seven and is deliberately
+// not widened with it: the extra rows are POINTS, they kill more, and pointwise killing is not a
+// clause anybody can state about a class. The bucket clause is the only one of the three arguments
+// that is total: every rung message.EphBucketSeconds names is a row under both roots, and the
+// complement of that coverage is asserted empty rather than described.
+//
+// Beside them stand two other gates that fail over different things. The reference-graph gate walks
+// the control flow and names, in its own header, every shape it is known not to see. And
+// ephpurity_test.go compares this function against an HKDF-Expand written out separately, over
+// inputs that are DRAWN rather than listed -- which is the only gate here whose reach is a MEASURE:
+// it catches an influence in proportion to how often that influence fires under the draw. Measured
+// on this commit, against a clock the graph gate cannot see: 600 of 600 for an influence
+// conditional on the eph_root, 394 of 600 for one conditional on the window band a 2020s-2030s
+// sender computes in, and 0 of 600 for one conditional on a single (bucket, window) pair.
 //
 // WHAT THAT LEAVES, which is two classes and not one, both measured rather than feared:
 //
-//   - an influence conditional on a ROOT or a WINDOW the table does not carry. Two roots of 2^256
-//     and five windows of 2^64 are a sample. A clock fired on a third root, or on one unpinned
-//     window, is value changing and passes every gate in this tree. Widening the table from five
-//     vectors to seventeen on 2026-09-13 killed the two plants that then existed -- one fired on
-//     bucket 3, one on every root but the fixture's -- and did not close the class, which no
-//     finite table can.
+//   - an influence conditional on a ROOT or a WINDOW the table does not carry, NARROWED on
+//     2026-09-13 and not closed. Two roots of 2^256 and ten windows of 2^64 are a sample. Widening
+//     the table from five vectors to seventeen killed the two plants that then existed -- one fired
+//     on bucket 3, one on every root but the fixture's -- and a third, fired on 1000 < window <
+//     1000000, then walked past all seventeen because fifteen of them carried a window below 1000.
+//     Ten production-shaped rows at a stated instant kill THAT one, eight rows red, and the drawn
+//     oracle kills it again at 394 of 600 and kills the root-conditional class at 600 of 600. What
+//     survives all of it, measured rather than feared: a clock fired on ONE (bucket, window) pair
+//     whose two coordinates are each pinned. Its measure is about 2^-64, no draw a test can afford
+//     reaches it, and no finite table ever will.
 //   - a clock bound LATER than the test binary -- an exported setter written by a composition
 //     root's init, a build-tag file, a plugin. In that binary this function really is pure, so no
 //     width of table reaches it. Open item MG-3 in this directory's OPENITEMS.md carries the
@@ -192,8 +206,11 @@ func EphKey(ephRoot []byte, bucket uint8, window uint64) []byte {
 // pairs. No import can hold them together. WHAT CROSSES A FORBIDDEN IMPORT IS A VALUE:
 // testdata/eph-window-kat.txt carries fifty seven answers computed from section 8's sentence
 // outside both repositories, the other repository carries the same file byte for byte, and each
-// drives its own copy over it. ephwindowkat_test.go is this side. Ledger item 193 carries the
-// digest and what is still owed.
+// drives its own copy over it. ephwindowkat_test.go is this side and it landed on 2026-09-13, so
+// the fastening is two gates rather than one digest string a person compares: an edit to the table
+// in either repository turns the other red. Ledger item 193 carries the procedure for changing it
+// -- both copies and both pinned digests in one change -- and stays FILED, because what is fastened
+// is a set of values and no test in either repository may call the other's copy.
 func EphWindowAt(bucket uint8, sentAtMs int64) (uint64, error) {
 	seconds := message.EphBucketSeconds(bucket)
 	switch {

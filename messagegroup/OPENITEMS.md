@@ -184,13 +184,19 @@ package's to invent.**
 `EphKey` must be a pure function of `(eph_root, bucket, window)`. Two gates are supposed to hold
 that between them:
 
-1. `TestEphKeyIsMasterSection81sDerivationAndNotThisPackagesOpinionOfIt` pins seventeen known
-   answers computed outside this module from MASTER §8.1 and RFC 5869 — two `eph_root`s, every
-   rung of the ladder under both, five windows. It defends the **output**. It pinned **five** when
-   this row was filed, over one root and three of six rungs, and the widening on 2026-09-13 is
-   half of what this row now records.
+1. `TestEphKeyIsMasterSection81sDerivationAndNotThisPackagesOpinionOfIt` pins **twenty seven**
+   known answers computed outside this module from MASTER §8.1 and RFC 5869 — two `eph_root`s,
+   every rung of the ladder under both, ten windows. It defends the **output**, at POINTS. It
+   pinned **five** when this row was filed, over one root and three of six rungs; seventeen after
+   the first widening on 2026-09-13; twenty seven after the second, which added the window a real
+   sender computes for every rung at `2026-01-01T00:00:00Z`.
 2. `TestEphKeyReachesNoClockSourceInThisPackage` walks the reference graph. It defends the
    **control flow**, and it is explicitly not total — `ephkey_test.go` names what it cannot see.
+3. `TestEphKeyIsAFunctionOfItsThreeArgumentsOverDrawnInputs` — added 2026-09-13, second pass —
+   compares `EphKey` against an HKDF-Expand written out in `ephpurity_test.go`, over inputs that
+   are **drawn** rather than listed. It defends the **output** too, but by MEASURE rather than at
+   points: it catches an influence in proportion to how often that influence fires under the draw.
+   It is the first gate in this directory whose reach is not a list.
 
 The argument for stopping the gate/counter-gate race was that (1) backstops (2): a clock the graph
 misses still has to change the derived octets, and the known answers would kill it. **That argument
@@ -282,22 +288,65 @@ has already taken a step along.
 3. **State the precondition in writing** — say in the corpus that `EphKey`'s purity is asserted
    over a binary with no injected state, and make that a review obligation rather than a gate.
    Costs nothing and is honest; catches nothing.
-4. **Widen the sample, and say what remains a sample** — the coverage axis. Partly TAKEN on
-   2026-09-13 without a ruling, because adding vectors binds nobody and imposes no rule on any
-   other package: the table went from five points to seventeen, from one root to two, and from
-   three of six rungs to a complement over the ladder that is asserted empty. What a ruling would
-   still have to choose is how far to go — the bucket dimension is finite and is now complete, and
-   the root and window dimensions are 2 of 2^256 and 5 of 2^64 and cannot be completed by any
-   table. The candidates are a property test over drawn roots and windows (which needs a rule about
-   determinism and a seed the corpus publishes), a second independent implementation inside the
-   test binary (which `ephkey_test.go` argues against in as many words, because it would run on the
-   same understanding of the same three things the subject does), or accepting the sample and
-   saying so where a reader meets it, which is what `eph.go` now does.
+4. **Widen the sample, and say what remains a sample** — the coverage axis. TAKEN TWICE on
+   2026-09-13 without a ruling, because neither step binds anybody or imposes a rule on any other
+   package, and the second step is where the shape of the remaining question changed.
+
+   **First step, the table.** Five points to seventeen: one root to two, and three of six rungs to
+   a complement over the ladder that is asserted empty.
+
+   **The escape that step did not cover, measured.** A clock fired only on
+   `1000 < window < 1000000` — the band every 2020s–2030s sender computes in for buckets 1, 2, 3
+   and 4 — was **green on every gate in this tree** at `4289bf7`, because **fifteen of the
+   seventeen rows carried a window below 1000**. Widened again to twenty seven: ten production
+   shaped rows, one per rung under each root, at the stated instant `1767225600000` =
+   `2026-01-01T00:00:00Z`. That plant is now **8 of 27 rows red**. Bucket 5 is **not** one of them
+   — its production window is 730 today and does not exceed 1000 until 2046-09-27 — and that is
+   stated in the table rather than left for a reader to notice.
+
+   **Second step, and it is NOT more rows: a differential over DRAWN inputs.** `ephpurity_test.go`
+   compares `EphKey` against an HKDF-Expand written out from RFC 5869 §2.3, sharing no declaration
+   with the subject and asserted to share none by an AST gate over its own body. `ephkey_test.go`'s
+   objection to a second expansion is about the **formula** and is correct; it does **not** reach
+   **purity**, because a clock stirred into `EphKey` moves `EphKey`'s side of the comparison and
+   not the oracle's however wrong the two are together. Measured, each against a clock behind a
+   `fmt.Stringer` in `mls/syntax` that the graph gate cannot see:
+
+   | plant | KAT rows | uniform 2^64 | production shaped |
+   |---|---|---|---|
+   | committed bytes | 0 of 27 | 0 of 600 | 0 of 600 |
+   | fired unconditionally | 27 of 27 | 600 of 600 | 600 of 600 |
+   | `bucket == 3` | 5 of 27 | 93 of 600 | 105 of 600 |
+   | every root but the two pinned | **0 of 27** | **600 of 600** | **600 of 600** |
+   | every window but the five formerly pinned | 10 of 27 | 600 of 600 | 500 of 600 |
+   | `1000 < window < 1000000` | 8 of 27 | **0 of 600** | **394 of 600** |
+   | `bucket == 5 && window == 17` | 0 of 27 | 0 of 600 | 0 of 600 |
+
+   Three things a ruling has to take from that table. The **root** exclusion, which no table of two
+   roots reaches, dies 600 of 600 — the oracle is the only thing in this tree that touches it. The
+   **distribution is the coverage**: the production band is invisible to a uniform `uint64` draw and
+   obvious to a draw that computes windows from a wall clock instant. And the last row is where it
+   stops: a condition on ONE `(bucket, window)` pair survives both draws, all twenty seven rows, the
+   graph gate and an unfiltered `./messagegroup/` run. Its measure is about 2^-64; a firing set of
+   probability p is found in N draws with probability `1 - (1-p)^N`, which at N = 600 is 99.8% for
+   p = 0.01 and zero for any run anybody will make at 2^-64.
+
+   **What a ruling still has to choose**, and the second step narrowed it rather than answering it:
+   the bucket dimension is finite and complete; the root and window dimensions are 2 of 2^256 and
+   10 of 2^64 as POINTS, and are now additionally covered by measure under two named distributions.
+   Neither is closed. The open questions are whether the corpus wants a published seed and a
+   determinism rule (this file draws from `crypto/rand` and **logs** the seed, which reproduces a
+   failure without pinning the points), how many draws and at what distributions, and whether any
+   of that is worth a rule at all given that **none of it touches this row** — a clock bound after
+   the test binary is nil at every point of the input space, so measure over drawn inputs reaches it
+   exactly as far as a table does, which is not at all.
 
 ### What is owed elsewhere
 
 A `SPEC-LEDGER.md` number and one sentence from the owner. Options 2 and 4 are the ones that could
-be done inside this repository without a rule that binds other packages; option 4's first step was
-taken on 2026-09-13 because widening a table imposes nothing on anybody, and option 2 is still not
-this package's to impose on a composition root it does not own. **Nothing here is ruled.**
+be done inside this repository without a rule that binds other packages; option 4's **both** steps
+were taken on 2026-09-13 because neither a wider table nor a test-local differential imposes
+anything on anybody, and option 2 is still not this package's to impose on a composition root it
+does not own. **Nothing here is ruled, and the second step is evidence about the COVERAGE direction
+and about nothing else — it is not evidence that this row is smaller than it was.**
 

@@ -23,13 +23,26 @@
 // other half, and landing it is what makes the fastening TWO GATES rather than one digest string
 // compared by a person: an edit to the table in either repository turns the other red.
 //
-// THE FILE IS msgrepo's BYTES AND NOT A RESTATEMENT OF THEM, including its prose. Its header still
-// says "connect owes the other half ... until that lands", which this very file is the landing of.
-// That sentence cannot be corrected here: the two copies are pinned by a digest over the whole
-// file, so an edit to one repository's comment is an edit the other repository reads as drift.
-// Correcting it is a coordinated edit in both repositories plus a republished digest, and it is
-// SPEC-LEDGER.md item 193's to make -- filed, not ruled, and not this package's to close. What is
-// owed here is byte-identity, and byte-identity is what is asserted.
+// THE FILE IS ONE TABLE CARRIED BY TWO REPOSITORIES AND NOT A RESTATEMENT, including its prose,
+// and THE STALE PARAGRAPH IS NOW GONE FROM BOTH COPIES. Its header used to say "connect owes the
+// other half ... until that lands", which this very file was the landing of; the sentence could not
+// be corrected on either side alone, because the two copies are pinned by a digest over the WHOLE
+// file, so a one sided comment edit is drift the other repository's gate goes red on. It was
+// therefore made as one change in both repositories with both digests republished, which is the
+// procedure SPEC-LEDGER.md item 193 carries, and 193 stays FILED rather than closed: what is
+// fastened is a set of values, and no test in either repository can call the other's copy of the
+// formula. What is owed here is byte-identity, and byte-identity is what is asserted.
+//
+// THE DIGEST MOVED ON 2026-09-13 and the old value is recorded rather than dropped, because a
+// reader meeting a red gate needs to know whether the table was edited or smudged:
+//
+//	f6ef2ae645294a085ae88705209b756578f403029dcd0e0f5b2ef726e897712a  before, 57 rows
+//	6cdbff6c52021bae040a79beda712b18afbe342036ea84cf3066dee24c1521b8  after, 57 rows, PROSE ONLY
+//
+// No answer changed. The edit removed the stale paragraph and added one naming sent_at_ms
+// 1767225600000 as 2026-01-01T00:00:00Z, which is the instant ephkey_test.go's production shaped
+// known answers are computed for -- so the two tables in this directory now state the same instant
+// and one of them recomputes the other's windows from it.
 package messagegroup
 
 import (
@@ -62,7 +75,7 @@ const ephWindowKatPath = "testdata/eph-window-kat.txt"
 // MEASURED on the committed file, not typed from memory:
 //
 //	sha256 of messagegroup/testdata/eph-window-kat.txt with \r\n -> \n
-const ephWindowKatDigest = "f6ef2ae645294a085ae88705209b756578f403029dcd0e0f5b2ef726e897712a"
+const ephWindowKatDigest = "6cdbff6c52021bae040a79beda712b18afbe342036ea84cf3066dee24c1521b8"
 
 // The refusal names the table uses. They name the SENTINEL and not the message text, because the
 // two repositories prefix their messages differently on purpose ("messagegroup: ..." against

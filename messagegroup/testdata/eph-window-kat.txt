@@ -13,12 +13,18 @@
 # value: one table, pinned here, that each copy of the formula is driven over in its own
 # repository.
 #
-# THIS FILE IS msgrepo's HALF. connect owes the other half -- a byte-identical copy of this
-# table and a test that drives connect/messagegroup.EphWindowAt over it. Until that lands, this
-# table binds msgrepo's two copies (harness.EphWindowAt and api's fixture helper) to each other
-# and to these values, and it binds connect only by inspection. Ledger item 193 carries the
-# digest and what is owed; nothing in THIS repository can make connect's half red, and no test
-# here claims to.
+# THIS FILE IS ONE TABLE CARRIED BY TWO REPOSITORIES, BYTE FOR BYTE, AND NEITHER OF THEM OWNS IT.
+# It was msgrepo's alone until 2026-09-13. connect landed the other half on that day -- the same
+# bytes at connect/messagegroup/testdata/eph-window-kat.txt, driven over
+# connect/messagegroup.EphWindowAt by messagegroup/ephwindowkat_test.go -- so the paragraph that
+# stood here, which said connect "owes the other half ... until that lands", stopped being true and
+# is what this edit corrects. Each side pins the WHOLE of this file, its prose included, by SHA-256
+# over its canonical LF bytes: msgrepo in harness/ephkat_test.go, connect in ephwindowkat_test.go.
+# An edit here is therefore an edit both repositories have to make in the same change, and either
+# one alone turns the other's gate red on its next run -- which is exactly why correcting one stale
+# paragraph was itself a two-repository edit with two republished digests. Ledger item 193 carries
+# the digest and the procedure, and it remains FILED rather than closed: what is fastened is these
+# values, and no test in either repository can call the other's copy of the formula.
 #
 # THE ANSWERS WERE NOT READ OUT OF THE CODE THEY CHECK. They were computed from the sentence
 # above, independently, and then confirmed against connect/messagegroup.EphWindowAt in a
@@ -39,6 +45,25 @@
 # the refusal. Lines beginning with # and blank lines are commentary. The refusal names are
 # the sentinel's identity and not its message text, because the two repositories prefix their
 # messages differently on purpose.
+#
+# THE PRODUCTION INSTANT, AND WHY ONE ROW OF THIS TABLE IS USED AS AN INPUT SOMEWHERE ELSE.
+# sent_at_ms 1767225600000 is 2026-01-01T00:00:00Z. It is the one reading below at which every
+# rung's answer is a window a REAL sender computes, and it is carried for all six rungs on purpose:
+#
+#   b = 0 -> 0        by definition; section 8.1 says bucket 0's window is never computed
+#   b = 1 -> 490896   hourly          b = 2 -> 61362    eight hourly     b = 3 -> 20454   daily
+#   b = 4 -> 2922     weekly          b = 5 -> 730      four weekly
+#
+# connect's EphKey known answers (messagegroup/ephkey_test.go) pin K_eph at those same five windows
+# under two eph_roots, and a gate there RECOMPUTES them from this instant rather than copying them,
+# so a digit fumbled in either place is a red test and not a difference nobody notices. Those rows
+# exist because a clock read fired only on 1000 < t < 1000000 -- the band buckets 1 to 4 compute in
+# for the whole of the 2020s and 2030s -- was measured green against every gate in connect's tree
+# while fifteen of that table's seventeen rows carried a window below 1000.
+#
+# NOTE WHAT BUCKET 5's ANSWER IS. 730 is BELOW 1000: a four-weekly window does not exceed 1000
+# until 2046-09-27, so that rung is outside the band this table's neighbours are worried about for
+# another twenty years, and no row here or there changes that.
 #
 # ORDER OF REFUSAL IS PART OF THE ANSWER. Rows (6, -1), (16, -1), (21, -1) and (255, -1) are
 # the ones that distinguish the two orders: a copy that tests the clock reading first answers
