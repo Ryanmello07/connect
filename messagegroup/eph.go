@@ -114,15 +114,31 @@ func NewEphRoot(random io.Reader) ([]byte, error) {
 // differ on every record that crossed a bucket boundary between being sealed and being read.
 //
 // HOW FAR THAT SENTENCE IS ACTUALLY HELD, because it is asserted by two gates and neither is
-// total. ephkey_test.go's five known answers are computed outside this module and kill any clock
-// that changes the derived octets IN THE BINARY THEY RUN IN; the reference-graph gate beside them
-// walks the control flow and names, in its own header, every shape it is known not to see. The gap
-// between the two is one class and it is filed rather than papered over: a clock bound LATER than
-// the test binary -- an exported setter written by a composition root's init, a build-tag file, a
-// plugin -- changes this function's output in the shipped binary with every gate in this tree
-// green. Open item MG-3 in this directory's OPENITEMS.md carries the reproduction and what a
-// ruling would have to choose between. NOTHING IN THIS PACKAGE INSTALLS SUCH A HOOK and the row
-// exists so that the absence is a measured claim instead of an assumption.
+// total, and because the two earlier versions of this paragraph both said MORE than was true.
+// ephkey_test.go carries seventeen known answers computed outside this module, over two eph_roots
+// and every rung of the ladder. They kill a clock read whose influence on the derived octets is
+// UNCONDITIONAL, or depends on the BUCKET ALONE, in the binary they run in. The bucket clause is
+// the only one of the three arguments that is total: every rung message.EphBucketSeconds names is
+// a row under both roots, and the complement of that coverage is asserted empty rather than
+// described. Beside them the reference-graph gate walks the control flow and names, in its own
+// header, every shape it is known not to see.
+//
+// WHAT THAT LEAVES, which is two classes and not one, both measured rather than feared:
+//
+//   - an influence conditional on a ROOT or a WINDOW the table does not carry. Two roots of 2^256
+//     and five windows of 2^64 are a sample. A clock fired on a third root, or on one unpinned
+//     window, is value changing and passes every gate in this tree. Widening the table from five
+//     vectors to seventeen on 2026-09-13 killed the two plants that then existed -- one fired on
+//     bucket 3, one on every root but the fixture's -- and did not close the class, which no
+//     finite table can.
+//   - a clock bound LATER than the test binary -- an exported setter written by a composition
+//     root's init, a build-tag file, a plugin. In that binary this function really is pure, so no
+//     width of table reaches it. Open item MG-3 in this directory's OPENITEMS.md carries the
+//     reproduction and what a ruling would have to choose between.
+//
+// NOTHING IN THIS PACKAGE INSTALLS SUCH A HOOK, and nothing in it conditions this derivation on
+// anything but its three arguments. The rows exist so that the absence is a measured claim
+// instead of an assumption.
 //
 // BOTH REFUSALS ARE PANICS CARRYING A SENTINEL, because spec A section 5.3 publishes this
 // signature with no error in it and RecordKeyZero already set that precedent for the same
@@ -166,6 +182,18 @@ func EphKey(ephRoot []byte, bucket uint8, window uint64) []byte {
 // A reading before the unix epoch is refused rather than wrapped into an enormous window. It is
 // a clock that is wrong by decades, and floor() of a negative is not what master section 8.1's
 // "count of whole buckets since that origin" means.
+//
+// THIS FUNCTION HAS A COPY IN ANOTHER REPOSITORY AND THE TWO HAVE ALREADY DRIFTED. The message
+// server plays the sender in its own harness, and spec B section 2.2 forbids that module to link
+// this package, so section 12.1 hands it the divisor and it does the division itself. Its copy
+// once read "if seconds <= 0 { return 0 }", which collapses the off ladder answer and the
+// transient rung into ONE -- the sentinel collision the 2026-09-13 ruling exists to eliminate,
+// reintroduced one repository over, and the two answered differently on nine of thirty two probed
+// pairs. No import can hold them together. WHAT CROSSES A FORBIDDEN IMPORT IS A VALUE:
+// testdata/eph-window-kat.txt carries fifty seven answers computed from section 8's sentence
+// outside both repositories, the other repository carries the same file byte for byte, and each
+// drives its own copy over it. ephwindowkat_test.go is this side. Ledger item 193 carries the
+// digest and what is still owed.
 func EphWindowAt(bucket uint8, sentAtMs int64) (uint64, error) {
 	seconds := message.EphBucketSeconds(bucket)
 	switch {

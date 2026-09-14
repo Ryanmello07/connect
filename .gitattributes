@@ -67,3 +67,19 @@
 # the only thing between "the corpus is evidence" and "the corpus is whatever the
 # checkout left behind".
 mls/testdata/corpus/** -text
+
+# messagegroup/testdata/eph-window-kat.txt is ONE HALF OF A PAIR. msgrepo carries the same 57
+# answers, byte for byte, at its own module root, and each repository drives its own copy of
+# MASTER section 8's sender formula over them. That is the only fastening available: Spec B
+# section 2.2 forbids the message-server module to link connect/messagegroup, so no import can
+# hold the two implementations together and what crosses a forbidden import is a value. The
+# other repository pins the same path with a *.txt rule to the same ending.
+#
+# Both gates fold CRLF to LF before hashing, so a CRLF checkout does not turn either of them
+# red. That is deliberate -- neither repository's checkout rules are the other's to set, and a
+# digest that cried wolf on a clean clone would be deleted rather than fixed. What this line
+# buys is the stronger statement: with core.autocrlf true at system scope on the Windows boxes
+# that build this repo, it is what makes "byte for byte identical to msgrepo's copy" true ON
+# DISK and not only after a fold, so cmp between the two working trees is an answer rather than
+# a smudge.
+messagegroup/testdata/eph-window-kat.txt text eol=lf

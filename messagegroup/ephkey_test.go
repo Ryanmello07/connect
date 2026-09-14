@@ -23,6 +23,7 @@ import (
 	"go/parser"
 	"go/token"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -36,8 +37,8 @@ import (
 // the derivation itself, against an implementation written outside this module
 // ---------------------------------------------------------------------------
 
-// K_eph[n][b][t] for the fixture's own eph_root, computed by a python program that reads MASTER
-// section 8.1 and RFC 5869 and no Go file at all.
+// K_eph[n][b][t] for two eph_roots over every rung of the ladder, computed by a python program
+// that reads MASTER section 8.1 and RFC 5869 and no Go file at all.
 //
 // WHY A HEX STRING AND NOT A SECOND EXPANSION IN THIS FILE. An expansion written here would run
 // on the same understanding of the same three things the subject does -- the info's field order,
@@ -47,6 +48,35 @@ import (
 // thirty two octets. A build that wrote the window little endian, or the bucket after the window,
 // or the info without the label, answers something else here.
 //
+// THE CONSTANTS ARE NOT INHERITED, and the worry the earlier version of this comment recorded is
+// answered rather than left standing. All five of the answers this table used to carry, plus the
+// info octets, were re-derived by the 2026-09-13 close-out review in python from RFC 5869 section
+// 2.3 written out by hand and the formula as spec A section 903 publishes it, reading no .go file:
+// they matched byte for byte. The commit that widened the table re-derived them a third time, in
+// the same shape and in one program with the twelve new ones, before any new constant was written
+// down here. Nothing below rests on an earlier reader's word.
+//
+// WHY SEVENTEEN AND NOT FIVE, which is the whole of the 2026-09-13 repair. Five vectors pinned ONE
+// root, THREE of the ladder's six rungs -- {0, 1, 5} -- and four windows, and on the strength of
+// them this file and eph.go both claimed that a clock changing EphKey's output in the binary they
+// run in would be caught. MEASURED FALSE. EphKey is asserted pure over
+// (root in 2^256, bucket in 6 rungs, window in 2^64); purity is a PER INPUT property, so a defect
+// can be per input too, and a clock read conditioned on a point the table does not carry is
+// invisible to it however early it is bound. Two such plants were made by the review and both
+// cleared every gate in this tree at the clean baseline exactly, 8,253 pass and 0 fail:
+//
+//	P3   if bucket == 3 { stirred[0] ^= <a clock behind fmt.Stringer in mls/syntax> }
+//	     -- buckets 2, 3 and 4 had no externally derived pin ANYWHERE in this tree
+//	P4   if ephRoot[0] != 0xE0 { <the same clock> }
+//	     -- fires on every root a real epoch produces and on none the tests use
+//
+// The repair is VECTORS AND NOT CLAUSES, because the hole is coverage and no sentence covers
+// anything: every rung of the ladder under BOTH roots, so a bucket conditioned influence has no
+// rung left to hide on, and a second root, so a root conditioned one has to miss two rather than
+// one. Both plants are red on this commit. What the widening buys and what it does NOT is written
+// out at the head of P5 below, and the bucket half of it is ASSERTED rather than described, by
+// TestTheKnownAnswersCoverEveryRungOfTheLadderUnderBothRoots.
+//
 // The program:
 //
 //	def expand(prk, info, L):        # RFC 5869 section 2.3
@@ -55,46 +85,212 @@ import (
 //	        t = hmac.new(prk, t+info+bytes([i]), hashlib.sha256).digest(); out += t; i += 1
 //	    return out[:L]
 //	info = b"eph/v1" + struct.pack(">B", b) + struct.pack(">Q", t)
-//	root = bytes((0xE0 + i) & 0xFF for i in range(32))       # testEphRoot()
+//	rootA = bytes((0xE0 + i) & 0xFF for i in range(32))                        # testEphRoot()
+//	rootB = hashlib.sha256(b"URmessage/v1 eph known answer root two").digest()
 const (
-	ephKeyKatBucket0Window0     = "be056c0605b17ef6b10d7a2c8a2d4ae30a49e46cc234dcf18f1fcb0df19c78b2"
-	ephKeyKatBucket1Window0     = "8b1a94286ea26028829cfccee9dfbdf2bab556bfa7f42fcc85c7229af2505070"
-	ephKeyKatBucket1Window1     = "72d2fe4145819b2b81be3418110f38dc47b5f7ec6f15cc751863d13fed12d4b2"
-	ephKeyKatBucket5Window709   = "282933d8669601c264bc5a6dfcc83f0dc16402527cdf1442b69758547708fb47"
-	ephKeyKatBucket5WindowWideT = "25fd9ad113f67c2b9f351a66ce3ad99885df5cea56deda7245087cab6e04f129"
 	// the info octets for b = 1, t = 1, so a reader can see where the KATs come from and a
 	// width error is visible as a length rather than only as a different key.
 	ephKeyKatInfoBucket1Window1 = "6570682f7631010000000000000001"
+
+	// The second eph_root, and why this table pins a second one at all.
+	//
+	// testEphRoot() is 0xE0..0xFF and it was the only root any known answer in this tree stood
+	// under until 2026-09-13. A clock read written as `if ephRoot[0] != 0xE0` then fires on
+	// every root a real epoch produces and on NONE of the vectors -- plant P4, measured green
+	// against every gate in this tree including these answers. One more root does not make the
+	// root dimension covered: it is 2 of 2^256, and the head of P5 says so in those words. What
+	// it does is cost that plant a red test, because a condition written to miss the fixture's
+	// root now has to miss two roots that share nothing.
+	//
+	// Its provenance is a RULE and not thirty two octets somebody typed:
+	// SHA-256("URmessage/v1 eph known answer root two"). The hex is written out rather than
+	// hashed here, for the same reason the answers below are hex and not a second expansion: a
+	// fixture this file computes is a fixture that moves when the thing under test moves.
+	ephKeyKatRootTwo = "7c840c32ea1a6d042a3a890062bc2653079373975f0afede319daba4523633d1"
+
+	// The names this table's rows give the two roots, short because they appear in every row.
+	ephKeyKatRootAName = "A"
+	ephKeyKatRootBName = "B"
 )
 
-// TestEphKeyIsMasterSection81sDerivationAndNotThisPackagesOpinionOfIt holds all five.
+// One known answer: which root, which rung, which window, and the thirty two octets MASTER
+// section 8.1 and RFC 5869 say EphKey must answer for them.
+type ephKeyKnownAnswer struct {
+	root   string
+	bucket uint8
+	window uint64
+	want   string
+}
+
+// The table. Seventeen rows, none of them read out of the code they check.
 //
-// The wide window is the one that says the field is eight octets and big endian:
-// 0x0102030405060708 has a non zero octet at every position, so a build that wrote four octets,
-// or wrote them in the other order, is a different info and a different key.
+// The wide window is what says the field is eight octets and big endian: 0x0102030405060708 has a
+// non zero octet at every position, so a build that wrote four octets, or wrote them in the other
+// order, is a different info and a different key. It is carried under both roots for the same
+// reason every rung is.
+var ephKeyKnownAnswers = []ephKeyKnownAnswer{
+	{ephKeyKatRootAName, 0, 0, "be056c0605b17ef6b10d7a2c8a2d4ae30a49e46cc234dcf18f1fcb0df19c78b2"},
+	{ephKeyKatRootAName, 1, 0, "8b1a94286ea26028829cfccee9dfbdf2bab556bfa7f42fcc85c7229af2505070"},
+	{ephKeyKatRootAName, 1, 1, "72d2fe4145819b2b81be3418110f38dc47b5f7ec6f15cc751863d13fed12d4b2"},
+	{ephKeyKatRootAName, 2, 0, "e4efd94c32b902d241f2798652b90550bfaa3570f248cfaf05a4bc7b474b49e7"},
+	{ephKeyKatRootAName, 3, 0, "44f6646d5c69127ea35f780cc4f1a432063361fcc90b804ad62fc005a3f1f56f"},
+	{ephKeyKatRootAName, 3, 17, "23454621c94d3fde5f7013dffafcda55127070ba6651ba756c7e3ca593cd105e"},
+	{ephKeyKatRootAName, 4, 0, "3a842f25849eb0ff0a72f082762345441574af3b289e1bf3c9bee0654a1b7da0"},
+	{ephKeyKatRootAName, 5, 0, "5c18ac7645c478f2f5cd47023f469256840723cbef408ec276b4ecbc17ee1bfa"},
+	{ephKeyKatRootAName, 5, 709, "282933d8669601c264bc5a6dfcc83f0dc16402527cdf1442b69758547708fb47"},
+	{ephKeyKatRootAName, 5, 0x0102030405060708, "25fd9ad113f67c2b9f351a66ce3ad99885df5cea56deda7245087cab6e04f129"},
+	{ephKeyKatRootBName, 0, 0, "c803e3e4aae3dd41896d4a2ecbbbfd3f13284d142ea979f32fb9c320f8fd8138"},
+	{ephKeyKatRootBName, 1, 0, "278f75da0b9dedcf5c0ca94a9ebb853e6fc71366b3d6004f4b6ea6d284244fb6"},
+	{ephKeyKatRootBName, 2, 0, "e02a12d45ce4267a1085cb5d918b46a00585359cd5a8859b496a0a94759a0cae"},
+	{ephKeyKatRootBName, 3, 0, "43246655aa9be807a7b66e7c191f64123368415964d288f83481d5afafdf1dd8"},
+	{ephKeyKatRootBName, 4, 0, "6122a152ef28d50d3ef87aa025601392da55b50fe6c36157d781c3e8bbf27b6b"},
+	{ephKeyKatRootBName, 5, 0, "0cfe9b5eb5b15efc09ba3588014bb83baaa79c917307429ab24cdf31f6d13285"},
+	{ephKeyKatRootBName, 5, 0x0102030405060708, "560bd241edd4a2d044b5f677dbffef08783d053e37ebe51c1037c85533470a0f"},
+}
+
+// ephKeyKatRoots is the two roots the table stands under, by the name its rows use.
+//
+// The three Fatals are fail closed guards and not hygiene. A root that failed to decode, a root of
+// the wrong width, or two roots that are the same value each leave a table that still passes and
+// pins less than it reads as pinning, which is the exact defect this whole block is the repair
+// for.
+func ephKeyKatRoots(t *testing.T) map[string][]byte {
+	t.Helper()
+	second, err := hex.DecodeString(ephKeyKatRootTwo)
+	if err != nil {
+		t.Fatalf("the second known answer root is not hex, so this table stands under one root and not two: %v", err)
+	}
+	roots := map[string][]byte{ephKeyKatRootAName: testEphRoot(), ephKeyKatRootBName: second}
+	for _, name := range slices.Sorted(maps.Keys(roots)) {
+		if len(roots[name]) != EphRootBytes {
+			t.Fatalf("known answer root %s is %d octets and an eph_root is %d", name, len(roots[name]), EphRootBytes)
+		}
+	}
+	if bytes.Equal(roots[ephKeyKatRootAName], roots[ephKeyKatRootBName]) {
+		t.Fatalf("the two known answer roots are the same value, so this table pins ONE point of the root dimension while reading as though it pinned two")
+	}
+	return roots
+}
+
+// TestEphKeyIsMasterSection81sDerivationAndNotThisPackagesOpinionOfIt holds all seventeen.
 func TestEphKeyIsMasterSection81sDerivationAndNotThisPackagesOpinionOfIt(t *testing.T) {
-	root := testEphRoot()
-	for _, one := range []struct {
-		bucket uint8
-		window uint64
-		want   string
-	}{
-		{0, 0, ephKeyKatBucket0Window0},
-		{1, 0, ephKeyKatBucket1Window0},
-		{1, 1, ephKeyKatBucket1Window1},
-		{5, 709, ephKeyKatBucket5Window709},
-		{5, 0x0102030405060708, ephKeyKatBucket5WindowWideT},
-	} {
+	roots := ephKeyKatRoots(t)
+	if len(ephKeyKnownAnswers) == 0 {
+		t.Fatal("the known answer table is empty, so this gate compared nothing")
+	}
+	for _, one := range ephKeyKnownAnswers {
+		root, isNamed := roots[one.root]
+		if !isNamed {
+			t.Fatalf("known answer (root %s, bucket %d, window %d) names a root this file does not carry", one.root, one.bucket, one.window)
+		}
 		got := hex.EncodeToString(EphKey(root, one.bucket, one.window))
 		if got != one.want {
-			t.Errorf("EphKey(root, %d, %d) = %s, want %s -- computed from MASTER section 8.1 and RFC 5869 outside this module",
-				one.bucket, one.window, got, one.want)
+			t.Errorf("EphKey(root %s, %d, %d) = %s, want %s -- computed from MASTER section 8.1 and RFC 5869 outside this module",
+				one.root, one.bucket, one.window, got, one.want)
 		}
 	}
 	// and the info itself, so a failure above says WHICH of the three things moved
 	if got := hex.EncodeToString(ephLabelledInfo(1, 1)); got != ephKeyKatInfoBucket1Window1 {
 		t.Errorf("the info for bucket 1 window 1 is %s, want %s = \"eph/v1\" then u8(1) then eight octets of big endian u64(1)",
 			got, ephKeyKatInfoBucket1Window1)
+	}
+	t.Logf("%d known answers over %d roots, computed outside this module", len(ephKeyKnownAnswers), len(roots))
+}
+
+// TestTheKnownAnswersCoverEveryRungOfTheLadderUnderBothRoots is the SECOND dimension of the known
+// answers, and it is the property the 2026-09-13 repair exists to make checkable.
+//
+// -- CLASS: the rungs of the eph ladder, read off message.EphBucketSeconds by offering it all 256
+// values of a bucket byte rather than written down as "0 through 5", so a rung added upstream
+// arrives here as a red test instead of as silence.
+// -- SCOPE: ephKeyKnownAnswers above, and both roots it stands under.
+// -- PROPERTY: every rung is pinned under EVERY root, so the complement -- the rungs a root does
+// not carry -- is empty, and it is the NUMBER that is asserted and the members that are printed.
+//
+// WHY AN EMPTY COMPLEMENT IS THE ANSWER HERE AND THE TELL EVERYWHERE ELSE IN THIS FILE. Every
+// other complement below is a set of things a narrowing DECLINED to look at, and an empty one
+// there means the narrowing removed nothing and defends nothing. This one is the set of rungs the
+// table MISSES, and the table is meant to miss none, so empty is completeness rather than vacuity.
+// The failure that reading invites is an empty complement produced by an empty CLASS -- a ladder
+// read as naming no rung, or a table read as having no rows -- and that is what the two Fatals
+// are for. Each was broken alone on the commit that added this test and each named itself.
+//
+// WHAT IT DOES NOT ASSERT, because the domain will not allow it: the root and the window
+// dimensions. Two roots of 2^256 and five windows of 2^64 are not a complement anybody prints.
+// They are logged as the sample they are, and the head of P5 below carries what that costs.
+func TestTheKnownAnswersCoverEveryRungOfTheLadderUnderBothRoots(t *testing.T) {
+	roots := ephKeyKatRoots(t)
+
+	rungs := []uint8{}
+	for candidate := 0; candidate <= 0xFF; candidate += 1 {
+		if 0 <= message.EphBucketSeconds(uint8(candidate)) {
+			rungs = append(rungs, uint8(candidate))
+		}
+	}
+	if len(rungs) == 0 {
+		t.Fatal("message.EphBucketSeconds named no rung at all, so the class this coverage is measured against is empty and the empty complement below would mean nothing")
+	}
+	if len(ephKeyKnownAnswers) == 0 {
+		t.Fatal("the known answer table has no rows, so every rung is missing and an empty table would otherwise report as full coverage of nothing")
+	}
+
+	// what the table actually carries, per root, read off the table rather than declared
+	carried := map[string][]uint8{}
+	windows := []uint64{}
+	for _, one := range ephKeyKnownAnswers {
+		if _, isNamed := roots[one.root]; !isNamed {
+			t.Fatalf("known answer (root %s, bucket %d, window %d) names a root this file does not carry", one.root, one.bucket, one.window)
+		}
+		if !slices.Contains(carried[one.root], one.bucket) {
+			carried[one.root] = append(carried[one.root], one.bucket)
+		}
+		if !slices.Contains(windows, one.window) {
+			windows = append(windows, one.window)
+		}
+	}
+
+	// half one: the rung complement, per root, asserted as a number and printed with its members
+	for _, name := range slices.Sorted(maps.Keys(roots)) {
+		missing := []uint8{}
+		for _, rung := range rungs {
+			if !slices.Contains(carried[name], rung) {
+				missing = append(missing, rung)
+			}
+		}
+		t.Logf("class: the ladder names %d rungs %v; root %s carries %d of them; COMPLEMENT: %d rung(s) %v",
+			len(rungs), rungs, name, len(carried[name]), len(missing), missing)
+		if len(missing) != 0 {
+			t.Errorf("root %s pins %d of the ladder's %d rungs and names none of %v; a rung no known answer carries is a rung a per bucket defect hides on, which is what plant P3 did on buckets 2, 3 and 4",
+				name, len(rungs)-len(missing), len(rungs), missing)
+		}
+	}
+
+	// half two: no two rows are the same input, and no two rows carry the same octets. A table
+	// with a duplicated answer pins one point twice while reading as pinning two, and a
+	// transcription that pasted one row's hex onto another row's inputs would otherwise be a
+	// silent hole of exactly the shape this test exists for.
+	seenInput := map[string]bool{}
+	seenWant := map[string]string{}
+	for _, one := range ephKeyKnownAnswers {
+		input := fmt.Sprintf("root %s bucket %d window %d", one.root, one.bucket, one.window)
+		if seenInput[input] {
+			t.Errorf("the known answers name (%s) twice, so the table has %d rows and fewer points", input, len(ephKeyKnownAnswers))
+		}
+		seenInput[input] = true
+		if first, isRepeat := seenWant[one.want]; isRepeat {
+			t.Errorf("(%s) carries the same thirty two octets as (%s); two distinct infos under HKDF-Expand do not collide, so this is a transcription and the row pins nothing new",
+				input, first)
+		}
+		seenWant[one.want] = input
+	}
+
+	// half three: the two dimensions that are a SAMPLE, reported as one rather than asserted as
+	// coverage. These numbers are what the sentence at the head of P5 is allowed to say.
+	slices.Sort(windows)
+	t.Logf("sample: %d roots of 2^256, %d windows of 2^64 %v; the bucket dimension is %d of %d and is the only one of the three that is COMPLETE",
+		len(roots), len(windows), windows, len(rungs), len(rungs))
+	if len(roots) < 2 {
+		t.Errorf("the known answers stand under %d root(s); ONE root is what let plant P4 condition on the fixture's first octet and pass every gate in this tree", len(roots))
 	}
 }
 
@@ -232,6 +428,12 @@ func TestTheWindowArithmeticIsThreeAnswersOverTheLaddersThree(t *testing.T) {
 // owed the argument rather than another clause, and because the argument that was going to be
 // written here DOES NOT REPRODUCE and the corrected one is narrower.
 //
+// THE 2026-09-13 REPAIR IS NOT A FOURTH ROUND ON THE GATE. Nothing below the class derivation is
+// touched: no clause was added to the graph, no boundary moved, no pin widened. What changed is
+// the TABLE the argument leans on -- five vectors to seventeen, one root to two, three of six
+// rungs to six of six -- and the two sentences that overstated what a table of five could hold.
+// The gate's blind spots are the same eight they were, and they are still named below.
+//
 // THREE ROUNDS, EACH REPAIR REAL AND EACH BEATEN BY THE NEXT ATTACKER.
 //
 //	round 1  a boolean table keyed on import path        beaten by a clock added to a package the
@@ -256,46 +458,88 @@ func TestTheWindowArithmeticIsThreeAnswersOverTheLaddersThree(t *testing.T) {
 // THE OBSERVATION THAT ENDS THE RACE. Every escaping shape any attacker has produced, across all
 // three rounds, was VALUE NEUTRAL BY CONSTRUCTION -- each was written so the clock could not reach
 // the derived key, as `if <clock> < 0 { return nil }`. That is not an accident of style. EphKey is
-// a pure function of (eph_root, bucket, window) whose output is pinned by five known answers
-// computed OUTSIDE this module, from MASTER section 8.1 and RFC 5869 alone, plus the info octets.
-// So the property a reader cares about splits in two, and the halves are defended by different
-// things:
+// a pure function of (eph_root, bucket, window) whose output is pinned by known answers computed
+// OUTSIDE this module, from MASTER section 8.1 and RFC 5869 alone, plus the info octets. So the
+// property a reader cares about splits in two, and the halves are defended by different things:
 //
 //	(1) EPHKEY'S OUTPUT DOES NOT DEPEND ON A CLOCK -- defended CRYPTOGRAPHICALLY, by
 //	    TestEphKeyIsMasterSection81sDerivationAndNotThisPackagesOpinionOfIt above. This is the half
-//	    that matters, and it is at a level where being wrong is visible in octets.
+//	    that matters, and it is at a level where being wrong is visible in octets AT THE POINTS THE
+//	    TABLE PINS. The next paragraph is what that qualifier costs.
 //	(2) EPHKEY'S CONTROL FLOW TOUCHES NO CLOCK -- defended by the graph gate below, which is strong
 //	    and is NOT total. This half is hygiene.
 //
-// AND HERE IS THE CORRECTION, MEASURED ON THIS COMMIT RATHER THAN TAKEN ON ANYBODY'S WORD. The
-// sentence this comment was going to carry -- "a clock read that actually influences the derived
-// key changes the octets, and the known answers kill it" -- is FALSE as written. Five value
-// CHANGING plants were made in EphKey. Four died and one did not:
+// (1) IS NOT ONE CLAIM, IT IS TWO, AND THEY HAVE DIFFERENT STRENGTHS. The known answers defend the
+// DERIVATION FORMULA -- label, field order, field widths, big endian u64, HKDF-Expand -- and they
+// defend it COMPLETELY: any structural error moves every vector at once, and there is no way to
+// get the formula wrong at bucket 3 and right at bucket 1. They defend PURITY -- "no clock
+// influences the output" -- POINTWISE, because purity is a per input property and a defect can be
+// per input too. The word "sample" belongs in this file and was missing from it until 2026-09-13.
 //
-//	V1   window recomputed inside EphKey from time.Now().UnixMilli()   KAT RED, 4 of 5 vectors;
+// AND HERE IS THE CORRECTION, MEASURED ON THIS COMMIT RATHER THAN TAKEN ON ANYBODY'S WORD, AND IT
+// IS THE SECOND CORRECTION THIS ARGUMENT HAS NEEDED. The sentence this comment was first going to
+// carry -- "a clock read that actually influences the derived key changes the octets, and the known
+// answers kill it" -- was measured FALSE and replaced by "...IN THE BINARY THE KNOWN ANSWERS RUN
+// IN". That replacement was measured false too, by the close-out review, and it had by then reached
+// eph.go's production doc comment. Both errors were the same error: the gap was diagnosed as
+// BINDING TIME alone, and the second dimension is COVERAGE.
+//
+// Nine value CHANGING plants have now been made in EphKey. Every row below was run; the last two
+// are the ones that say where the boundary is, and they are here because a mutation that turns
+// nothing red is the most useful row in a table like this.
+//
+//	V1   window recomputed inside EphKey from time.Now().UnixMilli()   KAT RED, 4 of 5 vectors then;
 //	                                                                   bucket 0's window is 0 by
 //	                                                                   definition and cannot move
-//	V2   the PRK stirred with the instant inside EphKey                KAT RED, 5 of 5
-//	V3   the info stirred with the instant in ephLabelledInfo, one     KAT RED, 5 of 5 and the info
-//	     hop inside the closure                                        octet vector as well
+//	V2   the PRK stirred with the instant inside EphKey                KAT RED
+//	V3   the info stirred with the instant in ephLabelledInfo, one     KAT RED, and the info octet
+//	     hop inside the closure                                        vector as well
 //	V4b  the clock behind a fmt.Stringer in connect/mls/syntax,        CLOCK GATE GREEN, BOTH IMPORT
-//	     reached by fmt.Sprint -- the shape the graph cannot see       PINS GREEN, KAT RED 5 of 5
+//	     reached by fmt.Sprint -- the shape the graph cannot see       PINS GREEN, KAT RED
 //	V5b  the clock injected as a func(uint8) byte, written by an       CLOCK GATE GREEN, BOTH IMPORT
 //	     init in a package only a composition root links               PINS GREEN, KAT PASS
+//	P3   V4b's clock, fired only `if bucket == 3`                      every gate GREEN at the clean
+//	     -- measured at 993a4ea, when buckets 2, 3 and 4 had no        baseline exactly, 8,253 pass
+//	     externally derived pin anywhere in this tree                  / 0 fail. KAT RED on this
+//	                                                                   commit, 3 rows
+//	P4   V4b's clock, fired only `if ephRoot[0] != 0xE0` -- that is,   every gate GREEN at 993a4ea.
+//	     on every root a real epoch produces and none the tests use    KAT RED on this commit, 7
+//	                                                                   rows, all of them root B's
+//	Pu   V4b's clock, fired unconditionally                            KAT RED, 17 of 17
+//	P6   V4b's clock, fired on a root that is NEITHER of the two the   KAT PASS. The whole of
+//	     table carries                                                 ./messagegroup/ ok. SURVIVES
+//	P7   V4b's clock, fired only `if window == 42`, a window the       KAT PASS. The whole of
+//	     table does not carry                                          ./messagegroup/ ok. SURVIVES
 //
-// V4b is the case the argument needs and it holds: the gate is blind to that shape and the known
-// answers are not. V5b is the case that breaks it. It IS value changing -- a test that installs the
-// hook and calls EphKey prints 8a425dfc... where MASTER section 8.1's known answer for (bucket 1,
-// window 0) is 8b1a9428... -- and the whole of ./messagegroup/ passes over it. The reason is not
-// subtle: the hook is NIL in the binary the known answers run in, so in THAT binary EphKey really
-// is pure, and the clock exists only in a binary this suite never builds.
+// P6 and P7 were confirmed VALUE CHANGING by a probe that compared EphKey against the clock free
+// derivation of the same inputs and was deleted before every suite measurement, not asserted to be
+// value changing on the strength of reading them. P6 prints
+// 53b24158... where the clock free derivation is 4f17d3d2...; P7 prints edc396dc... against
+// 3d92999e....
 //
-// SO THE HONEST FORM OF (1) IS NARROWER: a clock read that influences the derived key IN THE BINARY
-// THE KNOWN ANSWERS RUN IN changes the octets and they kill it. A clock bound LATER than the test
-// binary -- an exported setter, an init in a package only the production composition root links, a
-// build tag selected file, a plugin, a linker substitution -- changes the derived key in the shipped
-// binary and leaves every gate in this tree green. That residue is filed as MG-3 in this directory's
-// OPENITEMS.md. It is not closed here and nothing in this file pretends it is.
+// SO THE HONEST FORM OF (1) IS TWO CLAUSES AND NOT ONE, AND THIS IS THE SENTENCE THE FILE STANDS
+// BEHIND: THE KNOWN ANSWERS KILL A CLOCK READ WHOSE INFLUENCE ON THE DERIVED OCTETS IS
+// UNCONDITIONAL, OR DEPENDS ON THE BUCKET ALONE, IN THE BINARY THEY RUN IN. The bucket clause is
+// the one that is TOTAL rather than sampled: every rung message.EphBucketSeconds names is a row
+// under both roots, the complement of that coverage is empty, and it is asserted as a number by
+// TestTheKnownAnswersCoverEveryRungOfTheLadderUnderBothRoots rather than described here. What the
+// sentence EXCLUDES, and both exclusions are measured above rather than feared:
+//
+//	an influence conditional on a ROOT or a WINDOW the table does not carry. The table pins 2 roots
+//	of 2^256 and 5 windows of 2^64. Those are samples, nothing makes them more, and P6 and P7 are
+//	each about a dozen lines. Widening killed the two plants that existed; it did not close the
+//	class, and no finite table can.
+//
+//	an influence bound LATER than the binary the known answers run in -- an exported setter, an
+//	init in a package only the production composition root links, a build tag selected file, a
+//	plugin, a linker substitution. V5b. In THAT binary EphKey really is pure, so no table of any
+//	width sees it. Filed as MG-3 in this directory's OPENITEMS.md, not closed here, and nothing in
+//	this file pretends it is.
+//
+// The two exclusions are INDEPENDENT and that is why MG-3's remedy menu had to be repaired
+// alongside this comment: its option 2, "move the known answers to where composition happens",
+// answers the second exclusion and does nothing at all about the first. P3 and P4 would pass in a
+// composition root's binary exactly as they passed here.
 //
 // WHAT THE GATE BELOW CANNOT SEE, named rather than reassured about. Each is a measured escape and
 // not a worry, and none of them is chased on this commit:
@@ -320,8 +564,28 @@ func TestTheWindowArithmeticIsThreeAnswersOverTheLaddersThree(t *testing.T) {
 //	reflection        reflect.Value.Call has no callee name at all. Never tried against this gate.
 //	promotion         a method promoted from an embedded field is called by the outer type's name,
 //	                  and the walk draws no edge to the embedded declaration.
-//	late binding      V5b above, and it is the only one of these that reaches past the gate into
-//	                  the known answers as well.
+//	late binding      V5b above, and it is the only one of these that is invisible to the known
+//	                  answers BY CONSTRUCTION -- the hook is nil in the binary they run in, at every
+//	                  point of the input space, so no width of table reaches it.
+//
+// WHETHER ANY OF THE OTHER SEVEN REACHES PAST THE GATE INTO THE KNOWN ANSWERS IS NOT A PROPERTY OF
+// THE SHAPE. It is a property of what the clock is CONDITIONED ON, and that is the row this block
+// was missing until 2026-09-13. Until then the late binding row read "the only one of these that
+// reaches past the gate into the known answers as well", which is false: P3 and P4 are the fmt
+// dispatch row doing exactly that, and they did it at 993a4ea with every gate in this tree green.
+// The two axes are independent -- a shape the graph cannot follow, carrying an influence
+// conditional on an input the table does not sample, is defended by NOTHING -- and the cross is
+// the honest picture:
+//
+//	the clock read is ...                          graph can follow      graph cannot follow
+//	unconditional, or bucket conditional           gate RED and KAT RED  KAT RED  (V4b, P3, Pu)
+//	conditional on an unsampled root or window     gate RED  (P1)        NOTHING  (P6, P7)
+//	bound after the test binary                    gate RED              NOTHING  (V5b, MG-3)
+//
+// WIDENING THE TABLE MOVED ONE CELL. Before 2026-09-13 the middle right cell held P3 and P4 as
+// well, because bucket 3 and every non fixture root were unsampled; they are sampled now, so those
+// two plants are red and the cell holds only what is genuinely outside a 2 root, 5 window, 6 rung
+// table. The bottom right cell did not move and cannot be moved by vectors.
 //
 // AND WHAT REACH THE TWO IMPORT PINS ACTUALLY HAVE, because that is what decides whether the blind
 // spots matter. messagegroup's TestThisPackageIsBuiltFromExactlyTheseImports is this directory only.

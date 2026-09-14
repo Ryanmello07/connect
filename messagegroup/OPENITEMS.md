@@ -184,14 +184,30 @@ package's to invent.**
 `EphKey` must be a pure function of `(eph_root, bucket, window)`. Two gates are supposed to hold
 that between them:
 
-1. `TestEphKeyIsMasterSection81sDerivationAndNotThisPackagesOpinionOfIt` pins five known answers
-   computed outside this module from MASTER §8.1 and RFC 5869. It defends the **output**.
+1. `TestEphKeyIsMasterSection81sDerivationAndNotThisPackagesOpinionOfIt` pins seventeen known
+   answers computed outside this module from MASTER §8.1 and RFC 5869 — two `eph_root`s, every
+   rung of the ladder under both, five windows. It defends the **output**. It pinned **five** when
+   this row was filed, over one root and three of six rungs, and the widening on 2026-09-13 is
+   half of what this row now records.
 2. `TestEphKeyReachesNoClockSourceInThisPackage` walks the reference graph. It defends the
    **control flow**, and it is explicitly not total — `ephkey_test.go` names what it cannot see.
 
 The argument for stopping the gate/counter-gate race was that (1) backstops (2): a clock the graph
 misses still has to change the derived octets, and the known answers would kill it. **That argument
-is false in one direction and this row is that direction.**
+is false in TWO independent directions, and this row is one of them.**
+
+- **BINDING TIME** — the hook is nil in the binary the known answers run in, so in that binary
+  `EphKey` really is pure. **This row.** No table of any width reaches it.
+- **COVERAGE** — the known answers are a finite SAMPLE of `(root, bucket, window)`, and purity is a
+  per-input property, so a clock conditioned on a point the table does not carry is invisible to
+  them *however early it is bound*. Measured by the close-out review on `993a4ea`: two plants, one
+  fired `if bucket == 3` and one `if ephRoot[0] != 0xE0`, each value-changing, each clearing every
+  gate in this tree at the clean baseline exactly. **Repaired on 2026-09-13 by widening the table**
+  — every rung under two roots — which turns both of those plants red. The class is narrowed and
+  not closed: a plant fired on a third root, or on an unpinned window, still passes, and
+  `ephkey_test.go`'s P5 header carries both measurements.
+
+The two are independent, and telling them apart is what the remedy menu below had wrong.
 
 ### The reproduction
 
@@ -248,19 +264,40 @@ form reproduced above. **The pin catches one spelling of this shape and the shap
 
 ### What a ruling would have to choose between
 
+**Options 1 to 3 answer BINDING TIME ONLY.** That was not said when they were written, and it made
+option 2 read as though it answered the whole of the argument above. **Measured: it answers neither
+of the coverage plants.** A composition root's test binary re-running the *same* vectors would run
+them against the same roots and the same rungs, so `if bucket == 3` and `if ephRoot[0] != 0xE0` pass
+there exactly as they passed here. Option 4 is the coverage axis and it is the one this repository
+has already taken a step along.
+
 1. **Ban late binding into the derivation by construction** — a gate asserting that no declaration
    `EphKey`'s closure reads is a function-typed value writable from outside its own package. It is
    the level, but it is a rule over composition and it would bind `mls` and `connect/message` too.
 2. **Move the known answers to where composition happens** — require the composition root's own
-   test binary to re-run the five vectors, so that whatever it installs is in the binary that
-   checks them. Cheap, and it puts the check where the defect can exist.
+   test binary to re-run the vectors, so that whatever it installs is in the binary that checks
+   them. Cheap, and it puts the check where the defect of *this row* can exist. It is **not** a
+   remedy for the coverage direction, and the sentence that called it "the practical one" without
+   that qualifier is the sentence this repair exists to correct.
 3. **State the precondition in writing** — say in the corpus that `EphKey`'s purity is asserted
    over a binary with no injected state, and make that a review obligation rather than a gate.
    Costs nothing and is honest; catches nothing.
+4. **Widen the sample, and say what remains a sample** — the coverage axis. Partly TAKEN on
+   2026-09-13 without a ruling, because adding vectors binds nobody and imposes no rule on any
+   other package: the table went from five points to seventeen, from one root to two, and from
+   three of six rungs to a complement over the ladder that is asserted empty. What a ruling would
+   still have to choose is how far to go — the bucket dimension is finite and is now complete, and
+   the root and window dimensions are 2 of 2^256 and 5 of 2^64 and cannot be completed by any
+   table. The candidates are a property test over drawn roots and windows (which needs a rule about
+   determinism and a seed the corpus publishes), a second independent implementation inside the
+   test binary (which `ephkey_test.go` argues against in as many words, because it would run on the
+   same understanding of the same three things the subject does), or accepting the sample and
+   saying so where a reader meets it, which is what `eph.go` now does.
 
 ### What is owed elsewhere
 
-A `SPEC-LEDGER.md` number and one sentence from the owner. Option 2 is the only one that could be
-done inside this repository without a rule that binds other packages, and it is not this package's
-to impose on a composition root it does not own.
+A `SPEC-LEDGER.md` number and one sentence from the owner. Options 2 and 4 are the ones that could
+be done inside this repository without a rule that binds other packages; option 4's first step was
+taken on 2026-09-13 because widening a table imposes nothing on anybody, and option 2 is still not
+this package's to impose on a composition root it does not own. **Nothing here is ruled.**
 
