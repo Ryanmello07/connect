@@ -312,24 +312,60 @@ has already taken a step along.
    not the oracle's however wrong the two are together. Measured, each against a clock behind a
    `fmt.Stringer` in `mls/syntax` that the graph gate cannot see:
 
-   | plant | KAT rows | uniform 2^64 | production shaped |
-   |---|---|---|---|
-   | committed bytes | 0 of 27 | 0 of 600 | 0 of 600 |
-   | fired unconditionally | 27 of 27 | 600 of 600 | 600 of 600 |
-   | `bucket == 3` | 5 of 27 | 93 of 600 | 105 of 600 |
-   | every root but the two pinned | **0 of 27** | **600 of 600** | **600 of 600** |
-   | every window but the five formerly pinned | 10 of 27 | 600 of 600 | 500 of 600 |
-   | `1000 < window < 1000000` | 8 of 27 | **0 of 600** | **394 of 600** |
-   | `bucket == 5 && window == 17` | 0 of 27 | 0 of 600 | 0 of 600 |
+   | plant | KAT rows | uniform 2^64 | production shaped | runs killed |
+   |---|---|---|---|---|
+   | committed bytes | 0 of 27 | 0 of 600 | 0 of 600 | — |
+   | fired unconditionally | 27 of 27 | 600 of 600 | 600 of 600 | 3/3 |
+   | `bucket == b`, each rung | 2/5/4/5/4/7 = all 27 | — | — | — |
+   | `bucket == 3` | 5 of 27 | 89..101 | 90..116 | 3/3 |
+   | every root but the two pinned | **0 of 27** | **600 of 600** | **600 of 600** | 3/3 |
+   | every window but the ten pinned | **0 of 27** | 600 of 600 | 499..516 | 3/3 |
+   | `1000 < window < 1000000` | 8 of 27 | **0 of 600** | **375..413** | 10/10 |
+   | `ephRoot[0] == 0x00` (2^-8) | 0 of 27 | 0..5 | 2..6 | 12/12 |
+   | `ephRoot[0]==0 && [1]<0x10` (2^-12) | 0 of 27 | 0..2 | 0 | **6/20** |
+   | `bucket == 5 && window == 17` | 0 of 27 | 0 of 600 | 0 of 600 | **0/6** |
+   | `bucket == 5 && 1000 < window < 1000000` | 0 of 27 | 0 of 600 | 0 of 600 | **0/6** |
+   | `613607 < window < 1000000` | 0 of 27 | 0 of 600 | 0 of 600 | **0/6** |
+
+   **Every count of 600 is a count of a random draw, not a constant**, which is why the cells carry
+   ranges and the table carries a *runs killed* column. `1000 < window < 1000000` read 375..413 over
+   ten runs, mean 399.7, against `Binomial(600, 4/6) = 400`. The 2^-12 root row is the one a ruling
+   should read twice: `1 - (1-2^-12)^1200 = 25%`, measured **6 of 20 runs**, so that plant **passes
+   most CI runs**. Even the 600-of-600 cells are draws: the root exclusion agrees whenever a drawn
+   root lands on one of the two pinned `(first, last)` octet pairs, expected `600 * 2 * 2^-16 =
+   0.018` times per run, so its complement is *rare*, not *empty*; it read 600 of 600 in the three
+   runs measured. A single number in any of these cells would be a seed and not a fact.
 
    Three things a ruling has to take from that table. The **root** exclusion, which no table of two
    roots reaches, dies 600 of 600 — the oracle is the only thing in this tree that touches it. The
    **distribution is the coverage**: the production band is invisible to a uniform `uint64` draw and
-   obvious to a draw that computes windows from a wall clock instant. And the last row is where it
-   stops: a condition on ONE `(bucket, window)` pair survives both draws, all twenty seven rows, the
-   graph gate and an unfiltered `./messagegroup/` run. Its measure is about 2^-64; a firing set of
-   probability p is found in N draws with probability `1 - (1-p)^N`, which at N = 600 is 99.8% for
-   p = 0.01 and zero for any run anybody will make at 2^-64.
+   obvious to a draw that computes windows from a wall clock instant. And **what survives is now
+   published as a measurement rather than as a characterisation**, because four successive attempts
+   to state it in one sentence were each too strong and each was corrected by the next measurement —
+   the most recent called it one `(bucket, window)` pair of measure 2^-64, and two of the three rows
+   below are about 2^21 cheaper than that and are reachable by a real sender:
+
+   * `bucket == 5 && window == 17` — **not** production reachable; bucket 5's window 17 is
+     1971-04-22.
+   * `bucket == 5 && 1000 < window < 1000000` — **production reachable from 2046-09-27**, the
+     instant bucket 5's window first exceeds 1000 (`1001 * 2419200 * 1000 = 2421619200000`). After
+     that date, up to window 1000000 (the year 78600), every 28-day window a real sender computes
+     is inside it.
+   * `613607 < window < 1000000` — **production reachable from 2040-01-01**: the 386,392 hourly
+     windows bucket 1 computes between 2040-01-01 and 2084-01-29. The production shaped draw
+     reaches 205,585 of this band's 998,999 windows, so **79.4% of the band is outside both draws
+     and outside the table**.
+
+   Each survived everything in the tree: 0 of 27 rows, 0 of 600 on both draws over six runs each,
+   the reference graph gate green, and an unfiltered `./messagegroup/` at **0 failures**. A shape
+   that survives cannot be shown value-changing by a gate going red, so each was **probed**: each
+   moves the derived octets at its own firing point and at no other point probed.
+
+   **The boundary of that surviving class is NOT KNOWN TO BE TIGHT.** Those are the shapes that have
+   been *tried*, not the shapes that *exist*. Nobody has characterised the set of conditions this
+   ensemble misses; each of the three was found by trying one more, and the two production reachable
+   ones were found only after a sentence had already called the residue a point. This corpus has not
+   characterised what else is in there.
 
    **What a ruling still has to choose**, and the second step narrowed it rather than answering it:
    the bucket dimension is finite and complete; the root and window dimensions are 2 of 2^256 and

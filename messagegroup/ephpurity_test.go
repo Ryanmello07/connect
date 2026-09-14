@@ -72,11 +72,17 @@ import (
 
 // How many points each distribution is compared at.
 //
-// The number is a cost and not a strength. W1's firing set has measure ~1 and W5's has measure 4/6,
-// so both die in the first handful of draws, and six hundred is only what makes the PRINTED RATE
-// steady enough to compare between runs. A condition whose measure is small enough for six hundred
-// to matter -- W4's 2^-64 -- is not reached by six hundred million either, and the honest response
-// to that is the paragraph at the head of the test below rather than a larger number here.
+// The number is a cost and not a strength. W1's firing set has measure ~1 and W5's has measure 4/6
+// -- measured, mean 399.7 of 600 over ten runs -- so both die in the first handful of draws, and
+// six hundred is only what makes the PRINTED RATE steady enough to compare between runs.
+//
+// RAISING IT WOULD NOT REACH THE SHAPES THAT ESCAPE, AND FOR TWO DIFFERENT REASONS. A condition
+// whose measure is merely SMALL -- W4's 2^-64 -- is not reached by six hundred million either. But
+// S1 and S2 at the head of the test below escape the production shaped draw at measure EXACTLY
+// ZERO, not merely small: that draw's clock band stops at 2040, so no number written here reaches
+// a window a sender computes after it. For those two the fix would be a different SUPPORT and not
+// more points, and the honest response to both is the measurement below rather than a larger
+// number here.
 const ephPurityDraws = 600
 
 // The wall clock band the production shaped draw samples, as unix milliseconds, written out rather
@@ -187,7 +193,7 @@ var ephPurityDistributions = []struct {
 	},
 	{
 		name: "production shaped",
-		why:  "MASTER section 8's own formula over a wall clock instant drawn from 2020-01-01 to 2040-01-01, which is the only draw that reaches the windows a real sender computes",
+		why:  "MASTER section 8's own formula over a wall clock instant drawn from 2020-01-01 to 2040-01-01, which is the only draw that reaches the windows a real sender computes -- and it reaches ONLY the ones inside that band, never a window a sender computes after 2040",
 		window: func(source *mathrand.Rand, bucket uint8) uint64 {
 			sentAtMs := ephPurityFirstMs + source.Int64N(ephPurityLastMs-ephPurityFirstMs)
 			seconds := message.EphBucketSeconds(bucket)
@@ -220,20 +226,35 @@ var ephPurityDistributions = []struct {
 // is the twenty seven known answers next door, run at the same time, and it is here because the two
 // gates fail over DIFFERENT things and that is the whole reason to have both:
 //
-//	plant                                          KAT rows   uniform 2^64   production shaped
-//	committed bytes                                0 of 27    0 of 600       0 of 600      PASS
-//	Pu  fired unconditionally                      27 of 27   600 of 600     600 of 600
-//	P3  bucket == 3                                5 of 27     93 of 600     105 of 600
-//	W1  every root but the two the table pins      0 of 27    600 of 600     600 of 600  <- table blind
-//	W2  every window but the five formerly pinned  10 of 27   600 of 600     500 of 600
-//	W5  1000 < window < 1000000                    8 of 27      0 of 600     394 of 600  <- uniform blind
-//	W4  bucket == 5 && window == 17                0 of 27      0 of 600       0 of 600  <- SURVIVES ALL
+//	plant                                        KAT rows   uniform 2^64  production shaped   runs
+//	committed bytes                              0 of 27     0 of 600      0 of 600          --
+//	Pu  fired unconditionally                    27 of 27  600 of 600    600 of 600         3/3
+//	    bucket == b, at each rung b              2/5/4/5/4/7, summing to all 27              --
+//	P3  bucket == 3                              5 of 27    89..101       90..116           3/3
+//	W1  every root but the two the table pins    0 of 27   600 of 600    600 of 600         3/3
+//	W2  every window but the ten the table pins  0 of 27   600 of 600    499..516           3/3
+//	W5  1000 < window < 1000000                  8 of 27     0 of 600    375..413          10/10
+//	R1  ephRoot[0] == 0x00            (2^-8)     0 of 27     0..5          2..6            12/12
+//	R2  ephRoot[0] == 0 && [1] < 0x10 (2^-12)    0 of 27     0..2          0               6/20
+//	W4  bucket == 5 && window == 17              0 of 27     0 of 600      0 of 600         0/6
+//	S1  bucket == 5 && 1000 < window < 1000000   0 of 27     0 of 600      0 of 600         0/6
+//	S2  613607 < window < 1000000                0 of 27     0 of 600      0 of 600         0/6
 //
-// The six hundreds move by a few points with the seed, because they are counts of a random draw and
-// not constants: W5's production shaped count was 393, 400 and 394 in three runs. It is not noise
-// around nothing -- under W5 the disagreement count and the IN BAND draw count printed on the next
-// line are the SAME NUMBER in every run, which is the direct measurement that what this gate caught
-// is exactly the band and not a coincidence that happens to be the right size.
+// EVERY SIX HUNDRED IS A COUNT OF A RANDOM DRAW AND NOT A CONSTANT, which is why the columns above
+// carry ranges and a RUNS KILLED column rather than one number each. W5's production shaped count
+// read 375..413 over ten runs, mean 399.7, against Binomial(600, 4/6) = 400 -- four of the six
+// rungs put a 2020-2040 window in the band, which the SUPPORT lines below print. R2 is the row that
+// makes the point sharpest: a root condition of measure 2^-12 is found with probability
+// 1-(1-2^-12)^1200 = 25% per run, and it was killed in 6 of 20 runs, so it PASSES most CI runs.
+// Even the 600 of 600 cells are draws and not certainties: W1 agrees whenever a drawn root lands on
+// one of the two pinned (first, last) octet pairs, expected 600 * 2 * 2^-16 = 0.018 times per run,
+// so its complement is RARE and not EMPTY. It read 600 of 600 in the three runs measured here.
+// A single figure in any of these cells would be a seed and not a fact.
+//
+// It is not noise around nothing -- under W5 the disagreement count and the IN BAND draw count
+// printed on the next line are the SAME NUMBER, re-measured 5 of 5 runs here at 413/413, 413/413,
+// 389/389, 386/386 and 387/387, which is the direct measurement that what this gate caught is
+// exactly the band and not a coincidence that happens to be the right size.
 //
 //	query: plant the edit in EphKey, then
 //	go test -count=1 -v -run TestEphKeyIsAFunctionOfItsThreeArgumentsOverDrawnInputs ./messagegroup/
@@ -244,12 +265,13 @@ var ephPurityDistributions = []struct {
 // WHAT THIS DOES NOT KILL, stated as plainly as what it does, because an unstated boundary is the
 // next hole and this line has already published two sentences that were too wide:
 //
-//   - A POINT CONDITION. W4 fires on one (bucket, window) pair whose two coordinates are each
-//     pinned by the known answers, and it survives BOTH draws at six hundred points, survives the
-//     twenty seven rows, survives the graph gate, and survives an unfiltered ./messagegroup/ run --
-//     measured, 0 failures. Its measure is about 2^-64 and no draw a test can afford reaches it. An
-//     oracle NARROWS the unsampled root and window classes in proportion to a condition's measure.
-//     It does not close them, and nothing finite does.
+//   - THE SHAPES NAMED UNDER "WHAT SURVIVED" BELOW, which are published as a MEASUREMENT and not
+//     as a characterisation. Four successive attempts to describe this residue in one sentence
+//     were each too strong and each was corrected by the next measurement; the most recent called
+//     it ONE (bucket, window) pair of measure 2^-64, and two of the three shapes below are about
+//     2^21 cheaper than that and are reachable by a real sender. An oracle NARROWS the unsampled
+//     root and window classes in proportion to a condition's measure. It does not close them, and
+//     nothing finite does.
 //   - THE BINDING TIME CLASS, ledger item MG-3. A clock installed by an init in a package only the
 //     production composition root links is NIL in the binary this test runs in, at every point of
 //     the input space. No table of any width and no oracle of any width reaches it, because there
@@ -264,6 +286,33 @@ var ephPurityDistributions = []struct {
 //     probability 1 - 2^-44, so the uniform draw enters the band about 3e-11 times in six hundred.
 //     Distribution IS coverage, and a draw over a field's declared range is not a draw over the
 //     values anything actually computes.
+//
+// WHAT SURVIVED, NAMED. Each of these was planted, run and found green on EVERYTHING in this tree:
+// 0 of 27 known answer rows, 0 of 600 on BOTH draws in six runs each, the reference graph gate
+// green, and an unfiltered go test ./messagegroup/ at 0 failures. A shape that survives cannot be
+// shown value-changing by a gate going red, so each was PROBED directly: each moves the derived
+// octets at its own firing point and at no other point probed.
+//
+//	bucket == 5 && window == 17
+//	    NOT production reachable: bucket 5's window 17 is 1971-04-22.
+//
+//	bucket == 5 && 1000 < window < 1000000
+//	    PRODUCTION REACHABLE FROM 2046-09-27, the instant bucket 5's window first exceeds
+//	    1000: 1001 * 2419200 * 1000 = 2421619200000. From that date up to window 1000000
+//	    (the year 78600), every 28-day window a real sender computes is inside it.
+//	    ephkey_test.go discloses the gap and the rung SUPPORT lines print it; it is named
+//	    HERE because this is where a reader looks for what survives.
+//
+//	613607 < window < 1000000
+//	    PRODUCTION REACHABLE FROM 2040-01-01: the 386,392 hourly windows bucket 1 computes
+//	    between 2040-01-01 and 2084-01-29. 2040 is where ephPurityLastMs stops, not where
+//	    senders stop. The production shaped draw reaches 205,585 of this band's 998,999
+//	    windows, so 79.4% of the band is outside BOTH draws and outside the table.
+//
+// THE BOUNDARY OF THIS SURVIVING CLASS IS NOT KNOWN TO BE TIGHT. These are the shapes that have
+// been TRIED, not the shapes that EXIST. This corpus has not characterised the set of conditions
+// this ensemble misses; each of the three was found by trying one more, and the two a real sender
+// reaches were found only after a sentence had already called the residue a single point.
 func TestEphKeyIsAFunctionOfItsThreeArgumentsOverDrawnInputs(t *testing.T) {
 	if ephPurityDraws <= 0 {
 		t.Fatal("this gate is configured to draw no point at all, so it would report the clean pass a holding property reports, having compared nothing")
@@ -461,15 +510,27 @@ func TestTheProductionShapedDrawActuallyReachesTheBandTheKnownAnswersMissed(t *t
 			low = uint64(ephPurityFirstMs / (int64(seconds) * 1000))
 			high = uint64((ephPurityLastMs - 1) / (int64(seconds) * 1000))
 		}
+		// set for EVERY rung, not only the out-of-band ones. Printing the range only when a
+		// rung MISSES the band is what let "rung 1 stops at 613607" go unpublished, and 613607
+		// is the left edge of a 386,392 window escape that is green on every gate in this tree.
+		reason[rung] = fmt.Sprintf("its 2020-2040 windows run %d..%d", low, high)
 		if ephPurityBandLow < low && high < ephPurityBandHigh {
 			inBand = append(inBand, rung)
 		} else {
 			outOfBand = append(outOfBand, rung)
-			reason[rung] = fmt.Sprintf("its 2020-2040 windows run %d..%d", low, high)
 		}
 	}
 	t.Logf("class: %d rung(s) %v; a production shaped draw puts %d of them wholly inside %d < t < %d: %v",
 		len(rungs), rungs, len(inBand), ephPurityBandLow, ephPurityBandHigh, inBand)
+	// the draw's SUPPORT, printed for every rung. This is a Logf and asserts nothing; it is here
+	// so the reachable set is something the run STATES rather than something a reader derives.
+	// Over these six ranges the draw can produce 205,585 of the band's 998,999 windows, so 79.4%
+	// of the band is outside it -- five contiguous gaps, the widest being (613607, 1000000) at
+	// 386,392 windows. query: for each rung, low = ephPurityFirstMs/(seconds*1000) and
+	// high = (ephPurityLastMs-1)/(seconds*1000); union the parts of [low,high] inside the band.
+	for _, rung := range rungs {
+		t.Logf("SUPPORT: rung %d -- %s", rung, reason[rung])
+	}
 	for _, rung := range outOfBand {
 		t.Logf("COMPLEMENT member: rung %d is NOT reached by this band -- %s", rung, reason[rung])
 	}

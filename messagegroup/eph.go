@@ -130,8 +130,11 @@ func NewEphRoot(random io.Reader) ([]byte, error) {
 // inputs that are DRAWN rather than listed -- which is the only gate here whose reach is a MEASURE:
 // it catches an influence in proportion to how often that influence fires under the draw. Measured
 // on this commit, against a clock the graph gate cannot see: 600 of 600 for an influence
-// conditional on the eph_root, 394 of 600 for one conditional on the window band a 2020s-2030s
-// sender computes in, and 0 of 600 for one conditional on a single (bucket, window) pair.
+// conditional on the eph_root, 375 TO 413 OF 600 ACROSS TEN RUNS for one conditional on the window
+// band a 2020s-2030s sender computes in, and 0 of 600 for one conditional on a single
+// (bucket, window) pair. The middle number is a COUNT OF A RANDOM DRAW AND NOT A CONSTANT: it is
+// Binomial(600, 4/6) because four of the ladder's six rungs put a 2020-2040 window in that band,
+// mean 400, and ten runs measured 399.7. A single figure written here would be a seed, not a fact.
 //
 // WHAT THAT LEAVES, which is two classes and not one, both measured rather than feared:
 //
@@ -141,14 +144,57 @@ func NewEphRoot(random io.Reader) ([]byte, error) {
 //     on bucket 3, one on every root but the fixture's -- and a third, fired on 1000 < window <
 //     1000000, then walked past all seventeen because fifteen of them carried a window below 1000.
 //     Ten production-shaped rows at a stated instant kill THAT one, eight rows red, and the drawn
-//     oracle kills it again at 394 of 600 and kills the root-conditional class at 600 of 600. What
-//     survives all of it, measured rather than feared: a clock fired on ONE (bucket, window) pair
-//     whose two coordinates are each pinned. Its measure is about 2^-64, no draw a test can afford
-//     reaches it, and no finite table ever will.
+//     oracle kills it again in ten runs of ten and kills the root-conditional class at 600 of 600.
+//     What survives all of it is published as a MEASUREMENT below rather than as a sentence,
+//     because the sentence that stood here was too strong four times running.
 //   - a clock bound LATER than the test binary -- an exported setter written by a composition
 //     root's init, a build-tag file, a plugin. In that binary this function really is pure, so no
 //     width of table reaches it. Open item MG-3 in this directory's OPENITEMS.md carries the
 //     reproduction and what a ruling would have to choose between.
+//
+// WHAT SURVIVES, PUBLISHED AS A MEASUREMENT AND NOT AS A CHARACTERISATION. Four successive
+// attempts to describe the residue in one sentence were each too strong, and each was corrected by
+// the next measurement rather than by a reader; two of the four shipped in this comment. So what
+// follows is the list of shapes that were PLANTED AND RUN, with what each one did. Every row is a
+// clock behind fmt's dispatch in connect/mls/syntax, reached from here, differing from the others
+// only in its firing condition. The rows that go red are value-changing BECAUSE they go red; the
+// three survivors, which cannot be shown that way, were probed directly and are recorded below:
+//
+//	plant                                   known answers   drawn oracle
+//	fired unconditionally                   27 of 27 rows   600 of 600 both draws, killed 3/3
+//	bucket == b, at each rung b             2/5/4/5/4/7, summing to all 27
+//	every root but the two pinned            0 of 27 rows   600 of 600 both draws, killed 3/3
+//	every window but the ten pinned          0 of 27 rows   600 uniform, 499..516 prod, killed 3/3
+//	1000 < window < 1000000                  8 of 27 rows   0 uniform, 375..413 prod, killed 10/10
+//	ephRoot[0] == 0x00            (2^-8)     0 of 27 rows   killed in 12 of 12 runs
+//	ephRoot[0] == 0 && [1] < 0x10 (2^-12)    0 of 27 rows   killed in 6 of 20 runs
+//
+// EVERY COUNT OF 600 IS A COUNT OF A RANDOM DRAW AND NOT A CONSTANT, which is why those cells carry
+// ranges and a runs-killed rate. The 2^-12 root row is the one to read twice: it is found with
+// probability 1-(1-2^-12)^1200 = 25% per run, so it PASSES most CI runs. Even the 600 of 600 cells
+// are draws: the root exclusion agrees whenever a drawn root happens to land on one of the two
+// pinned (first, last) octet pairs, expected 600 * 2 * 2^-16 = 0.018 times per run. It read 600 of
+// 600 in the three runs measured here, which is rare-complement and not empty-complement.
+//
+// AND THREE SHAPES THAT SURVIVED EVERYTHING -- 0 of 27 rows, 0 of 600 on BOTH draws in six runs
+// each, the reference graph gate green, and an unfiltered go test ./messagegroup/ at 0 failures.
+// Named, each with what a real deployment computes:
+//
+//	bucket == 5 && window == 17
+//	    NOT production reachable: bucket 5's window 17 is 1971-04-22.
+//	bucket == 5 && 1000 < window < 1000000
+//	    PRODUCTION REACHABLE FROM 2046-09-27, the instant bucket 5's window first exceeds
+//	    1000: 1001 * 2419200 * 1000 = 2421619200000. From that date until window 1000000,
+//	    which is the year 78600, every 28-day window a real sender computes is inside it.
+//	613607 < window < 1000000
+//	    PRODUCTION REACHABLE FROM 2040-01-01: the 386,392 hourly windows bucket 1 computes
+//	    between 2040-01-01 and 2084-01-29. 2040 is where the drawn band stops, not where
+//	    senders do.
+//
+// THE BOUNDARY OF THAT SURVIVING CLASS IS NOT KNOWN TO BE TIGHT. Those are the shapes that have
+// been TRIED, not the shapes that EXIST. This corpus has not characterised the set of conditions
+// this ensemble misses; each of the three was found by trying one more, and the two that a real
+// sender reaches were found only after a sentence had already called the residue a single point.
 //
 // NOTHING IN THIS PACKAGE INSTALLS SUCH A HOOK, and nothing in it conditions this derivation on
 // anything but its three arguments. The rows exist so that the absence is a measured claim
