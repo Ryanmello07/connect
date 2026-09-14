@@ -22,6 +22,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -269,7 +270,40 @@ func ephIsClockPackage(path string) bool {
 // rather than nothing at all. Its complement -- every out-of-module package in scope that the
 // closure does NOT reach -- is printed member by member, because a pin that only ever prints what
 // it admitted says nothing about what it removed.
-var ephKeyExternalReach = []string{"crypto/hkdf", "fmt", "strconv"}
+// RE-MEASURED. This was [crypto/hkdf fmt strconv] while the walk followed calls out of function
+// bodies only. It is seven now because the closure below is taken over package level declarations
+// too: EphKey reads keyScheduleCrypto and Suite, whose initialisers run mls.NewCryptoProvider and
+// mls.LookupSuite, and those reach crypto/rand, crypto/sha256, encoding/binary and errors. The
+// four new members are not new code -- they are code EphKey always depended on and this gate could
+// not see. None of the seven answers the current instant.
+//
+//	query: go test -run TestEphKeyReachesNoClockSourceInThisPackage -v ./messagegroup/, the
+//	"class: the N out-of-module package(s)" line.
+var ephKeyExternalReach = []string{
+	"crypto/hkdf", "crypto/rand", "crypto/sha256", "encoding/binary", "errors", "fmt", "strconv",
+}
+
+// The names CALLED inside EphKey's closure that resolve to no declaration of any package this gate
+// read: builtins, conversions, and methods on types outside this module.
+//
+// THIS LIST IS PINNED AND NOT MERELY PRINTED, and that is the whole of finding F2. It was computed
+// and logged member by member before, and asserted against nothing -- and under four separate
+// clock plants it grew by exactly one name, printed the escape BY NAME (UnixMilli, ephNow, NowMs,
+// Micros), and the test passed. A complement that is printed and unasserted is a complement that
+// answers to nobody; the sibling pin two logs above it has always been an Errorf and that is the
+// difference. The edge widening above catches those four shapes by resolving them instead, so this
+// pin is now the SECOND net rather than the first: an escape has to both resolve nowhere in scope
+// and leave this list unchanged, and the two failures are not the same failure.
+//
+// It carries a maintenance tax -- a new builtin or a new external method in the closure is a red
+// test on the commit that adds it. That is the price the external pin above already pays, for the
+// same reason: this is the boundary of what the walk can read, and a boundary that moves silently
+// is not a boundary.
+//
+//	query: the "boundary: N call name(s)" line of the same run.
+var ephKeyUnresolvedNames = []string{
+	"AppendUint64", "Error", "append", "int", "len", "make", "panic", "string", "uint16",
+}
 
 // One production .go file of one package of this module, with the import qualifiers THAT FILE
 // declares.
@@ -292,6 +326,11 @@ type ephPackage struct {
 	clockValueNames map[string]bool
 	clockShapeAt    []string
 	imports         []string
+	// the package level var and const names this package declares, and whether it declares an
+	// init. A package level var is a DECLARATION like any other here: it has a node, its
+	// initialiser is walked, and reading it is an edge to it.
+	valueNames map[string]bool
+	hasInit    bool
 }
 
 // The call graph of this module's own source, as far as this package's imports reach.
@@ -313,6 +352,13 @@ type ephModuleGraph struct {
 	clockImports  []string
 	unresolved    map[string][]string
 	externalCalls map[string][]string
+	// the vertices FILE SCOPE contributed, recorded where they are created rather than looked up
+	// by name afterwards. By name is not the same question: a method and a package level var of
+	// one package may share a name -- mls declares both a Suite var and a Suite method -- so a
+	// lookup of "does a node with this value's name exist" is answered by the METHOD, and the
+	// guard below would clear a run in which no value declaration became a vertex at all. That
+	// is measured: disabling the value arm of the edge pass left the by-name form green.
+	valueNodes []string
 }
 
 // ephModule answers this module's path, this package's own import path within it, and the module
@@ -350,6 +396,21 @@ func ephModule(t *testing.T) (string, string, string) {
 	return modulePath, self, root
 }
 
+// ephDeclareNode gives one declaration a vertex and a source position, once.
+func (self *ephModuleGraph) ephDeclareNode(node string, at string) {
+	if _, already := self.calls[node]; !already {
+		self.calls[node] = []string{}
+		self.where[node] = at
+	}
+}
+
+// ephAddEdge records one edge, once.
+func (self *ephModuleGraph) ephAddEdge(node string, callee string) {
+	if !slices.Contains(self.calls[node], callee) {
+		self.calls[node] = append(self.calls[node], callee)
+	}
+}
+
 // ephInModule is "this import path names a package whose source this gate reads".
 func (self *ephModuleGraph) ephInModule(path string) bool {
 	return path == self.modulePath || strings.HasPrefix(path, self.modulePath+"/")
@@ -375,6 +436,7 @@ func (self *ephModuleGraph) ephReadPackage(t *testing.T, importPath string, modu
 		dir:             filepath.ToSlash(dir),
 		declared:        map[string]bool{},
 		clockValueNames: map[string]bool{},
+		valueNames:      map[string]bool{},
 	}
 	seen := map[string]bool{}
 	for _, entry := range entries {
@@ -432,101 +494,143 @@ func ephIsClockShape(expr ast.Expr) bool {
 	return isIdent && name.Name == "int64"
 }
 
-// ephWalkBody records every edge out of one function body.
-func (self *ephModuleGraph) ephWalkBody(pkg *ephPackage, file ephSourceFile, node string, body *ast.BlockStmt) {
-	add := func(callee string) {
-		if !slices.Contains(self.calls[node], callee) {
-			self.calls[node] = append(self.calls[node], callee)
-		}
-	}
+// ephWalkBody records every edge out of ONE DECLARATION of this module -- a function body, or the
+// initialiser and declared type of one package level var or const.
+//
+// -- CLASS (of edge). A REFERENCE, and not a call. Every *ast.Ident and every *ast.SelectorExpr
+//
+//	inside the declaration is resolved, whether it sits in a call position or not. The previous
+//	shape of this walk recorded an edge only for an *ast.CallExpr, and five clock shapes walked
+//	past it on that one word: a package level `var ephNow func() int64 = message.SenderClockMs`
+//	read as `ephNow()` is a CALL of a local name and a READ of a package level one, and only the
+//	second is the edge that leads anywhere. "Reads" is the verb the property needs -- a value
+//	that was obtained from a clock has already read it, and no call site shows that.
+//
+// -- SCOPE (of resolution). THE WHOLE SET OF PACKAGES THIS GATE READ, and not the calling
+//
+//	package's import list. A bare name is this package's declaration if it has one, and it is
+//	also a method or field name on a value whose type this walk does not resolve, so every
+//	package in scope that declares the name becomes an edge -- all of them and not the first that
+//	matches. The narrower rule (this package plus the packages IT imports) is the same defect the
+//	scope repair fixed one level up: connect/mls/atkclock is in scope because connect/mls imports
+//	it, and a method declared there and read here resolved to nothing at all.
+//
+// The ONE position that still reports a boundary is the call position: a name that is CALLED and
+// resolves to no declaration in scope is a builtin, a local func value, or a method on a type
+// outside this module, and those are printed AND pinned as ephKeyUnresolvedNames. A name merely
+// READ and resolving nowhere is a local, a parameter or a field name, which is every other
+// identifier in the file and says nothing; it is not on the boundary list for that reason.
+func (self *ephModuleGraph) ephWalkBody(pkg *ephPackage, file ephSourceFile, node string, tree ast.Node) {
 	note := func(bag map[string][]string, what string) {
 		if !slices.Contains(bag[node], what) {
 			bag[node] = append(bag[node], what)
 		}
 	}
-	// a name with no package qualifier on it. It is this package's own declaration if it has one,
-	// and it is ALSO a method on a value whose TYPE this walk does not resolve -- so this
-	// package's declaration and every package of this module that this one imports and declares
-	// the name ALL become edges. Both halves and not the first that matches: writer.Bytes() in
-	// ephLabelledInfo is connect/mls/syntax's, and this package happens to declare a Bytes of its
-	// own, so a first-match rule would have resolved it locally and a clock added to the syntax
-	// writer would have been invisible -- the same shape as the import-path table this gate
-	// replaced. Resolving the receiver properly would take a type checker; over approximating is
-	// the safe direction for a gate whose answer is "nothing here reaches a clock", and what
-	// resolves nowhere in this module is printed rather than dropped.
+	// clause 2, MODULE WIDE. The clock shape func() int64 is collected in every package in scope,
+	// not only in the one being walked: the shape is this module's convention for an injected
+	// clock, and a field of that shape declared in connect/message is the same clock when it is
+	// read from here. Collected per calling package -- which is what this was -- the scope of the
+	// class was narrower than the scope of the walk that uses it.
+	//
+	// NAMED AS UNDEMONSTRATED, under the house rule that a clause nothing goes red without is a
+	// clause that defends nothing. Narrowed back to pkg.clockValueNames[name], the baseline stays
+	// green AND every one of the four interface- and field-shaped clock plants stays red, because
+	// the reference edges above reach them first: A2a-simple, A2a-hard, A2f and A2g are all caught
+	// by the graph naming the plant's own file and line. Two further shapes were built to isolate
+	// it -- a clock-shaped field in connect/message read through a package level value, and the
+	// same with a same-named harmless declaration in scope to absorb the bare name -- and both
+	// were caught by the graph as well. It is kept because it is a statement of what the CLASS is
+	// rather than an extra net: the class is "a read of a declaration of the clock shape", the
+	// scope of the walk is the module, and the scope of the class was the package. Those two being
+	// different sets is the defect the reviewer named, whether or not a shape exists that only it
+	// catches. The count it produces is printed, cross package, so an empty answer is visible.
+	readsClockShape := func(name string) bool {
+		for _, other := range self.packages {
+			if other != nil && other.clockValueNames[name] {
+				return true
+			}
+		}
+		return false
+	}
+	// every declaration in scope that this bare name could be, as an edge each.
 	resolveName := func(name string) {
-		landed := false
-		if pkg.declared[name] {
-			add(pkg.importPath + "." + name)
-			landed = true
-		}
-		for _, imported := range pkg.imports {
-			if !self.ephInModule(imported) {
-				continue
+		for _, importPath := range self.order {
+			if other := self.packages[importPath]; other != nil && other.declared[name] {
+				self.ephAddEdge(node, importPath+"."+name)
 			}
-			if other := self.packages[imported]; other != nil && other.declared[name] {
-				add(imported + "." + name)
-				landed = true
-			}
-		}
-		if !landed {
-			note(self.unresolved, name)
 		}
 	}
-	ast.Inspect(body, func(n ast.Node) bool {
-		call, isCall := n.(*ast.CallExpr)
-		if !isCall {
-			return true
+	resolvesInScope := func(name string) bool {
+		for _, other := range self.packages {
+			if other != nil && other.declared[name] {
+				return true
+			}
 		}
-		switch callee := call.Fun.(type) {
-		case *ast.Ident:
-			if pkg.clockValueNames[callee.Name] {
-				self.readsClock[node] = true
-			}
-			resolveName(callee.Name)
-		case *ast.SelectorExpr:
-			// clause 2: self.nowMs() and a nowMs parameter are both found by the NAME of a
-			// declaration whose type is the clock shape, without either word appearing here.
-			if pkg.clockValueNames[callee.Sel.Name] {
-				self.readsClock[node] = true
-			}
-			imported := ""
-			if qualifier, isIdent := callee.X.(*ast.Ident); isIdent {
-				imported = file.qualifiers[qualifier.Name]
-			}
-			switch {
-			case imported == "":
-				resolveName(callee.Sel.Name)
-			case ephIsClockPackage(imported):
-				self.readsClock[node] = true
-			case self.ephInModule(imported):
-				if other := self.packages[imported]; other != nil && other.declared[callee.Sel.Name] {
-					add(imported + "." + callee.Sel.Name)
-				} else {
-					note(self.unresolved, imported+"."+callee.Sel.Name)
+		return false
+	}
+	var visit func(n ast.Node) bool
+	visit = func(n ast.Node) bool {
+		switch expression := n.(type) {
+		case *ast.CallExpr:
+			// the boundary is a property of the CALL position only, and it is noted here rather
+			// than inside the resolution below so that a name merely read does not land on it.
+			switch callee := expression.Fun.(type) {
+			case *ast.Ident:
+				if !resolvesInScope(callee.Name) {
+					note(self.unresolved, callee.Name)
 				}
-			default:
-				note(self.externalCalls, imported)
+			case *ast.SelectorExpr:
+				if qualifier, isIdent := callee.X.(*ast.Ident); isIdent {
+					if _, isImport := file.qualifiers[qualifier.Name]; isImport {
+						return true
+					}
+				}
+				if !resolvesInScope(callee.Sel.Name) {
+					note(self.unresolved, callee.Sel.Name)
+				}
 			}
+			return true
+		case *ast.SelectorExpr:
+			if readsClockShape(expression.Sel.Name) {
+				self.readsClock[node] = true
+			}
+			if qualifier, isIdent := expression.X.(*ast.Ident); isIdent {
+				if imported, isImport := file.qualifiers[qualifier.Name]; isImport {
+					switch {
+					case ephIsClockPackage(imported):
+						// clause 1. time.Now() is a call, time.Now is a value and
+						// time.Time is a type; all three are this package answering the instant.
+						self.readsClock[node] = true
+					case self.ephInModule(imported):
+						if other := self.packages[imported]; other != nil && other.declared[expression.Sel.Name] {
+							self.ephAddEdge(node, imported+"."+expression.Sel.Name)
+						} else {
+							note(self.unresolved, imported+"."+expression.Sel.Name)
+						}
+					default:
+						note(self.externalCalls, imported)
+					}
+					// the qualifier names a package and not a value, so there is nothing
+					// under it to read.
+					return false
+				}
+			}
+			// x.Sel where x is a VALUE: both halves are names of this module until something
+			// says otherwise -- Sel as a method or field, and everything under x as an
+			// expression, which is how message.Wall.NowMs finds message.Wall.
+			resolveName(expression.Sel.Name)
+			ast.Inspect(expression.X, visit)
+			return false
+		case *ast.Ident:
+			if readsClockShape(expression.Name) {
+				self.readsClock[node] = true
+			}
+			resolveName(expression.Name)
+			return false
 		}
 		return true
-	})
-	// a clock package reached without a call at all -- time.Now is a call, but a package level
-	// variable or a method value is not -- is still a reach.
-	ast.Inspect(body, func(n ast.Node) bool {
-		selector, isSelector := n.(*ast.SelectorExpr)
-		if !isSelector {
-			return true
-		}
-		qualifier, isIdent := selector.X.(*ast.Ident)
-		if !isIdent {
-			return true
-		}
-		if ephIsClockPackage(file.qualifiers[qualifier.Name]) {
-			self.readsClock[node] = true
-		}
-		return true
-	})
+	}
+	ast.Inspect(tree, visit)
 }
 
 // ephBuildModuleGraph reads this package and, transitively, every package of this module it
@@ -581,8 +685,47 @@ func ephBuildModuleGraph(t *testing.T) *ephModuleGraph {
 		pkg := graph.packages[importPath]
 		for _, file := range pkg.files {
 			for _, declaration := range file.parsed.Decls {
-				if function, isFunction := declaration.(*ast.FuncDecl); isFunction && function.Body != nil {
-					pkg.declared[function.Name.Name] = true
+				switch declaration := declaration.(type) {
+				case *ast.FuncDecl:
+					if declaration.Body == nil {
+						continue
+					}
+					pkg.declared[declaration.Name.Name] = true
+					if declaration.Recv == nil && declaration.Name.Name == "init" {
+						pkg.hasInit = true
+					}
+				case *ast.GenDecl:
+					// a package level var or const is a declaration of this package, so a
+					// reference to it resolves and gets a node of its own below. Without this
+					// the whole of file scope was invisible to the walk: the gate read only
+					// *ast.FuncDecl bodies, and a clock bound into a package level var was a
+					// clock the graph had no vertex for.
+					if declaration.Tok != token.VAR && declaration.Tok != token.CONST {
+						continue
+					}
+					for _, spec := range declaration.Specs {
+						values, isValues := spec.(*ast.ValueSpec)
+						if !isValues {
+							continue
+						}
+						for _, name := range values.Names {
+							if name.Name == "_" {
+								continue
+							}
+							pkg.declared[name.Name] = true
+							pkg.valueNames[name.Name] = true
+						}
+						// clause 2 reads the TYPE, so a package level value of the clock
+						// shape is in the class exactly as a struct field of it is.
+						if values.Type == nil || !ephIsClockShape(values.Type) {
+							continue
+						}
+						for _, name := range values.Names {
+							pkg.clockValueNames[name.Name] = true
+							pkg.clockShapeAt = append(pkg.clockShapeAt,
+								fmt.Sprintf("%s (%s:%d)", name.Name, file.path, graph.fileSet.Position(name.Pos()).Line))
+						}
+					}
 				}
 			}
 			ast.Inspect(file.parsed, func(node ast.Node) bool {
@@ -604,16 +747,55 @@ func ephBuildModuleGraph(t *testing.T) *ephModuleGraph {
 		pkg := graph.packages[importPath]
 		for _, file := range pkg.files {
 			for _, declaration := range file.parsed.Decls {
-				function, isFunction := declaration.(*ast.FuncDecl)
-				if !isFunction || function.Body == nil {
-					continue
+				switch declaration := declaration.(type) {
+				case *ast.FuncDecl:
+					if declaration.Body == nil {
+						continue
+					}
+					node := importPath + "." + declaration.Name.Name
+					graph.ephDeclareNode(node, fmt.Sprintf("%s:%d", file.path, graph.fileSet.Position(declaration.Pos()).Line))
+					graph.ephWalkBody(pkg, file, node, declaration.Body)
+				case *ast.GenDecl:
+					if declaration.Tok != token.VAR && declaration.Tok != token.CONST {
+						continue
+					}
+					for _, spec := range declaration.Specs {
+						values, isValues := spec.(*ast.ValueSpec)
+						if !isValues {
+							continue
+						}
+						for index, name := range values.Names {
+							if name.Name == "_" {
+								continue
+							}
+							node := importPath + "." + name.Name
+							graph.ephDeclareNode(node, fmt.Sprintf("%s:%d", file.path, graph.fileSet.Position(name.Pos()).Line))
+							graph.valueNodes = append(graph.valueNodes, node)
+							// A PACKAGE LEVEL VAR IS WRITTEN BY ITS PACKAGE'S init, and no
+							// call site says so: init is called by the runtime, from nowhere
+							// this graph can see, so an edge FROM the variable TO init is what
+							// makes "this variable holds whatever init put in it" reachable.
+							// It is every init of the package and not only the ones that
+							// assign this name, which over approximates in the direction this
+							// gate is allowed to be wrong in.
+							if declaration.Tok == token.VAR && pkg.hasInit {
+								graph.ephAddEdge(node, importPath+".init")
+							}
+							if values.Type != nil {
+								graph.ephWalkBody(pkg, file, node, values.Type)
+							}
+							switch {
+							case len(values.Values) == len(values.Names):
+								graph.ephWalkBody(pkg, file, node, values.Values[index])
+							default:
+								// one call feeding several names: every name takes it.
+								for _, value := range values.Values {
+									graph.ephWalkBody(pkg, file, node, value)
+								}
+							}
+						}
+					}
 				}
-				node := importPath + "." + function.Name.Name
-				if _, already := graph.calls[node]; !already {
-					graph.calls[node] = []string{}
-					graph.where[node] = fmt.Sprintf("%s:%d", file.path, graph.fileSet.Position(function.Pos()).Line)
-				}
-				graph.ephWalkBody(pkg, file, node, function.Body)
 			}
 		}
 	}
@@ -652,33 +834,60 @@ func (self *ephModuleGraph) ephClockReaders(importPath string) []string {
 
 // TestEphKeyReachesNoClockSourceInThisPackage is P5.
 //
-// -- CLASS (of clock sources). Three clauses, all computed, none of them a list of time.*
+// -- CLASS (of clock source). Three clauses, all computed, none of them a list of time.*
 //
 //	spellings. Clause 1: an expression qualified by an import of time or runtime -- the two names
 //	above, which are the only literal in this derivation and are about the standard library
-//	rather than about any package of this repository. Clause 2: a call of any declaration whose
-//	TYPE is this module's clock shape, func() int64, which is how self.nowMs() and a nowMs
-//	parameter are found without either word appearing here. Clause 3: a fixed point over the call
-//	graph, so a function that calls a function that reaches either reaches it too.
+//	rather than about any package of this repository. It is any expression and not a call:
+//	time.Now(), the func value time.Now, and the type time.Time are one clause. Clause 2: a READ
+//	of any declaration whose TYPE is this module's clock shape, func() int64, collected in EVERY
+//	package in scope -- which is how self.nowMs() and a nowMs parameter are found without either
+//	word appearing here, and how a clock shaped field declared in connect/message is found when
+//	it is read from this one. Clause 3: a fixed point over the reference graph, so a declaration
+//	that reaches a declaration that reaches either reaches it too.
 //
-// -- SCOPE. Every non test .go file of this package AND of every package OF THIS MODULE this
+// -- CLASS (of edge), stated apart from the clock class because it is where the last five escapes
 //
-//	package transitively imports, each directory resolved off go.mod's module path with
-//	os.ReadDir at run time. Not a list of files and NOT A TABLE OF PACKAGES: the previous shape
-//	of this gate rowed connect/message as answering no clock, and a live clock added to
-//	connect/message and called from EphKey passed it. The scope IS the repair.
+//	lived. A REFERENCE, not a call; and out of ANY declaration, not only out of a function body.
+//	See ephWalkBody. The old edge was "*ast.CallExpr inside an *ast.FuncDecl body", and that is
+//	two separate holes: a package level `var x = <expr>` is an *ast.ValueSpec at file scope and
+//	was never walked, and reading such a variable is an *ast.Ident in a non-call position, which
+//	was not an edge even when the declaration that wrote it had already been classified as a
+//	clock reader. Package level vars and consts are vertices here, their initialisers and their
+//	declared types are walked, and a var is given an edge to its package's init because init is
+//	what writes it from a call site no graph can see.
 //
-// -- PROPERTY. The transitive call closure of EphKey, taken over that whole graph, contains no
+// -- SCOPE (of source). Every non test .go file of this package AND of every package OF THIS
 //
-//	member of that class; and the out-of-module packages that closure reaches are exactly
-//	ephKeyExternalReach, which is the only place the walk stops at a boundary.
+//	MODULE this package transitively imports, each directory resolved off go.mod's module path
+//	with os.ReadDir at run time. Not a list of files and NOT A TABLE OF PACKAGES: the previous
+//	shape of this gate rowed connect/message as answering no clock, and a live clock added to
+//	connect/message and called from EphKey passed it.
 //
-// -- FAIL CLOSED, four ways, because each is a shape that would report a clean bill having read
+// -- SCOPE (of name resolution), stated apart from the source scope because these two were not
+//
+//	the same set and the difference was a hole. A bare name is resolved against EVERY package
+//	this gate read, not against the calling package's import list. connect/mls/atkclock is in
+//	scope when connect/mls imports it; a method declared there and read from here resolved to
+//	nothing under the narrower rule, and a clock behind it was invisible.
+//
+// -- PROPERTY. The transitive reference closure of EphKey, taken over that whole graph, contains
+//
+//	no member of the clock class; the out-of-module packages that closure reaches are exactly
+//	ephKeyExternalReach; and the names it calls that resolve nowhere in scope are exactly
+//	ephKeyUnresolvedNames. Those two pins are the two boundaries of the walk, and both are
+//	asserted -- printing one and asserting the other is how four clock plants were named by this
+//	gate, in its own output, under a passing test.
+//
+// -- FAIL CLOSED, six ways, because each is a shape that would report a clean bill having read
 //
 //	nothing: more than one package of this module must be read; time or runtime must be found
-//	among the imports of some package in scope; this package must have clock reaching functions
-//	of its own (it does -- the sealer and the opener); and SOME OTHER package in scope must have
-//	them too (connect/mls does), which is what says the cross package half of the walk is working
+//	among the imports of some package in scope; package level value declarations must have become
+//	vertices, or the whole of file scope was walked past again; the boundary list must be
+//	non-empty, because the closure calls len and append at the very least; this package must have
+//	clock reaching functions of its own (it does -- the sealer and the opener); and SOME OTHER
+//	package in scope must have them too (connect/mls does), which is what says the cross package
+//	half of the walk is working
 //	rather than silently resolving nothing.
 func TestEphKeyReachesNoClockSourceInThisPackage(t *testing.T) {
 	graph := ephBuildModuleGraph(t)
@@ -691,6 +900,19 @@ func TestEphKeyReachesNoClockSourceInThisPackage(t *testing.T) {
 	self := graph.packages[graph.self]
 	if self == nil || len(self.clockValueNames) == 0 {
 		t.Fatal("no declaration of type func() int64 was found in this package's production source, so clause 2 of the clock class is empty and an injected clock would be invisible to this gate")
+	}
+	// the vertices file scope contributes. An empty answer here is the exact state this gate was
+	// in when five clock shapes walked past it: package level declarations were parsed, and the
+	// walk that draws edges looked only at *ast.FuncDecl bodies, so nothing at file scope was a
+	// vertex and no edge could lead to one.
+	valueNodes := slices.Clone(graph.valueNodes)
+	slices.Sort(valueNodes)
+	valueNodes = slices.Compact(valueNodes)
+	if len(valueNodes) == 0 {
+		t.Fatal("no package level var or const in scope became a vertex of this graph, so file scope was walked past entirely. This package declares ErrEphBucketOffLadder, Suite and keyScheduleCrypto at file scope, and a clock bound into any of them is the shape this gate now exists to see")
+	}
+	if len(self.valueNames) == 0 {
+		t.Fatal("this package declares no package level var or const at all, which it does; an empty answer is a declaration pass that read no *ast.GenDecl")
 	}
 	if !self.declared["EphKey"] {
 		t.Fatal("this package declares no EphKey, so the closure below cleared a function that does not exist")
@@ -707,6 +929,17 @@ func TestEphKeyReachesNoClockSourceInThisPackage(t *testing.T) {
 		len(graph.external), graph.external)
 	t.Logf("class, clause 2: %d declaration(s) of the clock shape func() int64 in this package, %v",
 		len(self.clockShapeAt), self.clockShapeAt)
+	elsewhereShaped := []string{}
+	for _, importPath := range graph.order {
+		if importPath != graph.self {
+			elsewhereShaped = append(elsewhereShaped, graph.packages[importPath].clockShapeAt...)
+		}
+	}
+	slices.Sort(elsewhereShaped)
+	t.Logf("class, clause 2, cross package: %d declaration(s) of the clock shape elsewhere in scope, %v",
+		len(elsewhereShaped), elsewhereShaped)
+	t.Logf("vertices from file scope: %d package level var/const declaration(s) in scope are nodes of this graph",
+		len(valueNodes))
 
 	here := graph.ephClockReaders(graph.self)
 	if len(here) == 0 {
@@ -785,6 +1018,13 @@ func TestEphKeyReachesNoClockSourceInThisPackage(t *testing.T) {
 	t.Logf("complement: the %d out-of-module package(s) in scope it does not reach, %v", len(notReached), notReached)
 	t.Logf("boundary: %d call name(s) inside the closure resolve to no declaration of this module, %v",
 		len(unresolved), unresolved)
+	if len(unresolved) == 0 {
+		t.Fatalf("no name called inside EphKey's closure resolves outside this module, so the boundary pin removed nothing and says nothing. The closure calls len, make and append at the very least, so an empty answer here is a walk that visited no call expression rather than a closure that makes none")
+	}
+	if !slices.Equal(unresolved, ephKeyUnresolvedNames) {
+		t.Errorf("the names called inside EphKey's closure that resolve nowhere in scope are %v, and ephKeyUnresolvedNames pins %v. A name that resolves nowhere is the one kind of callee this walk cannot follow, so the set of them is pinned rather than printed: a clock reached through a new one is a clock this gate would otherwise report a clean bill over",
+			unresolved, ephKeyUnresolvedNames)
+	}
 	if !slices.Equal(reached, ephKeyExternalReach) {
 		t.Errorf("EphKey's closure reaches the out-of-module packages %v, and ephKeyExternalReach pins %v. A package outside this module is the one thing the derivation above cannot read, so the set of them this closure touches is pinned instead: say why the new one cannot answer the current instant, or take the call back out",
 			reached, ephKeyExternalReach)
@@ -1619,6 +1859,108 @@ func TestEveryCitationOfTheRuledItemsCarriesItsRulingDate(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// The retracted sentinel name, held by the query that publishes its count
+// ---------------------------------------------------------------------------
+
+// The file whose job is to record retracted names, and which therefore contains them.
+const ephInventoryFile = "messagegroup/doc.go"
+
+// TestTheRetractedSentinelSurvivesOnlyInTheParagraphThatRetractsIt runs the query doc.go publishes.
+//
+// -- CLASS. Every line of every .go file of THIS MODULE that contains the retracted sentinel name,
+//
+//	test files included, because a retracted name left in a test is a caller of it. The needle is
+//	assembled at run time from two halves rather than written as one literal, so THIS FILE IS NOT
+//	IN ITS OWN ANSWER by construction rather than by an exclusion list -- which is the whole
+//	point of the finding: doc.go published "answers one line" and the paragraph publishing it was
+//	the second and third lines of the answer. A count whose query matches the claim is the
+//	self-match item 152 -- ruled 2026-09-13 -- filed for handle_link.
+//
+// -- SCOPE. The module root resolved off go.mod at run time by keySourceModuleRoot, walked with
+//
+//	filepath.WalkDir. The whole module and not this directory: the claim doc.go publishes is
+//	about connect, so the reading has to be about connect. The ../sdk half of the published query
+//	is NOT held here -- sdk is another repository, its checkout is not implied by this one, and a
+//	gate that read it would be green on a machine where it is absent, which is a gate that says
+//	nothing. doc.go states that half as a measurement rather than as a gate for that reason.
+//
+// -- PROPERTY. Excluding the inventory file, the name survives on exactly one line, and that line
+//
+//	is in errors.go -- the paragraph that describes the retraction. The complement, every line
+//	the exclusion removed, is printed member by member and asserted non-empty.
+//
+// -- FAIL CLOSED, three ways: the walk must have read .go files at all; the name must be found
+//
+//	SOMEWHERE, or the reading found nothing and would clear any claim; and the exclusion must
+//	have removed something, or it is decoration rather than a guard and the inventory has stopped
+//	recording the rename it exists to record.
+func TestTheRetractedSentinelSurvivesOnlyInTheParagraphThatRetractsIt(t *testing.T) {
+	// two halves, so this file is not a hit of its own query.
+	retracted := "ErrRetentionClass" + "Unruled"
+	// the rename is only a rename if the new name is really declared; this is a compile time
+	// assertion of the other half of doc.go's claim.
+	_ = ErrRetentionClassUnknown
+
+	moduleDir, modulePath := keySourceModuleRoot(t)
+	read, kept, removed := 0, []string{}, []string{}
+	err := filepath.WalkDir(moduleDir, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") {
+			return nil
+		}
+		body, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		read++
+		within, err := filepath.Rel(moduleDir, path)
+		if err != nil {
+			return err
+		}
+		within = filepath.ToSlash(within)
+		for number, line := range strings.Split(string(body), "\n") {
+			if !strings.Contains(line, retracted) {
+				continue
+			}
+			at := fmt.Sprintf("%s:%d", within, number+1)
+			if within == ephInventoryFile {
+				removed = append(removed, at)
+			} else {
+				kept = append(kept, at)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk %s, the root of %s: %v", moduleDir, modulePath, err)
+	}
+	if read == 0 {
+		t.Fatalf("no .go file was read out of %s, so this gate counted occurrences of %s in nothing", moduleDir, retracted)
+	}
+	slices.Sort(kept)
+	slices.Sort(removed)
+	t.Logf("scope: %d .go file(s) of %s read from %s", read, modulePath, moduleDir)
+	t.Logf("class: %d line(s) outside the inventory still carry the retracted name, %v", len(kept), kept)
+	t.Logf("complement: %d line(s) the exclusion of %s removed, %v", len(removed), ephInventoryFile, removed)
+	if len(kept)+len(removed) == 0 {
+		t.Fatalf("the retracted name is nowhere in %s at all. errors.go's retraction paragraph names it, and doc.go's inventory entry names it twice, so an empty answer is a reading that found nothing rather than a module that has finished with the name", modulePath)
+	}
+	if len(removed) == 0 {
+		t.Fatalf("excluding %s removed no line, so the exclusion in the published query guards nothing. That file is the inventory: it records the rename and it quotes the query, and if it has stopped naming the retracted name then the entry doc.go publishes has gone", ephInventoryFile)
+	}
+	if len(kept) != 1 {
+		t.Errorf("the retracted name survives on %d line(s) outside the inventory, %v, and doc.go publishes ONE. Either a caller of the retracted name came back, or the retraction paragraph moved: correct the number where it is published, and keep the query one whose own answer does not contain it",
+			len(kept), kept)
+		return
+	}
+	if !strings.HasPrefix(kept[0], "messagegroup/errors.go:") {
+		t.Errorf("the one surviving line is %s, and doc.go publishes it as the paragraph in errors.go that describes the retraction", kept[0])
+	}
+}
+
+// ---------------------------------------------------------------------------
 // BOUNDARY: what the citation gates see, what they cannot, and why
 // ---------------------------------------------------------------------------
 //
@@ -1640,9 +1982,17 @@ func TestEveryCitationOfTheRuledItemsCarriesItsRulingDate(t *testing.T) {
 // THERE ARE TWO HONESTY GATES OVER THIS PACKAGE'S PROSE AND BETWEEN THEM THEY COVER TWO SHAPES.
 //
 //   - THIS ONE covers a CITATION: a line naming one of the two closed items by number. Its
-//     membership predicate is those two numbers, and its judgement is a DATE, which has no
-//     polarity and therefore cannot be satisfied by a sentence that says the opposite of what the
-//     ruling says. Scope is every .go file of this directory, comments and string literals alike.
+//     membership predicate is those two numbers, and its judgement is CO-LOCATION with the
+//     standing ruling's date, within two lines. THAT IS WEAKER THAN "the citation agrees with the
+//     ruling" AND THE DIFFERENCE IS MEASURED, not guessed: a comment asserting the reversed
+//     reading and carrying 2026-09-13 on the same line passes, and so does one carrying it on the
+//     next line as an unrelated aside. A date has no polarity, which is exactly why it is proof
+//     against the "has not ruled" false negative a word list walked into -- and it is the same
+//     property that stops it refusing a sentence whose words disagree with it. What this gate
+//     delivers is that a reader who meets a citation of a reversed item is shown WHICH ruling is
+//     current; what it does not deliver is that the citation says what that ruling says.
+//     Classifying prose is outside it, for the reason the paragraph above gives. Scope is every
+//     .go file of this directory, comments and string literals alike.
 //
 //   - TestTheInventoryDoesNotDenyWhatThisPackageProves (enginejoin_test.go) covers a DENIAL: a
 //     production sentence that contradicts a claim some named case proves. Its membership

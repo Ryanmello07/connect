@@ -141,11 +141,22 @@
 // class alone could be sealed pending a ruling on which record key seals ct_head, and what it says
 // now is that the value in hand names no retention class at all. A sentinel still named Unruled
 // for something ruled on 2026-09-13 is the pre-amendment trap this corpus keeps filing, so the
-// name moved rather than only the text. The blast radius is measured rather than assumed:
-// grep -rn ErrRetentionClassUnruled --include=*.go over connect and over sdk answers one line, the
-// paragraph in errors.go that describes the retraction. errors.go carries the whole reasoning
-// beside the declaration; this entry is so that a reader of the inventory learns the surface
-// changed without having to read errors.go to find out.
+// name moved rather than only the text. The blast radius is measured rather than assumed, and the
+// query that measures it EXCLUDES THE FILE YOU ARE READING, because this paragraph is itself an
+// occurrence of the retracted name and a query over the whole tree counts the sentence that
+// publishes it -- the self-match ledger item 152, ruled 2026-09-13, filed when handle_link's query
+// began matching itself the moment it was written into the ledger. Published as it is run:
+//
+//	grep -rn ErrRetentionClassUnruled --include=*.go . ../sdk | grep -v 'messagegroup/doc.go:'
+//
+// answers ONE line over connect, errors.go's retraction paragraph, and NONE over sdk. The connect
+// half of that is not a number typed into a comment: TestTheRetractedSentinelSurvivesOnlyInThe
+// ParagraphThatRetractsIt in ephkey_test.go runs it over this whole module at run time and prints
+// the lines the exclusion removed, so a second occurrence anywhere in connect is a red test rather
+// than a stale sentence here. The sdk half is a measurement and NOT a gate: sdk is another
+// repository and a gate in connect cannot hold it. errors.go carries the whole reasoning beside
+// the declaration; this entry is so that a reader of the inventory learns the surface changed
+// without having to read errors.go to find out.
 //
 // FOUR NAMES WERE INVENTED HERE AND NO DOCUMENT OF THE CORPUS DECLARES ANY OF THEM: InstallEphRoot,
 // the session's own eph_root field, senderLadderKey's eph window, and TrackSender's ephWindow
