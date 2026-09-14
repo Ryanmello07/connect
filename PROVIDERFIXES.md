@@ -49,7 +49,7 @@ Three same-datacenter Linux VPSs plus one distant client:
 | Role | Shape | Notes |
 | --- | --- | --- |
 | client | 4 vCPU, 8 GB, kernel 6.1 | socks harness and kernel-TUN client |
-| provider | 6 vCPU, kernel 6.8 | `urprovider` from `sn/cli/miner`, pprof on loopback |
+| provider | 6 vCPU, kernel 6.1.0-9 (Debian 12) | `urprovider` from `sn/cli/miner`, pprof on loopback |
 | relay | 8 vCPU, shared beta infrastructure | Caddy (TLS + websocket proxy) in front of `connect` |
 | distant client | 1 vCPU, 2 GB, ~100 ms to relay and provider | long-RTT regime |
 
@@ -126,8 +126,11 @@ A later four-rep check on CDN traffic: 1 flow 210/219/210/210 -> 719/719/610/610
 | `TestUpstreamTcpConnReceiveBufferGrowsThroughDialPath` (this PR) | through `TcpBufferSettings.DialContext` + `configureUpstreamTcpConn`, the buffer grows during a 256 MiB transfer | the original bug **and** a fix that moves `SO_RCVBUF` instead of removing it |
 
 Both are `//go:build linux`. The new test skips when
-`net.ipv4.tcp_moderate_rcvbuf` is off. Measured on Linux 6.8
-(`tcp_rmem 4096 131072 6291456`):
+`net.ipv4.tcp_moderate_rcvbuf` is off. Measured on Linux 6.1.0-9
+(`tcp_rmem 4096 131072 6291456`). An earlier revision said 6.8, which is the relay's
+kernel, not the provider's. The throughput cost is kernel-dependent: on 6.1 an
+`SO_RCVBUF` set after connect freezes `rcv_ssthresh` at ~64 KB; a 7.0.0-27 host does not
+freeze. The new test has only been run on 6.1.
 
 | Tree | Existing test | New test |
 | --- | --- | --- |
