@@ -52,6 +52,27 @@ func tcpReturnTestPayload(segmentCount int, segmentByteCount int) []byte {
 	return payload
 }
 
+// Payload bytes per full segment on a flow built with `options`: the
+// configured mtu less the flow's IP header, the TCP header and the timestamp
+// option when negotiated.
+func tcpReturnTestSegmentByteCountFor(options tcpReturnTestOptions) int {
+	segmentByteCount := tcpReturnTestSegmentByteCount
+	if options.ipVersion == 6 {
+		segmentByteCount -= Ipv6HeaderSize - Ipv4HeaderSizeWithoutExtensions
+	}
+	if options.timestamps {
+		segmentByteCount -= tcpTimestampOptionByteCount
+	}
+	return segmentByteCount
+}
+
+// The source's timestamp clock (RFC 7323), in milliseconds of virtual time.
+// The bubble's clock starts before the process's epoch, so the value is far
+// from zero, and only its progress means anything.
+func tcpReturnTestSourceTimestampValue() uint32 {
+	return uint32(time.Since(tcpTimestampEpoch)/time.Millisecond) + 1
+}
+
 // One acknowledgement on its way to the sequence.
 type tcpReturnTestDelayedAck struct {
 	ackNumber uint32
@@ -66,6 +87,7 @@ type tcpReturnTestSegment struct {
 	rst     bool
 	// the timestamp option, when the segment carried one
 	timestampValue uint32
+	timestampEcho  uint32
 	// the whole IP packet's length
 	packetByteCount int
 	at              time.Time
@@ -120,6 +142,8 @@ type tcpReturnTestSource struct {
 	renegeOnce bool
 	// RFC 7323 TS.Recent: the value echoed in acknowledgements
 	timestampRecent uint32
+	// the timestamp value of the last acknowledgement sent
+	lastAckTimestampValue uint32
 	// scaled units the advertised window has grown by since the handshake;
 	// every acknowledgement carries it
 	windowGrowth uint16
@@ -271,7 +295,8 @@ func (self *tcpReturnTestSource) buildAckWithLock(ackNumber uint32) ([]byte, par
 		options[1] = 1
 		options[2] = 8
 		options[3] = 10
-		binary.BigEndian.PutUint32(options[4:8], uint32(time.Since(tcpTimestampEpoch)/time.Millisecond)+1)
+		self.lastAckTimestampValue = tcpReturnTestSourceTimestampValue()
+		binary.BigEndian.PutUint32(options[4:8], self.lastAckTimestampValue)
 		binary.BigEndian.PutUint32(options[8:12], self.timestampRecent)
 		optionIndex = tcpTimestampOptionByteCount
 	}
@@ -481,13 +506,7 @@ func newTcpReturnRetransmitTestHarness(t *testing.T, options tcpReturnTestOption
 	if ipVersion == 0 {
 		ipVersion = 4
 	}
-	segmentByteCount := tcpReturnTestSegmentByteCount
-	if ipVersion == 6 {
-		segmentByteCount -= Ipv6HeaderSize - Ipv4HeaderSizeWithoutExtensions
-	}
-	if options.timestamps {
-		segmentByteCount -= tcpTimestampOptionByteCount
-	}
+	segmentByteCount := tcpReturnTestSegmentByteCountFor(options)
 	// one socket read is eight segments
 	settings.ReadBufferByteCount = 8 * segmentByteCount
 	if options.configure != nil {
@@ -591,6 +610,7 @@ func newTcpReturnRetransmitTestHarness(t *testing.T, options tcpReturnTestOption
 				fin:             tcp.fin,
 				rst:             tcp.rst,
 				timestampValue:  tcp.timestampValue,
+				timestampEcho:   tcp.timestampEcho,
 				packetByteCount: len(packet),
 				at:              time.Now(),
 			})
@@ -620,7 +640,10 @@ func newTcpReturnRetransmitTestHarness(t *testing.T, options tcpReturnTestOption
 	synOptions := []byte{3, 3, byte(windowScale), 1}
 	if options.timestamps {
 		synOptions = append(synOptions, 1, 1, 8, 10, 0, 0, 0, 0, 0, 0, 0, 0)
-		binary.BigEndian.PutUint32(synOptions[8:12], 1)
+		// from the clock the acknowledgements use: a fixed 1 reads as newer
+		// than that clock's values modulo 2^32, so the sequence never moved
+		// its echo past the SYN's and no row could tell a current echo
+		binary.BigEndian.PutUint32(synOptions[8:12], tcpReturnTestSourceTimestampValue())
 	}
 	synPacket, synTcpHeader := harness.sourcePacket(TcpHeaderSizeWithoutExtensions + len(synOptions))
 	copy(synTcpHeader[TcpHeaderSizeWithoutExtensions:], synOptions)
@@ -760,6 +783,38 @@ func (self *tcpReturnRetransmitTestHarness) requireStream(want []byte) {
 	if stream := self.source.streamCopy(); !bytes.Equal(stream, want) {
 		self.t.Fatalf("stream has %d bytes, want %d exact", len(stream), len(want))
 	}
+}
+
+// Requires every data segment the source was handed, originals, pieces and
+// retransmissions alike, to carry exactly the bytes of `payload` at its
+// sequence's offset from the first data byte, whatever the wrap.
+func (self *tcpReturnRetransmitTestHarness) requireDeliveriesAtTheirOffsets(payload []byte) {
+	self.t.Helper()
+	self.source.stateLock.Lock()
+	defer self.source.stateLock.Unlock()
+	for deliveryIndex, segment := range self.source.segments {
+		if len(segment.payload) == 0 {
+			continue
+		}
+		offset := int(segment.seq - self.dataSeq)
+		if len(payload) < offset+len(segment.payload) {
+			self.t.Fatalf("delivery %d at %d carries %d bytes from offset %d, past the %d byte payload", deliveryIndex, segment.seq, len(segment.payload), offset, len(payload))
+		}
+		if !bytes.Equal(segment.payload, payload[offset:offset+len(segment.payload)]) {
+			self.t.Fatalf("delivery %d at %d carries %d bytes that are not the payload's at offset %d", deliveryIndex, segment.seq, len(segment.payload), offset)
+		}
+	}
+}
+
+// The delivery at `seq` numbered `deliveryIndex` from zero, failing the test
+// rather than panicking the package's test binary when there are fewer.
+func (self *tcpReturnRetransmitTestHarness) requireDelivery(seq uint32, deliveryIndex int) tcpReturnTestSegment {
+	self.t.Helper()
+	deliveries := self.source.deliveries(seq)
+	if len(deliveries) <= deliveryIndex {
+		self.t.Fatalf("%d deliveries at %d, want at least %d", len(deliveries), seq, deliveryIndex+1)
+	}
+	return deliveries[deliveryIndex]
 }
 
 func (self *tcpReturnRetransmitTestHarness) requireSeenCount(segmentIndex int, want int) {
@@ -1141,7 +1196,7 @@ func TestTcpReturnRetransmitSpuriousTimeoutSendsOnlyTheHead(t *testing.T) {
 			for segmentIndex := 1; segmentIndex < segmentCount; segmentIndex += 1 {
 				harness.requireSeenCount(segmentIndex, 1)
 			}
-			if got := harness.source.deliveryTimes(harness.segmentSeq(0))[1].Sub(start); got != returnRetransmitInitialRto {
+			if got := harness.requireDelivery(harness.segmentSeq(0), 1).at.Sub(start); got != returnRetransmitInitialRto {
 				t.Fatalf("stride %d: head retransmitted at +%s, want +%s", stride, got, returnRetransmitInitialRto)
 			}
 			if stats := harness.counters.snapshot(); stats.TimeoutCount != 1 || stats.AbandonCount != 0 {
@@ -1186,7 +1241,7 @@ func TestTcpReturnRetransmitRealTimeoutRecoversOnTheDuplicateAck(t *testing.T) {
 		harness.requireStream(append(append([]byte(nil), payload...), later...))
 		for segmentIndex := 0; segmentIndex < flightCount; segmentIndex += 1 {
 			harness.requireSeenCount(segmentIndex, 2)
-			if got := harness.source.deliveryTimes(harness.segmentSeq(segmentIndex))[1].Sub(start); got != returnRetransmitInitialRto {
+			if got := harness.requireDelivery(harness.segmentSeq(segmentIndex), 1).at.Sub(start); got != returnRetransmitInitialRto {
 				t.Fatalf("segment %d retransmitted at +%s, want at the one expiry +%s", segmentIndex, got, returnRetransmitInitialRto)
 			}
 		}
@@ -1272,7 +1327,7 @@ func TestTcpReturnRetransmitPrunedSpanRecoversInBursts(t *testing.T) {
 		time.Sleep(defaultReturnRetransmitTimeout / 2)
 		synctest.Wait()
 
-		fastRetransmitAt := harness.source.deliveryTimes(harness.segmentSeq(1))[1]
+		fastRetransmitAt := harness.requireDelivery(harness.segmentSeq(1), 1).at
 		requireTcpReturnTestBurstRecovery(t, harness, payload, 2, segmentCount, fastRetransmitAt, 12)
 		harness.requireSeenCount(0, 1)
 		harness.requireSeenCount(1, 2)
@@ -1316,12 +1371,12 @@ func TestTcpReturnRetransmitLostFlightRecoversInBurstsAfterTheProbe(t *testing.T
 		// the probe's head goes at its expiry, and the loss shows real at
 		// the second, twice that timer after the head's acknowledgement
 		rto := 3 * tcpReturnTestBurstRoundTrip
-		start := harness.source.deliveryTimes(harness.segmentSeq(0))[0]
-		probeAt := harness.source.deliveryTimes(harness.segmentSeq(1))[1]
+		start := harness.requireDelivery(harness.segmentSeq(0), 0).at
+		probeAt := harness.requireDelivery(harness.segmentSeq(1), 1).at
 		if got, want := probeAt.Sub(start), tcpReturnTestBurstRoundTrip+rto; got != want {
 			t.Fatalf("probe at +%s, want +%s", got, want)
 		}
-		lossAt := harness.source.deliveryTimes(harness.segmentSeq(2))[1]
+		lossAt := harness.requireDelivery(harness.segmentSeq(2), 1).at
 		if got, want := lossAt.Sub(probeAt), tcpReturnTestBurstRoundTrip+2*rto; got != want {
 			t.Fatalf("second expiry %s after the probe, want %s", got, want)
 		}
@@ -1669,6 +1724,9 @@ func tcpReturnTestRetransmittedPieces(
 	harness.source.stateLock.Lock()
 	defer harness.source.stateLock.Unlock()
 	start := harness.segmentSeq(segmentIndex)
+	if len(harness.source.segments) < originalCount {
+		t.Fatalf("%d deliveries, fewer than the %d originals", len(harness.source.segments), originalCount)
+	}
 	pieces := append([]tcpReturnTestSegment(nil), harness.source.segments[originalCount:]...)
 	for _, piece := range pieces {
 		if offset := int(int32(piece.seq - start)); offset < 0 || harness.segmentByteCount <= offset {
@@ -1760,7 +1818,7 @@ func TestTcpReturnRetransmitCutsARetransmissionToTheReportedPathMtu(t *testing.T
 			payload := harness.payload(segmentCount)
 			harness.write(payload)
 			synctest.Wait()
-			if original := harness.source.deliveries(harness.segmentSeq(1))[0]; original.packetByteCount != tcpReturnTestMtu {
+			if original := harness.requireDelivery(harness.segmentSeq(1), 0); original.packetByteCount != tcpReturnTestMtu {
 				t.Fatalf("IPv%d: the original is a %d byte packet, want the configured mtu %d", c.ipVersion, original.packetByteCount, tcpReturnTestMtu)
 			}
 
@@ -1869,6 +1927,141 @@ func TestTcpReturnRetransmitProbeHeadAcknowledgedInPiecesDecidesNothing(t *testi
 			t.Fatalf("stats=%+v, want two timeouts and no abandon", stats)
 		}
 	})
+}
+
+// A source that negotiates timestamps, as Linux does by default: every packet
+// toward it carries the twelve-byte option ahead of the payload, and every
+// segment twelve fewer payload bytes. A segment its kernel drops, with or
+// without SACK, and repaired by duplicate acknowledgements, by the timer, or
+// in pieces after a smaller path mtu, reaches the source as exactly the
+// payload's bytes at the segment's offset. Every packet sent again carries a
+// timestamp value advanced by exactly the virtual time since the original and
+// echoes the newest timestamp the source sent, which an acknowledgement or a
+// window update after the original moved, never the original's options. A
+// retained payload located as if the option were absent, or packets sized
+// without it, put the option's bytes into the stream. Before the path mtu
+// rows no test negotiated timestamps, and none has checked what a
+// retransmission's option carries.
+func TestTcpReturnRetransmitWithTimestampsSendsExactBytesAndCurrentTimestamps(t *testing.T) {
+	const segmentCount = 4
+	// how long after the originals the acknowledgement-driven rows repair the
+	// loss, and the timer row's window update comes: inside the timer
+	const repairDelay = 300 * time.Millisecond
+	for _, c := range []struct {
+		ipVersion int
+		sack      bool
+		// "duplicates", "timer" or "pieces"
+		recovery string
+	}{
+		{ipVersion: 4, sack: false, recovery: "duplicates"},
+		{ipVersion: 4, sack: true, recovery: "duplicates"},
+		{ipVersion: 4, sack: false, recovery: "timer"},
+		{ipVersion: 4, sack: true, recovery: "timer"},
+		{ipVersion: 4, sack: false, recovery: "pieces"},
+		{ipVersion: 4, sack: true, recovery: "pieces"},
+		{ipVersion: 6, sack: true, recovery: "pieces"},
+	} {
+		runTcpReturnRetransmitTest(t, func(t *testing.T) {
+			t.Logf("IPv%d sack=%t recovery by %s", c.ipVersion, c.sack, c.recovery)
+			harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{
+				ipVersion:  c.ipVersion,
+				sack:       c.sack,
+				timestamps: true,
+			})
+			// the timer's head is the first segment; the acknowledgements
+			// repair the second
+			lostIndex := 1
+			if c.recovery == "timer" {
+				lostIndex = 0
+			}
+			lostSeq := harness.segmentSeq(lostIndex)
+			harness.source.dropCounts[lostSeq] = 1
+			harness.source.holdAcks = true
+			payload := harness.payload(segmentCount)
+			harness.write(payload)
+			synctest.Wait()
+			first := harness.requireDelivery(harness.segmentSeq(0), 0)
+			withoutTimestampsByteCount := tcpReturnTestSegmentByteCountFor(tcpReturnTestOptions{ipVersion: c.ipVersion})
+			if first.packetByteCount != tcpReturnTestMtu || len(first.payload) != withoutTimestampsByteCount-tcpTimestampOptionByteCount {
+				t.Fatalf("the first segment is a %d byte packet carrying %d bytes, want the %d byte mtu carrying twelve fewer than %d", first.packetByteCount, len(first.payload), tcpReturnTestMtu, withoutTimestampsByteCount)
+			}
+			original := harness.requireDelivery(lostSeq, 0)
+			if original.timestampValue == 0 {
+				t.Fatal("the original carries no timestamp")
+			}
+			pathMtu := ipv4MinimumPathMtu
+			if c.ipVersion == 6 {
+				pathMtu = ipv6MinimumPathMtu
+			}
+			if c.recovery == "pieces" {
+				harness.source.stateLock.Lock()
+				harness.source.pathMtu = pathMtu
+				harness.source.stateLock.Unlock()
+				harness.sequence.applyPathMtu(pathMtu)
+			}
+
+			time.Sleep(repairDelay)
+			switch c.recovery {
+			case "timer":
+				harness.source.sendWindowUpdate(16)
+				time.Sleep(returnRetransmitInitialRto - repairDelay)
+			default:
+				harness.source.sendAck(lostSeq)
+				for range returnRetransmitDupAckThreshold {
+					harness.source.sendDuplicateAck()
+				}
+			}
+			repairAt := time.Now()
+			harness.source.stateLock.Lock()
+			wantEcho := harness.source.lastAckTimestampValue
+			harness.source.stateLock.Unlock()
+			if wantEcho == original.timestampEcho {
+				t.Fatalf("the source's newest timestamp %d is the original's echo, so this row cannot tell them apart", wantEcho)
+			}
+			synctest.Wait()
+
+			retransmitted := tcpReturnTestRetransmittedPieces(t, harness, segmentCount, lostIndex)
+			if c.recovery == "pieces" {
+				requireTcpReturnTestPiecesAtPathMtu(t, harness, retransmitted, payload, lostIndex, pathMtu, true)
+			} else if len(retransmitted) != 1 || len(retransmitted[0].payload) != harness.segmentByteCount {
+				t.Fatalf("segment %d sent again in %d packets, want once whole", lostIndex, len(retransmitted))
+			}
+			wantValue := original.timestampValue + uint32(repairAt.Sub(original.at)/time.Millisecond)
+			for index, packet := range retransmitted {
+				if !packet.at.Equal(repairAt) {
+					t.Fatalf("packet %d sent again at +%s, want +%s", index, packet.at.Sub(original.at), repairAt.Sub(original.at))
+				}
+				if packet.timestampValue != wantValue {
+					t.Fatalf("packet %d sent again with timestamp %d, want %d, the original's %d advanced by %s", index, packet.timestampValue, wantValue, original.timestampValue, repairAt.Sub(original.at))
+				}
+				if packet.timestampEcho != wantEcho {
+					t.Fatalf("packet %d sent again echoing %d, want the source's newest %d (the original echoed %d)", index, packet.timestampEcho, wantEcho, original.timestampEcho)
+				}
+			}
+
+			harness.source.ackNow()
+			synctest.Wait()
+			harness.requireStream(payload)
+			harness.requireDeliveriesAtTheirOffsets(payload)
+			retainedByteCount, retainedCount, packetCount, reasonCounts := harness.retransmitState()
+			if retainedByteCount != 0 || retainedCount != 0 {
+				t.Fatalf("retained after full acknowledgement: %d bytes in %d segments", retainedByteCount, retainedCount)
+			}
+			wantReason := tcpReturnRetransmitReasonDupAck
+			switch {
+			case c.recovery == "timer":
+				wantReason = tcpReturnRetransmitReasonTimeout
+			case c.sack:
+				wantReason = tcpReturnRetransmitReasonSackHole
+			}
+			if packetCount != int64(len(retransmitted)) || reasonCounts[wantReason] != 1 {
+				t.Fatalf("retransmissions=%d reasons=%v, want segment %d once on %s in %d packets", packetCount, reasonCounts, lostIndex, wantReason, len(retransmitted))
+			}
+			if stats := harness.counters.snapshot(); stats.ByteCount != ByteCount(harness.segmentByteCount) {
+				t.Fatalf("stats=%+v, want one segment of %d bytes sent again", stats, harness.segmentByteCount)
+			}
+		})
+	}
 }
 
 // (g) Ownership across loss, selective acknowledgement, the FIN and the
