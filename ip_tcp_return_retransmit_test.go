@@ -189,11 +189,36 @@ type tcpReturnTestSource struct {
 	// the acknowledgements waiting for the test's stepAcks, in the order the
 	// arrivals caused them
 	steppedAcks []tcpReturnTestDelayedAck
+	// the first delivery of `reorderSeq` reaches the source only after
+	// `reorderAfter` later segments have, as a route crossover delivers it;
+	// zero holds nothing back
+	reorderSeq     uint32
+	reorderAfter   int
+	reordered      *tcpReturnTestSegment
+	reorderPending int
+	reorderDone    bool
 }
 
 func (self *tcpReturnTestSource) receive(segment tcpReturnTestSegment) {
 	var ackPacket []byte
 	var ackTcp parsedTcp
+	held := func() bool {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		if 0 < self.reorderAfter && segment.seq == self.reorderSeq &&
+			!self.reorderDone && 0 < len(segment.payload) {
+			// the path holds it back; the segments behind it pass it
+			self.reorderDone = true
+			reordered := segment
+			self.reordered = &reordered
+			self.reorderPending = self.reorderAfter
+			return true
+		}
+		return false
+	}()
+	if held {
+		return
+	}
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
@@ -257,6 +282,23 @@ func (self *tcpReturnTestSource) receive(segment tcpReturnTestSegment) {
 	}()
 	if ackPacket != nil {
 		self.harness.sendFromSource(&ackTcp, ackPacket)
+	}
+	var reordered *tcpReturnTestSegment
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		if self.reordered != nil && 0 < self.reorderPending {
+			self.reorderPending -= 1
+			if self.reorderPending == 0 {
+				reordered = self.reordered
+				self.reordered = nil
+			}
+		}
+	}()
+	if reordered != nil {
+		// the segments it was held behind have arrived; it arrives now
+		reordered.at = time.Now()
+		self.receive(*reordered)
 	}
 }
 
@@ -1816,6 +1858,52 @@ func TestTcpReturnRetransmitBurstsStopAtDataTheSourceHeld(t *testing.T) {
 			}
 		})
 	}
+}
+
+// One segment reaching the source behind three later ones, as a route
+// crossover delivers it, with nothing lost. Three duplicate acknowledgements
+// cannot tell that from loss, so the reordered segment is sent again once, and
+// that is the whole cost: the acknowledgement that follows covers a head whose
+// retransmission is far too young to be what answered it, so the recovery ends
+// there. Going on, every ordinary acknowledgement of the data in flight read
+// as a partial acknowledgement and its burst sent that data again, whose
+// duplicates drew more: the flight and every round after it, for one segment
+// that was never lost.
+func TestTcpReturnRetransmitAReorderedSegmentIsSentAgainOnlyOnce(t *testing.T) {
+	const firstCount = 40
+	const roundCount = 20
+	const roundCountPerFlow = 6
+	const reorderedIndex = 10
+	runTcpReturnRetransmitTest(t, func(t *testing.T) {
+		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{
+			ackDelay: tcpReturnTestStepRoundTrip,
+			stepAcks: true,
+		})
+		harness.source.reorderSeq = harness.segmentSeq(reorderedIndex)
+		harness.source.reorderAfter = returnRetransmitDupAckThreshold
+
+		segmentCount := firstCount + roundCountPerFlow*roundCount
+		payload := harness.payload(segmentCount)
+		written := harness.writeSegments(payload, 0, firstCount)
+		for round := 0; round < roundCountPerFlow; round += 1 {
+			written = harness.writeSegments(payload, written, roundCount)
+			harness.stepAcks(tcpReturnTestStepRoundTrip)
+		}
+		for range 8 {
+			harness.stepAcks(tcpReturnTestStepRoundTrip)
+		}
+
+		harness.requireStream(payload)
+		_, heldSentAgain := harness.requireSegmentsSentAgain(segmentCount, nil)
+		_, _, packetCount, reasonCounts := harness.retransmitState()
+		t.Logf("retransmissions=%d reasons=%v", packetCount, reasonCounts)
+		if 1 < packetCount || heldSentAgain != int(packetCount) {
+			t.Fatalf("retransmissions=%d reasons=%v with nothing lost, want at most the reordered segment once", packetCount, reasonCounts)
+		}
+		if stats := harness.counters.snapshot(); stats.TimeoutCount != 0 {
+			t.Fatalf("stats=%+v, want no timer expiry", stats)
+		}
+	})
 }
 
 // A run of segments the source's kernel drops with data still flowing behind

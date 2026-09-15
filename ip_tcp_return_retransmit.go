@@ -280,7 +280,14 @@ func (self *returnRetransmitCounters) snapshot() ReturnRetransmitStats {
 // recovery point, and never a segment this recovery already sent again. An
 // advance that ends inside a segment this recovery already sent again sends
 // nothing: it acknowledges one of the pieces the segment went in, the rest are
-// in flight, and the next hole is not known until they land. The failure this
+// in flight, and the next hole is not known until they land. An advance an
+// earlier copy of the head explains, because the head was never sent again or
+// its retransmission is younger than half the shortest round trip this flow
+// has measured, ends the recovery instead: the head was never missing, so the
+// recovery was spurious. Path reordering, which three duplicates cannot tell
+// from loss, is one cause; going on from it, every ordinary acknowledgement of
+// data in flight would read as a partial one and its bursts would send that
+// data again, a whole window for one reordered segment. The failure this
 // path exists for is a receive socket out of memory, and the kernel then
 // prunes its out-of-order queue when the hole fills, so the source holds
 // nothing past it; one segment per partial acknowledgement would take a round
@@ -382,8 +389,11 @@ type tcpReturnRetransmitState struct {
 	// retransmission an acknowledgement covers
 	burstSegmentCount int
 
-	rttKnown         bool
-	srttNanos        int64
+	rttKnown  bool
+	srttNanos int64
+	// the shortest round trip this flow ever measured, which bounds how soon
+	// a retransmission of its own can be acknowledged
+	minRttNanos      int64
 	rttvarNanos      int64
 	rtoNanos         int64
 	rtoDeadlineNanos int64
@@ -587,15 +597,37 @@ func (self *tcpReturnRetransmitState) updateRttWithLock(sampleNanos int64) {
 	if !self.rttKnown {
 		self.rttKnown = true
 		self.srttNanos = sampleNanos
+		self.minRttNanos = sampleNanos
 		self.rttvarNanos = sampleNanos / 2
 		return
 	}
+	self.minRttNanos = min(self.minRttNanos, sampleNanos)
 	deviationNanos := self.srttNanos - sampleNanos
 	if deviationNanos < 0 {
 		deviationNanos = -deviationNanos
 	}
 	self.rttvarNanos = (3*self.rttvarNanos + deviationNanos) / 4
 	self.srttNanos = (7*self.srttNanos + sampleNanos) / 8
+}
+
+// Whether this flow's own retransmission of a segment, sent at
+// `retransmitNanos`, can be what the acknowledgement covering it answers,
+// rather than a copy sent before it. An acknowledgement cannot answer a
+// retransmission sooner than the shortest round trip the flow ever measured,
+// and half of that leaves room for a path that became faster. Before any
+// sample nothing can be told, and the retransmission is taken as the answer.
+func (self *tcpReturnRetransmitState) retransmissionExplainsWithLock(
+	segmentResent bool,
+	retransmitNanos int64,
+	nowNanos int64,
+) bool {
+	if !segmentResent {
+		return false
+	}
+	if !self.rttKnown {
+		return true
+	}
+	return self.minRttNanos/2 <= nowNanos-retransmitNanos
 }
 
 func (self *tcpReturnRetransmitState) markDueWithLock(
@@ -875,6 +907,8 @@ func (self *tcpReturnRetransmitState) ackWithLock(
 	}
 	ackNumber := tcp.ackNumber
 	if ackNumber != previousAckNumber {
+		// the head the acknowledgement advanced over, before it is released
+		previousHead := *self.segmentAtWithLock(0)
 		ackedResentCount, ackedHeldCount := self.releaseAckedWithLock(ackNumber, nowNanos)
 		self.dupAckCount = 0
 		self.progressNanos = nowNanos
@@ -912,6 +946,21 @@ func (self *tcpReturnRetransmitState) ackWithLock(
 				// the rest are in flight, and a burst here would grow on
 				// each piece and resend what lies past them, which the
 				// source may hold
+			} else if !self.retransmissionExplainsWithLock(
+				0 < previousHead.retransmitCount,
+				previousHead.retransmitNanos,
+				nowNanos,
+			) {
+				// the head was never sent again, or came too soon after the
+				// retransmission to be its answer: a copy sent before it
+				// arrived, so the head was never missing and this recovery
+				// is spurious. Its cause is reordering on the path, which
+				// three duplicates cannot tell from loss, or duplicates this
+				// flow's own retransmissions drew. Recovery ends here: going
+				// on, every ordinary acknowledgement of data in flight would
+				// read as a partial one and its bursts would send that data
+				// again
+				self.recoveryPhase = tcpReturnRecoveryPhaseNone
 			} else {
 				// a partial acknowledgement: the next hole starts at the
 				// new head, and waiting three more duplicates for it would
