@@ -168,8 +168,10 @@ func (self *returnRetransmitCounters) snapshot() ReturnRetransmitStats {
 // byte stream; an unrecoverable one is an explicit, bounded failure.
 //
 // Triggers. Fast retransmit: the third duplicate acknowledgement of one
-// cumulative ack with no payload retransmits the first unacknowledged segment
-// (RFC 5681 §3.2). With SACK blocks it retransmits every unmarked segment
+// cumulative ack retransmits the first unacknowledged segment (RFC 5681
+// §3.2). A duplicate repeats the cumulative ack and the window and carries no
+// payload, SYN or FIN (RFC 5681 §2): a window update is not one, however many
+// the source sends while its application reads. With SACK blocks it retransmits every unmarked segment
 // below the highest selectively acknowledged byte instead, and further
 // duplicate acknowledgements that extend the marked range retransmit the
 // holes they newly reveal. A partial acknowledgement inside a recovery, one
@@ -217,8 +219,11 @@ type tcpReturnRetransmitState struct {
 	dueCount              int
 
 	dupAckCount int
-	recovering  bool
-	recoveryEnd uint32
+	// the scaled window of the last acceptable acknowledgement, which a
+	// duplicate must repeat
+	ackWindowByteCount uint32
+	recovering         bool
+	recoveryEnd        uint32
 
 	rttKnown         bool
 	srttNanos        int64
@@ -584,12 +589,16 @@ func (self *tcpReturnRetransmitState) releaseAckedWithLock(ackNumber uint32, now
 
 // Applies one acknowledgement the sequence has already validated against its
 // emitted range. `previousAckNumber` is the cumulative acknowledgement before
-// it. Reports whether a retransmission is now due, which wakes the worker.
+// it and `windowByteCount` its window after scaling. Reports whether a
+// retransmission is now due, which wakes the worker.
 func (self *tcpReturnRetransmitState) ackWithLock(
 	tcp *parsedTcp,
 	previousAckNumber uint32,
+	windowByteCount uint32,
 	nowNanos int64,
 ) (due bool) {
+	previousWindowByteCount := self.ackWindowByteCount
+	self.ackWindowByteCount = windowByteCount
 	if !self.enabled || self.count == 0 {
 		self.dupAckCount = 0
 		return false
@@ -620,8 +629,10 @@ func (self *tcpReturnRetransmitState) ackWithLock(
 		}
 		return 0 < self.dueCount
 	}
-	if 0 < len(tcp.payload) || tcp.syn || tcp.fin || tcp.rst {
-		// not a duplicate acknowledgement: it carries something of its own
+	if 0 < len(tcp.payload) || tcp.syn || tcp.fin || tcp.rst || windowByteCount != previousWindowByteCount {
+		// not a duplicate acknowledgement: it carries something of its own,
+		// if only a window update, which a receiver sends as its application
+		// reads and which says nothing about loss (RFC 5681 §2)
 		return false
 	}
 	self.dupAckCount += 1

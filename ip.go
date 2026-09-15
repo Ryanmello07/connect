@@ -4851,12 +4851,15 @@ func (self *TcpSequence) releaseReturnRetransmitWithLock() {
 // and the drain when the ring emptied. The sequence mutex must be held.
 func (self *TcpSequence) applyReturnRetransmitAckWithLock(tcp *parsedTcp, previousReceiveSeqAck uint32) {
 	state := &self.returnRetransmit
+	windowByteCount := uint32(tcp.windowSize) << self.receiveWindowScale
 	if !state.enabled || state.count == 0 {
-		// nothing retained: an idle flow's acknowledgements cost nothing here
+		// nothing retained: an idle flow's acknowledgements cost nothing here,
+		// beyond the window the next duplicate is compared with
 		state.dupAckCount = 0
+		state.ackWindowByteCount = windowByteCount
 		return
 	}
-	if state.ackWithLock(tcp, previousReceiveSeqAck, monotonicNanos()) {
+	if state.ackWithLock(tcp, previousReceiveSeqAck, windowByteCount, monotonicNanos()) {
 		self.signalReturnRetransmit()
 	}
 	if state.count == 0 {

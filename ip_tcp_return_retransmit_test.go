@@ -100,6 +100,9 @@ type tcpReturnTestSource struct {
 	renegeOnce bool
 	// RFC 7323 TS.Recent: the value echoed in acknowledgements
 	timestampRecent uint32
+	// scaled units the advertised window has grown by since the handshake;
+	// every acknowledgement carries it
+	windowGrowth uint16
 }
 
 func (self *tcpReturnTestSource) receive(segment tcpReturnTestSegment) {
@@ -143,7 +146,7 @@ func (self *tcpReturnTestSource) receive(segment tcpReturnTestSegment) {
 		if self.holdAcks {
 			return
 		}
-		ackPacket, ackTcp = self.buildAckWithLock(self.rcvNxt, 0)
+		ackPacket, ackTcp = self.buildAckWithLock(self.rcvNxt)
 	}()
 	if ackPacket != nil {
 		self.harness.sendFromSource(&ackTcp, ackPacket)
@@ -195,8 +198,8 @@ func (self *tcpReturnTestSource) accept(segment tcpReturnTestSegment) {
 
 // Builds one pure acknowledgement at `ackNumber`, with SACK blocks for the
 // out-of-order runs when negotiated, a timestamp when negotiated, and the
-// window grown by `windowDelta` scaled units. The lock must be held.
-func (self *tcpReturnTestSource) buildAckWithLock(ackNumber uint32, windowDelta uint16) ([]byte, parsedTcp) {
+// current window. The lock must be held.
+func (self *tcpReturnTestSource) buildAckWithLock(ackNumber uint32) ([]byte, parsedTcp) {
 	var blocks []tcpSackBlock
 	if self.sack {
 		for _, queued := range self.ooo {
@@ -255,7 +258,7 @@ func (self *tcpReturnTestSource) buildAckWithLock(ackNumber uint32, windowDelta 
 		seq:        self.harness.dataSeq,
 		ack:        true,
 		ackNumber:  ackNumber,
-		windowSize: uint16(tcpReturnTestWindowByteCount>>tcpReturnTestWindowScale) - 64 + windowDelta,
+		windowSize: uint16(tcpReturnTestWindowByteCount>>tcpReturnTestWindowScale) - 64 + self.windowGrowth,
 		options:    options,
 	}
 	parseTcpOptions(&parsed)
@@ -270,7 +273,7 @@ func (self *tcpReturnTestSource) ackNow() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
 		self.holdAcks = false
-		ackPacket, ackTcp = self.buildAckWithLock(self.rcvNxt, 0)
+		ackPacket, ackTcp = self.buildAckWithLock(self.rcvNxt)
 	}()
 	self.harness.sendFromSource(&ackTcp, ackPacket)
 }
@@ -303,33 +306,35 @@ func (self *tcpReturnTestSource) ackHeldPerSegment() {
 		func() {
 			self.stateLock.Lock()
 			defer self.stateLock.Unlock()
-			ackPacket, ackTcp = self.buildAckWithLock(boundary, 0)
+			ackPacket, ackTcp = self.buildAckWithLock(boundary)
 		}()
 		self.harness.sendFromSource(&ackTcp, ackPacket)
 	}
 }
 
-// Sends one pure acknowledgement at the current frontier whose only news is
-// a larger window.
-func (self *tcpReturnTestSource) sendWindowUpdate(windowDelta uint16) {
+// Sends one pure acknowledgement that repeats the last cumulative
+// acknowledgement and whose only news is a window grown by `growth` scaled
+// units, as a receiver sends when its application reads.
+func (self *tcpReturnTestSource) sendWindowUpdate(growth uint16) {
 	var ackPacket []byte
 	var ackTcp parsedTcp
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
-		ackPacket, ackTcp = self.buildAckWithLock(self.rcvNxt, windowDelta)
+		self.windowGrowth += growth
+		ackPacket, ackTcp = self.buildAckWithLock(self.lastAckNumber)
 	}()
 	self.harness.sendFromSource(&ackTcp, ackPacket)
 }
 
-// Sends one duplicate of the last acknowledgement.
+// Sends one duplicate of the last acknowledgement, window included.
 func (self *tcpReturnTestSource) sendDuplicateAck() {
 	var ackPacket []byte
 	var ackTcp parsedTcp
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
-		ackPacket, ackTcp = self.buildAckWithLock(self.lastAckNumber, 0)
+		ackPacket, ackTcp = self.buildAckWithLock(self.lastAckNumber)
 	}()
 	self.harness.sendFromSource(&ackTcp, ackPacket)
 }
@@ -835,6 +840,41 @@ func TestTcpReturnRetransmitPartialAckFillsTheNextHole(t *testing.T) {
 			reasonCounts[tcpReturnRetransmitReasonPartialAck] != 1 {
 			t.Fatalf("retransmissions=%d reasons=%v, want one on duplicate acks and one on the partial ack", packetCount, reasonCounts)
 		}
+	})
+}
+
+// Pure acknowledgements that repeat the cumulative acknowledgement but open
+// the window are window updates, which a receiver sends as its application
+// reads, not duplicates (RFC 5681 §2): three of them with data outstanding
+// retransmit nothing, and three true duplicates after them retransmit the
+// head once. Counting the updates sent a segment the source already held.
+func TestTcpReturnRetransmitWindowUpdatesAreNotDuplicateAcks(t *testing.T) {
+	runTcpReturnRetransmitTest(t, func(t *testing.T) {
+		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{})
+		harness.source.holdAcks = true
+
+		harness.write(harness.payload(2))
+		synctest.Wait()
+
+		for range 3 {
+			harness.source.sendWindowUpdate(16)
+		}
+		synctest.Wait()
+		if _, _, packetCount, reasonCounts := harness.retransmitState(); packetCount != 0 {
+			t.Fatalf("retransmissions=%d reasons=%v after three window updates, want none", packetCount, reasonCounts)
+		}
+		harness.requireSeenCount(0, 1)
+
+		for range 3 {
+			harness.source.sendDuplicateAck()
+		}
+		synctest.Wait()
+		_, _, packetCount, reasonCounts := harness.retransmitState()
+		if packetCount != 1 || reasonCounts[tcpReturnRetransmitReasonDupAck] != 1 {
+			t.Fatalf("retransmissions=%d reasons=%v after three duplicates, want the head once", packetCount, reasonCounts)
+		}
+		harness.requireSeenCount(0, 2)
+		harness.requireSeenCount(1, 1)
 	})
 }
 
