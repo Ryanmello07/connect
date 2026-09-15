@@ -234,11 +234,11 @@ func (self *returnRetransmitCounters) snapshot() ReturnRetransmitStats {
 // with a memory target (DefaultProviderLocalUserNatSettingsWithMemoryTarget)
 // sizes flow counts by a per-flow cost that leaves out window-sized data,
 // treats every window as a demand-driven ceiling, and changes neither the
-// window nor the cap, so no constructor lowers the cap. A per-flow value small enough for a
-// phone's provider share would impose the rate ceiling above on every flow and
-// still not bound the sum across flows, which only an aggregate bound charged
-// to that share could. A host that must keep less per flow sets the cap, or
-// MaxWindowSize with it.
+// window nor the cap, so no constructor lowers the cap. A per-flow value small
+// enough for a phone's provider share would impose the rate ceiling above on
+// every flow and still not bound the sum across flows, which only an
+// aggregate bound charged to that share could. A host that must keep less per
+// flow sets the cap, or MaxWindowSize with it.
 //
 // Time is bounded by ReturnRetransmitTimeout: when the cumulative
 // acknowledgement has not advanced for that long with delivered segments
@@ -270,8 +270,8 @@ func (self *returnRetransmitCounters) snapshot() ReturnRetransmitStats {
 // prunes its out-of-order queue when the hole fills, so the source holds
 // nothing past it; one segment per partial acknowledgement would take a round
 // trip per purged segment where a real sender slow-starts the go-back-N.
-// Without SACK a burst may resend a segment the source held,
-// at most the ceiling per acknowledgement and each at most once per recovery.
+// Without SACK a burst may resend a segment the source held, at most the
+// ceiling per acknowledgement and each at most once per recovery.
 // The timer: max(200 ms, 2 x srtt, srtt + 4 rttvar) from the inner round
 // trip, one second before a sample exists, doubling on each expiry to an 8 s
 // ceiling and reset by acknowledgement progress; expiry retransmits the first
@@ -793,12 +793,12 @@ func (self *tcpReturnRetransmitState) ackWithLock(
 				self.recoveryPhase = tcpReturnRecoveryPhaseTimeoutProbeAdvanced
 				keepBackoff = true
 			} else {
-				// past the retransmitted head, so after any advance to it
-				// with no duplicate between: the source holds bytes that
-				// were never sent again, so the originals arrived and only
-				// their acknowledgements were late (RFC 5682 §2.1 step 3b).
-				// The expiry was spurious: nothing more is sent, and the
-				// base below is the timer it doubled
+				// past the retransmitted head, whatever advanced to it
+				// before: the source holds bytes that were never sent again,
+				// so the originals arrived and only their acknowledgements
+				// were late (RFC 5682 §2.1 step 3b). The expiry was spurious:
+				// nothing more is sent, and the base below is the timer it
+				// doubled
 				self.recoveryPhase = tcpReturnRecoveryPhaseNone
 			}
 		case tcpReturnRecoveryPhaseLoss:

@@ -3876,12 +3876,11 @@ type TcpBufferSettings struct {
 	// sends it again on three duplicate acknowledgements, on partial
 	// acknowledgements during loss recovery, on the holes below a selective
 	// acknowledgement, and on a retransmission timer, cut to the current path
-	// mtu. Transfer
-	// delivers the segments losslessly to the source device, but the device
-	// kernel can drop one on the flow's receive socket at high single-flow
-	// rates, and without this that drop is permanent: the source answers with
-	// duplicate acknowledgements for ever and the download stops. See
-	// tcpReturnRetransmitState for the design. On by default; off restores
+	// mtu. Transfer delivers the segments losslessly to the source device, but
+	// the device kernel can drop one on the flow's receive socket at high
+	// single-flow rates, and without this that drop is permanent: the source
+	// answers with duplicate acknowledgements for ever and the download stops.
+	// See tcpReturnRetransmitState for the design. On by default; off restores
 	// the earlier behaviour byte for byte, with nothing retained.
 	EnableReturnRetransmit bool
 	// The hard cap on retained sequence bytes per flow beside the source's
