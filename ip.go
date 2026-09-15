@@ -4888,31 +4888,45 @@ func (self *TcpSequence) waitReturnRetransmitDrained() {
 	}
 }
 
-// A retransmission is a fresh packet at the retained sequence with the current
+// A retransmission is fresh packets at the retained sequence with the current
 // acknowledgement, window and timestamps, as the handshake retransmits its
-// SYN-ACK (see tcpReturnRetransmitState). The sequence mutex must be held.
-// The per-segment line lives here because this is where the segment is.
-func (self *TcpSequence) buildReturnRetransmitWithLock(segment *tcpReturnRetainedSegment) []byte {
-	flags := tcpFlagAck
-	if segment.fin {
-		flags |= tcpFlagFin
-	}
+// SYN-ACK, cut by the segment size packetization would use now: after the
+// source reports a smaller path mtu, a segment packetized before it goes as
+// consecutive pieces that each fit, where the whole would only be dropped
+// again (see tcpReturnRetransmitState). Appends to `packets`, which the caller
+// delivers outside the lock. The sequence mutex must be held. The per-segment
+// line lives here because this is where the segment is.
+func (self *TcpSequence) buildReturnRetransmitWithLock(packets [][]byte, segment *tcpReturnRetainedSegment) [][]byte {
 	var payload []byte
 	if segment.packet != nil {
 		payload = segment.packet[int(segment.payloadOffset) : int(segment.payloadOffset)+int(segment.payloadByteCount)]
 	}
+	pieceByteCount := self.dataPayloadByteCount(self.tcpBufferSettings.Mtu)
 	if self.log.V(1).Enabled() {
 		self.log.Infof(
-			"[rx]return retransmit %s seq=%d bytes=%d fin=%t n=%d rto=%s\n",
+			"[rx]return retransmit %s seq=%d bytes=%d pieces=%d fin=%t n=%d rto=%s\n",
 			segment.dueReason,
 			segment.seq,
 			segment.byteCount,
+			max(1, (len(payload)+pieceByteCount-1)/pieceByteCount),
 			segment.fin,
 			segment.retransmitCount,
 			time.Duration(self.returnRetransmit.rtoNanos),
 		)
 	}
-	return self.tcpPacket(flags, segment.seq, payload)
+	// a bare FIN is one empty piece
+	for i := 0; ; {
+		j := min(i+pieceByteCount, len(payload))
+		flags := tcpFlagAck
+		if segment.fin && j == len(payload) {
+			flags |= tcpFlagFin
+		}
+		packets = append(packets, self.tcpPacket(flags, segment.seq+uint32(i), payload[i:j]))
+		i = j
+		if len(payload) <= i {
+			return packets
+		}
+	}
 }
 
 // The worker: builds and sends what the acknowledgement path and the timer
@@ -6798,26 +6812,27 @@ func (self *ConnectionState) RstAck() ([]byte, error) {
 	return self.tcpPacket(tcpFlagAck|tcpFlagRst, self.receiveSeq, nil), nil
 }
 
-func (self *ConnectionState) DataPackets(payload []byte, n int, mtu int) ([][]byte, error) {
-	var ipHeaderByteCount int
-	switch self.ipVersion {
-	case 4:
-		ipHeaderByteCount = Ipv4HeaderSizeWithoutExtensions
-	case 6:
-		ipHeaderByteCount = Ipv6HeaderSize
-	}
-	headerByteCount := ipHeaderByteCount + TcpHeaderSizeWithoutExtensions
-	if self.enableTimestamp {
-		headerByteCount += tcpTimestampOptionByteCount
-	}
-
-	mtu = self.clampPathMtu(mtu)
-	packetByteCount := mtu - headerByteCount
+// The most payload one data segment toward the source carries: `mtu`, lowered
+// to a path mtu the source has reported, less the headers tcpPacket writes for
+// this flow's address family and negotiated options, and no more than the
+// source's mss less the same options. Packetization and retransmission both
+// cut by it, so a segment sent again after the path mtu shrank fits as a new
+// one does.
+func (self *ConnectionState) dataPayloadByteCount(mtu int) int {
+	headerByteCount := self.returnHeaderByteCount()
+	payloadByteCount := self.clampPathMtu(mtu) - headerByteCount
 	if self.peerMss != 0 {
-		optionByteCount := headerByteCount - ipHeaderByteCount - TcpHeaderSizeWithoutExtensions
-		packetByteCount = min(packetByteCount, int(self.peerMss)-optionByteCount)
+		optionByteCount := 0
+		if self.enableTimestamp {
+			optionByteCount = tcpTimestampOptionByteCount
+		}
+		payloadByteCount = min(payloadByteCount, int(self.peerMss)-optionByteCount)
 	}
-	packetByteCount = max(1, packetByteCount)
+	return max(1, payloadByteCount)
+}
+
+func (self *ConnectionState) DataPackets(payload []byte, n int, mtu int) ([][]byte, error) {
+	packetByteCount := self.dataPayloadByteCount(mtu)
 	if n <= packetByteCount {
 		// reuse the single-packet backing for the common unsegmented case
 		// (see singleDataPacket); the result is consumed before the next call

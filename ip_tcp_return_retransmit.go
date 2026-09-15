@@ -114,7 +114,8 @@ type tcpReturnRetainedSegment struct {
 // Cumulative counts of return-path retransmission across a NAT's TCP flows.
 // Read with `LocalUserNat.ReturnRetransmitStats` or the provider's.
 type ReturnRetransmitStats struct {
-	// segments sent again, and their sequence bytes
+	// packets sent again, each piece of a segment cut for a smaller path mtu
+	// counted, and the sequence bytes of the segments they carried
 	PacketCount int64
 	ByteCount   ByteCount
 	// retransmission timer expiries
@@ -173,6 +174,20 @@ func (self *returnRetransmitCounters) snapshot() ReturnRetransmitStats {
 // current acknowledgement, window and timestamps, exactly as the handshake
 // retransmits its SYN-ACK.
 //
+// A retransmission is cut by the segment size packetization would use at that
+// moment. After the source reports a smaller path mtu (fragmentation needed,
+// packet too big), a segment packetized before the report is larger than the
+// path carries, and sent again whole it would be dropped again on every
+// trigger until the bound; so a retained segment above the current size goes
+// as consecutive pieces, each within it. The ring still holds one record per
+// packetized segment and never splits one: its share, its counts and every
+// rule below stay per record, and the path that repairs loss never shifts the
+// ring or takes another share. The cost is granularity. An acknowledgement
+// that ends inside a record releases and samples nothing, a SACK block that
+// covers only some of its pieces marks none of them, and a record goes again
+// whole, so a piece the source already holds can go again, at most one
+// packetized segment's bytes per retransmission.
+//
 // Sent means delivered. A segment is retained when it is packetized, for the
 // cap, but it counts as sent only once the delivery drain has handed it to
 // the return path: retransmissions leave on their own goroutine and can
@@ -207,12 +222,15 @@ func (self *returnRetransmitCounters) snapshot() ReturnRetransmitStats {
 // (NewReno, RFC 6582), and not only the hole: a burst of consecutive segments
 // from the cumulative acknowledgement, one on the first partial
 // acknowledgement and doubling on each to a ceiling of 128, never past the
-// recovery point and never a segment this recovery already sent again. The
-// failure this path exists for is a receive socket out of memory, and the
-// kernel then prunes its out-of-order queue when the hole fills, so the
-// source holds nothing past it; one segment per partial acknowledgement
-// would take a round trip per purged segment where a real sender slow-starts
-// the go-back-N. Without SACK a burst may resend a segment the source held,
+// recovery point and never a segment this recovery already sent again. An
+// advance that ends inside a segment this recovery already sent again sends
+// nothing: it acknowledges one of the pieces the segment went in, the rest are
+// in flight, and the next hole is not known until they land. The failure this
+// path exists for is a receive socket out of memory, and the kernel then
+// prunes its out-of-order queue when the hole fills, so the source holds
+// nothing past it; one segment per partial acknowledgement would take a round
+// trip per purged segment where a real sender slow-starts the go-back-N.
+// Without SACK a burst may resend a segment the source held,
 // at most the ceiling per acknowledgement and each at most once per recovery.
 // The timer: max(200 ms, 2 x srtt, srtt + 4 rttvar) from the inner round
 // trip, one second before a sample exists, doubling on each expiry to an 8 s
@@ -740,6 +758,13 @@ func (self *tcpReturnRetransmitState) ackWithLock(
 		case tcpReturnRecoveryPhaseLoss:
 			if recovered {
 				self.recoveryPhase = tcpReturnRecoveryPhaseNone
+			} else if head := self.segmentAtWithLock(0); 0 < int32(ackNumber-head.seq) &&
+				0 < head.retransmitCount && self.recoveryStartNanos <= head.retransmitNanos {
+				// it ends inside a segment this recovery already sent
+				// again, as the acknowledgement of one of its pieces does:
+				// the rest are in flight, and a burst here would grow on
+				// each piece and resend what lies past them, which the
+				// source may hold
 			} else {
 				// a partial acknowledgement: the next hole starts at the
 				// new head, and waiting three more duplicates for it would
@@ -839,12 +864,13 @@ func (self *tcpReturnRetransmitState) timerWithLock(nowNanos int64) (abandon boo
 	return false, min(self.rtoDeadlineNanos, abandonNanos) - nowNanos
 }
 
-// Builds every due segment through `build` and records the send. The packets
-// are the caller's to deliver outside the lock.
+// Builds every due segment through `build`, which appends its packets, one or
+// more pieces, and records the send. The packets are the caller's to deliver
+// outside the lock.
 func (self *tcpReturnRetransmitState) takeDueWithLock(
 	packets [][]byte,
 	nowNanos int64,
-	build func(segment *tcpReturnRetainedSegment) []byte,
+	build func(packets [][]byte, segment *tcpReturnRetainedSegment) [][]byte,
 ) [][]byte {
 	for index := 0; 0 < self.dueCount && index < self.count; index += 1 {
 		segment := self.segmentAtWithLock(index)
@@ -855,14 +881,16 @@ func (self *tcpReturnRetransmitState) takeDueWithLock(
 		self.dueCount -= 1
 		segment.retransmitNanos = nowNanos
 		segment.retransmitCount += 1
-		self.retransmitPacketCount += 1
+		builtCount := len(packets)
+		packets = build(packets, segment)
+		builtCount = len(packets) - builtCount
+		self.retransmitPacketCount += int64(builtCount)
 		self.retransmitByteCount += int64(segment.byteCount)
 		self.reasonCounts[segment.dueReason] += 1
 		if self.counters != nil {
-			self.counters.packetCount.Add(1)
+			self.counters.packetCount.Add(int64(builtCount))
 			self.counters.byteCount.Add(int64(segment.byteCount))
 		}
-		packets = append(packets, build(segment))
 	}
 	return packets
 }

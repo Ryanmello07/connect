@@ -66,7 +66,9 @@ type tcpReturnTestSegment struct {
 	rst     bool
 	// the timestamp option, when the segment carried one
 	timestampValue uint32
-	at             time.Time
+	// the whole IP packet's length
+	packetByteCount int
+	at              time.Time
 }
 
 // The source device's TCP receiver, reduced to what the sequence can observe:
@@ -93,6 +95,10 @@ type tcpReturnTestSource struct {
 	stream     []byte
 	// out of order, by sequence, without overlap
 	ooo []tcpReturnTestSegment
+	// when positive, the path toward the source drops every packet longer
+	// than this before the kernel sees it, as a link whose mtu is below the
+	// sequence's does; the path mtu report is the test's to give
+	pathMtu int
 	// how many more deliveries of each sequence the kernel drops
 	dropCounts map[uint32]int
 	// how many deliveries of each sequence arrived, drops included
@@ -133,6 +139,10 @@ func (self *tcpReturnTestSource) receive(segment tcpReturnTestSegment) {
 			return
 		}
 		self.seenCounts[segment.seq] += 1
+		if 0 < self.pathMtu && self.pathMtu < segment.packetByteCount {
+			// too big for the path, so nothing answers it either
+			return
+		}
 		if 0 < self.dropCounts[segment.seq] {
 			// the kernel drop: TCP never sees it, so nothing answers it
 			self.dropCounts[segment.seq] -= 1
@@ -252,10 +262,7 @@ func (self *tcpReturnTestSource) buildAckWithLock(ackNumber uint32) ([]byte, par
 		optionByteCount += 2 + 2 + 8*len(blocks)
 	}
 	tcpHeaderByteCount := TcpHeaderSizeWithoutExtensions + optionByteCount
-	packet := MessagePoolGet(Ipv4HeaderSizeWithoutExtensions + tcpHeaderByteCount)
-	clear(packet)
-	packet[0] = 0x45
-	tcp := packet[Ipv4HeaderSizeWithoutExtensions:]
+	packet, tcp := self.harness.sourcePacket(tcpHeaderByteCount)
 	tcp[12] = byte(tcpHeaderByteCount/4) << 4
 	options := tcp[TcpHeaderSizeWithoutExtensions:tcpHeaderByteCount]
 	optionIndex := 0
@@ -402,6 +409,8 @@ func (self *tcpReturnTestSlowCloseConn) Close() error {
 
 // How one harness is built.
 type tcpReturnTestOptions struct {
+	// zero is 4
+	ipVersion  int
 	sack       bool
 	timestamps bool
 	// zero is the default well inside the sequence space
@@ -426,6 +435,7 @@ type tcpReturnRetransmitTestHarness struct {
 	source         *tcpReturnTestSource
 	transferSource TransferPath
 	counters       returnRetransmitCounters
+	ipVersion      int
 	initialSynSeq  uint32
 	// data starts after the SYN's sequence byte
 	dataSeq uint32
@@ -464,7 +474,14 @@ func newTcpReturnRetransmitTestHarness(t *testing.T, options tcpReturnTestOption
 			return sequenceConn, nil
 		},
 	}
+	ipVersion := options.ipVersion
+	if ipVersion == 0 {
+		ipVersion = 4
+	}
 	segmentByteCount := tcpReturnTestSegmentByteCount
+	if ipVersion == 6 {
+		segmentByteCount -= Ipv6HeaderSize - Ipv4HeaderSizeWithoutExtensions
+	}
 	if options.timestamps {
 		segmentByteCount -= tcpTimestampOptionByteCount
 	}
@@ -485,6 +502,7 @@ func newTcpReturnRetransmitTestHarness(t *testing.T, options tcpReturnTestOption
 		settings:         settings,
 		upstream:         upstreamSocket,
 		transferSource:   SourceId(NewId()),
+		ipVersion:        ipVersion,
 		initialSynSeq:    initialSynSeq,
 		dataSeq:          initialSynSeq + 1,
 		segmentByteCount: segmentByteCount,
@@ -529,6 +547,10 @@ func newTcpReturnRetransmitTestHarness(t *testing.T, options tcpReturnTestOption
 
 	sourceIp := net.IPv4(192, 0, 2, 10).To4()
 	destinationIp := net.IPv4(203, 0, 113, 7).To4()
+	if ipVersion == 6 {
+		sourceIp = net.ParseIP("2001:db8::10")
+		destinationIp = net.ParseIP("2001:db8::7")
+	}
 	harness.sequence = NewTcpSequence(
 		ctx,
 		func(
@@ -537,7 +559,11 @@ func newTcpReturnRetransmitTestHarness(t *testing.T, options tcpReturnTestOption
 			ipPath *IpPath,
 			packet []byte,
 		) {
-			_, packetSourceIp, packetDestinationIp, transport, ok := parseIpv4(packet)
+			parse := parseIpv4
+			if ipVersion == 6 {
+				parse = parseIpv6
+			}
+			_, packetSourceIp, packetDestinationIp, transport, ok := parse(packet)
 			if !ok {
 				return
 			}
@@ -557,17 +583,18 @@ func newTcpReturnRetransmitTestHarness(t *testing.T, options tcpReturnTestOption
 				return
 			}
 			harness.source.receive(tcpReturnTestSegment{
-				seq:            tcp.seq,
-				payload:        append([]byte(nil), tcp.payload...),
-				fin:            tcp.fin,
-				rst:            tcp.rst,
-				timestampValue: tcp.timestampValue,
-				at:             time.Now(),
+				seq:             tcp.seq,
+				payload:         append([]byte(nil), tcp.payload...),
+				fin:             tcp.fin,
+				rst:             tcp.rst,
+				timestampValue:  tcp.timestampValue,
+				packetByteCount: len(packet),
+				at:              time.Now(),
 			})
 		},
 		harness.transferSource,
 		protocol.ProvideMode_Network,
-		4,
+		ipVersion,
 		sourceIp,
 		40001,
 		destinationIp,
@@ -588,15 +615,13 @@ func newTcpReturnRetransmitTestHarness(t *testing.T, options tcpReturnTestOption
 		synOptions = append(synOptions, 1, 1, 8, 10, 0, 0, 0, 0, 0, 0, 0, 0)
 		binary.BigEndian.PutUint32(synOptions[8:12], 1)
 	}
-	synPacket := MessagePoolGet(Ipv4HeaderSizeWithoutExtensions + TcpHeaderSizeWithoutExtensions + len(synOptions))
-	clear(synPacket)
-	synPacket[0] = 0x45
-	copy(synPacket[Ipv4HeaderSizeWithoutExtensions+TcpHeaderSizeWithoutExtensions:], synOptions)
+	synPacket, synTcpHeader := harness.sourcePacket(TcpHeaderSizeWithoutExtensions + len(synOptions))
+	copy(synTcpHeader[TcpHeaderSizeWithoutExtensions:], synOptions)
 	synTcp := parsedTcp{
 		syn:        true,
 		seq:        initialSynSeq,
 		windowSize: 0xffff,
-		options:    synPacket[Ipv4HeaderSizeWithoutExtensions+TcpHeaderSizeWithoutExtensions:],
+		options:    synTcpHeader[TcpHeaderSizeWithoutExtensions:],
 	}
 	parseTcpOptions(&synTcp)
 	harness.sendFromSource(&synTcp, synPacket)
@@ -611,6 +636,22 @@ func newTcpReturnRetransmitTestHarness(t *testing.T, options tcpReturnTestOption
 
 	t.Cleanup(harness.close)
 	return harness
+}
+
+// A zeroed pooled packet from the source with room for `tcpByteCount` bytes of
+// TCP after this flow's IP header, and that TCP part. The sequence reads the
+// parsed fields beside it, so only the version and the length are real.
+func (self *tcpReturnRetransmitTestHarness) sourcePacket(tcpByteCount int) (packet []byte, tcp []byte) {
+	ipHeaderByteCount := Ipv4HeaderSizeWithoutExtensions
+	versionByte := byte(0x45)
+	if self.ipVersion == 6 {
+		ipHeaderByteCount = Ipv6HeaderSize
+		versionByte = 0x60
+	}
+	packet = MessagePoolGet(ipHeaderByteCount + tcpByteCount)
+	clear(packet)
+	packet[0] = versionByte
+	return packet, packet[ipHeaderByteCount:]
 }
 
 // The sequence number of the k-th full data segment, from zero.
@@ -644,9 +685,7 @@ func (self *tcpReturnRetransmitTestHarness) sendFromSource(tcp *parsedTcp, packe
 
 // Sends the source's reset.
 func (self *tcpReturnRetransmitTestHarness) sendRstFromSource() {
-	packet := MessagePoolGet(Ipv4HeaderSizeWithoutExtensions + TcpHeaderSizeWithoutExtensions)
-	clear(packet)
-	packet[0] = 0x45
+	packet, _ := self.sourcePacket(TcpHeaderSizeWithoutExtensions)
 	self.sendFromSource(&parsedTcp{
 		seq:       self.dataSeq,
 		ack:       true,
@@ -1493,6 +1532,161 @@ func TestTcpReturnRetransmitSackedSegmentsStayRetainedUntilCumulativeAck(t *test
 			t.Fatalf("retained after full acknowledgement: %d bytes in %d segments", retainedByteCount, retainedCount)
 		}
 	})
+}
+
+// The retransmitted pieces of one retained segment, as the source saw them:
+// every delivery after the first `originalCount`, which must all lie inside
+// the segment at `segmentIndex`.
+func tcpReturnTestRetransmittedPieces(
+	t *testing.T,
+	harness *tcpReturnRetransmitTestHarness,
+	originalCount int,
+	segmentIndex int,
+) []tcpReturnTestSegment {
+	t.Helper()
+	harness.source.stateLock.Lock()
+	defer harness.source.stateLock.Unlock()
+	start := harness.segmentSeq(segmentIndex)
+	pieces := append([]tcpReturnTestSegment(nil), harness.source.segments[originalCount:]...)
+	for _, piece := range pieces {
+		if offset := int(int32(piece.seq - start)); offset < 0 || harness.segmentByteCount <= offset {
+			t.Fatalf("a retransmission at %d lies outside segment %d at %d", piece.seq, segmentIndex, start)
+		}
+	}
+	return pieces
+}
+
+// Requires `pieces` to be the segment at `segmentIndex` cut as packetization
+// cuts at `pathMtu`: consecutive from its start, every piece but the last
+// exactly filling the path mtu, and together its exact bytes.
+func requireTcpReturnTestPiecesAtPathMtu(
+	t *testing.T,
+	harness *tcpReturnRetransmitTestHarness,
+	pieces []tcpReturnTestSegment,
+	payload []byte,
+	segmentIndex int,
+	pathMtu int,
+	timestamps bool,
+) {
+	t.Helper()
+	headerByteCount := Ipv4HeaderSizeWithoutExtensions + TcpHeaderSizeWithoutExtensions
+	if harness.ipVersion == 6 {
+		headerByteCount = Ipv6HeaderSize + TcpHeaderSizeWithoutExtensions
+	}
+	if timestamps {
+		headerByteCount += tcpTimestampOptionByteCount
+	}
+	pieceByteCount := pathMtu - headerByteCount
+	wantPieceCount := (harness.segmentByteCount + pieceByteCount - 1) / pieceByteCount
+	if len(pieces) != wantPieceCount {
+		t.Fatalf("segment %d sent again in %d packets, want %d pieces of at most %d bytes", segmentIndex, len(pieces), wantPieceCount, pieceByteCount)
+	}
+	var reassembled []byte
+	for pieceIndex, piece := range pieces {
+		if pathMtu < piece.packetByteCount {
+			t.Fatalf("piece %d is a %d byte packet, above the path mtu %d", pieceIndex, piece.packetByteCount, pathMtu)
+		}
+		if pieceIndex < len(pieces)-1 && piece.packetByteCount != pathMtu {
+			t.Fatalf("piece %d is a %d byte packet, want the path mtu %d exactly", pieceIndex, piece.packetByteCount, pathMtu)
+		}
+		if wantSeq := harness.segmentSeq(segmentIndex) + uint32(len(reassembled)); piece.seq != wantSeq {
+			t.Fatalf("piece %d at %d, want %d", pieceIndex, piece.seq, wantSeq)
+		}
+		if timestamps && piece.timestampValue == 0 {
+			t.Fatalf("piece %d carries no timestamp", pieceIndex)
+		}
+		reassembled = append(reassembled, piece.payload...)
+	}
+	segmentStart := segmentIndex * harness.segmentByteCount
+	if !bytes.Equal(reassembled, payload[segmentStart:segmentStart+harness.segmentByteCount]) {
+		t.Fatalf("pieces carry %d bytes, want segment %d's %d exact", len(reassembled), segmentIndex, harness.segmentByteCount)
+	}
+}
+
+// The source reports a smaller path mtu after a burst was packetized at the
+// configured one, and then drops a segment of that burst: the path drops
+// anything larger than it reported, so fast retransmit sends the segment as
+// consecutive pieces cut as packetization cuts now, for either address family
+// and with or without the timestamp option, and the source reassembles the
+// exact bytes. The acknowledgements of the first pieces end inside the
+// segment and send nothing more, since the rest are in flight. Sent whole, the
+// retransmission was dropped on every trigger until the bound reset the flow.
+func TestTcpReturnRetransmitCutsARetransmissionToTheReportedPathMtu(t *testing.T) {
+	const segmentCount = 4
+	for _, c := range []struct {
+		ipVersion  int
+		timestamps bool
+		pathMtu    int
+	}{
+		// the family floors: three pieces for IPv4, the last short, and two
+		// for IPv6
+		{ipVersion: 4, timestamps: false, pathMtu: ipv4MinimumPathMtu},
+		{ipVersion: 4, timestamps: true, pathMtu: ipv4MinimumPathMtu},
+		{ipVersion: 6, timestamps: false, pathMtu: ipv6MinimumPathMtu},
+		{ipVersion: 6, timestamps: true, pathMtu: ipv6MinimumPathMtu},
+	} {
+		runTcpReturnRetransmitTest(t, func(t *testing.T) {
+			harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{
+				ipVersion:  c.ipVersion,
+				timestamps: c.timestamps,
+			})
+			harness.source.dropCounts[harness.segmentSeq(1)] = 1
+			// acknowledgements go one at a time below, with the worker run
+			// between them as it runs between arrivals
+			harness.source.holdAcks = true
+			start := time.Now()
+			payload := harness.payload(segmentCount)
+			harness.write(payload)
+			synctest.Wait()
+			if original := harness.source.deliveries(harness.segmentSeq(1))[0]; original.packetByteCount != tcpReturnTestMtu {
+				t.Fatalf("IPv%d: the original is a %d byte packet, want the configured mtu %d", c.ipVersion, original.packetByteCount, tcpReturnTestMtu)
+			}
+
+			harness.source.stateLock.Lock()
+			harness.source.pathMtu = c.pathMtu
+			harness.source.stateLock.Unlock()
+			harness.sequence.applyPathMtu(c.pathMtu)
+
+			harness.source.sendAck(harness.segmentSeq(1))
+			for range returnRetransmitDupAckThreshold {
+				harness.source.sendDuplicateAck()
+			}
+			synctest.Wait()
+
+			pieces := tcpReturnTestRetransmittedPieces(t, harness, segmentCount, 1)
+			requireTcpReturnTestPiecesAtPathMtu(t, harness, pieces, payload, 1, c.pathMtu, c.timestamps)
+			for _, piece := range pieces {
+				if !piece.at.Equal(start) {
+					t.Fatalf("IPv%d: piece at +%s, want at once on the duplicates", c.ipVersion, piece.at.Sub(start))
+				}
+			}
+			ackNumber := harness.segmentSeq(1)
+			for _, piece := range pieces[:len(pieces)-1] {
+				ackNumber += uint32(len(piece.payload))
+				harness.source.sendAck(ackNumber)
+				synctest.Wait()
+			}
+			// the last piece fills the hole, and the source held the rest
+			harness.source.sendAck(harness.segmentSeq(segmentCount))
+			synctest.Wait()
+
+			harness.requireStream(payload)
+			if got := tcpReturnTestRetransmittedPieces(t, harness, segmentCount, 1); len(got) != len(pieces) {
+				t.Fatalf("IPv%d: %d packets sent again after the pieces were acknowledged, want none", c.ipVersion, len(got)-len(pieces))
+			}
+			retainedByteCount, retainedCount, packetCount, reasonCounts := harness.retransmitState()
+			if retainedByteCount != 0 || retainedCount != 0 {
+				t.Fatalf("IPv%d: retained after full acknowledgement: %d bytes in %d segments", c.ipVersion, retainedByteCount, retainedCount)
+			}
+			if packetCount != int64(len(pieces)) || reasonCounts[tcpReturnRetransmitReasonDupAck] != 1 ||
+				reasonCounts[tcpReturnRetransmitReasonPartialAck] != 0 {
+				t.Fatalf("IPv%d: retransmissions=%d reasons=%v, want the segment once on duplicates, in %d pieces", c.ipVersion, packetCount, reasonCounts, len(pieces))
+			}
+			if stats := harness.counters.snapshot(); stats.PacketCount != int64(len(pieces)) || stats.ByteCount != ByteCount(harness.segmentByteCount) {
+				t.Fatalf("IPv%d: stats=%+v, want %d packets carrying one segment", c.ipVersion, stats, len(pieces))
+			}
+		})
+	}
 }
 
 // (g) Ownership across loss, selective acknowledgement, the FIN and the
