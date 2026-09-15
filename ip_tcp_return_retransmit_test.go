@@ -1761,6 +1761,63 @@ func (self *tcpReturnRetransmitTestHarness) requireSegmentsSentAgain(
 	return
 }
 
+// Recovery without SACK cannot see what the source holds past a hole, so its
+// bursts are bounded by what the acknowledgements have shown lost: the run
+// from the cumulative acknowledgement grows by one segment for each
+// retransmission an acknowledgement covers, which doubles it every round trip,
+// and starts again at the head alone as soon as an acknowledgement covers data
+// the source held. Holes spread through a flight then cost exactly one
+// retransmission each, and a run of losses costs at most the run again in
+// segments the source held past it. Bursts that doubled on every partial
+// acknowledgement reached the ceiling within two round trips and sent back
+// whatever lay past the loss, which the source answered with duplicate
+// acknowledgements of its own.
+func TestTcpReturnRetransmitBurstsStopAtDataTheSourceHeld(t *testing.T) {
+	const segmentCount = 40
+	for _, c := range []struct {
+		name  string
+		drops []int
+		// segments the source held that recovery may send again
+		maxHeldSentAgain int
+	}{
+		{name: "holes spread through the flight", drops: []int{1, 10, 20, 30}, maxHeldSentAgain: 0},
+		{name: "a run of losses", drops: []int{1, 2, 3, 4, 5, 6, 7, 8}, maxHeldSentAgain: 8},
+	} {
+		runTcpReturnRetransmitTest(t, func(t *testing.T) {
+			t.Logf("%s", c.name)
+			harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{
+				ackDelay: tcpReturnTestStepRoundTrip,
+				stepAcks: true,
+			})
+			lost := map[int]bool{}
+			for _, segmentIndex := range c.drops {
+				harness.source.dropCounts[harness.segmentSeq(segmentIndex)] = 1
+				lost[segmentIndex] = true
+			}
+			payload := harness.payload(segmentCount)
+			harness.writeSegments(payload, 0, segmentCount)
+			// every acknowledgement of the flight, and the recovery after it
+			for range 16 {
+				harness.stepAcks(tcpReturnTestStepRoundTrip)
+			}
+
+			harness.requireStream(payload)
+			lostSentAgain, heldSentAgain := harness.requireSegmentsSentAgain(segmentCount, lost)
+			_, _, packetCount, reasonCounts := harness.retransmitState()
+			t.Logf("%s: retransmissions=%d reasons=%v, %d of them segments the source held", c.name, packetCount, reasonCounts, heldSentAgain)
+			if lostSentAgain != 0 {
+				t.Fatalf("%s: %d lost segments were sent again more than once", c.name, lostSentAgain)
+			}
+			if c.maxHeldSentAgain < heldSentAgain {
+				t.Fatalf("%s: %d segments the source held were sent again, for %d lost", c.name, heldSentAgain, len(c.drops))
+			}
+			if stats := harness.counters.snapshot(); stats.TimeoutCount != 0 {
+				t.Fatalf("%s: stats=%+v, want every repair on duplicate or partial acknowledgements", c.name, stats)
+			}
+		})
+	}
+}
+
 // A run of segments the source's kernel drops with data still flowing behind
 // it. Recovery sends a few segments the source held past the run, and the
 // source's kernel answers every one of them with a duplicate acknowledgement.
@@ -1817,7 +1874,7 @@ func TestTcpReturnRetransmitDuplicatesOfItsOwnRetransmissionsDoNotStartARecovery
 		if lostSentAgain != 0 {
 			t.Fatalf("%d lost segments were sent again more than once", lostSentAgain)
 		}
-		if returnRetransmitMaxBurstSegmentCount < heldSentAgain {
+		if maxHeldSentAgain := 4 * (lostEnd - lostStart); maxHeldSentAgain < heldSentAgain {
 			t.Fatalf("%d segments the source held were sent again, for %d lost", heldSentAgain, lostEnd-lostStart)
 		}
 		if stats := harness.counters.snapshot(); stats.TimeoutCount != 0 {
