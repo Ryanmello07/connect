@@ -108,6 +108,10 @@ type TransferCarrierProperties struct {
 	// route-wide meaning of Unreliable. The callback must be safe for concurrent
 	// use and must not block.
 	unreliableForMessageByteCount func(transferFrameByteCount int) bool
+	// receiveObserver samples the queue delay of the frames read on this
+	// receive route (see transport_h1_observer.go). It is local to the carrier
+	// that publishes it and never serialized. Nil observes nothing.
+	receiveObserver *h1RouteObserver
 }
 
 func (self TransferCarrierProperties) messageUnreliable(
@@ -332,6 +336,8 @@ type TransportMultiRouteReader interface {
 type transferReceiveDisposition struct {
 	transportType TransportType
 	reliability   CarrierReliability
+	// the exact route's receive observer, or nil
+	observer *h1RouteObserver
 }
 
 type transferCarrierMultiRouteReader interface {
@@ -1857,9 +1863,11 @@ func (self *routeSnapshot) transportType(route Route) TransportType {
 }
 
 func (self *routeSnapshot) receiveDisposition(route Route) transferReceiveDisposition {
+	properties := self.routeCarrierProperties[route]
 	return transferReceiveDisposition{
 		transportType: self.transportType(route),
-		reliability:   self.routeCarrierProperties[route].ReceiveReliability,
+		reliability:   properties.ReceiveReliability,
+		observer:      properties.receiveObserver,
 	}
 }
 

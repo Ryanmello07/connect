@@ -4140,6 +4140,7 @@ func (self *Client) run() {
 		var transferFrameBytes []byte
 		var transportType TransportType
 		var carrierReliability CarrierReliability
+		var receiveObserver *h1RouteObserver
 		var err error
 		c := func() error {
 			if carrierReader, ok := multiRouteReader.(transferCarrierMultiRouteReader); ok {
@@ -4150,16 +4151,19 @@ func (self *Client) run() {
 				)
 				transportType = disposition.transportType
 				carrierReliability = disposition.reliability
+				receiveObserver = disposition.observer
 			} else if transportReader, ok := multiRouteReader.(TransportMultiRouteReader); ok {
 				transferFrameBytes, transportType, err = transportReader.ReadWithTransport(
 					self.ctx,
 					self.settings.ReadTimeout,
 				)
 				carrierReliability = CarrierReliabilityUnknown
+				receiveObserver = nil
 			} else {
 				transferFrameBytes, err = multiRouteReader.Read(self.ctx, self.settings.ReadTimeout)
 				transportType = TransportTypeUnknown
 				carrierReliability = CarrierReliabilityUnknown
+				receiveObserver = nil
 			}
 			return err
 		}
@@ -4173,6 +4177,14 @@ func (self *Client) run() {
 		}
 		if err != nil {
 			continue
+		}
+		// A route that publishes a receive observer samples one frame in
+		// PackSampleEvery; only a sampled frame reads the clock, and the time is
+		// taken before decode so the queue delay excludes this loop's own work.
+		observerSampled := receiveObserver != nil && receiveObserver.sampleNext()
+		var observerReadTime time.Time
+		if observerSampled {
+			observerReadTime = time.Now()
 		}
 
 		// at this point, the route is expected to have already parsed the transfer frame
@@ -4394,6 +4406,10 @@ func (self *Client) run() {
 			}
 
 			if ack != nil {
+				if observerSampled && ack.Tag != nil {
+					// the tag echoes this client's own send time
+					receiveObserver.observeAck(ack.Tag.SendTime, observerReadTime)
+				}
 				c := func() bool {
 					defer MessagePoolReturn(transferFrameBytes)
 					receiveAck, err := receiveAckMessageFromProtocol(ack)
@@ -4433,6 +4449,10 @@ func (self *Client) run() {
 					inboundDecodedTransferFrames.put(decodedFrame)
 					MessagePoolReturn(transferFrameBytes)
 					continue
+				}
+				if observerSampled && pack.Tag != nil {
+					// the tag is the sender's clock at pack build, kept on resends
+					receiveObserver.observePack(path.SourceId, pack.Tag.SendTime, observerReadTime)
 				}
 				// Optimistic EC apply: deliver EncryptedControl frames straight to
 				// the per-peer session from the receive loop, bypassing the in-order

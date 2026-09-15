@@ -140,6 +140,7 @@ type H1PathRerollSettings struct {
 	// kernel unsent bytes at or above this make a send-side tick backlogged
 	SendBacklogByteCount ByteCount
 	// the queue delay baseline is the minimum over BaselineBucketCount buckets
+	// (at most 16)
 	BaselineBucketDuration time.Duration
 	BaselineBucketCount    int
 	// the ack echo round trip is the minimum over this window
