@@ -1158,17 +1158,33 @@ func TestTcpReturnRetransmitDuplicatesBeforeTheirBatchIsMarkedFastRetransmit(t *
 // (b) Two separated segments dropped, with SACK: the third duplicate
 // acknowledgement's blocks reveal both holes and only the holes are sent, at
 // once, with no cumulative-progress round between them and nothing
-// retransmitted on the duplicate acknowledgements that follow.
+// retransmitted on the duplicate acknowledgements that follow. The
+// acknowledgements are held and sent by hand, in the order the source's
+// arrivals cause them, for the reason
+// TestTcpReturnRetransmitPartialAckFillsTheNextHole gives.
 func TestTcpReturnRetransmitSackRetransmitsOnlyTheHoles(t *testing.T) {
 	for _, initialSynSeq := range tcpReturnTestInitialSynSeqs(tcpReturnTestOptions{}, 1, 2, 3, 5) {
 		runTcpReturnRetransmitTest(t, func(t *testing.T) {
 			t.Logf("initial sequence %d", initialSynSeq)
 			harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{initialSynSeq: initialSynSeq, sack: true})
+			harness.source.holdAcks = true
 			harness.source.dropCounts[harness.segmentSeq(1)] = 1
 			harness.source.dropCounts[harness.segmentSeq(3)] = 1
 
 			payload := harness.payload(8)
 			harness.write(payload)
+			synctest.Wait()
+
+			// the first segment, then the five that arrived out of order
+			harness.source.sendAck(harness.segmentSeq(1))
+			for range 5 {
+				harness.source.sendDuplicateAck()
+			}
+			synctest.Wait()
+			harness.requireSeenCount(1, 2)
+			harness.requireSeenCount(3, 2)
+			// the holes are filled, so the acknowledgement covers the flight
+			harness.source.ackNow()
 			synctest.Wait()
 
 			harness.requireStream(payload)
