@@ -24,11 +24,10 @@ import (
 )
 
 const (
-	tcpReturnTestInitialSynSeq = uint32(1000)
-	// data starts after the SYN's sequence byte
-	tcpReturnTestDataSeq = tcpReturnTestInitialSynSeq + 1
-	tcpReturnTestMtu     = 1500
-	// one segment: the mtu less the IPv4 and option-free TCP headers
+	tcpReturnTestDefaultInitialSynSeq = uint32(1000)
+	tcpReturnTestMtu                  = 1500
+	// one segment: the mtu less the IPv4 and option-free TCP headers; a
+	// timestamp-negotiated flow carries twelve fewer payload bytes
 	tcpReturnTestSegmentByteCount = tcpReturnTestMtu - Ipv4HeaderSizeWithoutExtensions - TcpHeaderSizeWithoutExtensions
 	tcpReturnTestWindowScale      = uint32(4)
 	// the largest window the literal field can carry at that scale
@@ -44,16 +43,11 @@ func runTcpReturnRetransmitTest(t *testing.T, test func(t *testing.T)) {
 	synctest.Test(t, test)
 }
 
-// The sequence number of the k-th data segment, from zero.
-func tcpReturnTestSegmentSeq(segmentIndex int) uint32 {
-	return tcpReturnTestDataSeq + uint32(segmentIndex*tcpReturnTestSegmentByteCount)
-}
-
 // A deterministic payload of whole segments whose bytes identify their offset.
-func tcpReturnTestPayload(segmentCount int) []byte {
-	payload := make([]byte, segmentCount*tcpReturnTestSegmentByteCount)
+func tcpReturnTestPayload(segmentCount int, segmentByteCount int) []byte {
+	payload := make([]byte, segmentCount*segmentByteCount)
 	for index := range payload {
-		payload[index] = byte(index*7 + index/tcpReturnTestSegmentByteCount)
+		payload[index] = byte(index*7 + index/segmentByteCount)
 	}
 	return payload
 }
@@ -64,16 +58,19 @@ type tcpReturnTestSegment struct {
 	payload []byte
 	fin     bool
 	rst     bool
-	at      time.Time
+	// the timestamp option, when the segment carried one
+	timestampValue uint32
+	at             time.Time
 }
 
 // The source device's TCP receiver, reduced to what the sequence can observe:
 // in-order reassembly, out-of-order queueing, cumulative acknowledgements
-// with optional SACK blocks, and a drop policy standing in for the kernel's
-// receive-socket drop, which produces no acknowledgement at all.
+// with optional SACK blocks and timestamps, and a drop policy standing in for
+// the kernel's receive-socket drop, which produces no acknowledgement at all.
 type tcpReturnTestSource struct {
-	harness *tcpReturnRetransmitTestHarness
-	sack    bool
+	harness    *tcpReturnRetransmitTestHarness
+	sack       bool
+	timestamps bool
 
 	stateLock sync.Mutex
 	// while held, nothing is acknowledged; released by ackNow
@@ -91,14 +88,18 @@ type tcpReturnTestSource struct {
 	finReceived bool
 	rstReceived bool
 	rstAt       time.Time
-	// the last cumulative acknowledgement sent
+	// the last cumulative acknowledgement sent, and how many were sent
 	lastAckNumber uint32
+	ackCount      int
 	// the most sequence bytes the source ever held past its last
 	// acknowledgement, which is what the retention cap bounds
 	maxOutstandingByteCount int64
 	// a receiver that discards its out-of-order queue on the next in-order
-	// arrival, to renege on what it selectively acknowledged
+	// arrival, to renege on what it selectively acknowledged, or as a kernel
+	// prunes its queue on the hole fill
 	renegeOnce bool
+	// RFC 7323 TS.Recent: the value echoed in acknowledgements
+	timestampRecent uint32
 }
 
 func (self *tcpReturnTestSource) receive(segment tcpReturnTestSegment) {
@@ -120,8 +121,14 @@ func (self *tcpReturnTestSource) receive(segment tcpReturnTestSegment) {
 			self.dropCounts[segment.seq] -= 1
 			return
 		}
+		if self.timestamps && int32(segment.seq-self.rcvNxt) <= 0 &&
+			0 <= int32(segment.timestampValue-self.timestampRecent) {
+			// RFC 7323 §4.3: an in-order or older segment with a newer
+			// value updates the echo
+			self.timestampRecent = segment.timestampValue
+		}
 		if self.renegeOnce && 0 < len(self.ooo) && 0 <= int32(self.rcvNxt-segment.seq) {
-			// the hole is filled and what was reported beyond it is gone
+			// the hole is filled and what was queued beyond it is gone
 			self.renegeOnce = false
 			self.ooo = nil
 		}
@@ -136,7 +143,7 @@ func (self *tcpReturnTestSource) receive(segment tcpReturnTestSegment) {
 		if self.holdAcks {
 			return
 		}
-		ackPacket, ackTcp = self.buildAckWithLock()
+		ackPacket, ackTcp = self.buildAckWithLock(self.rcvNxt, 0)
 	}()
 	if ackPacket != nil {
 		self.harness.sendFromSource(&ackTcp, ackPacket)
@@ -186,9 +193,10 @@ func (self *tcpReturnTestSource) accept(segment tcpReturnTestSegment) {
 	}
 }
 
-// Builds one pure acknowledgement at the current frontier, with SACK blocks
-// for the out-of-order runs when negotiated. The lock must be held.
-func (self *tcpReturnTestSource) buildAckWithLock() ([]byte, parsedTcp) {
+// Builds one pure acknowledgement at `ackNumber`, with SACK blocks for the
+// out-of-order runs when negotiated, a timestamp when negotiated, and the
+// window grown by `windowDelta` scaled units. The lock must be held.
+func (self *tcpReturnTestSource) buildAckWithLock(ackNumber uint32, windowDelta uint16) ([]byte, parsedTcp) {
 	var blocks []tcpSackBlock
 	if self.sack {
 		for _, queued := range self.ooo {
@@ -207,9 +215,12 @@ func (self *tcpReturnTestSource) buildAckWithLock() ([]byte, parsedTcp) {
 		}
 	}
 	optionByteCount := 0
+	if self.timestamps {
+		optionByteCount += tcpTimestampOptionByteCount
+	}
 	if 0 < len(blocks) {
 		// two NOPs then the SACK option, a multiple of four
-		optionByteCount = 2 + 2 + 8*len(blocks)
+		optionByteCount += 2 + 2 + 8*len(blocks)
 	}
 	tcpHeaderByteCount := TcpHeaderSizeWithoutExtensions + optionByteCount
 	packet := MessagePoolGet(Ipv4HeaderSizeWithoutExtensions + tcpHeaderByteCount)
@@ -218,22 +229,33 @@ func (self *tcpReturnTestSource) buildAckWithLock() ([]byte, parsedTcp) {
 	tcp := packet[Ipv4HeaderSizeWithoutExtensions:]
 	tcp[12] = byte(tcpHeaderByteCount/4) << 4
 	options := tcp[TcpHeaderSizeWithoutExtensions:tcpHeaderByteCount]
-	if 0 < len(blocks) {
+	optionIndex := 0
+	if self.timestamps {
 		options[0] = 1
 		options[1] = 1
-		options[2] = 5
-		options[3] = byte(2 + 8*len(blocks))
+		options[2] = 8
+		options[3] = 10
+		binary.BigEndian.PutUint32(options[4:8], uint32(time.Since(tcpTimestampEpoch)/time.Millisecond)+1)
+		binary.BigEndian.PutUint32(options[8:12], self.timestampRecent)
+		optionIndex = tcpTimestampOptionByteCount
+	}
+	if 0 < len(blocks) {
+		options[optionIndex] = 1
+		options[optionIndex+1] = 1
+		options[optionIndex+2] = 5
+		options[optionIndex+3] = byte(2 + 8*len(blocks))
 		for blockIndex, block := range blocks {
-			binary.BigEndian.PutUint32(options[4+8*blockIndex:], block.start)
-			binary.BigEndian.PutUint32(options[8+8*blockIndex:], block.end)
+			binary.BigEndian.PutUint32(options[optionIndex+4+8*blockIndex:], block.start)
+			binary.BigEndian.PutUint32(options[optionIndex+8+8*blockIndex:], block.end)
 		}
 	}
-	self.lastAckNumber = self.rcvNxt
+	self.lastAckNumber = ackNumber
+	self.ackCount += 1
 	parsed := parsedTcp{
-		seq:        tcpReturnTestDataSeq,
+		seq:        self.harness.dataSeq,
 		ack:        true,
-		ackNumber:  self.rcvNxt,
-		windowSize: uint16(tcpReturnTestWindowByteCount >> tcpReturnTestWindowScale),
+		ackNumber:  ackNumber,
+		windowSize: uint16(tcpReturnTestWindowByteCount>>tcpReturnTestWindowScale) - 64 + windowDelta,
 		options:    options,
 	}
 	parseTcpOptions(&parsed)
@@ -248,7 +270,66 @@ func (self *tcpReturnTestSource) ackNow() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
 		self.holdAcks = false
-		ackPacket, ackTcp = self.buildAckWithLock()
+		ackPacket, ackTcp = self.buildAckWithLock(self.rcvNxt, 0)
+	}()
+	self.harness.sendFromSource(&ackTcp, ackPacket)
+}
+
+// Releases held acknowledgements one segment boundary at a time, as a
+// receiver whose acknowledgements were merely delayed answers.
+func (self *tcpReturnTestSource) ackHeldPerSegment() {
+	var boundaries []uint32
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		self.holdAcks = false
+		for _, segment := range self.segments {
+			end := segment.seq + uint32(len(segment.payload))
+			if segment.fin {
+				end += 1
+			}
+			if segment.rst || 0 < int32(end-self.rcvNxt) || int32(end-self.lastAckNumber) <= 0 {
+				continue
+			}
+			if 0 < len(boundaries) && boundaries[len(boundaries)-1] == end {
+				continue
+			}
+			boundaries = append(boundaries, end)
+		}
+	}()
+	for _, boundary := range boundaries {
+		var ackPacket []byte
+		var ackTcp parsedTcp
+		func() {
+			self.stateLock.Lock()
+			defer self.stateLock.Unlock()
+			ackPacket, ackTcp = self.buildAckWithLock(boundary, 0)
+		}()
+		self.harness.sendFromSource(&ackTcp, ackPacket)
+	}
+}
+
+// Sends one pure acknowledgement at the current frontier whose only news is
+// a larger window.
+func (self *tcpReturnTestSource) sendWindowUpdate(windowDelta uint16) {
+	var ackPacket []byte
+	var ackTcp parsedTcp
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		ackPacket, ackTcp = self.buildAckWithLock(self.rcvNxt, windowDelta)
+	}()
+	self.harness.sendFromSource(&ackTcp, ackPacket)
+}
+
+// Sends one duplicate of the last acknowledgement.
+func (self *tcpReturnTestSource) sendDuplicateAck() {
+	var ackPacket []byte
+	var ackTcp parsedTcp
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		ackPacket, ackTcp = self.buildAckWithLock(self.lastAckNumber, 0)
 	}()
 	self.harness.sendFromSource(&ackTcp, ackPacket)
 }
@@ -259,15 +340,24 @@ func (self *tcpReturnTestSource) seenCount(seq uint32) int {
 	return self.seenCounts[seq]
 }
 
-// Delivery times of every segment at one sequence, in order.
-func (self *tcpReturnTestSource) deliveryTimes(seq uint32) []time.Time {
+// Every delivery at one sequence, in order.
+func (self *tcpReturnTestSource) deliveries(seq uint32) []tcpReturnTestSegment {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	var times []time.Time
+	var deliveries []tcpReturnTestSegment
 	for _, segment := range self.segments {
 		if segment.seq == seq && !segment.rst {
-			times = append(times, segment.at)
+			deliveries = append(deliveries, segment)
 		}
+	}
+	return deliveries
+}
+
+// Delivery times of every segment at one sequence, in order.
+func (self *tcpReturnTestSource) deliveryTimes(seq uint32) []time.Time {
+	var times []time.Time
+	for _, segment := range self.deliveries(seq) {
+		times = append(times, segment.at)
 	}
 	return times
 }
@@ -276,6 +366,35 @@ func (self *tcpReturnTestSource) streamCopy() []byte {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	return append([]byte(nil), self.stream...)
+}
+
+func (self *tcpReturnTestSource) sentAckCount() int {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.ackCount
+}
+
+// An upstream whose Close takes time, as a real socket's can, so the
+// goroutine closing it yields to whatever its earlier defers woke.
+type tcpReturnTestSlowCloseConn struct {
+	net.Conn
+	closeDelay time.Duration
+}
+
+func (self *tcpReturnTestSlowCloseConn) Close() error {
+	time.Sleep(self.closeDelay)
+	return self.Conn.Close()
+}
+
+// How one harness is built.
+type tcpReturnTestOptions struct {
+	sack       bool
+	timestamps bool
+	// zero is the default well inside the sequence space
+	initialSynSeq uint32
+	// how long the sequence's Close of its upstream takes
+	upstreamCloseDelay time.Duration
+	configure          func(*TcpBufferSettings)
 }
 
 // Runs one TCP user-NAT sequence against an in-memory upstream, with the
@@ -290,23 +409,28 @@ type tcpReturnRetransmitTestHarness struct {
 	source         *tcpReturnTestSource
 	transferSource TransferPath
 	counters       returnRetransmitCounters
-	synAckReceived chan struct{}
-	runDone        chan struct{}
-	poolTaken      uint64
-	poolReturned   uint64
-	violations     uint64
-	closeOnce      sync.Once
+	initialSynSeq  uint32
+	// data starts after the SYN's sequence byte
+	dataSeq uint32
+	// payload bytes per full segment on this flow
+	segmentByteCount int
+	synAckReceived   chan struct{}
+	runDone          chan struct{}
+	poolTaken        uint64
+	poolReturned     uint64
+	violations       uint64
+	closeOnce        sync.Once
 }
 
-func newTcpReturnRetransmitTestHarness(
-	t *testing.T,
-	sack bool,
-	configure func(*TcpBufferSettings),
-) *tcpReturnRetransmitTestHarness {
+func newTcpReturnRetransmitTestHarness(t *testing.T, options tcpReturnTestOptions) *tcpReturnRetransmitTestHarness {
 	t.Helper()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	sequenceSocket, upstreamSocket := net.Pipe()
+	var sequenceConn net.Conn = sequenceSocket
+	if 0 < options.upstreamCloseDelay {
+		sequenceConn = &tcpReturnTestSlowCloseConn{Conn: sequenceSocket, closeDelay: options.upstreamCloseDelay}
+	}
 	settings := DefaultTcpBufferSettingsWithBufferSize(8)
 	// far beyond every virtual clock the tests run, so only the bound under
 	// test can end a flow
@@ -316,38 +440,50 @@ func newTcpReturnRetransmitTestHarness(
 	settings.AckCompressTimeout = 0
 	settings.WriteBatchSize = 4
 	settings.Mtu = tcpReturnTestMtu
-	// one socket read is eight segments
-	settings.ReadBufferByteCount = 8 * tcpReturnTestSegmentByteCount
 	settings.DialContextSettings = &DialContextSettings{
 		DialContext: func(dialCtx context.Context, network string, addr string) (net.Conn, error) {
-			return sequenceSocket, nil
+			return sequenceConn, nil
 		},
 	}
-	if configure != nil {
-		configure(settings)
+	segmentByteCount := tcpReturnTestSegmentByteCount
+	if options.timestamps {
+		segmentByteCount -= tcpTimestampOptionByteCount
+	}
+	// one socket read is eight segments
+	settings.ReadBufferByteCount = 8 * segmentByteCount
+	if options.configure != nil {
+		options.configure(settings)
+	}
+	initialSynSeq := options.initialSynSeq
+	if initialSynSeq == 0 {
+		initialSynSeq = tcpReturnTestDefaultInitialSynSeq
 	}
 
 	poolTaken, poolReturned, _ := MessagePoolCounts()
 	harness := &tcpReturnRetransmitTestHarness{
-		t:              t,
-		cancel:         cancel,
-		settings:       settings,
-		upstream:       upstreamSocket,
-		transferSource: SourceId(NewId()),
-		synAckReceived: make(chan struct{}, 1),
-		runDone:        make(chan struct{}),
-		poolTaken:      poolTaken,
-		poolReturned:   poolReturned,
-		violations:     MessagePoolViolationCount(),
+		t:                t,
+		cancel:           cancel,
+		settings:         settings,
+		upstream:         upstreamSocket,
+		transferSource:   SourceId(NewId()),
+		initialSynSeq:    initialSynSeq,
+		dataSeq:          initialSynSeq + 1,
+		segmentByteCount: segmentByteCount,
+		synAckReceived:   make(chan struct{}, 1),
+		runDone:          make(chan struct{}),
+		poolTaken:        poolTaken,
+		poolReturned:     poolReturned,
+		violations:       MessagePoolViolationCount(),
 	}
 	harness.source = &tcpReturnTestSource{
-		harness:    harness,
-		sack:       sack,
-		rcvNxt:     tcpReturnTestDataSeq,
-		dropCounts: map[uint32]int{},
-		seenCounts: map[uint32]int{},
+		harness:       harness,
+		sack:          options.sack,
+		timestamps:    options.timestamps,
+		rcvNxt:        harness.dataSeq,
+		lastAckNumber: harness.dataSeq,
+		dropCounts:    map[uint32]int{},
+		seenCounts:    map[uint32]int{},
 	}
-	harness.source.lastAckNumber = tcpReturnTestDataSeq
 
 	sourceIp := net.IPv4(192, 0, 2, 10).To4()
 	destinationIp := net.IPv4(203, 0, 113, 7).To4()
@@ -379,11 +515,12 @@ func newTcpReturnRetransmitTestHarness(
 				return
 			}
 			harness.source.receive(tcpReturnTestSegment{
-				seq:     tcp.seq,
-				payload: append([]byte(nil), tcp.payload...),
-				fin:     tcp.fin,
-				rst:     tcp.rst,
-				at:      time.Now(),
+				seq:            tcp.seq,
+				payload:        append([]byte(nil), tcp.payload...),
+				fin:            tcp.fin,
+				rst:            tcp.rst,
+				timestampValue: tcp.timestampValue,
+				at:             time.Now(),
 			})
 		},
 		harness.transferSource,
@@ -393,7 +530,7 @@ func newTcpReturnRetransmitTestHarness(
 		40001,
 		destinationIp,
 		443,
-		tcpReturnTestInitialSynSeq,
+		initialSynSeq,
 		settings,
 	)
 	harness.sequence.returnRetransmit.counters = &harness.counters
@@ -403,15 +540,19 @@ func newTcpReturnRetransmitTestHarness(
 	}()
 
 	// the SYN negotiates a window scale so the source can advertise a window
-	// larger than the retention cap under test
+	// larger than the retention cap under test, and timestamps when asked
 	synOptions := []byte{3, 3, byte(tcpReturnTestWindowScale), 1}
+	if options.timestamps {
+		synOptions = append(synOptions, 1, 1, 8, 10, 0, 0, 0, 0, 0, 0, 0, 0)
+		binary.BigEndian.PutUint32(synOptions[8:12], 1)
+	}
 	synPacket := MessagePoolGet(Ipv4HeaderSizeWithoutExtensions + TcpHeaderSizeWithoutExtensions + len(synOptions))
 	clear(synPacket)
 	synPacket[0] = 0x45
 	copy(synPacket[Ipv4HeaderSizeWithoutExtensions+TcpHeaderSizeWithoutExtensions:], synOptions)
 	synTcp := parsedTcp{
 		syn:        true,
-		seq:        tcpReturnTestInitialSynSeq,
+		seq:        initialSynSeq,
 		windowSize: 0xffff,
 		options:    synPacket[Ipv4HeaderSizeWithoutExtensions+TcpHeaderSizeWithoutExtensions:],
 	}
@@ -428,6 +569,15 @@ func newTcpReturnRetransmitTestHarness(
 
 	t.Cleanup(harness.close)
 	return harness
+}
+
+// The sequence number of the k-th full data segment, from zero.
+func (self *tcpReturnRetransmitTestHarness) segmentSeq(segmentIndex int) uint32 {
+	return self.dataSeq + uint32(segmentIndex*self.segmentByteCount)
+}
+
+func (self *tcpReturnRetransmitTestHarness) payload(segmentCount int) []byte {
+	return tcpReturnTestPayload(segmentCount, self.segmentByteCount)
 }
 
 // Hands one source packet to the sequence as the TCP buffer does: an
@@ -448,6 +598,19 @@ func (self *tcpReturnRetransmitTestHarness) sendFromSource(tcp *parsedTcp, packe
 	if err != nil || !success {
 		MessagePoolReturn(packet)
 	}
+}
+
+// Sends the source's reset.
+func (self *tcpReturnRetransmitTestHarness) sendRstFromSource() {
+	packet := MessagePoolGet(Ipv4HeaderSizeWithoutExtensions + TcpHeaderSizeWithoutExtensions)
+	clear(packet)
+	packet[0] = 0x45
+	self.sendFromSource(&parsedTcp{
+		seq:       self.dataSeq,
+		ack:       true,
+		ackNumber: self.source.lastAckNumber,
+		rst:       true,
+	}, packet)
 }
 
 // Writes origin bytes into the upstream; returns when the sequence's socket
@@ -493,6 +656,20 @@ func (self *tcpReturnRetransmitTestHarness) retransmitState() (
 	defer self.sequence.mutex.Unlock()
 	state := &self.sequence.returnRetransmit
 	return state.retainedByteCount, state.count, state.retransmitPacketCount, state.reasonCounts
+}
+
+func (self *tcpReturnRetransmitTestHarness) requireStream(want []byte) {
+	self.t.Helper()
+	if stream := self.source.streamCopy(); !bytes.Equal(stream, want) {
+		self.t.Fatalf("stream has %d bytes, want %d exact", len(stream), len(want))
+	}
+}
+
+func (self *tcpReturnRetransmitTestHarness) requireSeenCount(segmentIndex int, want int) {
+	self.t.Helper()
+	if got := self.source.seenCount(self.segmentSeq(segmentIndex)); got != want {
+		self.t.Fatalf("segment %d delivered %d times, want %d", segmentIndex, got, want)
+	}
 }
 
 // Ends the sequence and reconciles the pool: every root taken since the
@@ -567,27 +744,22 @@ func TestParseTcpOptionsExtractsSackBlocks(t *testing.T) {
 // permanent hole (see TestTcpReturnRetransmitDisabledNeverRetransmits).
 func TestTcpReturnRetransmitRecoversOneDroppedSegmentOnDuplicateAcks(t *testing.T) {
 	runTcpReturnRetransmitTest(t, func(t *testing.T) {
-		harness := newTcpReturnRetransmitTestHarness(t, false, nil)
-		droppedSeq := tcpReturnTestSegmentSeq(1)
+		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{})
+		droppedSeq := harness.segmentSeq(1)
 		harness.source.dropCounts[droppedSeq] = 1
 		start := time.Now()
 
-		payload := tcpReturnTestPayload(8)
+		payload := harness.payload(8)
 		harness.write(payload)
 		synctest.Wait()
 
-		if stream := harness.source.streamCopy(); !bytes.Equal(stream, payload) {
-			t.Fatalf("stream has %d bytes, want %d exact", len(stream), len(payload))
-		}
+		harness.requireStream(payload)
 		for segmentIndex := 0; segmentIndex < 8; segmentIndex += 1 {
-			seq := tcpReturnTestSegmentSeq(segmentIndex)
 			want := 1
-			if seq == droppedSeq {
+			if harness.segmentSeq(segmentIndex) == droppedSeq {
 				want = 2
 			}
-			if got := harness.source.seenCount(seq); got != want {
-				t.Fatalf("segment %d delivered %d times, want %d", segmentIndex, got, want)
-			}
+			harness.requireSeenCount(segmentIndex, want)
 		}
 		// fast, not by the timer: no virtual time passed
 		for _, at := range harness.source.deliveryTimes(droppedSeq) {
@@ -602,7 +774,7 @@ func TestTcpReturnRetransmitRecoversOneDroppedSegmentOnDuplicateAcks(t *testing.
 		if packetCount != 1 || reasonCounts[tcpReturnRetransmitReasonDupAck] != 1 {
 			t.Fatalf("retransmissions=%d reasons=%v, want one on duplicate acks", packetCount, reasonCounts)
 		}
-		if stats := harness.counters.snapshot(); stats.PacketCount != 1 || stats.ByteCount != tcpReturnTestSegmentByteCount {
+		if stats := harness.counters.snapshot(); stats.PacketCount != 1 || stats.ByteCount != ByteCount(harness.segmentByteCount) {
 			t.Fatalf("stats=%+v", stats)
 		}
 	})
@@ -614,28 +786,21 @@ func TestTcpReturnRetransmitRecoversOneDroppedSegmentOnDuplicateAcks(t *testing.
 // retransmitted on the duplicate acknowledgements that follow.
 func TestTcpReturnRetransmitSackRetransmitsOnlyTheHoles(t *testing.T) {
 	runTcpReturnRetransmitTest(t, func(t *testing.T) {
-		harness := newTcpReturnRetransmitTestHarness(t, true, nil)
-		firstHoleSeq := tcpReturnTestSegmentSeq(1)
-		secondHoleSeq := tcpReturnTestSegmentSeq(3)
-		harness.source.dropCounts[firstHoleSeq] = 1
-		harness.source.dropCounts[secondHoleSeq] = 1
+		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{sack: true})
+		harness.source.dropCounts[harness.segmentSeq(1)] = 1
+		harness.source.dropCounts[harness.segmentSeq(3)] = 1
 
-		payload := tcpReturnTestPayload(8)
+		payload := harness.payload(8)
 		harness.write(payload)
 		synctest.Wait()
 
-		if stream := harness.source.streamCopy(); !bytes.Equal(stream, payload) {
-			t.Fatalf("stream has %d bytes, want %d exact", len(stream), len(payload))
-		}
+		harness.requireStream(payload)
 		for segmentIndex := 0; segmentIndex < 8; segmentIndex += 1 {
-			seq := tcpReturnTestSegmentSeq(segmentIndex)
 			want := 1
-			if seq == firstHoleSeq || seq == secondHoleSeq {
+			if segmentIndex == 1 || segmentIndex == 3 {
 				want = 2
 			}
-			if got := harness.source.seenCount(seq); got != want {
-				t.Fatalf("segment %d delivered %d times, want %d", segmentIndex, got, want)
-			}
+			harness.requireSeenCount(segmentIndex, want)
 		}
 		_, _, packetCount, reasonCounts := harness.retransmitState()
 		if packetCount != 2 ||
@@ -653,25 +818,17 @@ func TestTcpReturnRetransmitSackRetransmitsOnlyTheHoles(t *testing.T) {
 // duplicates that no new data would produce.
 func TestTcpReturnRetransmitPartialAckFillsTheNextHole(t *testing.T) {
 	runTcpReturnRetransmitTest(t, func(t *testing.T) {
-		harness := newTcpReturnRetransmitTestHarness(t, false, nil)
-		firstHoleSeq := tcpReturnTestSegmentSeq(1)
-		secondHoleSeq := tcpReturnTestSegmentSeq(3)
-		harness.source.dropCounts[firstHoleSeq] = 1
-		harness.source.dropCounts[secondHoleSeq] = 1
+		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{})
+		harness.source.dropCounts[harness.segmentSeq(1)] = 1
+		harness.source.dropCounts[harness.segmentSeq(3)] = 1
 
-		payload := tcpReturnTestPayload(8)
+		payload := harness.payload(8)
 		harness.write(payload)
 		synctest.Wait()
 
-		if stream := harness.source.streamCopy(); !bytes.Equal(stream, payload) {
-			t.Fatalf("stream has %d bytes, want %d exact", len(stream), len(payload))
-		}
-		if got := harness.source.seenCount(firstHoleSeq); got != 2 {
-			t.Fatalf("first hole delivered %d times, want 2", got)
-		}
-		if got := harness.source.seenCount(secondHoleSeq); got != 2 {
-			t.Fatalf("second hole delivered %d times, want 2", got)
-		}
+		harness.requireStream(payload)
+		harness.requireSeenCount(1, 2)
+		harness.requireSeenCount(3, 2)
 		_, _, packetCount, reasonCounts := harness.retransmitState()
 		if packetCount != 2 ||
 			reasonCounts[tcpReturnRetransmitReasonDupAck] != 1 ||
@@ -684,33 +841,25 @@ func TestTcpReturnRetransmitPartialAckFillsTheNextHole(t *testing.T) {
 // (c) A source that acknowledges nothing: the timer sends the first
 // unacknowledged segment again at one second, doubling to the ceiling, and
 // the no-progress bound ends the flow with a reset rather than leaving it
-// idle. The schedule is exact in virtual time.
+// idle. The schedule is exact in virtual time and derived from the constants.
 func TestTcpReturnRetransmitTimesOutWithBackoffThenResets(t *testing.T) {
 	runTcpReturnRetransmitTest(t, func(t *testing.T) {
-		harness := newTcpReturnRetransmitTestHarness(t, false, nil)
+		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{})
 		harness.source.holdAcks = true
 		start := time.Now()
 
-		harness.write(tcpReturnTestPayload(2))
+		harness.write(harness.payload(2))
 		synctest.Wait()
 
-		harness.waitRunDone(2 * time.Minute)
+		harness.waitRunDone(defaultReturnRetransmitTimeout + time.Minute)
 
-		// 1, 2, 4, then 8 s steps: 1, 3, 7, 15, 23, 31, 39, 47, 55, and 63
-		// would pass the 60 s bound
-		wantOffsets := []time.Duration{
-			0,
-			1 * time.Second,
-			3 * time.Second,
-			7 * time.Second,
-			15 * time.Second,
-			23 * time.Second,
-			31 * time.Second,
-			39 * time.Second,
-			47 * time.Second,
-			55 * time.Second,
+		wantOffsets := []time.Duration{0}
+		rto := returnRetransmitInitialRto
+		for at := rto; at < defaultReturnRetransmitTimeout; at += rto {
+			wantOffsets = append(wantOffsets, at)
+			rto = min(2*rto, returnRetransmitMaxRto)
 		}
-		times := harness.source.deliveryTimes(tcpReturnTestSegmentSeq(0))
+		times := harness.source.deliveryTimes(harness.segmentSeq(0))
 		if len(times) != len(wantOffsets) {
 			t.Fatalf("first segment delivered %d times, want %d", len(times), len(wantOffsets))
 		}
@@ -720,9 +869,7 @@ func TestTcpReturnRetransmitTimesOutWithBackoffThenResets(t *testing.T) {
 			}
 		}
 		// only the head is sent on the timer
-		if got := harness.source.seenCount(tcpReturnTestSegmentSeq(1)); got != 1 {
-			t.Fatalf("second segment delivered %d times, want 1", got)
-		}
+		harness.requireSeenCount(1, 1)
 		harness.source.stateLock.Lock()
 		rstReceived, rstAt := harness.source.rstReceived, harness.source.rstAt
 		harness.source.stateLock.Unlock()
@@ -732,8 +879,9 @@ func TestTcpReturnRetransmitTimesOutWithBackoffThenResets(t *testing.T) {
 		if got := rstAt.Sub(start); got != defaultReturnRetransmitTimeout {
 			t.Fatalf("reset at +%s, want +%s", got, defaultReturnRetransmitTimeout)
 		}
-		if stats := harness.counters.snapshot(); stats.TimeoutCount != 9 || stats.AbandonCount != 1 || stats.PacketCount != 9 {
-			t.Fatalf("stats=%+v", stats)
+		wantTimeoutCount := int64(len(wantOffsets) - 1)
+		if stats := harness.counters.snapshot(); stats.TimeoutCount != wantTimeoutCount || stats.AbandonCount != 1 || stats.PacketCount != wantTimeoutCount {
+			t.Fatalf("stats=%+v, want %d timeouts and one abandon", stats, wantTimeoutCount)
 		}
 		retainedByteCount, retainedCount, _, _ := harness.retransmitState()
 		if retainedByteCount != 0 || retainedCount != 0 {
@@ -749,12 +897,14 @@ func TestTcpReturnRetransmitTimesOutWithBackoffThenResets(t *testing.T) {
 func TestTcpReturnRetransmitRetainedBytesStayWithinTheCap(t *testing.T) {
 	runTcpReturnRetransmitTest(t, func(t *testing.T) {
 		const capSegmentCount = 4
-		harness := newTcpReturnRetransmitTestHarness(t, false, func(settings *TcpBufferSettings) {
-			settings.ReturnRetransmitRetainByteCount = capSegmentCount * tcpReturnTestSegmentByteCount
+		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{
+			configure: func(settings *TcpBufferSettings) {
+				settings.ReturnRetransmitRetainByteCount = capSegmentCount * tcpReturnTestSegmentByteCount
+			},
 		})
 		harness.source.holdAcks = true
 
-		payload := tcpReturnTestPayload(16)
+		payload := harness.payload(16)
 		writeDone := make(chan struct{})
 		go func() {
 			defer close(writeDone)
@@ -783,9 +933,7 @@ func TestTcpReturnRetransmitRetainedBytesStayWithinTheCap(t *testing.T) {
 		}
 		synctest.Wait()
 
-		if stream := harness.source.streamCopy(); !bytes.Equal(stream, payload) {
-			t.Fatalf("stream has %d bytes, want %d exact", len(stream), len(payload))
-		}
+		harness.requireStream(payload)
 		harness.source.stateLock.Lock()
 		maxOutstandingByteCount := harness.source.maxOutstandingByteCount
 		harness.source.stateLock.Unlock()
@@ -813,22 +961,21 @@ func TestTcpReturnRetransmitRetainedBytesStayWithinTheCap(t *testing.T) {
 // behaviour and the failure this change exists for.
 func TestTcpReturnRetransmitDisabledNeverRetransmits(t *testing.T) {
 	runTcpReturnRetransmitTest(t, func(t *testing.T) {
-		harness := newTcpReturnRetransmitTestHarness(t, false, func(settings *TcpBufferSettings) {
-			settings.EnableReturnRetransmit = false
+		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{
+			configure: func(settings *TcpBufferSettings) {
+				settings.EnableReturnRetransmit = false
+			},
 		})
-		droppedSeq := tcpReturnTestSegmentSeq(1)
-		harness.source.dropCounts[droppedSeq] = 1
+		harness.source.dropCounts[harness.segmentSeq(1)] = 1
 
-		payload := tcpReturnTestPayload(8)
+		payload := harness.payload(8)
 		harness.write(payload)
 		synctest.Wait()
 		time.Sleep(defaultReturnRetransmitTimeout + returnRetransmitMaxRto)
 		synctest.Wait()
 
-		if got := harness.source.seenCount(droppedSeq); got != 1 {
-			t.Fatalf("dropped segment delivered %d times with retransmission off, want 1", got)
-		}
-		if stream := harness.source.streamCopy(); len(stream) != tcpReturnTestSegmentByteCount {
+		harness.requireSeenCount(1, 1)
+		if stream := harness.source.streamCopy(); len(stream) != harness.segmentByteCount {
 			t.Fatalf("stream has %d bytes, want the one segment before the hole", len(stream))
 		}
 		retainedByteCount, retainedCount, packetCount, _ := harness.retransmitState()
@@ -849,12 +996,12 @@ func TestTcpReturnRetransmitDisabledNeverRetransmits(t *testing.T) {
 // ends without a reset.
 func TestTcpReturnRetransmitRetainsAndRetransmitsFin(t *testing.T) {
 	runTcpReturnRetransmitTest(t, func(t *testing.T) {
-		harness := newTcpReturnRetransmitTestHarness(t, false, nil)
-		payload := tcpReturnTestPayload(2)
+		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{})
+		payload := harness.payload(2)
 		harness.write(payload)
 		synctest.Wait()
 
-		finSeq := tcpReturnTestSegmentSeq(2)
+		finSeq := harness.segmentSeq(2)
 		harness.source.dropCounts[finSeq] = 1
 		closeAt := time.Now()
 		harness.closeUpstream()
@@ -884,13 +1031,71 @@ func TestTcpReturnRetransmitRetainsAndRetransmitsFin(t *testing.T) {
 		if !finReceived || rstReceived {
 			t.Fatalf("fin=%t rst=%t, want the FIN accepted and no reset", finReceived, rstReceived)
 		}
-		if stream := harness.source.streamCopy(); !bytes.Equal(stream, payload) {
-			t.Fatalf("stream has %d bytes, want %d exact", len(stream), len(payload))
-		}
+		harness.requireStream(payload)
 		_, _, packetCount, reasonCounts := harness.retransmitState()
 		if packetCount != 1 || reasonCounts[tcpReturnRetransmitReasonTimeout] != 1 {
 			t.Fatalf("retransmissions=%d reasons=%v, want the FIN once on the timer", packetCount, reasonCounts)
 		}
+	})
+}
+
+// Establishes a flow whose upstream has sent its FIN, unacknowledged and
+// held in retention, with the delivery drain parked waiting for that
+// acknowledgement, on an upstream whose Close takes time.
+func newTcpReturnRetransmitTestHarnessWithParkedDrain(t *testing.T, configure func(*TcpBufferSettings)) *tcpReturnRetransmitTestHarness {
+	t.Helper()
+	harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{
+		upstreamCloseDelay: 20 * time.Millisecond,
+		configure:          configure,
+	})
+	payload := harness.payload(2)
+	harness.write(payload)
+	synctest.Wait()
+	harness.source.holdAcks = true
+	harness.closeUpstream()
+	synctest.Wait()
+	if harness.runIsDone() {
+		t.Fatal("the sequence ended with the FIN unacknowledged")
+	}
+	return harness
+}
+
+// The flow ends while the drain is parked on the retained FIN, by the
+// source's reset: the sequence must end, every worker with it, and every
+// share must come back. Before the fix the drain was woken once, before the
+// cancel, waited again, and nothing ever woke it, so Run never returned and
+// the flow's slot and shares were held for ever.
+func TestTcpReturnRetransmitParkedDrainEndsOnSourceReset(t *testing.T) {
+	runTcpReturnRetransmitTest(t, func(t *testing.T) {
+		harness := newTcpReturnRetransmitTestHarnessWithParkedDrain(t, nil)
+		harness.sendRstFromSource()
+		harness.waitRunDone(time.Second)
+		retainedByteCount, retainedCount, _, _ := harness.retransmitState()
+		if retainedByteCount != 0 || retainedCount != 0 {
+			t.Fatalf("retained after the end: %d bytes in %d segments", retainedByteCount, retainedCount)
+		}
+		harness.close()
+	})
+}
+
+// The same with the flow ended by the idle timer rather than the source.
+func TestTcpReturnRetransmitParkedDrainEndsOnIdleTimeout(t *testing.T) {
+	runTcpReturnRetransmitTest(t, func(t *testing.T) {
+		const idleTimeout = 2 * time.Second
+		harness := newTcpReturnRetransmitTestHarnessWithParkedDrain(t, func(settings *TcpBufferSettings) {
+			settings.IdleTimeout = idleTimeout
+			// the idle timer must be the thing that ends this flow
+			settings.ReturnRetransmitTimeout = time.Minute
+		})
+		// the idle condition closes on the first interval with no update
+		// since its checkpoint, which is the second interval here: the
+		// handshake and data acknowledgements moved it during the first
+		harness.waitRunDone(2*idleTimeout + time.Second)
+		retainedByteCount, retainedCount, _, _ := harness.retransmitState()
+		if retainedByteCount != 0 || retainedCount != 0 {
+			t.Fatalf("retained after the end: %d bytes in %d segments", retainedByteCount, retainedCount)
+		}
+		harness.close()
 	})
 }
 
@@ -900,14 +1105,13 @@ func TestTcpReturnRetransmitRetainsAndRetransmitsFin(t *testing.T) {
 // selective acknowledgement would leave the discarded segments unrecoverable.
 func TestTcpReturnRetransmitSackedSegmentsStayRetainedUntilCumulativeAck(t *testing.T) {
 	runTcpReturnRetransmitTest(t, func(t *testing.T) {
-		harness := newTcpReturnRetransmitTestHarness(t, true, nil)
-		holeSeq := tcpReturnTestSegmentSeq(1)
-		harness.source.dropCounts[holeSeq] = 1
+		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{sack: true})
+		harness.source.dropCounts[harness.segmentSeq(1)] = 1
 		// the hole's retransmission is the next in-order arrival, and the
 		// source drops its whole out-of-order queue when it comes
 		harness.source.renegeOnce = true
 
-		payload := tcpReturnTestPayload(6)
+		payload := harness.payload(6)
 		harness.write(payload)
 		synctest.Wait()
 		// the reneged segments inside the recovery come back on partial
@@ -915,17 +1119,11 @@ func TestTcpReturnRetransmitSackedSegmentsStayRetainedUntilCumulativeAck(t *test
 		time.Sleep(2 * returnRetransmitInitialRto)
 		synctest.Wait()
 
-		if stream := harness.source.streamCopy(); !bytes.Equal(stream, payload) {
-			t.Fatalf("stream has %d bytes, want %d exact", len(stream), len(payload))
-		}
+		harness.requireStream(payload)
 		for segmentIndex := 1; segmentIndex < 6; segmentIndex += 1 {
-			if got := harness.source.seenCount(tcpReturnTestSegmentSeq(segmentIndex)); got != 2 {
-				t.Fatalf("segment %d delivered %d times, want 2 (dropped or reneged, then retained)", segmentIndex, got)
-			}
+			harness.requireSeenCount(segmentIndex, 2)
 		}
-		if got := harness.source.seenCount(tcpReturnTestSegmentSeq(0)); got != 1 {
-			t.Fatalf("first segment delivered %d times, want 1", got)
-		}
+		harness.requireSeenCount(0, 1)
 		retainedByteCount, retainedCount, _, _ := harness.retransmitState()
 		if retainedByteCount != 0 || retainedCount != 0 {
 			t.Fatalf("retained after full acknowledgement: %d bytes in %d segments", retainedByteCount, retainedCount)
@@ -939,17 +1137,20 @@ func TestTcpReturnRetransmitSackedSegmentsStayRetainedUntilCumulativeAck(t *test
 // explicitly and drives the paths that hold shares longest.
 func TestTcpReturnRetransmitReturnsEveryPooledBufferOnce(t *testing.T) {
 	runTcpReturnRetransmitTest(t, func(t *testing.T) {
-		harness := newTcpReturnRetransmitTestHarness(t, true, func(settings *TcpBufferSettings) {
-			settings.ReturnRetransmitTimeout = 5 * time.Second
+		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{
+			sack: true,
+			configure: func(settings *TcpBufferSettings) {
+				settings.ReturnRetransmitTimeout = 5 * time.Second
+			},
 		})
-		harness.source.dropCounts[tcpReturnTestSegmentSeq(2)] = 1
-		harness.write(tcpReturnTestPayload(6))
+		harness.source.dropCounts[harness.segmentSeq(2)] = 1
+		harness.write(harness.payload(6))
 		synctest.Wait()
 
 		// the tail is never acknowledged: the FIN and the last segments are
 		// held in retention until the bound resets the flow
 		harness.source.holdAcks = true
-		harness.write(tcpReturnTestPayload(3))
+		harness.write(harness.payload(3))
 		synctest.Wait()
 		harness.closeUpstream()
 		harness.waitRunDone(time.Minute)

@@ -4918,6 +4918,13 @@ func (self *TcpSequence) buildReturnRetransmitWithLock(segment *tcpReturnRetaine
 // copy is the only one the return path can recover from, and that lane may
 // wait on this dedicated goroutine as the socket reader's may.
 func (self *TcpSequence) runReturnRetransmitWorker() {
+	defer func() {
+		// the worker ends only with the sequence, so a drain parked on the
+		// ring must be woken to see that
+		self.mutex.Lock()
+		defer self.mutex.Unlock()
+		self.returnRetransmitCondition().Broadcast()
+	}()
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 	packets := make([][]byte, 0, 8)
@@ -5367,6 +5374,13 @@ func (self *TcpSequence) Run() {
 	receiveAckCond := self.receiveAckCondition()
 	ackCond := sync.NewCond(&self.mutex)
 	defer func() {
+		// Cancel before waking: a waiter woken here checks the context and,
+		// finding it live, waits again, and the cancel that follows in a
+		// later defer wakes nobody. The acknowledgement worker and the
+		// retransmit drain both wait that way, and with an upstream whose
+		// Close takes any time at all the woken waiter runs first.
+		self.cancel()
+
 		self.mutex.Lock()
 		defer self.mutex.Unlock()
 
