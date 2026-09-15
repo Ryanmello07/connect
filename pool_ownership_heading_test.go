@@ -63,6 +63,7 @@ func TestEveryPoolBufferEntryPointDeclaresItsOwnership(t *testing.T) {
 		{"RemoteUserNatProvider.receiveTransferBatch", borrows},
 		{"ReceiveFunction", borrows},
 		{"ReceivePacketFunction", borrows},
+		{"tcpReturnRetransmitState.retainWithLock", borrows},
 		{"TcpSequence.receivePacket", takes},
 		{"TcpSequence.receiveBatch", takes},
 		{"LocalUserNat.SendPacket", takesOnSuccess},

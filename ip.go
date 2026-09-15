@@ -477,7 +477,12 @@ func DefaultTcpBufferSettingsWithBufferSize(bufferSize int) *TcpBufferSettings {
 		// on by default: the benchmark range is reserved (RFC 2544) and the
 		// synthetic server only ever answers flows explicitly addressed to it
 		EnableSyntheticSpeed: true,
-		ConnectSettings:      *DefaultConnectSettings(),
+		// on by default: a source kernel's receive drop is otherwise a
+		// permanent hole (see tcpReturnRetransmitState)
+		EnableReturnRetransmit:          true,
+		ReturnRetransmitRetainByteCount: defaultReturnRetransmitRetainByteCount,
+		ReturnRetransmitTimeout:         defaultReturnRetransmitTimeout,
+		ConnectSettings:                 *DefaultConnectSettings(),
 	}
 	// the upstream socket buffers are the kernel's unless an explicit request
 	// beats its autotuning ceiling on this host (THROUGHPUTFIX §15); nil when
@@ -717,6 +722,9 @@ type LocalUserNat struct {
 	// (THROUGHPUTFIX §12). Read from the socket's own counter at close on
 	// Linux; zero elsewhere. Invisible to every layer above the socket.
 	udpKernelReceiveDropCount atomic.Uint64
+	// return-path retransmission across every TCP flow (see
+	// tcpReturnRetransmitState); shared with the TCP buffers' sequences
+	returnRetransmitCounters returnRetransmitCounters
 
 	sendPackets chan *SendPacket
 	sendLock    sync.Mutex
@@ -933,6 +941,12 @@ func (self *LocalUserNat) UdpKernelReceiveDropCount() uint64 {
 
 func (self *LocalUserNat) SecurityPolicyStats(reset bool) SecurityPolicyStats {
 	return SecurityPolicyStats{}
+}
+
+// Cumulative return-path retransmission counts over every TCP flow of this
+// NAT (see tcpReturnRetransmitState).
+func (self *LocalUserNat) ReturnRetransmitStats() ReturnRetransmitStats {
+	return self.returnRetransmitCounters.snapshot()
 }
 
 // Takes the packet on success only: a true return transfers ownership, and on
@@ -1449,6 +1463,8 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 	tcp6Buffer := newTcp6BufferWithTransferKey(self.ctx, self.receiveTransfer, self.settings.TcpBufferSettings)
 	tcp4Buffer.flowCloseCallback = self.closeTcpFlow
 	tcp6Buffer.flowCloseCallback = self.closeTcpFlow
+	tcp4Buffer.returnRetransmitCounters = &self.returnRetransmitCounters
+	tcp6Buffer.returnRetransmitCounters = &self.returnRetransmitCounters
 	icmp4Buffer := newIcmp4BufferWithTransferKey(self.ctx, self.receiveTransfer, self.settings.IcmpBufferSettings)
 	icmp6Buffer := newIcmp6BufferWithTransferKey(self.ctx, self.receiveTransfer, self.settings.IcmpBufferSettings)
 	sourceRetirementUnsub := self.addSourceRetirementCallback(func(sourceId Id, retired bool) []<-chan struct{} {
@@ -2019,7 +2035,11 @@ type parsedTcp struct {
 	enableTimestamp   bool
 	timestampValue    uint32
 	timestampEcho     uint32
-	payload           []byte
+	// selective acknowledgement blocks (RFC 2018), in the option's order, at
+	// most tcpMaxSackBlockCount; a fixed array keeps the parse allocation free
+	sackBlockCount int
+	sackBlocks     [tcpMaxSackBlockCount]tcpSackBlock
+	payload        []byte
 }
 
 func (self *parsedTcp) flagsString() string {
@@ -2160,6 +2180,7 @@ func parseTcpOptions(tcp *parsedTcp) {
 	tcp.enableTimestamp = false
 	tcp.timestampValue = 0
 	tcp.timestampEcho = 0
+	tcp.sackBlockCount = 0
 	for optionIndex := 0; optionIndex < len(tcp.options); {
 		switch tcp.options[optionIndex] {
 		case 0:
@@ -2187,6 +2208,18 @@ func parseTcpOptions(tcp *parsedTcp) {
 				if optionByteCount == 3 {
 					tcp.enableWindowScale = true
 					tcp.windowScale = min(uint32(tcp.options[optionIndex+2]), 14)
+				}
+			case 5:
+				// SACK: 2 + 8n bytes. Blocks past the fixed capacity are
+				// ignored rather than failing the segment.
+				if 10 <= optionByteCount && (optionByteCount-2)%8 == 0 {
+					for blockIndex := optionIndex + 2; blockIndex+8 <= optionIndex+optionByteCount && tcp.sackBlockCount < tcpMaxSackBlockCount; blockIndex += 8 {
+						tcp.sackBlocks[tcp.sackBlockCount] = tcpSackBlock{
+							start: binary.BigEndian.Uint32(tcp.options[blockIndex : blockIndex+4]),
+							end:   binary.BigEndian.Uint32(tcp.options[blockIndex+4 : blockIndex+8]),
+						}
+						tcp.sackBlockCount += 1
+					}
 				}
 			case 8:
 				if optionByteCount == 10 {
@@ -3837,6 +3870,25 @@ type TcpBufferSettings struct {
 	// measurement of the tunnel path itself, isolated from origin and
 	// upstream network variability.
 	EnableSyntheticSpeed bool
+	// EnableReturnRetransmit retains each inner TCP segment sent toward the
+	// source until the source's cumulative acknowledgement covers it, and
+	// sends it again on three duplicate acknowledgements, on the holes below
+	// a selective acknowledgement, and on a retransmission timer. Transfer
+	// delivers the segments losslessly to the source device, but the device
+	// kernel can drop one on the flow's receive socket at high single-flow
+	// rates, and without this that drop is permanent: the source answers with
+	// duplicate acknowledgements for ever and the download stops. See
+	// tcpReturnRetransmitState for the design. On by default; off restores
+	// the earlier behaviour byte for byte, with nothing retained.
+	EnableReturnRetransmit bool
+	// The hard cap on retained sequence bytes per flow beside the source's
+	// advertised window; a burst beyond it waits for acknowledgements as it
+	// waits for the window. Zero is 4 MiB.
+	ReturnRetransmitRetainByteCount ByteCount
+	// How long the cumulative acknowledgement may stand still with segments
+	// outstanding before the flow is reset toward the source and closed,
+	// rather than left idle. Zero is 60 seconds.
+	ReturnRetransmitTimeout time.Duration
 	// Tests may hold a newly admitted sequence before it can consume its first
 	// pooled packet. Nil is a production no-op.
 	beforeSequenceRunForTest func()
@@ -4005,6 +4057,8 @@ type TcpBuffer[BufferId comparable] struct {
 	receiveTransferPacketsCallback receiveTransferPacketsBatchFunction
 	tcpBufferSettings              *TcpBufferSettings
 	flowCloseCallback              tcpFlowCloseFunction
+	// the owning NAT's counters, handed to every sequence; nil counts nothing
+	returnRetransmitCounters *returnRetransmitCounters
 
 	mutex sync.Mutex
 	// The local NAT closes send admission before waiting, so no Add can race
@@ -4218,6 +4272,7 @@ func (self *TcpBuffer[BufferId]) tcpSend(
 		)
 		sequence.receiveTransferPacketsCallback = self.receiveTransferPacketsCallback
 		sequence.flowCloseCallback = self.flowCloseCallback
+		sequence.returnRetransmit.counters = self.returnRetransmitCounters
 		self.sequences[bufferId] = sequence
 		sourceSequences := self.sourceSequences[source]
 		if sourceSequences == nil {
@@ -4527,6 +4582,16 @@ type TcpSequence struct {
 	// Tests may hold Run before its first queued owner is consumed. Nil is a
 	// production no-op.
 	beforeRunForTest func()
+	// Return-path retransmission (see tcpReturnRetransmitState), guarded by
+	// ConnectionState.mutex. The one-deep signal wakes the worker that builds
+	// and sends what the acknowledgement path and the timer decided; the
+	// condition holds the delivery drain open after the upstream's FIN until
+	// the ring is empty. Both are lazily usable, since some focused tests
+	// build TcpSequence values directly.
+	returnRetransmit         tcpReturnRetransmitState
+	returnRetransmitSignal   chan struct{}
+	returnRetransmitCondOnce sync.Once
+	returnRetransmitCond     *sync.Cond
 	ConnectionState
 }
 
@@ -4595,6 +4660,9 @@ func newTcpSequenceWithTransferKey(
 		transferState:     newTransferState(source, transferKey),
 		initialSynSeq:     initialSynSeq,
 		beforeRunForTest:  tcpBufferSettings.beforeSequenceRunForTest,
+		returnRetransmit:  newTcpReturnRetransmitState(tcpBufferSettings),
+		// one-deep: a pending wake is as good as many
+		returnRetransmitSignal: make(chan struct{}, 1),
 		ConnectionState: ConnectionState{
 			source:          source,
 			provideMode:     provideMode,
@@ -4692,6 +4760,276 @@ func (self *TcpSequence) receiveAckCondition() *sync.Cond {
 		self.receiveAckCond = sync.NewCond(&self.mutex)
 	})
 	return self.receiveAckCond
+}
+
+// The condition the delivery drain waits on for the retained ring to empty
+// (see tcpReturnRetransmitState). Lazy like receiveAckCond.
+func (self *TcpSequence) returnRetransmitCondition() *sync.Cond {
+	self.returnRetransmitCondOnce.Do(func() {
+		self.returnRetransmitCond = sync.NewCond(&self.mutex)
+	})
+	return self.returnRetransmitCond
+}
+
+// Wakes the retransmission worker; a wake already pending is enough. A nil
+// signal (a sequence built directly by a test) drops the wake.
+func (self *TcpSequence) signalReturnRetransmit() {
+	select {
+	case self.returnRetransmitSignal <- struct{}{}:
+	default:
+	}
+}
+
+// Retains the segments the packetizer just built, in sequence order from the
+// current receiveSeq. The sequence mutex must be held.
+func (self *TcpSequence) retainReturnPacketsWithLock(packets [][]byte) {
+	if !self.returnRetransmit.enabled {
+		return
+	}
+	headerByteCount := self.returnHeaderByteCount()
+	seq := self.receiveSeq
+	for _, packet := range packets {
+		payloadByteCount := len(packet) - headerByteCount
+		self.returnRetransmit.retainWithLock(packet, seq, headerByteCount, payloadByteCount, false)
+		seq += uint32(payloadByteCount)
+	}
+}
+
+// Retains the FIN at the current receiveSeq, before the caller advances past
+// it. The sequence mutex must be held.
+func (self *TcpSequence) retainReturnFinWithLock() {
+	self.returnRetransmit.retainWithLock(nil, self.receiveSeq, 0, 0, true)
+}
+
+// The sequence numbers of packets this sequence built, read from their
+// headers into `seqs`, so a batch can be matched against the retained ring
+// after the delivery has returned the packets.
+func (self *TcpSequence) returnPacketSeqs(seqs []uint32, packets [][]byte) []uint32 {
+	seqs = seqs[:0]
+	if !self.returnRetransmit.enabled {
+		return seqs
+	}
+	for _, packet := range packets {
+		ipHeaderByteCount := Ipv6HeaderSize
+		if packet[0]>>4 == 4 {
+			ipHeaderByteCount = int(packet[0]&0xf) * 4
+		}
+		seqs = append(seqs, binary.BigEndian.Uint32(packet[ipHeaderByteCount+4:ipHeaderByteCount+8]))
+	}
+	return seqs
+}
+
+// Marks a delivered batch as sent (see tcpReturnRetransmitState) and arms the
+// worker's timer when it was the first outstanding delivery.
+func (self *TcpSequence) markReturnDelivered(seqs []uint32) {
+	if !self.returnRetransmit.enabled || len(seqs) == 0 {
+		return
+	}
+	armed := false
+	func() {
+		self.mutex.Lock()
+		defer self.mutex.Unlock()
+		armed = self.returnRetransmit.markDeliveredWithLock(seqs, monotonicNanos())
+	}()
+	if armed {
+		self.signalReturnRetransmit()
+	}
+}
+
+// Discards the retained ring, on a reset or at the sequence's end, and
+// releases a drain waiting for it to empty. The sequence mutex must be held.
+func (self *TcpSequence) releaseReturnRetransmitWithLock() {
+	if !self.returnRetransmit.enabled {
+		return
+	}
+	self.returnRetransmit.releaseAllWithLock()
+	self.returnRetransmitCondition().Broadcast()
+}
+
+// Feeds one acknowledgement applySendAckWithLock accepted to the
+// retransmission state, waking the worker when it decided a retransmission
+// and the drain when the ring emptied. The sequence mutex must be held.
+func (self *TcpSequence) applyReturnRetransmitAckWithLock(tcp *parsedTcp, previousReceiveSeqAck uint32) {
+	state := &self.returnRetransmit
+	if !state.enabled || state.count == 0 {
+		// nothing retained: an idle flow's acknowledgements cost nothing here
+		state.dupAckCount = 0
+		return
+	}
+	if state.ackWithLock(tcp, previousReceiveSeqAck, monotonicNanos()) {
+		self.signalReturnRetransmit()
+	}
+	if state.count == 0 {
+		// emptied: the drain may be holding the sequence open for this
+		self.returnRetransmitCondition().Broadcast()
+	}
+}
+
+// After the upstream's FIN the delivery drain holds the sequence open until
+// the source has acknowledged every retained segment, or the sequence ends
+// (the no-progress bound, or any other cancel).
+func (self *TcpSequence) waitReturnRetransmitDrained() {
+	if !self.returnRetransmit.enabled {
+		return
+	}
+	self.mutex.Lock()
+	defer self.mutex.Unlock()
+	cond := self.returnRetransmitCondition()
+	for 0 < self.returnRetransmit.count {
+		select {
+		case <-self.ctx.Done():
+			return
+		default:
+		}
+		cond.Wait()
+	}
+}
+
+// A retransmission is a fresh packet at the retained sequence with the current
+// acknowledgement, window and timestamps, as the handshake retransmits its
+// SYN-ACK (see tcpReturnRetransmitState). The sequence mutex must be held.
+// The per-segment line lives here because this is where the segment is.
+func (self *TcpSequence) buildReturnRetransmitWithLock(segment *tcpReturnRetainedSegment) []byte {
+	flags := tcpFlagAck
+	if segment.fin {
+		flags |= tcpFlagFin
+	}
+	var payload []byte
+	if segment.packet != nil {
+		payload = segment.packet[int(segment.payloadOffset) : int(segment.payloadOffset)+int(segment.payloadByteCount)]
+	}
+	if self.log.V(1).Enabled() {
+		self.log.Infof(
+			"[rx]return retransmit %s seq=%d bytes=%d fin=%t n=%d rto=%s\n",
+			segment.dueReason,
+			segment.seq,
+			segment.byteCount,
+			segment.fin,
+			segment.retransmitCount,
+			time.Duration(self.returnRetransmit.rtoNanos),
+		)
+	}
+	return self.tcpPacket(flags, segment.seq, payload)
+}
+
+// The worker: builds and sends what the acknowledgement path and the timer
+// decided, and ends the flow at the no-progress bound. A child worker of
+// Run. Retransmissions ride the socket-data recovery lane, since the retained
+// copy is the only one the return path can recover from, and that lane may
+// wait on this dedicated goroutine as the socket reader's may.
+func (self *TcpSequence) runReturnRetransmitWorker() {
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	packets := make([][]byte, 0, 8)
+	for {
+		select {
+		case <-self.ctx.Done():
+			return
+		default:
+		}
+
+		var abandon bool
+		var waitNanos int64
+		var rstPacket []byte
+		var outstandingByteCount int64
+		packets = packets[:0]
+		func() {
+			self.mutex.Lock()
+			defer self.mutex.Unlock()
+
+			nowNanos := monotonicNanos()
+			abandon, waitNanos = self.returnRetransmit.timerWithLock(nowNanos)
+			if abandon {
+				outstandingByteCount = self.returnRetransmit.retainedByteCount
+				if self.returnRetransmit.finRetained {
+					// the socket reader left with its FIN, so the reset its
+					// teardown sends on a cancel will not follow this one
+					rstPacket, _ = self.RstAck()
+				}
+				self.releaseReturnRetransmitWithLock()
+				return
+			}
+			packets = self.returnRetransmit.takeDueWithLock(packets, nowNanos, self.buildReturnRetransmitWithLock)
+		}()
+
+		if abandon {
+			self.log.Infof(
+				"[rx]return retransmit abandoned %s: no acknowledgement progress for %s with %d bytes outstanding, resetting\n",
+				self.IpPath().DestinationHostPort(),
+				self.returnRetransmit.timeout,
+				outstandingByteCount,
+			)
+			if self.returnRetransmit.counters != nil {
+				self.returnRetransmit.counters.abandonCount.Add(1)
+			}
+			if rstPacket != nil {
+				self.receivePacket(rstPacket, receiveRecoveryModeRegenerableControl)
+			}
+			self.cancel()
+			return
+		}
+
+		for _, packet := range packets {
+			select {
+			case <-self.ctx.Done():
+				MessagePoolReturn(packet)
+				continue
+			default:
+			}
+			self.receivePacket(packet, receiveRecoveryModeTcpSocket)
+		}
+
+		if waitNanos < 0 {
+			// nothing outstanding: only a new segment can arm the timer
+			select {
+			case <-self.ctx.Done():
+				return
+			case <-self.returnRetransmitSignal:
+			}
+		} else {
+			timer.Reset(time.Duration(waitNanos))
+			select {
+			case <-self.ctx.Done():
+				return
+			case <-self.returnRetransmitSignal:
+			case <-timer.C:
+			}
+		}
+	}
+}
+
+// The end of the sequence, after every child worker is joined: returns every
+// retained share and leaves one summary line for a flow that retransmitted
+// anything, which is what a field capture counts.
+func (self *TcpSequence) finishReturnRetransmit() {
+	state := &self.returnRetransmit
+	if !state.enabled {
+		return
+	}
+	var packetCount int64
+	var byteCount int64
+	var reasonCounts [tcpReturnRetransmitReasonCount]int64
+	func() {
+		self.mutex.Lock()
+		defer self.mutex.Unlock()
+
+		self.releaseReturnRetransmitWithLock()
+		packetCount = state.retransmitPacketCount
+		byteCount = state.retransmitByteCount
+		reasonCounts = state.reasonCounts
+	}()
+	if 0 < packetCount {
+		self.log.Infof(
+			"[rx]return retransmit summary %s packets=%d bytes=%d dupack=%d sack=%d partial=%d timeout=%d\n",
+			self.IpPath().DestinationHostPort(),
+			packetCount,
+			byteCount,
+			reasonCounts[tcpReturnRetransmitReasonDupAck],
+			reasonCounts[tcpReturnRetransmitReasonSackHole],
+			reasonCounts[tcpReturnRetransmitReasonPartialAck],
+			reasonCounts[tcpReturnRetransmitReasonTimeout],
+		)
+	}
 }
 
 // applyEstablishedPureAck applies the independent ACK/window half of a TCP
@@ -4822,6 +5160,9 @@ func (self *TcpSequence) receiveBatch(packets [][]byte, recoveryMode receiveReco
 }
 
 func (self *TcpSequence) Run() {
+	// registered first, so it runs after every child worker is joined and no
+	// goroutine can still touch the retained ring
+	defer self.finishReturnRetransmit()
 	var childWorkers sync.WaitGroup
 	defer func() {
 		if self.beforeChildWorkersWaitForTest != nil {
@@ -5031,6 +5372,7 @@ func (self *TcpSequence) Run() {
 
 		receiveAckCond.Broadcast()
 		ackCond.Broadcast()
+		self.returnRetransmitCondition().Broadcast()
 	}()
 
 	// signals the ack pipeline to send a coalesced ack now
@@ -5247,6 +5589,15 @@ func (self *TcpSequence) Run() {
 		// reused across drains; receiveBatch consumes it before the next
 		// drain reuses it
 		batch := make([][]byte, 0, self.tcpBufferSettings.WriteBatchSize)
+		batchSeqs := make([]uint32, 0, self.tcpBufferSettings.WriteBatchSize)
+		// a delivered batch counts as sent for retransmission only once the
+		// return path has it, and the packets are gone by then, so their
+		// sequences are read first
+		deliverBatch := func() {
+			batchSeqs = self.returnPacketSeqs(batchSeqs, batch)
+			self.receiveBatch(batch, receiveRecoveryModeTcpSocket)
+			self.markReturnDelivered(batchSeqs)
+		}
 
 	read:
 		for {
@@ -5255,6 +5606,10 @@ func (self *TcpSequence) Run() {
 				return
 			case packet, ok := <-readPackets:
 				if !ok {
+					// the socket reader closed after its FIN: hold the
+					// sequence open until the source has acknowledged the
+					// retained segments, since the cancel below ends them
+					self.waitReturnRetransmitDrained()
 					return
 				}
 				batch = append(batch[:0], packet)
@@ -5264,16 +5619,17 @@ func (self *TcpSequence) Run() {
 					select {
 					case packet, ok := <-readPackets:
 						if !ok {
-							self.receiveBatch(batch, receiveRecoveryModeTcpSocket)
+							deliverBatch()
+							self.waitReturnRetransmitDrained()
 							return
 						}
 						batch = append(batch, packet)
 					default:
-						self.receiveBatch(batch, receiveRecoveryModeTcpSocket)
+						deliverBatch()
 						continue read
 					}
 				}
-				self.receiveBatch(batch, receiveRecoveryModeTcpSocket)
+				deliverBatch()
 			}
 		}
 	})
@@ -5291,6 +5647,9 @@ func (self *TcpSequence) Run() {
 					self.mutex.Lock()
 					defer self.mutex.Unlock()
 
+					// a reset is never repaired, so the retained segments
+					// go with it, and the drain need not wait for them
+					self.releaseReturnRetransmitWithLock()
 					packet, err = self.RstAck()
 				}()
 				if err == nil {
@@ -5352,6 +5711,10 @@ func (self *TcpSequence) Run() {
 							}
 
 							windowByteCount := int(int64(self.receiveWindowSize) - int64(self.receiveSeq-self.receiveSeqAck))
+							// the retention cap binds beside the window, and
+							// acknowledgements open both (see
+							// tcpReturnRetransmitState)
+							windowByteCount = int(min(int64(windowByteCount), self.returnRetransmit.roomWithLock()))
 							if 0 < windowByteCount {
 								j := min(i+windowByteCount, n)
 								var err error
@@ -5361,6 +5724,7 @@ func (self *TcpSequence) Run() {
 									stop = true
 									return
 								}
+								self.retainReturnPacketsWithLock(chunkPackets)
 								self.receiveSeq += uint32(j - i)
 								ackedSendSeq = self.sendSeq
 								i = j
@@ -5413,6 +5777,9 @@ func (self *TcpSequence) Run() {
 						defer self.mutex.Unlock()
 
 						finPacket, finErr = self.FinAck()
+						if finErr == nil {
+							self.retainReturnFinWithLock()
+						}
 						self.receiveSeq += 1
 					}()
 					if finErr == nil {
@@ -5590,6 +5957,10 @@ func (self *TcpSequence) Run() {
 			}
 		}
 	})
+
+	if self.returnRetransmit.enabled {
+		runChildWorker(self.runReturnRetransmitWorker)
+	}
 
 	// A route promotion can make a packet sent on the new path overtake one
 	// already in flight on the old path. Retain that bounded crossover window
@@ -6097,6 +6468,7 @@ send:
 
 // Updates the return-path acknowledgment/window. The caller holds mutex.
 func (self *TcpSequence) applySendAckWithLock(tcp *parsedTcp) (receiveAckUpdated bool) {
+	previousReceiveSeqAck := self.receiveSeqAck
 	if tcp.ack &&
 		0 <= int32(tcp.ackNumber-self.receiveSeqAck) &&
 		0 <= int32(self.receiveSeq-tcp.ackNumber) {
@@ -6137,6 +6509,9 @@ func (self *TcpSequence) applySendAckWithLock(tcp *parsedTcp) (receiveAckUpdated
 			self.receiveWindowSize = receiveWindowSize
 			receiveAckUpdated = true
 		}
+		// a validated acknowledgement releases retained segments, or counts
+		// as a duplicate against them
+		self.applyReturnRetransmitAckWithLock(tcp, previousReceiveSeqAck)
 	}
 
 	return
@@ -6259,6 +6634,23 @@ func (self *ConnectionState) IpPath() *IpPath {
 		DestinationIp:   self.destinationIp,
 		DestinationPort: int(self.destinationPort),
 	}
+}
+
+// The header bytes ahead of the payload in every packet tcpPacket builds, so
+// a retained packet's payload can be found again without parsing it.
+func (self *ConnectionState) returnHeaderByteCount() int {
+	var ipHeaderByteCount int
+	switch self.ipVersion {
+	case 4:
+		ipHeaderByteCount = Ipv4HeaderSizeWithoutExtensions
+	case 6:
+		ipHeaderByteCount = Ipv6HeaderSize
+	}
+	headerByteCount := ipHeaderByteCount + TcpHeaderSizeWithoutExtensions
+	if self.enableTimestamp {
+		headerByteCount += tcpTimestampOptionByteCount
+	}
+	return headerByteCount
 }
 
 func (self *ConnectionState) encodedWindowSize() uint16 {
@@ -7887,6 +8279,12 @@ func (self *RemoteUserNatProvider) sendReturnItem(item *providerReturnItem) {
 
 func (self *RemoteUserNatProvider) SecurityPolicyStats(reset bool) SecurityPolicyStats {
 	return self.securityPolicy.Stats().Stats(reset)
+}
+
+// Cumulative return-path retransmission counts over this provider's TCP flows
+// (see tcpReturnRetransmitState).
+func (self *RemoteUserNatProvider) ReturnRetransmitStats() ReturnRetransmitStats {
+	return self.localUserNat.ReturnRetransmitStats()
 }
 
 // PacketStats returns the cumulative packet counts relayed for remote clients.

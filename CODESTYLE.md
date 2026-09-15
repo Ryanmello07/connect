@@ -193,6 +193,7 @@ must return it after the call.
 - `RemoteUserNatProvider.Receive`, `receiveTransfer`, `receiveTransferWithRecovery`
 - `RemoteUserNatProvider.ReceiveBatch`, `receiveTransferBatch`
 - every `ReceiveFunction` / `ReceivePacketFunction` callback
+- `tcpReturnRetransmitState.retainWithLock` (keeps a share until the source acknowledges)
 
 **Takes** — ownership moves at the call and the buffer is returned by the
 callee. The caller must not return it and must not use it afterwards.
