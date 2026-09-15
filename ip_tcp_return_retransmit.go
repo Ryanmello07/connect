@@ -61,6 +61,23 @@ func (self tcpReturnRetransmitReason) String() string {
 	}
 }
 
+// Where a sequence stands in repairing its return path (see
+// tcpReturnRetransmitState).
+type tcpReturnRecoveryPhase int
+
+const (
+	tcpReturnRecoveryPhaseNone tcpReturnRecoveryPhase = iota
+	// a timer expiry sent the head again, and no acknowledgement has
+	// advanced or repeated since; the expiry may be spurious
+	tcpReturnRecoveryPhaseTimeoutProbe
+	// one acknowledgement since the expiry covered exactly the head it sent
+	// again, and the next acknowledgement decides
+	tcpReturnRecoveryPhaseTimeoutProbeAdvanced
+	// loss recovery: after the third duplicate acknowledgement, or after an
+	// expiry the acknowledgements showed real
+	tcpReturnRecoveryPhaseLoss
+)
+
 // One sent segment, retained until the source's cumulative acknowledgement
 // covers it. The ring owns `packet`, a read-only share of the delivered pool
 // buffer, and returns it exactly once: on acknowledgement, on reset, or at the
@@ -168,25 +185,47 @@ func (self *returnRetransmitCounters) snapshot() ReturnRetransmitStats {
 // byte stream; an unrecoverable one is an explicit, bounded failure.
 //
 // Triggers. Fast retransmit: the third duplicate acknowledgement of one
-// cumulative ack retransmits the first unacknowledged segment (RFC 5681
-// §3.2). A duplicate repeats the cumulative ack and the window and carries no
-// payload, SYN or FIN (RFC 5681 §2): a window update is not one, however many
-// the source sends while its application reads. With SACK blocks it retransmits every unmarked segment
-// below the highest selectively acknowledged byte instead, and further
-// duplicate acknowledgements that extend the marked range retransmit the
-// holes they newly reveal. A partial acknowledgement inside a recovery, one
-// that advances but not to the recovery's end, retransmits the next hole at
-// once (NewReno, RFC 6582). The timer: max(200 ms, 2 x srtt, srtt + 4 rttvar)
-// from the inner round trip, one second before a sample exists, doubling on
-// each expiry to an 8 s ceiling and reset by acknowledgement progress;
-// expiry retransmits the first unacknowledged segment only. The round trip is
-// sampled by the time from a segment's delivery to the acknowledgement that
-// covers it, from segments never retransmitted (Karn). Every hole is sent at
-// most once per max(srtt, 200 ms), whatever triggers it, so a run of
-// duplicate acknowledgements costs one segment; the timer bypasses that limit,
-// being a limit itself. Nothing is ever retransmitted above the window: the
-// retained set is inside the greatest advertised edge, which never moves
-// back. Duplicate suppression on the source is its kernel's job.
+// cumulative ack retransmits the first unacknowledged segment and starts loss
+// recovery (RFC 5681 §3.2). A duplicate repeats the cumulative ack and the
+// window and carries no payload, SYN or FIN (RFC 5681 §2): a window update is
+// not one, however many the source sends while its application reads. With
+// SACK blocks it retransmits every unmarked segment below the highest
+// selectively acknowledged byte instead, and further duplicate
+// acknowledgements that extend the marked range retransmit the holes they
+// newly reveal. A partial acknowledgement inside loss recovery, one that
+// advances but not to the recovery's end, retransmits the next hole at once
+// (NewReno, RFC 6582). The timer: max(200 ms, 2 x srtt, srtt + 4 rttvar) from
+// the inner round trip, one second before a sample exists, doubling on each
+// expiry to an 8 s ceiling and reset by acknowledgement progress; expiry
+// retransmits the first unacknowledged segment only.
+//
+// An expiry is not by itself loss. The round trip includes Transfer's
+// queueing, so a tunnel stall holds acknowledgements past the timer, and if
+// the expiry began loss recovery every late acknowledgement would read as a
+// partial one and send the window again. So an expiry probes, in the spirit
+// of F-RTO (RFC 5682), and sends nothing beyond the head until the
+// acknowledgements decide. The first to advance past the retransmitted head,
+// or a second to advance with no duplicate between, acknowledges a segment
+// never sent again: the originals arrived, the expiry was spurious, and the
+// probe ends with the timer back at its base, the value the expiry doubled,
+// updated by whatever round trips the late acknowledgements sampled. A
+// duplicate acknowledgement shows a segment missing and turns the probe into
+// loss recovery, retransmitting at once when the head had already advanced.
+// Silence decides nothing, so expiries with no answer at all only back off
+// and send the head again; an expiry after the source has answered is loss
+// (RFC 5682 §2.1 step 1), which is how a source that lost everything past the
+// head recovers when no later segment exists to draw a duplicate. Until the
+// probe decides, advances keep the doubled timer, so a stall that lets one
+// acknowledgement through must outlast twice the timer to read as loss.
+//
+// The round trip is sampled by the time from a segment's delivery to the
+// acknowledgement that covers it, from segments never retransmitted (Karn).
+// Every hole is sent at most once per max(srtt, 200 ms), whatever triggers
+// it, so a run of duplicate acknowledgements costs one segment; the timer
+// bypasses that limit, being a limit itself. Nothing is ever retransmitted
+// above the window: the retained set is inside the greatest advertised edge,
+// which never moves back. Duplicate suppression on the source is its
+// kernel's job.
 //
 // Lifecycle. When the upstream closes, the FIN is retained like data and the
 // sequence stays open until the source acknowledges everything, or the bound
@@ -222,8 +261,12 @@ type tcpReturnRetransmitState struct {
 	// the scaled window of the last acceptable acknowledgement, which a
 	// duplicate must repeat
 	ackWindowByteCount uint32
-	recovering         bool
-	recoveryEnd        uint32
+	recoveryPhase      tcpReturnRecoveryPhase
+	// the end of the highest delivered segment when the recovery or the
+	// probe last began; an acknowledgement that reaches it ends either
+	recoveryEnd uint32
+	// the end of the head the probe's expiry sent again
+	probeHeadEnd uint32
 
 	rttKnown         bool
 	srttNanos        int64
@@ -388,7 +431,7 @@ func (self *tcpReturnRetransmitState) releaseAllWithLock() {
 			MessagePoolReturn(segment.packet)
 		}
 	}
-	self.recovering = false
+	self.recoveryPhase = tcpReturnRecoveryPhaseNone
 	self.dupAckCount = 0
 	self.appliedSackBlockCount = 0
 }
@@ -608,15 +651,33 @@ func (self *tcpReturnRetransmitState) ackWithLock(
 		self.releaseAckedWithLock(ackNumber, nowNanos)
 		self.dupAckCount = 0
 		self.progressNanos = nowNanos
-		self.rtoNanos = self.baseRtoNanos()
-		self.rtoDeadlineNanos = nowNanos + self.rtoNanos
-		if self.count == 0 {
-			self.recovering = false
-			return false
-		}
-		if self.recovering {
-			if 0 <= int32(ackNumber-self.recoveryEnd) {
-				self.recovering = false
+		recovered := self.count == 0 || 0 <= int32(ackNumber-self.recoveryEnd)
+		// progress re-arms the timer from its base, which drops the backoff,
+		// except while a probe is undecided
+		keepBackoff := false
+		switch self.recoveryPhase {
+		case tcpReturnRecoveryPhaseTimeoutProbe, tcpReturnRecoveryPhaseTimeoutProbeAdvanced:
+			if recovered {
+				self.recoveryPhase = tcpReturnRecoveryPhaseNone
+			} else if self.recoveryPhase == tcpReturnRecoveryPhaseTimeoutProbe &&
+				int32(ackNumber-self.probeHeadEnd) <= 0 {
+				// exactly the head the expiry sent again: the source may
+				// hold its original or the retransmission, and nothing yet
+				// says which
+				self.recoveryPhase = tcpReturnRecoveryPhaseTimeoutProbeAdvanced
+				keepBackoff = true
+			} else {
+				// past the retransmitted head, or a second advance with no
+				// duplicate between: the source holds segments that were
+				// never sent again, so the originals arrived and only their
+				// acknowledgements were late (RFC 5682 §2.1 step 3b). The
+				// expiry was spurious: nothing more is sent, and the base
+				// below is the timer it doubled
+				self.recoveryPhase = tcpReturnRecoveryPhaseNone
+			}
+		case tcpReturnRecoveryPhaseLoss:
+			if recovered {
+				self.recoveryPhase = tcpReturnRecoveryPhaseNone
 			} else {
 				// a partial acknowledgement: the next hole starts at the
 				// new head, and waiting three more duplicates for it would
@@ -624,7 +685,14 @@ func (self *tcpReturnRetransmitState) ackWithLock(
 				self.markDueWithLock(self.segmentAtWithLock(0), tcpReturnRetransmitReasonPartialAck, nowNanos)
 			}
 		}
-		if self.applySackWithLock(tcp) && self.recovering {
+		if !keepBackoff {
+			self.rtoNanos = self.baseRtoNanos()
+		}
+		self.rtoDeadlineNanos = nowNanos + self.rtoNanos
+		if self.count == 0 {
+			return false
+		}
+		if self.applySackWithLock(tcp) && self.recoveryPhase == tcpReturnRecoveryPhaseLoss {
 			self.markSackHolesWithLock(nowNanos)
 		}
 		return 0 < self.dueCount
@@ -637,12 +705,26 @@ func (self *tcpReturnRetransmitState) ackWithLock(
 	}
 	self.dupAckCount += 1
 	sackChanged := self.applySackWithLock(tcp)
-	if self.dupAckCount < returnRetransmitDupAckThreshold || self.deliveredCount == 0 {
+	if self.deliveredCount == 0 {
 		return false
 	}
+	switch self.recoveryPhase {
+	case tcpReturnRecoveryPhaseTimeoutProbe:
+		// the source is missing the head: the expiry was real (RFC 5682
+		// §2.1 step 2a), and the head it sent again is already out
+		self.recoveryPhase = tcpReturnRecoveryPhaseLoss
+	case tcpReturnRecoveryPhaseTimeoutProbeAdvanced:
+		// the acknowledgement that covered exactly the head was a partial
+		// one, and the segment after it is missing too (step 3a)
+		self.recoveryPhase = tcpReturnRecoveryPhaseLoss
+		self.markDueWithLock(self.segmentAtWithLock(0), tcpReturnRetransmitReasonPartialAck, nowNanos)
+	}
+	if self.dupAckCount < returnRetransmitDupAckThreshold {
+		return 0 < self.dueCount
+	}
 	if self.dupAckCount == returnRetransmitDupAckThreshold || sackChanged {
-		if !self.recovering {
-			self.recovering = true
+		if self.recoveryPhase == tcpReturnRecoveryPhaseNone {
+			self.recoveryPhase = tcpReturnRecoveryPhaseLoss
 			self.recoveryEnd = self.highestDeliveredWithLock()
 		}
 		if 0 < self.sackedCount {
@@ -657,7 +739,9 @@ func (self *tcpReturnRetransmitState) ackWithLock(
 // The worker's clock. Reports an expired no-progress bound as `abandon`, marks
 // the head due on timer expiry with backoff, and returns how long the worker
 // waits for the next of either, negative when nothing delivered is
-// outstanding.
+// outstanding. An expiry with no answer from the source since the last one
+// probes; an expiry after the probe saw an answer, or during loss recovery,
+// is loss (RFC 5682 §2.1 step 1).
 func (self *tcpReturnRetransmitState) timerWithLock(nowNanos int64) (abandon bool, waitNanos int64) {
 	if !self.enabled || self.deliveredCount == 0 {
 		return false, -1
@@ -667,13 +751,20 @@ func (self *tcpReturnRetransmitState) timerWithLock(nowNanos int64) (abandon boo
 		return true, -1
 	}
 	if self.rtoDeadlineNanos <= nowNanos {
-		self.markDueWithLock(self.segmentAtWithLock(0), tcpReturnRetransmitReasonTimeout, nowNanos)
+		head := self.segmentAtWithLock(0)
+		self.markDueWithLock(head, tcpReturnRetransmitReasonTimeout, nowNanos)
 		self.rtoNanos = min(2*self.rtoNanos, int64(returnRetransmitMaxRto))
 		self.rtoDeadlineNanos = nowNanos + self.rtoNanos
-		if !self.recovering {
-			self.recovering = true
-			self.recoveryEnd = self.highestDeliveredWithLock()
+		switch self.recoveryPhase {
+		case tcpReturnRecoveryPhaseNone, tcpReturnRecoveryPhaseTimeoutProbe:
+			// silence is no evidence of loss: a stall that holds the
+			// acknowledgements back looks the same, so only the head goes
+			self.recoveryPhase = tcpReturnRecoveryPhaseTimeoutProbe
+			self.probeHeadEnd = head.seq + head.byteCount
+		default:
+			self.recoveryPhase = tcpReturnRecoveryPhaseLoss
 		}
+		self.recoveryEnd = self.highestDeliveredWithLock()
 		if self.counters != nil {
 			self.counters.timeoutCount.Add(1)
 		}
