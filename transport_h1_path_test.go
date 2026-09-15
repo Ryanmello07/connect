@@ -1,6 +1,7 @@
 package connect
 
 import (
+	"fmt"
 	"testing"
 	"time"
 )
@@ -821,5 +822,192 @@ func TestH1PathDefaultLedgerFollowsNetworkChange(t *testing.T) {
 	NetworkChanged()
 	if excluded := ledger.excluded(); len(excluded) != 0 {
 		t.Fatalf("NetworkChanged left the default ledger's excluded ports %v", excluded)
+	}
+}
+
+// The mode of a connection, in precedence order. The relay-advertised level of
+// the design is not implemented here, so the levels are the process override,
+// the environment and the settings.
+func TestH1PathEffectiveModePrecedence(t *testing.T) {
+	for _, c := range []struct {
+		name             string
+		settingsMode     H1PathRerollMode
+		role             H1PathRerollRole
+		allowProviderAct bool
+		envValue         string
+		overrideMode     H1PathRerollMode
+		overrideSet      bool
+		wantMode         H1PathRerollMode
+		wantSource       h1PathModeSource
+		wantEnvValid     bool
+	}{
+		{
+			name: "settings only", settingsMode: H1PathRerollModeObserve,
+			wantMode: H1PathRerollModeObserve, wantSource: h1PathModeSourceSettings, wantEnvValid: true,
+		},
+		{
+			name: "unknown settings mode", settingsMode: H1PathRerollMode(7),
+			wantMode: H1PathRerollModeOff, wantSource: h1PathModeSourceSettings, wantEnvValid: true,
+		},
+		{
+			name: "env act over settings observe", settingsMode: H1PathRerollModeObserve, envValue: "act",
+			wantMode: H1PathRerollModeAct, wantSource: h1PathModeSourceEnv, wantEnvValid: true,
+		},
+		{
+			name: "env off over settings act", settingsMode: H1PathRerollModeAct, envValue: "OFF ",
+			wantMode: H1PathRerollModeOff, wantSource: h1PathModeSourceEnv, wantEnvValid: true,
+		},
+		{
+			name: "empty env keeps the settings", settingsMode: H1PathRerollModeAct, envValue: "",
+			wantMode: H1PathRerollModeAct, wantSource: h1PathModeSourceSettings, wantEnvValid: true,
+		},
+		{
+			name: "bad env keeps the settings", settingsMode: H1PathRerollModeObserve, envValue: "bogus",
+			wantMode: H1PathRerollModeObserve, wantSource: h1PathModeSourceSettings, wantEnvValid: false,
+		},
+		{
+			name: "override observe over env act and settings act", settingsMode: H1PathRerollModeAct, envValue: "act",
+			overrideMode: H1PathRerollModeObserve, overrideSet: true,
+			wantMode: H1PathRerollModeObserve, wantSource: h1PathModeSourceOverride, wantEnvValid: true,
+		},
+		{
+			name: "override off over env act", settingsMode: H1PathRerollModeObserve, envValue: "act",
+			overrideMode: H1PathRerollModeOff, overrideSet: true,
+			wantMode: H1PathRerollModeOff, wantSource: h1PathModeSourceOverride, wantEnvValid: true,
+		},
+		{
+			name: "override act over settings off", settingsMode: H1PathRerollModeOff,
+			overrideMode: H1PathRerollModeAct, overrideSet: true,
+			wantMode: H1PathRerollModeAct, wantSource: h1PathModeSourceOverride, wantEnvValid: true,
+		},
+		{
+			name: "unknown override", settingsMode: H1PathRerollModeAct,
+			overrideMode: H1PathRerollMode(7), overrideSet: true,
+			wantMode: H1PathRerollModeOff, wantSource: h1PathModeSourceOverride, wantEnvValid: true,
+		},
+		{
+			name: "provider clamps the settings", settingsMode: H1PathRerollModeAct, role: H1PathRerollRoleProvider,
+			wantMode: H1PathRerollModeObserve, wantSource: h1PathModeSourceSettings, wantEnvValid: true,
+		},
+		{
+			name: "provider clamps the env", settingsMode: H1PathRerollModeObserve, role: H1PathRerollRoleProvider, envValue: "act",
+			wantMode: H1PathRerollModeObserve, wantSource: h1PathModeSourceEnv, wantEnvValid: true,
+		},
+		{
+			name: "provider clamps the override", settingsMode: H1PathRerollModeObserve, role: H1PathRerollRoleProvider,
+			overrideMode: H1PathRerollModeAct, overrideSet: true,
+			wantMode: H1PathRerollModeObserve, wantSource: h1PathModeSourceOverride, wantEnvValid: true,
+		},
+		{
+			name: "allowed provider acts", settingsMode: H1PathRerollModeObserve, role: H1PathRerollRoleProvider,
+			allowProviderAct: true, envValue: "act",
+			wantMode: H1PathRerollModeAct, wantSource: h1PathModeSourceEnv, wantEnvValid: true,
+		},
+		{
+			name: "provider off stays off", settingsMode: H1PathRerollModeAct, role: H1PathRerollRoleProvider,
+			allowProviderAct: true, envValue: "off",
+			wantMode: H1PathRerollModeOff, wantSource: h1PathModeSourceEnv, wantEnvValid: true,
+		},
+	} {
+		settings := DefaultH1PathRerollSettings()
+		settings.Mode = c.settingsMode
+		settings.Role = c.role
+		settings.AllowProviderAct = c.allowProviderAct
+		mode, source, envValid := h1PathEffectiveMode(&settings, c.overrideMode, c.overrideSet, c.envValue)
+		if mode != c.wantMode || source != c.wantSource || envValid != c.wantEnvValid {
+			t.Errorf(
+				"%s: mode = %s from %s (env valid %t); want %s from %s (env valid %t)",
+				c.name, mode, source, envValid, c.wantMode, c.wantSource, c.wantEnvValid,
+			)
+		}
+	}
+}
+
+// The process override is set, read and cleared, and an unknown mode is stored
+// as Off rather than reaching Act.
+func TestH1PathRerollModeOverrideApi(t *testing.T) {
+	previousMode, previousSet := H1PathRerollModeOverride()
+	t.Cleanup(func() {
+		if previousSet {
+			SetH1PathRerollModeOverride(previousMode)
+		} else {
+			ClearH1PathRerollModeOverride()
+		}
+	})
+
+	ClearH1PathRerollModeOverride()
+	if mode, ok := H1PathRerollModeOverride(); ok || mode != H1PathRerollModeOff {
+		t.Fatalf("override = %s, %t after clear", mode, ok)
+	}
+	for _, wantMode := range []H1PathRerollMode{
+		H1PathRerollModeOff,
+		H1PathRerollModeObserve,
+		H1PathRerollModeAct,
+	} {
+		SetH1PathRerollModeOverride(wantMode)
+		if mode, ok := H1PathRerollModeOverride(); !ok || mode != wantMode {
+			t.Errorf("override = %s, %t; want %s, true", mode, ok, wantMode)
+		}
+	}
+	SetH1PathRerollModeOverride(H1PathRerollMode(7))
+	if mode, ok := H1PathRerollModeOverride(); !ok || mode != H1PathRerollModeOff {
+		t.Fatalf("override = %s, %t after an unknown mode; want off, true", mode, ok)
+	}
+	ClearH1PathRerollModeOverride()
+	if _, ok := H1PathRerollModeOverride(); ok {
+		t.Fatal("the override survived a clear")
+	}
+}
+
+// A transport reads the environment at each connection. A value that does not
+// parse leaves the settings mode in force and is logged once per value.
+func TestH1PathRerollModeEnvironmentBadValueLogsOnce(t *testing.T) {
+	log := newRecordingLogger()
+	settings := DefaultPlatformTransportSettings()
+	settings.H1PathReroll.Mode = H1PathRerollModeObserve
+	transport := &PlatformTransport{log: log, settings: settings}
+
+	t.Setenv(H1PathRerollModeEnv, "act")
+	if mode, source := transport.h1PathEffectiveMode(); mode != H1PathRerollModeAct || source != h1PathModeSourceEnv {
+		t.Fatalf("mode = %s from %s, want act from env", mode, source)
+	}
+
+	// each distinct bad value is logged once, however many connections read it
+	badValue := fmt.Sprintf("bogus-%s", NewId())
+	t.Setenv(H1PathRerollModeEnv, badValue)
+	for range 3 {
+		if mode, source := transport.h1PathEffectiveMode(); mode != H1PathRerollModeObserve || source != h1PathModeSourceSettings {
+			t.Fatalf("mode = %s from %s, want the settings observe", mode, source)
+		}
+	}
+	if lines := log.linesWith(badValue); len(lines) != 1 {
+		t.Fatalf("log lines for %s = %v, want one", badValue, lines)
+	}
+
+	otherBadValue := fmt.Sprintf("bogus-%s", NewId())
+	t.Setenv(H1PathRerollModeEnv, otherBadValue)
+	transport.h1PathEffectiveMode()
+	if lines := log.linesWith(otherBadValue); len(lines) != 1 {
+		t.Fatalf("log lines for %s = %v, want one", otherBadValue, lines)
+	}
+}
+
+// The tick log is forced by the environment whatever the settings say.
+func TestH1PathLogTicksEnvironment(t *testing.T) {
+	settings := DefaultH1PathRerollSettings()
+	if h1PathLogTicks(&settings) {
+		t.Fatal("the default settings log every tick")
+	}
+	t.Setenv(H1PathRerollLogTicksEnv, "1")
+	if !h1PathLogTicks(&settings) {
+		t.Fatal("the environment did not force the tick log")
+	}
+	t.Setenv(H1PathRerollLogTicksEnv, "0")
+	if h1PathLogTicks(&settings) {
+		t.Fatal("a zero environment value forced the tick log")
+	}
+	settings.LogTicks = true
+	if !h1PathLogTicks(&settings) {
+		t.Fatal("the settings did not turn on the tick log")
 	}
 }

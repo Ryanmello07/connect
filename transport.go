@@ -994,6 +994,9 @@ type PlatformTransport struct {
 	// the queue delay baseline of every H1 connection of this transport:
 	// settings.h1PathBaseline, or one of its own. Immutable after construction.
 	h1PathBaseline *h1QueueDelayBaseline
+	// the H1 path mode and source this transport last logged, encoded by
+	// noteH1PathMode; zero before the first connection
+	h1PathModeNoted atomic.Int32
 }
 
 // newPlatformQuicConfig keeps H3's memory and path-MTU behavior explicit and

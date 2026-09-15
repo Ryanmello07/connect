@@ -472,13 +472,14 @@ func TestPlatformTransportH1PathCountsReceiveBackpressure(t *testing.T) {
 	})
 }
 
+// The effective mode is resolved before this (see
+// TestH1PathEffectiveModePrecedence); eligibility is what the connection's own
+// shape allows.
 func TestH1PathEligibility(t *testing.T) {
 	extenderIp := netip.MustParseAddr("192.0.2.7")
 	for _, c := range []struct {
 		name            string
 		mode            H1PathRerollMode
-		role            H1PathRerollRole
-		allowProvider   bool
 		generator       bool
 		proxied         bool
 		extenderIp      netip.Addr
@@ -492,20 +493,16 @@ func TestH1PathEligibility(t *testing.T) {
 		{name: "control only", mode: H1PathRerollModeAct, generator: true, wantMode: H1PathRerollModeOff},
 		{name: "extender", mode: H1PathRerollModeAct, extenderIp: extenderIp, wantMode: H1PathRerollModeAct, wantObserveOnly: true},
 		{name: "proxy", mode: H1PathRerollModeAct, proxied: true, wantMode: H1PathRerollModeAct, wantObserveOnly: true},
-		{name: "provider", mode: H1PathRerollModeAct, role: H1PathRerollRoleProvider, wantMode: H1PathRerollModeObserve},
-		{name: "provider allowed", mode: H1PathRerollModeAct, role: H1PathRerollRoleProvider, allowProvider: true, wantMode: H1PathRerollModeAct},
-		{name: "provider observe", mode: H1PathRerollModeObserve, role: H1PathRerollRoleProvider, wantMode: H1PathRerollModeObserve},
 	} {
 		settings := DefaultPlatformTransportSettings()
-		settings.H1PathReroll.Mode = c.mode
-		settings.H1PathReroll.Role = c.role
-		settings.H1PathReroll.AllowProviderAct = c.allowProvider
+		// the settings mode is not read here: the effective mode is the input
+		settings.H1PathReroll.Mode = H1PathRerollModeOff
 		if c.generator {
 			settings.TransportGenerator = func() (Transport, Transport) {
 				return NewSendClientTransport(DestinationId(ControlId)), NewReceiveGatewayTransport()
 			}
 		}
-		mode, observeOnly := h1PathConnectionMode(settings, c.proxied, c.extenderIp)
+		mode, observeOnly := h1PathConnectionMode(settings, c.mode, c.proxied, c.extenderIp)
 		if mode != c.wantMode || (mode != H1PathRerollModeOff && observeOnly != c.wantObserveOnly) {
 			t.Errorf("%s: mode = %s, observe only = %t; want %s, %t", c.name, mode, observeOnly, c.wantMode, c.wantObserveOnly)
 		}
@@ -648,6 +645,161 @@ func testingH1PathWaitForConvictions(t *testing.T, rig *testingH1PathRig, connec
 	}) {
 		count, _ := rig.convictions(connectionOrdinal)
 		t.Fatalf("connection %d convicted %d times, want %d followed by another tick (connections %v)", connectionOrdinal, count, convictionCount, rig.dials())
+	}
+}
+
+// Restores the process override when the test ends. Registered before the
+// transport, so it runs after the transport is closed.
+func testingH1PathRestoreModeOverride(t *testing.T) {
+	t.Helper()
+	previousMode, previousSet := H1PathRerollModeOverride()
+	t.Cleanup(func() {
+		if previousSet {
+			SetH1PathRerollModeOverride(previousMode)
+		} else {
+			ClearH1PathRerollModeOverride()
+		}
+	})
+}
+
+// The environment turns on Act for a transport whose settings say Observe, so
+// a collapsed connection is re-rolled. The mode does not depend on the address
+// family, so these tests run on one.
+func TestPlatformTransportH1PathEnvironmentActOverridesSettings(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	log := newRecordingLogger()
+	t.Setenv(H1PathRerollModeEnv, "act")
+	platform := newTestingPlatformServer(t)
+	rig := newTestingH1PathRig(func(connectionOrdinal int, tickIndex int) testingH1PathClass {
+		if connectionOrdinal == 0 {
+			return testingH1PathCollapsed
+		}
+		return testingH1PathHealthy
+	})
+	settings := testingH1PathTransportSettings(H1PathRerollModeObserve, rig)
+	settings.Log = log
+	transport := testingPlatformTransport(t, ctx, platform.url, settings)
+
+	if !waitForCondition(15*time.Second, func() bool {
+		return settings.H1PathReroll.CleanTicks <= len(rig.connectionDecisions(1))
+	}) {
+		t.Fatalf("connections %v, want the convicted connection re-rolled by the environment", rig.dials())
+	}
+	testingH1PathRequireRerolled(t, rig, 0)
+	if stats := rig.stats.snapshot(); stats.Rerolls != 1 || stats.RerollDials != 1 {
+		t.Fatalf("stats = %+v, want one re-roll", stats)
+	}
+	if !transport.IsConnected() {
+		t.Fatal("the transport is not connected after the re-roll")
+	}
+	// one line per transport, however many connections resolved the mode
+	if lines := log.linesWith("[t]h1 path mode=act source=env"); len(lines) != 1 {
+		t.Fatalf("mode lines = %v, want exactly one", lines)
+	}
+}
+
+// The process override wins over the environment: with the environment asking
+// for Act and the override for Observe, convictions are observed and the
+// connection stays.
+func TestPlatformTransportH1PathOverrideBeatsEnvironment(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	log := newRecordingLogger()
+	t.Setenv(H1PathRerollModeEnv, "act")
+	testingH1PathRestoreModeOverride(t)
+	SetH1PathRerollModeOverride(H1PathRerollModeObserve)
+
+	platform := newTestingPlatformServer(t)
+	rig := newTestingH1PathRig(testingH1PathCollapsedAlways)
+	settings := testingH1PathTransportSettings(H1PathRerollModeAct, rig)
+	settings.Log = log
+	transport := testingPlatformTransport(t, ctx, platform.url, settings)
+
+	testingH1PathWaitForConvictions(t, rig, 0, 2)
+	if dials := rig.dials(); len(dials) != 1 {
+		t.Fatalf("connections %v, want [0]: the override observed the convictions", dials)
+	}
+	stats := rig.stats.snapshot()
+	if stats.Rerolls != 0 || stats.RerollDials != 0 || stats.SuppressedObserve < 2 {
+		t.Fatalf("stats = %+v, want every conviction observed", stats)
+	}
+	if !transport.IsConnected() {
+		t.Fatal("the transport lost its connection")
+	}
+	if lines := log.linesWith("[t]h1 path mode=observe source=override"); len(lines) != 1 {
+		t.Fatalf("mode lines = %v, want exactly one", lines)
+	}
+}
+
+// An override set to Off after a connection is running stops the monitor at
+// the next dial: the replacement publishes no observer and is not counted.
+func TestPlatformTransportH1PathOverrideOffStopsTheNextConnection(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	testingH1PathRestoreModeOverride(t)
+	ClearH1PathRerollModeOverride()
+
+	platform := newTestingPlatformServer(t)
+	rig := newTestingH1PathRig(testingH1PathCollapsedAlways)
+	settings := testingH1PathTransportSettings(H1PathRerollModeObserve, rig)
+	transport := testingPlatformTransport(t, ctx, platform.url, settings)
+
+	if !waitForCondition(15*time.Second, func() bool {
+		observer, published := testingH1PathPublishedObserver(transport)
+		return published && observer != nil
+	}) {
+		t.Fatal("the first connection published no observer")
+	}
+	if stats := rig.stats.snapshot(); stats.ConnectionsMonitored != 1 {
+		t.Fatalf("stats = %+v, want the first connection monitored", stats)
+	}
+
+	SetH1PathRerollModeOverride(H1PathRerollModeOff)
+	transport.Kick()
+	if !waitForCondition(15*time.Second, func() bool {
+		observer, published := testingH1PathPublishedObserver(transport)
+		return published && observer == nil
+	}) {
+		t.Fatal("the connection after the override still publishes an observer")
+	}
+	if dials := rig.dials(); len(dials) != 1 {
+		t.Fatalf("connections %v, want [0]: the second connection is not monitored", dials)
+	}
+	stats := rig.stats.snapshot()
+	if stats.ConnectionsMonitored != 1 || stats.ConnectionsDormant != 0 || stats.Rerolls != 0 {
+		t.Fatalf("stats = %+v, want only the first connection monitored", stats)
+	}
+}
+
+// The environment forces the per-tick log of a monitored connection.
+func TestPlatformTransportH1PathLogTicksEnvironment(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	log := newRecordingLogger()
+	t.Setenv(H1PathRerollLogTicksEnv, "1")
+	platform := newTestingPlatformServer(t)
+	rig := newTestingH1PathRig(testingH1PathCollapsedAlways)
+	settings := testingH1PathTransportSettings(H1PathRerollModeObserve, rig)
+	settings.Log = log
+	if settings.H1PathReroll.LogTicks {
+		t.Fatal("the test settings already log every tick")
+	}
+	testingPlatformTransport(t, ctx, platform.url, settings)
+
+	if !waitForCondition(15*time.Second, func() bool {
+		return 5 <= len(rig.connectionDecisions(0))
+	}) {
+		t.Fatal("the connection did not tick")
+	}
+	decisionCount := len(rig.connectionDecisions(0))
+	// each tick logs before the decision reaches the rig
+	if lines := log.linesWith("[t]h1path tick connection=0"); len(lines) < decisionCount {
+		t.Fatalf("tick lines = %d for %d decisions", len(lines), decisionCount)
 	}
 }
 

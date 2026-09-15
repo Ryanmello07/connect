@@ -18,7 +18,9 @@ import (
 // that climbs to seconds while the window sits queued in the far socket.
 //
 // This file holds the pure parts, with no call sites of their own:
-//   - the settings and their defaults (library default Observe);
+//   - the settings and their defaults (library default Observe), the
+//     environment variables and the process mode override, and the precedence
+//     between them;
 //   - `h1PathMonitor`, one per connection, which classifies ticks from a
 //     sampled queue delay, the delivered rate and optional kernel TCP counters,
 //     and convicts a direction after a sustained collapse with loss evidence;
@@ -53,6 +55,108 @@ func ParseH1PathRerollMode(s string) (H1PathRerollMode, bool) {
 	default:
 		return H1PathRerollModeOff, false
 	}
+}
+
+// The environment variable that sets the mode of every H1 connection dialed
+// after it is read: off, observe or act. It wins over the settings, and the
+// process override wins over it. A value that does not parse is ignored and
+// logged once.
+const H1PathRerollModeEnv = "CONNECT_H1_PATH_REROLL"
+
+// "1" logs one line per monitor tick, whatever the settings say.
+const H1PathRerollLogTicksEnv = "CONNECT_H1_PATH_REROLL_LOG_TICKS"
+
+// Anything but Off, Observe and Act is Off, so a value from outside the
+// package cannot act by accident.
+func h1PathNormalizeMode(mode H1PathRerollMode) H1PathRerollMode {
+	switch mode {
+	case H1PathRerollModeObserve, H1PathRerollModeAct:
+		return mode
+	default:
+		return H1PathRerollModeOff
+	}
+}
+
+// Where a connection's mode came from, for its log lines.
+type h1PathModeSource int
+
+const (
+	h1PathModeSourceSettings h1PathModeSource = 0
+	h1PathModeSourceEnv      h1PathModeSource = 1
+	h1PathModeSourceOverride h1PathModeSource = 2
+)
+
+func (self h1PathModeSource) String() string {
+	switch self {
+	case h1PathModeSourceEnv:
+		return "env"
+	case h1PathModeSourceOverride:
+		return "override"
+	default:
+		return "settings"
+	}
+}
+
+// the process override as mode + 1; zero is no override
+var h1PathModeOverrideValue atomic.Int32
+
+// SetH1PathRerollModeOverride sets the H1 path re-roll mode of every
+// connection dialed after it, over the environment and over each transport's
+// settings. It is the host's kill switch: SetH1PathRerollModeOverride(Off)
+// stops the monitor everywhere without a settings change or a reconnect of its
+// own. An unknown mode is stored as Off.
+func SetH1PathRerollModeOverride(mode H1PathRerollMode) {
+	h1PathModeOverrideValue.Store(int32(h1PathNormalizeMode(mode)) + 1)
+}
+
+// ClearH1PathRerollModeOverride returns to the environment and the settings.
+func ClearH1PathRerollModeOverride() {
+	h1PathModeOverrideValue.Store(0)
+}
+
+// H1PathRerollModeOverride is the process override, and whether one is set.
+func H1PathRerollModeOverride() (H1PathRerollMode, bool) {
+	value := h1PathModeOverrideValue.Load()
+	if value == 0 {
+		return H1PathRerollModeOff, false
+	}
+	return H1PathRerollMode(value - 1), true
+}
+
+// The mode of a connection and where it came from, in precedence order: the
+// process override, then the environment, then the settings. An empty
+// environment value, or one that does not parse, falls through; envValid is
+// false only for a value that was set and did not parse, so the caller can log
+// it once. A provider is then clamped to Observe unless AllowProviderAct,
+// whichever level chose Act: a provider's re-dial counts against its
+// reliability.
+func h1PathEffectiveMode(
+	settings *H1PathRerollSettings,
+	overrideMode H1PathRerollMode,
+	overrideSet bool,
+	envValue string,
+) (mode H1PathRerollMode, source h1PathModeSource, envValid bool) {
+	mode = h1PathNormalizeMode(settings.Mode)
+	source = h1PathModeSourceSettings
+	envValid = true
+	if envValue != "" {
+		if envMode, ok := ParseH1PathRerollMode(envValue); ok {
+			mode = envMode
+			source = h1PathModeSourceEnv
+		} else {
+			envValid = false
+		}
+	}
+	if overrideSet {
+		mode = h1PathNormalizeMode(overrideMode)
+		source = h1PathModeSourceOverride
+	}
+	if mode == H1PathRerollModeAct &&
+		settings.Role == H1PathRerollRoleProvider &&
+		!settings.AllowProviderAct {
+		mode = H1PathRerollModeObserve
+	}
+	return mode, source, envValid
 }
 
 func (self H1PathRerollMode) String() string {
