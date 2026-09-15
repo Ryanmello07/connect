@@ -994,6 +994,73 @@ func TestTcpReturnRetransmitRecoversOneDroppedSegmentOnDuplicateAcks(t *testing.
 	}
 }
 
+// A batch whose first segment the source's kernel drops draws its duplicate
+// acknowledgements while the rest of the batch is still inside the delivery
+// callback, before the drain marks any of it delivered, as a provider's
+// return callback does while it waits for Transfer admission. Every one of
+// those duplicates counts, and fast retransmit follows the moment the batch is
+// marked, not the timer. A first segment held by a stalled tunnel write lets
+// the whole batch queue behind it, so all seven duplicates come before the
+// marking. They were counted and then ignored while nothing was delivered, and
+// only the third could trigger, so the hole waited a second for the timer,
+// with SACK or without.
+func TestTcpReturnRetransmitDuplicatesBeforeTheirBatchIsMarkedFastRetransmit(t *testing.T) {
+	const batchSegmentCount = 8
+	const stall = 10 * time.Millisecond
+	for _, sack := range []bool{false, true} {
+		runTcpReturnRetransmitTest(t, func(t *testing.T) {
+			harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{
+				sack: sack,
+				configure: func(settings *TcpBufferSettings) {
+					// the batch and the read queue both hold the whole write
+					settings.WriteBatchSize = 2 * batchSegmentCount
+				},
+			})
+			payload := harness.payload(1 + batchSegmentCount)
+			harness.source.stallDurations[harness.segmentSeq(0)] = stall
+			start := time.Now()
+			harness.write(payload[:harness.segmentByteCount])
+			synctest.Wait()
+			// the drain is held in the first segment's write, so the next read
+			// queues whole and goes as one batch
+			harness.source.stateLock.Lock()
+			harness.source.dropCounts[harness.segmentSeq(1)] = 1
+			harness.source.stateLock.Unlock()
+			harness.write(payload[harness.segmentByteCount:])
+			synctest.Wait()
+
+			time.Sleep(stall)
+			synctest.Wait()
+			// far past the timer
+			time.Sleep(2 * returnRetransmitInitialRto)
+			synctest.Wait()
+
+			harness.requireStream(payload)
+			for segmentIndex := 0; segmentIndex <= batchSegmentCount; segmentIndex += 1 {
+				want := 1
+				if segmentIndex == 1 {
+					want = 2
+				}
+				harness.requireSeenCount(segmentIndex, want)
+				if got := harness.requireDelivery(harness.segmentSeq(segmentIndex), want-1).at.Sub(start); got != stall {
+					t.Fatalf("sack=%t: segment %d delivered at +%s, want +%s after the stall", sack, segmentIndex, got, stall)
+				}
+			}
+			wantReason := tcpReturnRetransmitReasonDupAck
+			if sack {
+				wantReason = tcpReturnRetransmitReasonSackHole
+			}
+			_, _, packetCount, reasonCounts := harness.retransmitState()
+			if packetCount != 1 || reasonCounts[wantReason] != 1 {
+				t.Fatalf("sack=%t: retransmissions=%d reasons=%v, want one on %s", sack, packetCount, reasonCounts, wantReason)
+			}
+			if stats := harness.counters.snapshot(); stats.TimeoutCount != 0 {
+				t.Fatalf("sack=%t: stats=%+v, want no timer expiry", sack, stats)
+			}
+		})
+	}
+}
+
 // (b) Two separated segments dropped, with SACK: the third duplicate
 // acknowledgement's blocks reveal both holes and only the holes are sent, at
 // once, with no cumulative-progress round between them and nothing

@@ -203,7 +203,10 @@ func (self *returnRetransmitCounters) snapshot() ReturnRetransmitStats {
 // the source cannot have seen yet would be a spurious retransmission. Every
 // trigger below considers delivered segments only, the round trip is measured
 // from delivery, and the delivered set is always a prefix of the ring, since
-// the drain delivers in sequence order.
+// the drain delivers in sequence order. The drain marks a batch only when
+// its callback returns, and the source can answer the batch before that, so a
+// duplicate acknowledgement that arrives while nothing is marked still counts,
+// and fast retransmit follows the marking.
 //
 // Bounds. Retained sequence bytes never exceed the source's advertised window,
 // because the packetizer already stops at the greatest advertised edge and
@@ -488,9 +491,13 @@ func (self *tcpReturnRetransmitState) retainWithLock(
 // was acknowledged before the batch's callback returned, which the fast
 // acknowledgement path allows, and is skipped; a packet that was never
 // retained (a teardown reset) matches nothing and shifts nothing. Reports
-// whether the first delivered segment with nothing outstanding just went out,
-// which starts the timer and the no-progress clock.
-func (self *tcpReturnRetransmitState) markDeliveredWithLock(seqs []uint32, nowNanos int64) (armed bool) {
+// whether the worker must run: the first delivered segment with nothing
+// outstanding just went out, which starts the timer and the no-progress
+// clock, and fast retransmit may have followed it. The source answers a
+// batch while the drain is still inside its callback, so the duplicates of a
+// hole at the batch's head can all arrive before this marks the head; they
+// were counted (see ackWithLock), and the head is sent again here.
+func (self *tcpReturnRetransmitState) markDeliveredWithLock(seqs []uint32, nowNanos int64) (wake bool) {
 	if !self.enabled {
 		return false
 	}
@@ -504,7 +511,7 @@ func (self *tcpReturnRetransmitState) markDeliveredWithLock(seqs []uint32, nowNa
 			// this one, or an older one that in-order delivery put out
 			// before it
 			if self.deliveredCount == 0 {
-				armed = true
+				wake = true
 				self.progressNanos = nowNanos
 				self.rtoDeadlineNanos = nowNanos + self.rtoNanos
 			}
@@ -515,6 +522,9 @@ func (self *tcpReturnRetransmitState) markDeliveredWithLock(seqs []uint32, nowNa
 				break
 			}
 		}
+	}
+	if wake && self.recoveryPhase == tcpReturnRecoveryPhaseNone && returnRetransmitDupAckThreshold <= self.dupAckCount {
+		self.fastRetransmitWithLock(nowNanos)
 	}
 	return
 }
@@ -592,6 +602,19 @@ func (self *tcpReturnRetransmitState) beginLossRecoveryWithLock(startNanos int64
 	self.recoveryPhase = tcpReturnRecoveryPhaseLoss
 	self.recoveryStartNanos = startNanos
 	self.burstSegmentCount = 0
+}
+
+// Fast retransmit, on the duplicates of the head reaching the threshold with
+// no recovery under way: loss recovery to the highest delivered segment, and
+// the holes below the selectively acknowledged range, or the head.
+func (self *tcpReturnRetransmitState) fastRetransmitWithLock(nowNanos int64) {
+	self.beginLossRecoveryWithLock(nowNanos)
+	self.recoveryEnd = self.highestDeliveredWithLock()
+	if 0 < self.sackedCount {
+		self.markSackHolesWithLock(nowNanos)
+	} else {
+		self.markDueWithLock(self.segmentAtWithLock(0), tcpReturnRetransmitReasonDupAck, nowNanos)
+	}
 }
 
 // Sends the burst of one partial acknowledgement in loss recovery: twice the
@@ -853,6 +876,8 @@ func (self *tcpReturnRetransmitState) ackWithLock(
 	self.dupAckCount += 1
 	sackChanged := self.applySackWithLock(tcp)
 	if self.deliveredCount == 0 {
+		// the hole's batch is still being delivered, and this duplicate still
+		// counts: markDeliveredWithLock retransmits when it marks the head
 		return false
 	}
 	switch self.recoveryPhase {
@@ -871,16 +896,15 @@ func (self *tcpReturnRetransmitState) ackWithLock(
 	if self.dupAckCount < returnRetransmitDupAckThreshold {
 		return 0 < self.dueCount
 	}
-	if self.dupAckCount == returnRetransmitDupAckThreshold || sackChanged {
-		if self.recoveryPhase == tcpReturnRecoveryPhaseNone {
-			self.beginLossRecoveryWithLock(nowNanos)
-			self.recoveryEnd = self.highestDeliveredWithLock()
-		}
-		if 0 < self.sackedCount {
-			self.markSackHolesWithLock(nowNanos)
-		} else if self.dupAckCount == returnRetransmitDupAckThreshold {
-			self.markDueWithLock(self.segmentAtWithLock(0), tcpReturnRetransmitReasonDupAck, nowNanos)
-		}
+	switch {
+	case self.recoveryPhase == tcpReturnRecoveryPhaseNone:
+		// at the threshold, or past it when the duplicates before it came
+		// while nothing was delivered
+		self.fastRetransmitWithLock(nowNanos)
+	case 0 < self.sackedCount && (sackChanged || self.dupAckCount == returnRetransmitDupAckThreshold):
+		self.markSackHolesWithLock(nowNanos)
+	case self.dupAckCount == returnRetransmitDupAckThreshold:
+		self.markDueWithLock(self.segmentAtWithLock(0), tcpReturnRetransmitReasonDupAck, nowNanos)
 	}
 	return 0 < self.dueCount
 }

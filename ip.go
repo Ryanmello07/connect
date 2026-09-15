@@ -4829,19 +4829,20 @@ func (self *TcpSequence) returnPacketSeqs(seqs []uint32, packets [][]byte) []uin
 	return seqs
 }
 
-// Marks a delivered batch as sent (see tcpReturnRetransmitState) and arms the
-// worker's timer when it was the first outstanding delivery.
+// Marks a delivered batch as sent (see tcpReturnRetransmitState) and wakes the
+// worker when it was the first outstanding delivery, which arms the timer and
+// may retransmit a hole the batch's own duplicates showed.
 func (self *TcpSequence) markReturnDelivered(seqs []uint32) {
 	if !self.returnRetransmit.enabled || len(seqs) == 0 {
 		return
 	}
-	armed := false
+	wake := false
 	func() {
 		self.mutex.Lock()
 		defer self.mutex.Unlock()
-		armed = self.returnRetransmit.markDeliveredWithLock(seqs, monotonicNanos())
+		wake = self.returnRetransmit.markDeliveredWithLock(seqs, monotonicNanos())
 	}()
-	if armed {
+	if wake {
 		self.signalReturnRetransmit()
 	}
 }
