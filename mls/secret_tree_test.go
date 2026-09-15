@@ -5703,33 +5703,13 @@ func TestAReceiverPastTheSkipBoundStaysWhereItIs(t *testing.T) {
 		t.Fatalf("a peer %d generations ahead is inside the bound of %d, so this case observes an ordinary skip",
 			ahead, MaxGenerationSkip)
 	}
-	sender, receiver := stNewTree(t, 8), stNewTree(t, 8)
-	// the sender walks past the bound. The last generation it draws is the message a deaf
-	// receiver never reads.
-	//
-	// The loop is bounded by the distance it is walking and reports its own failure rather than
-	// spinning: "step until the counter reaches n" over a build whose counter stopped moving is a
-	// hang, and a fixture that answers a hang where it could answer a finding reports the same
-	// thing for a defect and for a broken machine -- which is the reason testStore's own
-	// DeleteGroupStateBefore is written the way it is.
-	var nextKey, nextNonce []byte
-	for draws := uint32(0); draws <= ahead+1; draws += 1 {
-		generation, key, nonce, err := sender.NextSenderKey(1, RatchetApplication)
-		if err != nil {
-			t.Fatalf("NextSenderKey at generation %d: %v", generation, err)
-		}
-		if generation == ahead+1 {
-			nextKey, nextNonce = bytes.Clone(key), bytes.Clone(nonce)
-			break
-		}
-	}
-	if nextKey == nil {
-		t.Fatalf("the sender did not reach generation %d in %d draws, so its ratchet is not handing out consecutive generations",
-			ahead+1, ahead+2)
-	}
-
-	_ = nextKey
-	_ = nextNonce
+	receiver := stNewTree(t, 8)
+	// THE SENDER IS NOT DRIVEN AT ALL, and the deletion of that fixture is part of what this case
+	// now says. It used to walk a second tree to generation ahead+1 and keep that generation's key,
+	// because the assertion was that the NEXT message opens and a key of the right length is not a
+	// key. Nothing here opens any more, so the only sender-side value this case needs is the one it
+	// takes from stSenderKeysThrough at the end, for the generation INSIDE the bound that still
+	// does.
 	if _, _, err := receiver.ReceiverKey(1, RatchetApplication, ahead); !errors.Is(err, ErrRatchetGenerationTooFarAhead) {
 		t.Fatalf("a receiver at head 0 asked for generation %d answered %v, want ErrRatchetGenerationTooFarAhead",
 			ahead, err)
