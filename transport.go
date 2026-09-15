@@ -518,6 +518,11 @@ type PlatformTransportSettings struct {
 	// drain, but never beyond this bound. A non-positive value uses twice
 	// InactiveDrainTimeout.
 	InactiveDrainMaxTimeout time.Duration
+	// H1PathReroll configures the per-connection H1 path monitor, which
+	// detects a websocket held on a lossy network path and, in Act mode,
+	// re-dials it onto a new 4-tuple. The zero value is Off; the default is
+	// Observe. See transport_h1_path.go.
+	H1PathReroll H1PathRerollSettings
 	// H1MaxMessageByteCount caps each complete WebSocket message before it can
 	// grow a pooled buffer. A non-positive value resolves to the framer limit.
 	H1MaxMessageByteCount int64
@@ -659,6 +664,7 @@ func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 		TransportBufferSize:       32,
 		InactiveDrainTimeout:      30 * time.Second,
 		InactiveDrainMaxTimeout:   60 * time.Second,
+		H1PathReroll:              DefaultH1PathRerollSettings(),
 		ModeInitialDelay:          2 * time.Second,
 		ModePreferences:           DefaultTransportModePreferences(),
 		PinnedReconnectMaxTimeout: 5 * time.Minute,
