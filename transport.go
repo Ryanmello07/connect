@@ -1986,6 +1986,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 	// (NextReconnectTime); a failed re-dial clears it, so retries fall back to
 	// the serialized NextConnectTime pacing.
 	hadConnection := false
+	// marks the dial that replaces a connection the H1 path monitor closed
+	// (see rerolled below); cleared by that dial's attempt
+	rerollDial := false
 	// numbers the connections of this transport from zero, for the H1 path
 	// monitor's test hooks
 	connectionOrdinal := 0
@@ -2031,9 +2034,13 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				self.applyIntentHeader(header)
 			}
 
+			dialCtx := self.dialContext(self.ctx)
+			if rerollDial {
+				self.h1PathStats().RerollDials.Add(1)
+			}
 			dialStart := time.Now()
 			ws, _, dialerInfo, err := self.clientStrategy.WsDialContextWithDialer(
-				self.dialContext(self.ctx),
+				dialCtx,
 				self.platformUrl,
 				header,
 			)
@@ -2124,6 +2131,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			ws, err = connect()
 		}
 		releaseReconnect()
+		rerollDial = false
 		if err != nil {
 			// a canceled dial is local teardown -- this transport or its owner
 			// shutting down mid-connect -- not a backend signal. Without this
@@ -2167,6 +2175,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 		// auth succeeded: the backend is reachable
 		self.noteDialSuccess()
 
+		// set only by this connection's watcher, when the H1 path monitor
+		// re-rolls the connection; read after c joins the watcher
+		var rerolled atomic.Bool
 		c := func() {
 			defer ws.Close()
 
@@ -2219,7 +2230,10 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			// is what unblocks a reader/writer parked in a socket call that
 			// handleCancel alone cannot wake.
 			// The same worker ticks the H1 path monitor of a far connection,
-			// and stops its ticker for good once the monitor goes dormant.
+			// and stops its ticker for good once the monitor goes dormant. A
+			// re-roll closes the connection the way a kick does, and only this
+			// H1 connection: Kick would also close H3, reset the pinned backoff
+			// and re-evaluate the family hold.
 			kick := self.kickMonitor.NotifyChannel()
 			startConnectionWorker(func() {
 				var ticker *time.Ticker
@@ -2242,7 +2256,20 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 						if handleCtx.Err() != nil {
 							return
 						}
-						if decision := pathConnection.tick(time.Now()); decision.dormant {
+						decision := pathConnection.tick(time.Now())
+						if decision.action == h1PathActionReroll {
+							rerolled.Store(true)
+							self.log.Infof(
+								"[t]h1 path re-roll: closing connection port=%d dir=%s confidence=%s\n",
+								pathConnection.localPort,
+								decision.direction,
+								decision.confidence,
+							)
+							handleCancel()
+							ws.Close()
+							return
+						}
+						if decision.dormant {
 							ticker.Stop()
 							tick = nil
 						}
@@ -2776,6 +2803,16 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 		connectionOrdinal += 1
 		// the connection ran and died: the next dial is a reconnect
 		hadConnection = true
+		if rerolled.Load() {
+			// this connection was closed on purpose, to leave a lossy 4-tuple.
+			// Re-dial now: reconnect.After would draw uniform(0,
+			// ReconnectTimeout - age), seconds on a young connection. The next
+			// iteration still stands down, waits for dial admission and takes
+			// the reconnect fast path; the ledger's device spacing bounds how
+			// often this can happen.
+			rerollDial = true
+			continue
+		}
 
 		select {
 		case <-self.ctx.Done():

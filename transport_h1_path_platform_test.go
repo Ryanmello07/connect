@@ -42,7 +42,8 @@ const (
 )
 
 type testingH1PathRig struct {
-	stats *h1PathStats
+	stats  *h1PathStats
+	ledger *h1PathLedger
 	// the class of each sample, by connection ordinal and tick index
 	class func(connectionOrdinal int, tickIndex int) testingH1PathClass
 	// the dial round trip of each connection
@@ -58,8 +59,12 @@ type testingH1PathRig struct {
 }
 
 func newTestingH1PathRig(class func(connectionOrdinal int, tickIndex int) testingH1PathClass) *testingH1PathRig {
+	stats := &h1PathStats{}
+	ledger := newH1PathLedger()
+	ledger.stats = stats
 	return &testingH1PathRig{
-		stats:       &h1PathStats{},
+		stats:       stats,
+		ledger:      ledger,
 		class:       class,
 		dialRtt:     testingH1PathRtt,
 		tickCounts:  map[int]int{},
@@ -121,7 +126,8 @@ func (self *testingH1PathRig) hooks() *h1PathTestHooks {
 			defer self.stateLock.Unlock()
 			self.decisions[connectionOrdinal] = append(self.decisions[connectionOrdinal], decision)
 		},
-		stats: self.stats,
+		stats:  self.stats,
+		ledger: self.ledger,
 	}
 }
 
@@ -586,5 +592,510 @@ func TestApiMultiClientGeneratorWindowSharesOneH1PathBaseline(t *testing.T) {
 	defer replacement.Close()
 	if replacement.h1PathBaseline != windowBaseline {
 		t.Fatal("the replacement generation has a baseline of its own")
+	}
+}
+
+type testingH1PathLedgerState struct {
+	pendingCount    int
+	lastReroll      time.Time
+	epochUnimproved int
+	latchUntil      time.Time
+	excludedPorts   []int
+}
+
+func testingH1PathLedgerSnapshot(ledger *h1PathLedger) testingH1PathLedgerState {
+	ledger.stateLock.Lock()
+	defer ledger.stateLock.Unlock()
+	return testingH1PathLedgerState{
+		pendingCount:    len(ledger.pendingRouteManagerRerollTimes),
+		lastReroll:      ledger.lastReroll,
+		epochUnimproved: ledger.epochUnimproved,
+		latchUntil:      ledger.latchUntil,
+		excludedPorts:   append([]int{}, ledger.excludedPorts...),
+	}
+}
+
+// Requires that the connection convicted exactly once and was re-rolled by
+// that conviction: its watcher returned, so nothing followed.
+func testingH1PathRequireRerolled(t *testing.T, rig *testingH1PathRig, connectionOrdinal int) {
+	t.Helper()
+	decisions := rig.connectionDecisions(connectionOrdinal)
+	convictionCount, _ := rig.convictions(connectionOrdinal)
+	if convictionCount != 1 || len(decisions) == 0 {
+		t.Fatalf("connection %d convicted %d times in %d decisions, want once", connectionOrdinal, convictionCount, len(decisions))
+	}
+	last := decisions[len(decisions)-1]
+	if !last.convicted || last.action != h1PathActionReroll {
+		t.Fatalf("connection %d ended with %+v, want its conviction re-rolled", connectionOrdinal, last)
+	}
+}
+
+// Requires that every conviction of the connection was refused for reason.
+func testingH1PathRequireSuppressed(t *testing.T, rig *testingH1PathRig, connectionOrdinal int, reason h1PathReason) {
+	t.Helper()
+	for _, decision := range rig.connectionDecisions(connectionOrdinal) {
+		if decision.convicted && (decision.action != h1PathActionSuppressed || decision.reason != reason) {
+			t.Fatalf("connection %d conviction %+v, want it suppressed by %s", connectionOrdinal, decision, reason)
+		}
+	}
+}
+
+func testingH1PathWaitForConvictions(t *testing.T, rig *testingH1PathRig, connectionOrdinal int, convictionCount int) {
+	t.Helper()
+	if !waitForCondition(15*time.Second, func() bool {
+		count, decisionCountAfter := rig.convictions(connectionOrdinal)
+		return convictionCount <= count && 0 < decisionCountAfter
+	}) {
+		count, _ := rig.convictions(connectionOrdinal)
+		t.Fatalf("connection %d convicted %d times, want %d followed by another tick (connections %v)", connectionOrdinal, count, convictionCount, rig.dials())
+	}
+}
+
+// A convicted connection is closed and re-dialed at once, without the
+// reconnect backoff: with an hour of ReconnectTimeout, the backoff on a young
+// connection would draw a wait of up to an hour.
+func TestPlatformTransportH1PathRerollRedialsWithoutBackoff(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		platform := newTestingPlatformServerIpVersion(t, ipVersion)
+		rig := newTestingH1PathRig(func(connectionOrdinal int, tickIndex int) testingH1PathClass {
+			if connectionOrdinal == 0 {
+				return testingH1PathCollapsed
+			}
+			return testingH1PathHealthy
+		})
+		settings := testingH1PathTransportSettings(H1PathRerollModeAct, rig)
+		settings.ReconnectTimeout = time.Hour
+		transport := testingPlatformTransport(t, ctx, platform.url, settings)
+
+		if !waitForCondition(15*time.Second, func() bool {
+			return 2 <= len(rig.dials())
+		}) {
+			t.Fatalf("connections %v, want the convicted connection re-dialed", rig.dials())
+		}
+		// the replacement runs healthy for twice its clean window
+		if !waitForCondition(15*time.Second, func() bool {
+			return 2*settings.H1PathReroll.CleanTicks <= len(rig.connectionDecisions(1))
+		}) {
+			t.Fatal("the replacement connection stopped ticking")
+		}
+		if dials := rig.dials(); len(dials) != 2 || dials[0] != 0 || dials[1] != 1 {
+			t.Fatalf("connections %v, want [0 1]", dials)
+		}
+		testingH1PathRequireRerolled(t, rig, 0)
+		if convictionCount, _ := rig.convictions(1); convictionCount != 0 {
+			t.Fatalf("the healthy replacement convicted %d times", convictionCount)
+		}
+		stats := rig.stats.snapshot()
+		if stats.RxConvictions != 1 || stats.Rerolls != 1 || stats.RerollDials != 1 || stats.ConnectionsMonitored != 2 {
+			t.Fatalf("stats = %+v, want one conviction, one re-roll and one re-roll dial", stats)
+		}
+		if !transport.IsConnected() {
+			t.Fatal("the transport is not connected after the re-roll")
+		}
+		if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
+			mode, _ := transport.activeMode()
+			t.Fatalf("active mode = %q after the re-roll, want h1", mode)
+		}
+	})
+}
+
+// Two re-rolls whose replacements convict again latch the ledger: the third
+// connection's convictions are refused and it stays. A network change starts a
+// new epoch but leaves a latch younger than LatchMinAgeForNetworkReset.
+func TestPlatformTransportH1PathRerollLatchesAfterUnimproved(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		platform := newTestingPlatformServerIpVersion(t, ipVersion)
+		rig := newTestingH1PathRig(testingH1PathCollapsedAlways)
+		settings := testingH1PathTransportSettings(H1PathRerollModeAct, rig)
+		settings.H1PathReroll.DeviceRerollSpacing = 50 * time.Millisecond
+		settings.H1PathReroll.LatchMinAgeForNetworkReset = time.Hour
+		transport := testingPlatformTransport(t, ctx, platform.url, settings)
+
+		testingH1PathWaitForConvictions(t, rig, 2, 2)
+		if dials := rig.dials(); len(dials) != 3 {
+			t.Fatalf("connections %v, want 3: two re-rolls, then the latch", dials)
+		}
+		testingH1PathRequireRerolled(t, rig, 0)
+		testingH1PathRequireRerolled(t, rig, 1)
+		testingH1PathRequireSuppressed(t, rig, 2, h1PathReasonLatched)
+		stats := rig.stats.snapshot()
+		if stats.Rerolls != 2 || stats.Unimproved != 2 || stats.SuppressedLatched < 2 || stats.Improved != 0 {
+			t.Fatalf("stats = %+v, want two unimproved re-rolls and the latch refusing", stats)
+		}
+		if state := testingH1PathLedgerSnapshot(rig.ledger); !time.Now().Before(state.latchUntil) {
+			t.Fatalf("ledger = %+v, want latched", state)
+		}
+
+		// the host's network change: the process ledger and the transport both
+		// subscribe to it; this test's ledger is private, so both are called
+		rig.ledger.networkChanged(time.Now())
+		transport.Kick()
+		testingH1PathWaitForConvictions(t, rig, 3, 2)
+		if dials := rig.dials(); len(dials) != 4 {
+			t.Fatalf("connections %v, want 4: the kick's re-dial only", dials)
+		}
+		testingH1PathRequireSuppressed(t, rig, 3, h1PathReasonLatched)
+		if stats := rig.stats.snapshot(); stats.Rerolls != 2 {
+			t.Fatalf("re-rolls = %d after a network change under a young latch", stats.Rerolls)
+		}
+	})
+}
+
+// A network change clears a latch at least LatchMinAgeForNetworkReset old:
+// re-rolls resume, and two more unimproved ones latch again.
+func TestPlatformTransportH1PathRerollLatchClearsOnNetworkChangeOnceOld(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		platform := newTestingPlatformServerIpVersion(t, ipVersion)
+		var armedLock sync.Mutex
+		// connections from the network change on are healthy until armed, so
+		// none can convict between the ledger's epoch change and the kick
+		armed := false
+		rig := newTestingH1PathRig(func(connectionOrdinal int, tickIndex int) testingH1PathClass {
+			armedLock.Lock()
+			defer armedLock.Unlock()
+			if 3 <= connectionOrdinal && !armed {
+				return testingH1PathHealthy
+			}
+			return testingH1PathCollapsed
+		})
+		settings := testingH1PathTransportSettings(H1PathRerollModeAct, rig)
+		settings.H1PathReroll.DeviceRerollSpacing = 50 * time.Millisecond
+		settings.H1PathReroll.LatchMinAgeForNetworkReset = 0
+		transport := testingPlatformTransport(t, ctx, platform.url, settings)
+
+		testingH1PathWaitForConvictions(t, rig, 2, 1)
+		testingH1PathRequireSuppressed(t, rig, 2, h1PathReasonLatched)
+
+		transport.Kick()
+		if !waitForCondition(15*time.Second, func() bool {
+			return 4 <= len(rig.dials())
+		}) {
+			t.Fatalf("connections %v, want the kick's re-dial", rig.dials())
+		}
+		rig.ledger.networkChanged(time.Now())
+		func() {
+			armedLock.Lock()
+			defer armedLock.Unlock()
+			armed = true
+		}()
+
+		testingH1PathWaitForConvictions(t, rig, 5, 1)
+		if dials := rig.dials(); len(dials) != 6 {
+			t.Fatalf("connections %v, want 6: two more re-rolls, then the latch again", dials)
+		}
+		testingH1PathRequireRerolled(t, rig, 3)
+		testingH1PathRequireRerolled(t, rig, 4)
+		testingH1PathRequireSuppressed(t, rig, 5, h1PathReasonLatched)
+		// connections 0, 1, 3 and 4 re-rolled, and each replacement's conviction
+		// resolved its predecessor's re-roll as unimproved
+		if stats := rig.stats.snapshot(); stats.Rerolls != 4 || stats.Unimproved != 4 {
+			t.Fatalf("stats = %+v, want four re-rolls, all unimproved", stats)
+		}
+	})
+}
+
+// Observe convicts without touching the ledger.
+func TestPlatformTransportH1PathObserveModeNeverRedials(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		platform := newTestingPlatformServerIpVersion(t, ipVersion)
+		rig := newTestingH1PathRig(testingH1PathCollapsedAlways)
+		settings := testingH1PathTransportSettings(H1PathRerollModeObserve, rig)
+		testingPlatformTransport(t, ctx, platform.url, settings)
+
+		testingH1PathWaitForConvictions(t, rig, 0, 2)
+		if dials := rig.dials(); len(dials) != 1 {
+			t.Fatalf("connections %v, want [0]", dials)
+		}
+		if stats := rig.stats.snapshot(); stats.Rerolls != 0 || stats.RerollDials != 0 || stats.SuppressedObserve < 2 {
+			t.Fatalf("stats = %+v, want observed convictions only", stats)
+		}
+		if state := testingH1PathLedgerSnapshot(rig.ledger); state.pendingCount != 0 ||
+			!state.lastReroll.IsZero() || len(state.excludedPorts) != 0 {
+			t.Fatalf("ledger = %+v, want untouched", state)
+		}
+	})
+}
+
+// A provider asking for Act without AllowProviderAct is observed: its re-dial
+// would count against its reliability.
+func TestPlatformTransportH1PathProviderRoleClampsToObserve(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		platform := newTestingPlatformServerIpVersion(t, ipVersion)
+		rig := newTestingH1PathRig(testingH1PathCollapsedAlways)
+		settings := testingH1PathTransportSettings(H1PathRerollModeAct, rig)
+		settings.H1PathReroll.Role = H1PathRerollRoleProvider
+		testingPlatformTransport(t, ctx, platform.url, settings)
+
+		testingH1PathWaitForConvictions(t, rig, 0, 2)
+		if dials := rig.dials(); len(dials) != 1 {
+			t.Fatalf("connections %v, want [0]", dials)
+		}
+		for _, decision := range rig.connectionDecisions(0) {
+			if decision.convicted && decision.action != h1PathActionObserve {
+				t.Fatalf("provider conviction %+v, want it observed", decision)
+			}
+		}
+		if stats := rig.stats.snapshot(); stats.Rerolls != 0 || stats.SuppressedObserve < 2 || stats.SuppressedRole != 0 {
+			t.Fatalf("stats = %+v, want the provider clamped to Observe", stats)
+		}
+		if state := testingH1PathLedgerSnapshot(rig.ledger); state.pendingCount != 0 || !state.lastReroll.IsZero() {
+			t.Fatalf("ledger = %+v, want untouched", state)
+		}
+	})
+}
+
+// A re-roll closes only the H1 connection. It does not kick the transport,
+// which would also close H3, reset the pinned backoff and re-evaluate the
+// family hold; a kick still re-dials H1 as before.
+func TestPlatformTransportH1PathRerollDoesNotTouchH3Carrier(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		platform := newTestingPlatformServerIpVersion(t, ipVersion)
+		var armedLock sync.Mutex
+		armed := false
+		rig := newTestingH1PathRig(func(connectionOrdinal int, tickIndex int) testingH1PathClass {
+			armedLock.Lock()
+			defer armedLock.Unlock()
+			if connectionOrdinal == 0 && armed {
+				return testingH1PathCollapsed
+			}
+			return testingH1PathHealthy
+		})
+		settings := testingH1PathTransportSettings(H1PathRerollModeAct, rig)
+		settings.PlatformTransportBudget = NewPlatformTransportBudget(mib(64), 8)
+		settings.H1BudgetByteCount = kib(64)
+		settings.H3BudgetByteCount = kib(64)
+		settings.ModePreferences = map[TransportMode]int{
+			TransportModeH1: 1,
+			TransportModeH3: 2,
+		}
+		h3Ctxs := make(chan context.Context, 1)
+		settings.runH3ModeForTest = func(ctx context.Context, mode TransportMode, _ time.Duration) {
+			select {
+			case h3Ctxs <- ctx:
+			default:
+			}
+			<-ctx.Done()
+		}
+		transport := NewPlatformTransportWithTargetMode(
+			ctx,
+			NewClientStrategyWithDefaults(ctx),
+			NewRouteManager(ctx, "h1-path-h3"),
+			platform.url,
+			&ClientAuth{
+				ByJwt:      "testing",
+				InstanceId: NewId(),
+				AppVersion: "testing",
+			},
+			TransportModeAuto,
+			settings,
+		)
+		t.Cleanup(transport.Close)
+
+		var h3Ctx context.Context
+		select {
+		case h3Ctx = <-h3Ctxs:
+		case <-time.After(15 * time.Second):
+			t.Fatal("the H3 carrier never started")
+		}
+		if !testingWaitForActiveMode(transport, TransportModeH1, 15*time.Second) {
+			t.Fatal("h1 was never elected")
+		}
+		kick := transport.kickMonitor.NotifyChannel()
+		func() {
+			armedLock.Lock()
+			defer armedLock.Unlock()
+			armed = true
+		}()
+
+		if !waitForCondition(15*time.Second, func() bool {
+			return 2 <= len(rig.dials()) && 0 < len(rig.connectionDecisions(1))
+		}) {
+			t.Fatalf("connections %v, want the H1 connection re-rolled", rig.dials())
+		}
+		testingH1PathRequireRerolled(t, rig, 0)
+		select {
+		case <-kick:
+			t.Fatal("the re-roll kicked the transport")
+		default:
+		}
+		if h3Ctx.Err() != nil {
+			t.Fatal("the re-roll closed the H3 carrier")
+		}
+
+		transport.Kick()
+		select {
+		case <-kick:
+		default:
+			t.Fatal("the control kick did not notify")
+		}
+		if !waitForCondition(15*time.Second, func() bool {
+			return 3 <= len(rig.dials())
+		}) {
+			t.Fatalf("connections %v, want the kick to re-dial H1", rig.dials())
+		}
+		if stats := rig.stats.snapshot(); stats.Rerolls != 1 || stats.RerollDials != 1 {
+			t.Fatalf("stats = %+v, want one re-roll dial; the kick's dial is not one", stats)
+		}
+	})
+}
+
+// A replacement that runs clean for CleanTicks resolves its re-roll as
+// improved and clears the pending entry.
+func TestPlatformTransportH1PathImprovementClearsPending(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		platform := newTestingPlatformServerIpVersion(t, ipVersion)
+		rig := newTestingH1PathRig(func(connectionOrdinal int, tickIndex int) testingH1PathClass {
+			if connectionOrdinal == 0 {
+				return testingH1PathCollapsed
+			}
+			return testingH1PathHealthy
+		})
+		settings := testingH1PathTransportSettings(H1PathRerollModeAct, rig)
+		transport := testingPlatformTransport(t, ctx, platform.url, settings)
+
+		if !waitForCondition(15*time.Second, func() bool {
+			return rig.stats.Improved.Load() == 1
+		}) {
+			t.Fatalf("stats = %+v, want the re-roll improved", rig.stats.snapshot())
+		}
+		testingH1PathRequireRerolled(t, rig, 0)
+		cleanTickCount := 0
+		for _, decision := range rig.connectionDecisions(1) {
+			if decision.clean {
+				cleanTickCount += 1
+			}
+		}
+		if cleanTickCount < settings.H1PathReroll.CleanTicks {
+			t.Fatalf("improved after %d clean ticks, want at least %d", cleanTickCount, settings.H1PathReroll.CleanTicks)
+		}
+		if stats := rig.stats.snapshot(); stats.Rerolls != 1 || stats.Unimproved != 0 || stats.Unresolved != 0 {
+			t.Fatalf("stats = %+v, want one re-roll resolved as improved", stats)
+		}
+		if state := testingH1PathLedgerSnapshot(rig.ledger); state.pendingCount != 0 || state.epochUnimproved != 0 {
+			t.Fatalf("ledger = %+v, want no pending re-roll", state)
+		}
+		if !transport.IsConnected() {
+			t.Fatal("the improved replacement is not connected")
+		}
+	})
+}
+
+func testingH1PathDecideConnection(mode H1PathRerollMode, observeOnly bool) (*h1PathConnection, *h1PathLedger) {
+	settings := DefaultH1PathRerollSettings()
+	settings.Mode = mode
+	stats := &h1PathStats{}
+	ledger := newH1PathLedger()
+	ledger.stats = stats
+	transport := &PlatformTransport{
+		log:            loggerOrDefault(nil),
+		routeManager:   NewRouteManager(context.Background(), "h1-path-decide"),
+		h1PathBaseline: newH1QueueDelayBaseline(&settings),
+	}
+	connection := &h1PathConnection{
+		transport:   transport,
+		settings:    &settings,
+		stats:       stats,
+		hooks:       &h1PathTestHooks{stats: stats, ledger: ledger},
+		mode:        mode,
+		observeOnly: observeOnly,
+		monitor:     &h1PathMonitor{start: time.Now().Add(-time.Minute)},
+		localPort:   50000,
+	}
+	return connection, ledger
+}
+
+func testingH1PathConviction() h1PathDecision {
+	return h1PathDecision{
+		convicted:  true,
+		direction:  h1PathDirectionRx,
+		confidence: h1PathConfidenceConfirmed,
+		pathRtt:    testingH1PathRtt,
+	}
+}
+
+// An observe-only connection (an extender or a proxy leg) never re-rolls in
+// Act, but its conviction still resolves a pending re-roll as unimproved.
+func TestH1PathConnectionObserveOnlyNeverRerolls(t *testing.T) {
+	connection, ledger := testingH1PathDecideConnection(H1PathRerollModeAct, true)
+	now := time.Now()
+	ledger.noteReroll(connection.transport.routeManager, connection.settings, now.Add(-time.Minute), H1PathRerollRoleClient, h1PathConfidenceConfirmed, 0)
+
+	decision := testingH1PathConviction()
+	connection.decide(now, &decision)
+	if decision.action != h1PathActionObserve {
+		t.Fatalf("decision = %+v, want observed", decision)
+	}
+	stats := connection.stats.snapshot()
+	if stats.Rerolls != 0 || stats.SuppressedObserve != 1 || stats.Unimproved != 1 {
+		t.Fatalf("stats = %+v, want one observed conviction and the earlier re-roll unimproved", stats)
+	}
+	if state := testingH1PathLedgerSnapshot(ledger); state.pendingCount != 0 || len(state.excludedPorts) != 0 {
+		t.Fatalf("ledger = %+v, want the pending re-roll resolved and no port recorded", state)
+	}
+}
+
+// Act goes through the ledger in order: a conviction re-rolls and records the
+// port and the stale-tag mark, clean ticks resolve it as improved, and the
+// device spacing refuses a conviction right after.
+func TestH1PathConnectionActRerollsThroughTheLedger(t *testing.T) {
+	connection, ledger := testingH1PathDecideConnection(H1PathRerollModeAct, false)
+	settings := connection.settings
+	// long enough to outlast the clean window below
+	settings.DeviceRerollSpacing = time.Minute
+	baseline := connection.transport.h1PathBaseline
+	sourceId := NewId()
+	start := time.Now()
+	baseline.observe(sourceId, 50, start)
+
+	decision := testingH1PathConviction()
+	connection.decide(start, &decision)
+	if decision.action != h1PathActionReroll {
+		t.Fatalf("decision = %+v, want a re-roll", decision)
+	}
+	state := testingH1PathLedgerSnapshot(ledger)
+	if state.pendingCount != 1 || !state.lastReroll.Equal(start) || len(state.excludedPorts) != 1 || state.excludedPorts[0] != 50000 {
+		t.Fatalf("ledger = %+v, want the re-roll pending with its port", state)
+	}
+	if baseline.freshAfter(sourceId) == 0 {
+		t.Fatal("the re-roll did not mark the baseline's stale tags")
+	}
+
+	for i := 1; i <= settings.CleanTicks; i += 1 {
+		clean := h1PathDecision{clean: true, pathRtt: testingH1PathRtt}
+		connection.decide(start.Add(time.Duration(i)*settings.TickInterval), &clean)
+	}
+	if stats := connection.stats.snapshot(); stats.Improved != 1 || stats.Rerolls != 1 {
+		t.Fatalf("stats = %+v, want the re-roll improved after %d clean ticks", stats, settings.CleanTicks)
+	}
+
+	soon := start.Add(time.Duration(settings.CleanTicks+1) * settings.TickInterval)
+	refused := testingH1PathConviction()
+	connection.decide(soon, &refused)
+	if refused.action != h1PathActionSuppressed || refused.reason != h1PathReasonSpacing {
+		t.Fatalf("decision = %+v, want refused by device spacing", refused)
+	}
+	if stats := connection.stats.snapshot(); stats.SuppressedSpacing != 1 || stats.Rerolls != 1 || stats.Unimproved != 0 {
+		t.Fatalf("stats = %+v, want one spacing refusal", stats)
 	}
 }

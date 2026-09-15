@@ -35,13 +35,25 @@ import (
 // platform leg's 4-tuple.
 //
 // In Observe a conviction is counted and logged, at most once per
-// ConvictionLogInterval per connection.
+// ConvictionLogInterval per connection. In Act, a conviction goes through the
+// process ledger, keyed by the transport's route manager:
+//   - noteConviction first, which counts an earlier re-roll on the same route
+//     manager as unimproved when this conviction lands in its improvement
+//     window;
+//   - an observe-only connection stops there and is observed;
+//   - allow, which may refuse (latched, daily budget, device spacing,
+//     unconfirmed budget, provider gate), counted by reason;
+//   - noteReroll, then the stale-tag mark on the shared baseline, and the
+//     decision's action is reroll. runH1's watcher closes the connection and
+//     the loop re-dials without the reconnect backoff.
+// Clean ticks after a re-roll resolve it as improved (noteClean).
 //
 // The connection is owned by the watcher goroutine, which runH1 joins before
 // close. Every method is nil-safe, so runH1 needs no check for an unmonitored
 // connection. The connection counts ConnectionsMonitored, ConnectionsDormant at
 // the dial gate, KernelUnavailable (once per connection: no kernel socket, or
-// its first read failed) and SuppressedObserve.
+// its first read failed), SuppressedObserve and the ledger's refusals,
+// Rerolls, Improved and Unimproved; runH1 counts RerollDials.
 
 // The per-connection counters runH1 keeps for the monitor. The reader and the
 // writer update them; the watcher reads them.
@@ -64,8 +76,11 @@ type h1PathTestHooks struct {
 	// borrows each decision after the connection chose its action; must not
 	// block
 	decision func(connectionOrdinal int, decision h1PathDecision)
-	// replaces the process counters for the connection and its monitor
+	// replaces the process counters for the connection, its monitor and
+	// runH1's re-roll dials
 	stats *h1PathStats
+	// replaces the process ledger
+	ledger *h1PathLedger
 }
 
 type h1PathConnection struct {
@@ -92,6 +107,8 @@ type h1PathConnection struct {
 	lastWriteCount uint64
 
 	lastLogTime time.Time
+	// clean ticks since the connection started or last convicted
+	cleanTicks int
 }
 
 // The connection's mode, and whether it may only observe. Off when the settings
@@ -120,6 +137,14 @@ func h1PathConnectionMode(
 	return mode, proxied || extenderIp.IsValid()
 }
 
+// the H1 path counters of this transport: the process counters, or a test's
+func (self *PlatformTransport) h1PathStats() *h1PathStats {
+	if hooks := self.settings.h1PathTestHooks; hooks != nil && hooks.stats != nil {
+		return hooks.stats
+	}
+	return &h1PathProcessStats
+}
+
 // Returns nil when the connection is not monitored (see the file header).
 func (self *PlatformTransport) newH1PathConnection(
 	ws *websocket.Conn,
@@ -137,10 +162,7 @@ func (self *PlatformTransport) newH1PathConnection(
 	}
 	settings := &self.settings.H1PathReroll
 	hooks := self.settings.h1PathTestHooks
-	stats := &h1PathProcessStats
-	if hooks != nil && hooks.stats != nil {
-		stats = hooks.stats
-	}
+	stats := self.h1PathStats()
 
 	dialRtt := dialDuration / 3
 	if hooks != nil && hooks.dialRtt != nil {
@@ -280,19 +302,72 @@ func (self *h1PathConnection) tick(now time.Time) h1PathDecision {
 	return decision
 }
 
-// Chooses the action for a verdict: a conviction is observed, and a loss
-// denial (counted by the monitor) is suppressed.
+// the ledger of an Act connection: the process ledger, or a test's
+func (self *h1PathConnection) ledger() *h1PathLedger {
+	if self.hooks != nil && self.hooks.ledger != nil {
+		return self.hooks.ledger
+	}
+	return h1PathDefaultLedger()
+}
+
+// Chooses the action for a verdict (see the file header). A loss denial,
+// counted by the monitor, is suppressed. Observe never touches the ledger.
 func (self *h1PathConnection) decide(now time.Time, decision *h1PathDecision) {
+	act := self.mode == H1PathRerollModeAct
+	key := self.transport.routeManager
 	switch {
 	case decision.convicted:
-		decision.action = h1PathActionObserve
-		decision.reason = h1PathReasonObserve
-		self.stats.recordSuppression(h1PathReasonObserve)
-		self.logVerdict(now, decision)
+		self.cleanTicks = 0
+		if !act {
+			self.observe(decision)
+			break
+		}
+		ledger := self.ledger()
+		if ledger.noteConviction(key, self.settings, now) {
+			self.stats.Unimproved.Add(1)
+		}
+		if self.observeOnly {
+			self.observe(decision)
+			break
+		}
+		role := self.settings.Role
+		allowed, reason := ledger.allow(
+			self.settings,
+			now,
+			role,
+			decision.confidence,
+			now.Sub(self.monitor.start),
+		)
+		if !allowed {
+			decision.action = h1PathActionSuppressed
+			decision.reason = reason
+			self.stats.recordSuppression(reason)
+			break
+		}
+		ledger.noteReroll(key, self.settings, now, role, decision.confidence, self.localPort)
+		// packs built for this connection, and their resends, carry old tags
+		// that must not convict the next one
+		self.transport.h1PathBaseline.markReroll(now, decision.pathRtt)
+		self.stats.Rerolls.Add(1)
+		decision.action = h1PathActionReroll
 	case decision.reason != h1PathReasonNone:
 		decision.action = h1PathActionSuppressed
+	case decision.clean && act:
+		self.cleanTicks += 1
+		if self.settings.CleanTicks <= self.cleanTicks &&
+			self.ledger().noteClean(key, self.settings, now, self.cleanTicks) {
+			self.stats.Improved.Add(1)
+		}
+	}
+	if decision.convicted || decision.reason != h1PathReasonNone {
 		self.logVerdict(now, decision)
 	}
+}
+
+func (self *h1PathConnection) observe(decision *h1PathDecision) {
+	decision.action = h1PathActionObserve
+	decision.reason = h1PathReasonObserve
+	self.stats.recordSuppression(h1PathReasonObserve)
 }
 
 // at most one line per ConvictionLogInterval per connection
