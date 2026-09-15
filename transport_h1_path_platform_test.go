@@ -702,6 +702,42 @@ func TestPlatformTransportH1PathRerollRedialsWithoutBackoff(t *testing.T) {
 	})
 }
 
+// With the Kernel source port policy a re-roll dial carries no plan: the
+// kernel chooses the local port and nothing is bound or counted.
+func TestPlatformTransportH1PathKernelSourcePortPolicyDoesNotBind(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		platform := newTestingPlatformServerIpVersion(t, ipVersion)
+		rig := newTestingH1PathRig(func(connectionOrdinal int, tickIndex int) testingH1PathClass {
+			if connectionOrdinal == 0 {
+				return testingH1PathCollapsed
+			}
+			return testingH1PathHealthy
+		})
+		settings := testingH1PathTransportSettings(H1PathRerollModeAct, rig)
+		settings.H1PathReroll.SourcePortPolicy = H1SourcePortKernel
+		randomCount := 0
+		settings.h1PathTestHooks.sourcePortRandom = func(n int) int {
+			randomCount += 1
+			return 0
+		}
+		testingPlatformTransport(t, ctx, platform.url, settings)
+
+		if !waitForCondition(15*time.Second, func() bool {
+			return settings.H1PathReroll.CleanTicks <= len(rig.connectionDecisions(1))
+		}) {
+			t.Fatalf("connections %v, want the convicted connection re-dialed", rig.dials())
+		}
+		testingH1PathRequireRerolled(t, rig, 0)
+		stats := rig.stats.snapshot()
+		if stats.RerollDials != 1 || stats.SourcePortBinds != 0 || stats.SourcePortFallbacks != 0 || randomCount != 0 {
+			t.Fatalf("stats = %+v with %d draws, want an unplanned re-roll dial", stats, randomCount)
+		}
+	})
+}
+
 // Two re-rolls whose replacements convict again latch the ledger: the third
 // connection's convictions are refused and it stays. A network change starts a
 // new epoch but leaves a latch younger than LatchMinAgeForNetworkReset.

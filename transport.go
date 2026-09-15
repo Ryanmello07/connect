@@ -2037,6 +2037,8 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			dialCtx := self.dialContext(self.ctx)
 			if rerollDial {
 				self.h1PathStats().RerollDials.Add(1)
+				// a far random local port, away from the convicted ones
+				dialCtx = self.h1PathRerollDialContext(dialCtx)
 			}
 			dialStart := time.Now()
 			ws, _, dialerInfo, err := self.clientStrategy.WsDialContextWithDialer(

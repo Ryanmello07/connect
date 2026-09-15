@@ -238,18 +238,20 @@ func (self *ConnectSettings) DialContext(ctx context.Context, network string, ad
 // permits and its addresses are raced with DefaultDialFallbackDelay, v6
 // first (see net_dial_race.go). An ip literal, or a datagram network, goes
 // straight to the dialer: the former has no family choice left, the latter
-// cannot be raced meaningfully.
+// cannot be raced meaningfully. The sockets of an H1 re-roll dial bind their
+// planned local port (h1_source_port.go).
 func (self *ConnectSettings) raceDialContext(netDialer *net.Dialer) DialContextFunction {
 	return func(ctx context.Context, network string, addr string) (net.Conn, error) {
+		dialer := h1SourcePortDialer(ctx, netDialer)
 		host, port, err := net.SplitHostPort(addr)
 		if err != nil || !isRaceableDialNetwork(network) || isIPLiteralDialAddr(host) || isZonedIPLiteralDialHost(host) {
-			return netDialer.DialContext(ctx, network, addr)
+			return dialer.DialContext(ctx, network, addr)
 		}
 		addrs, err := resolveDialAddrs(ctx, dialResolver(self.Resolver), network, host)
 		if err != nil {
 			return nil, err
 		}
-		return dialHostPortRace(ctx, network, port, addrs, DefaultDialFallbackDelay, netDialer.DialContext)
+		return dialHostPortRace(ctx, network, port, addrs, DefaultDialFallbackDelay, dialer.DialContext)
 	}
 }
 

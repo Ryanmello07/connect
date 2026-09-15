@@ -1,6 +1,7 @@
 package connect
 
 import (
+	"context"
 	"fmt"
 	"net/netip"
 	"sync/atomic"
@@ -34,6 +35,11 @@ import (
 // socket describes another leg, or nothing, and a re-dial does not choose the
 // platform leg's 4-tuple.
 //
+// The dial that replaces a re-rolled connection carries a source port plan
+// when the policy is FarRandom: its sockets bind a random ephemeral port far
+// from the local ports the ledger convicted this network epoch
+// (h1_source_port.go).
+//
 // In Observe a conviction is counted and logged, at most once per
 // ConvictionLogInterval per connection. In Act, a conviction goes through the
 // process ledger, keyed by the transport's route manager:
@@ -53,7 +59,9 @@ import (
 // connection. The connection counts ConnectionsMonitored, ConnectionsDormant at
 // the dial gate, KernelUnavailable (once per connection: no kernel socket, or
 // its first read failed), SuppressedObserve and the ledger's refusals,
-// Rerolls, Improved and Unimproved; runH1 counts RerollDials.
+// Rerolls, Improved and Unimproved; runH1 counts RerollDials, and a re-roll
+// dial's source port plan counts SourcePortBinds and SourcePortFallbacks, one
+// per socket it plans.
 
 // The per-connection counters runH1 keeps for the monitor. The reader and the
 // writer update them; the watcher reads them.
@@ -81,6 +89,9 @@ type h1PathTestHooks struct {
 	stats *h1PathStats
 	// replaces the process ledger
 	ledger *h1PathLedger
+	// replaces the random draw of re-roll dials' source port plans; must be
+	// safe for concurrent use
+	sourcePortRandom func(n int) int
 }
 
 type h1PathConnection struct {
@@ -143,6 +154,30 @@ func (self *PlatformTransport) h1PathStats() *h1PathStats {
 		return hooks.stats
 	}
 	return &h1PathProcessStats
+}
+
+// the ledger of this transport's connections: the process ledger, or a test's
+func (self *PlatformTransport) h1PathLedger() *h1PathLedger {
+	if hooks := self.settings.h1PathTestHooks; hooks != nil && hooks.ledger != nil {
+		return hooks.ledger
+	}
+	return h1PathDefaultLedger()
+}
+
+// The context of the dial that replaces a re-rolled connection. With policy
+// FarRandom it carries a source port plan that excludes the ports the ledger
+// convicted this network epoch; with policy Kernel it is ctx.
+func (self *PlatformTransport) h1PathRerollDialContext(ctx context.Context) context.Context {
+	settings := &self.settings.H1PathReroll
+	if settings.SourcePortPolicy != H1SourcePortFarRandom {
+		return ctx
+	}
+	var random func(n int) int
+	if hooks := self.settings.h1PathTestHooks; hooks != nil {
+		random = hooks.sourcePortRandom
+	}
+	plan := newH1SourcePortPlan(settings, self.h1PathLedger().excluded(), random, self.h1PathStats())
+	return withH1SourcePortPlan(ctx, plan)
 }
 
 // Returns nil when the connection is not monitored (see the file header).
