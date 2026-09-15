@@ -1310,6 +1310,56 @@ func TestTcpReturnRetransmitSurvivesAnAcknowledgementGapTheProviderWaitsOut(t *t
 	})
 }
 
+// The no-progress bound runs from the last acknowledgement progress, not from
+// the first delivery: a source whose cumulative acknowledgement advances
+// partway through a gap, with a segment still outstanding, keeps its flow past
+// the bound measured from the first delivery, and is reset exactly one bound
+// after that progress once nothing advances again. A clock that restarted only
+// when a segment went out with nothing outstanding reset every download whose
+// ring never emptied for the bound, however its acknowledgements advanced.
+func TestTcpReturnRetransmitNoProgressBoundRunsFromTheLastAcknowledgementProgress(t *testing.T) {
+	runTcpReturnRetransmitTest(t, func(t *testing.T) {
+		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{})
+		harness.source.holdAcks = true
+		start := time.Now()
+		harness.write(harness.payload(2))
+		synctest.Wait()
+
+		// progress inside the bound, with the second segment still outstanding
+		const progressAfter = defaultReturnRetransmitTimeout * 5 / 6
+		time.Sleep(progressAfter)
+		harness.source.sendAck(harness.segmentSeq(1))
+		synctest.Wait()
+
+		// past the bound from the first delivery, inside it from the progress
+		time.Sleep(defaultReturnRetransmitTimeout - progressAfter + time.Second)
+		synctest.Wait()
+		harness.source.stateLock.Lock()
+		rstReceived := harness.source.rstReceived
+		harness.source.stateLock.Unlock()
+		if rstReceived || harness.runIsDone() {
+			t.Fatalf("flow reset at +%s with acknowledgement progress at +%s: rst=%t", time.Since(start), progressAfter, rstReceived)
+		}
+		if _, retainedCount, _, _ := harness.retransmitState(); retainedCount != 1 {
+			t.Fatalf("%d segments retained, want the second still outstanding", retainedCount)
+		}
+
+		harness.waitRunDone(defaultReturnRetransmitTimeout)
+		harness.source.stateLock.Lock()
+		rstReceived, rstAt := harness.source.rstReceived, harness.source.rstAt
+		harness.source.stateLock.Unlock()
+		if !rstReceived {
+			t.Fatal("no reset reached the source one bound after the last progress")
+		}
+		if got, want := rstAt.Sub(start), progressAfter+defaultReturnRetransmitTimeout; got != want {
+			t.Fatalf("reset at +%s, want +%s, one bound after the progress", got, want)
+		}
+		if stats := harness.counters.snapshot(); stats.AbandonCount != 1 {
+			t.Fatalf("stats=%+v, want one abandon", stats)
+		}
+	})
+}
+
 // A source that received every segment but whose acknowledgements a stall
 // held past the timer, and then arrive late: the expiry sends the head once
 // and nothing else follows, whether the late acknowledgements come one per
