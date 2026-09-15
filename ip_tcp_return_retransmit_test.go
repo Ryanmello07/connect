@@ -415,6 +415,9 @@ type tcpReturnTestOptions struct {
 	timestamps bool
 	// zero is the default well inside the sequence space
 	initialSynSeq uint32
+	// the scale the source's SYN negotiates; zero is tcpReturnTestWindowScale,
+	// and every acknowledgement advertises almost the whole field at it
+	windowScale uint32
 	// how long the sequence's Close of its upstream takes
 	upstreamCloseDelay time.Duration
 	// how long each acknowledgement the source sends takes to arrive; zero
@@ -610,7 +613,11 @@ func newTcpReturnRetransmitTestHarness(t *testing.T, options tcpReturnTestOption
 
 	// the SYN negotiates a window scale so the source can advertise a window
 	// larger than the retention cap under test, and timestamps when asked
-	synOptions := []byte{3, 3, byte(tcpReturnTestWindowScale), 1}
+	windowScale := options.windowScale
+	if windowScale == 0 {
+		windowScale = tcpReturnTestWindowScale
+	}
+	synOptions := []byte{3, 3, byte(windowScale), 1}
 	if options.timestamps {
 		synOptions = append(synOptions, 1, 1, 8, 10, 0, 0, 0, 0, 0, 0, 0, 0)
 		binary.BigEndian.PutUint32(synOptions[8:12], 1)
@@ -1332,10 +1339,11 @@ func TestTcpReturnRetransmitLostFlightRecoversInBurstsAfterTheProbe(t *testing.T
 	})
 }
 
-// (d) The retention cap: with the source's window far larger than the cap
-// and no acknowledgements, packetizing stops at the cap and the upstream
-// write waits; acknowledgements free space and the burst completes, with the
-// bytes past the last acknowledgement never above the cap.
+// (d) An explicit retention cap, as a provider short of memory sets below the
+// flow's maximum window: with the source's window far larger than the cap and
+// no acknowledgements, packetizing stops at the cap and the upstream write
+// waits; acknowledgements free space and the burst completes, with the bytes
+// past the last acknowledgement never above the cap.
 func TestTcpReturnRetransmitRetainedBytesStayWithinTheCap(t *testing.T) {
 	runTcpReturnRetransmitTest(t, func(t *testing.T) {
 		const capSegmentCount = 4
@@ -1395,6 +1403,78 @@ func TestTcpReturnRetransmitRetainedBytesStayWithinTheCap(t *testing.T) {
 			t.Fatal("no round trip was sampled from the released acknowledgements")
 		}
 	})
+}
+
+// The cap a flow gets when the settings leave it zero is its own maximum
+// window. With the source advertising more than that window and acknowledging
+// nothing, packetizing stops at exactly MaxWindowSize, below the earlier fixed
+// 4 MiB or above it, and the acknowledgements then free the rest. The fixed
+// cap held a flow whose window and maximum window both allowed 8 MiB at half
+// of that, a rate ceiling of 4 MiB over the inner round trip, and let a flow
+// with a 256 KiB maximum window retain four times it.
+func TestTcpReturnRetransmitDefaultCapIsTheFlowsMaximumWindow(t *testing.T) {
+	for _, c := range []struct {
+		maxWindowSize uint32
+		// the source's window is almost 65,536 units at this scale: about
+		// 1 MiB at 4 and 16 MiB at 8, above the maximum window either way
+		windowScale uint32
+	}{
+		{maxWindowSize: uint32(kib(256)), windowScale: 4},
+		{maxWindowSize: uint32(mib(8)), windowScale: 8},
+	} {
+		runTcpReturnRetransmitTest(t, func(t *testing.T) {
+			harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{
+				windowScale: c.windowScale,
+				configure: func(settings *TcpBufferSettings) {
+					settings.MaxWindowSize = c.maxWindowSize
+				},
+			})
+			if harness.settings.ReturnRetransmitRetainByteCount != 0 {
+				t.Fatalf("default cap setting %d, want zero", harness.settings.ReturnRetransmitRetainByteCount)
+			}
+			harness.source.holdAcks = true
+			capByteCount := int(c.maxWindowSize)
+			// past the cap by more than one socket read
+			payload := harness.payload(capByteCount/harness.segmentByteCount + 16)
+
+			writeDone := make(chan struct{})
+			go func() {
+				defer close(writeDone)
+				harness.write(payload)
+			}()
+			synctest.Wait()
+			select {
+			case <-writeDone:
+				t.Fatalf("maximum window %d: the burst was consumed past it with nothing acknowledged", capByteCount)
+			default:
+			}
+			retainedByteCount, _, _, _ := harness.retransmitState()
+			if retainedByteCount != int64(capByteCount) {
+				t.Fatalf("maximum window %d: retained %d bytes, want exactly the maximum window", capByteCount, retainedByteCount)
+			}
+			if got := len(harness.source.streamCopy()); got != capByteCount {
+				t.Fatalf("maximum window %d: source received %d bytes, want the maximum window", capByteCount, got)
+			}
+
+			harness.source.ackNow()
+			select {
+			case <-writeDone:
+			case <-time.After(2 * time.Second):
+				t.Fatalf("maximum window %d: the burst did not complete after acknowledgements freed space", capByteCount)
+			}
+			synctest.Wait()
+			harness.requireStream(payload)
+			harness.source.stateLock.Lock()
+			maxOutstandingByteCount := harness.source.maxOutstandingByteCount
+			harness.source.stateLock.Unlock()
+			if int64(capByteCount) < maxOutstandingByteCount {
+				t.Fatalf("maximum window %d: bytes past the last acknowledgement reached %d", capByteCount, maxOutstandingByteCount)
+			}
+			if _, _, packetCount, _ := harness.retransmitState(); packetCount != 0 {
+				t.Fatalf("maximum window %d: retransmissions=%d with no loss", capByteCount, packetCount)
+			}
+		})
+	}
 }
 
 // (e) With the setting off nothing is retained and nothing is ever sent

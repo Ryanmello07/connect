@@ -479,10 +479,11 @@ func DefaultTcpBufferSettingsWithBufferSize(bufferSize int) *TcpBufferSettings {
 		EnableSyntheticSpeed: true,
 		// on by default: a source kernel's receive drop is otherwise a
 		// permanent hole (see tcpReturnRetransmitState)
-		EnableReturnRetransmit:          true,
-		ReturnRetransmitRetainByteCount: defaultReturnRetransmitRetainByteCount,
-		ReturnRetransmitTimeout:         defaultReturnRetransmitTimeout,
-		ConnectSettings:                 *DefaultConnectSettings(),
+		EnableReturnRetransmit: true,
+		// ReturnRetransmitRetainByteCount stays zero, so the cap follows
+		// MaxWindowSize as the flow reads it, after any caller's change
+		ReturnRetransmitTimeout: defaultReturnRetransmitTimeout,
+		ConnectSettings:         *DefaultConnectSettings(),
 	}
 	// the upstream socket buffers are the kernel's unless an explicit request
 	// beats its autotuning ceiling on this host (THROUGHPUTFIX §15); nil when
@@ -3883,7 +3884,12 @@ type TcpBufferSettings struct {
 	EnableReturnRetransmit bool
 	// The hard cap on retained sequence bytes per flow beside the source's
 	// advertised window; a burst beyond it waits for acknowledgements as it
-	// waits for the window. Zero is 4 MiB.
+	// waits for the window. Retained bytes are the bytes in flight, so a cap
+	// the window would pass is a rate ceiling of the cap over the inner round
+	// trip. Zero is the flow's MaxWindowSize, which the memory budget already
+	// scales, so by default the cap never binds below the flow's own window;
+	// a smaller value trades that rate for memory on a provider that cannot
+	// keep twice it in pool buffers per flow (see tcpReturnRetransmitState).
 	ReturnRetransmitRetainByteCount ByteCount
 	// How long the cumulative acknowledgement may stand still with segments
 	// outstanding before the flow is reset toward the source and closed,

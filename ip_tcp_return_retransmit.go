@@ -28,14 +28,13 @@ const (
 	// runs at this many segments a round trip. Without SACK nothing says what
 	// the source holds past a hole, so this is also the most one
 	// acknowledgement can resend that it already had: about 190 KB of
-	// full-size segments. At this ceiling the retain cap's worst case, a
-	// purged span of about 2,900 segments, recovers in about 30 round trips,
-	// under a second at 30 ms, where one segment a round trip took 87 s.
+	// full-size segments. At this ceiling the default cap's worst case at the
+	// 16 MiB maximum window, a purged span of about 11,600 segments of 1,448
+	// bytes, recovers in about 100 round trips, 3 s at 30 ms, where one
+	// segment a round trip took nearly 6 minutes.
 	returnRetransmitMaxBurstSegmentCount = 128
 	// the most blocks one SACK option carries beside a timestamp option
 	tcpMaxSackBlockCount = 4
-	// the retention cap used when the settings leave it zero
-	defaultReturnRetransmitRetainByteCount = ByteCount(4 * 1024 * 1024)
 	// the no-progress bound used when the settings leave it zero: the
 	// provider's bound on a source that acknowledges none of its returns
 	// (RemoteUserNatProviderSettings.ReturnSendAbandonTimeout). At 60 s, a
@@ -178,12 +177,12 @@ func (self *returnRetransmitCounters) snapshot() ReturnRetransmitStats {
 // on selective acknowledgements (RFC 2018 §8); a source whose cumulative
 // acknowledgement stops short of a segment it reported is treated as having
 // reneged, and every mark is dropped. A retransmission is not the retained
-// buffer: it is a fresh packet built from the retained payload with the
+// buffer: it is fresh packets built from the retained payload with the
 // current acknowledgement, window and timestamps, exactly as the handshake
-// retransmits its SYN-ACK.
+// retransmits its SYN-ACK, cut by the segment size packetization would use at
+// that moment.
 //
-// A retransmission is cut by the segment size packetization would use at that
-// moment. After the source reports a smaller path mtu (fragmentation needed,
+// Pieces. After the source reports a smaller path mtu (fragmentation needed,
 // packet too big), a segment packetized before the report is larger than the
 // path carries, and sent again whole it would be dropped again on every
 // trigger until the bound; so a retained segment above the current size goes
@@ -206,18 +205,49 @@ func (self *returnRetransmitCounters) snapshot() ReturnRetransmitStats {
 // the drain delivers in sequence order.
 //
 // Bounds. Retained sequence bytes never exceed the source's advertised window,
-// because the packetizer already stops at the window edge and every emitted
-// byte is retained, and never exceed ReturnRetransmitRetainByteCount, which
-// the packetizer applies beside the window: a burst larger than the cap waits
-// for acknowledgements to free space, as it waits for the window. Pool size
-// classes round each share up, so the memory is at most about 1.4 times the
-// cap. Time is bounded by ReturnRetransmitTimeout: when the cumulative
+// because the packetizer already stops at the greatest advertised edge and
+// every emitted byte is retained, and never exceed the cap,
+// ReturnRetransmitRetainByteCount, which the packetizer applies beside the
+// window: a burst larger than the cap waits for acknowledgements to free
+// space, as it waits for the window. The window is the source's to choose, up
+// to about a gigabyte at the largest scale, so it cannot bound the provider's
+// memory alone. Retained bytes are exactly the bytes in flight, so the cap is
+// also a rate ceiling of the cap over the inner round trip wherever it binds
+// before the window: 4 MiB at 100 ms is about 335 Mb/s. The cap therefore
+// defaults to the flow's own maximum window, MaxWindowSize, which the settings
+// already hold as the most packet data one sequence keeps in memory, and binds
+// only where a source advertises more than that.
+//
+// Memory. Without retention a delivered buffer goes back to the pool when
+// Transfer acknowledges it; with it, when the source's kernel does. In steady
+// flow the extra is what is sent between those two acknowledgements. While a
+// hole stands the kernel acknowledges nothing past it, and the extra grows to
+// everything sent since, up to the window and the cap, until the repair. A
+// share holds its whole pool buffer, and a full segment at the default mtu
+// fills about half of its 2 KiB class, so the memory is about twice the
+// retained bytes, more for the short segment that ends a read: per flow about
+// twice the cap, and across flows nothing but the flow count bounds the sum.
+//
+// Constrained providers. MaxWindowSize scales with the process memory budget
+// (DefaultTcpBufferSettingsWithBufferSize): 16 MiB unbudgeted, 8 MiB at the
+// phone network extension's 32 MiB, never below 256 KiB. The provider profile
+// with a memory target (DefaultProviderLocalUserNatSettingsWithMemoryTarget)
+// sizes flow counts by a per-flow cost that leaves out window-sized data,
+// treats every window as a demand-driven ceiling, and changes neither the
+// window nor the cap, so no constructor lowers the cap. A per-flow value small enough for a
+// phone's provider share would impose the rate ceiling above on every flow and
+// still not bound the sum across flows, which only an aggregate bound charged
+// to that share could. A host that must keep less per flow sets the cap, or
+// MaxWindowSize with it.
+//
+// Time is bounded by ReturnRetransmitTimeout: when the cumulative
 // acknowledgement has not advanced for that long with delivered segments
 // outstanding, the flow is reset toward the source and closed, never left
 // idle. It defaults to the provider's ReturnSendAbandonTimeout, 120 s, so a
 // gap in the source's acknowledgements shorter than the provider's own bound
-// on that source resets nothing. That is the acceptance contract: a transient loss completes the exact
-// byte stream; an unrecoverable one is an explicit, bounded failure.
+// on that source resets nothing. That is the acceptance contract: a transient
+// loss completes the exact byte stream; an unrecoverable one is an explicit,
+// bounded failure.
 //
 // Triggers. Fast retransmit: the third duplicate acknowledgement of one
 // cumulative ack retransmits the first unacknowledged segment and starts loss
@@ -349,7 +379,8 @@ func newTcpReturnRetransmitState(tcpBufferSettings *TcpBufferSettings) tcpReturn
 		rtoNanos:        int64(returnRetransmitInitialRto),
 	}
 	if state.retainByteCount <= 0 {
-		state.retainByteCount = int64(defaultReturnRetransmitRetainByteCount)
+		// the flow's maximum window, so the cap never binds below it
+		state.retainByteCount = int64(tcpBufferSettings.MaxWindowSize)
 	}
 	if state.timeout <= 0 {
 		state.timeout = defaultReturnRetransmitTimeout
@@ -397,9 +428,11 @@ func (self *tcpReturnRetransmitState) popWithLock() (segment tcpReturnRetainedSe
 	return
 }
 
-// Sequence bytes the cap still allows; unbounded when disabled.
+// Sequence bytes the cap still allows; unbounded when disabled, or when
+// neither the settings nor a maximum window give a cap and the window alone
+// bounds retention.
 func (self *tcpReturnRetransmitState) roomWithLock() int64 {
-	if !self.enabled {
+	if !self.enabled || self.retainByteCount <= 0 {
 		return int64(1) << 62
 	}
 	return self.retainByteCount - self.retainedByteCount
