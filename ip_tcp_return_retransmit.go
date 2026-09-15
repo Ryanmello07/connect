@@ -117,6 +117,10 @@ type tcpReturnRetainedSegment struct {
 	// decided for retransmission, waiting for the worker to build and send it
 	due       bool
 	dueReason tcpReturnRetransmitReason
+	// a burst's guess past the hole rather than a segment the
+	// acknowledgements showed missing: the source may hold it and answer the
+	// retransmission with a duplicate acknowledgement
+	guessed bool
 }
 
 // Cumulative counts of return-path retransmission across a NAT's TCP flows.
@@ -257,7 +261,11 @@ func (self *returnRetransmitCounters) snapshot() ReturnRetransmitStats {
 // cumulative ack retransmits the first unacknowledged segment and starts loss
 // recovery (RFC 5681 §3.2). A duplicate repeats the cumulative ack and the
 // window and carries no payload, SYN or FIN (RFC 5681 §2): a window update is
-// not one, however many the source sends while its application reads. With
+// not one, however many the source sends while its application reads. Nor are
+// the duplicates this flow's own retransmissions draw from the source, which
+// it answers one for one; a run of duplicates within reach of a recent
+// retransmission starts nothing unless it is longer than the retransmissions
+// that explain it (see fastRetransmitWithLock). With
 // SACK blocks it retransmits every unmarked segment below the highest
 // selectively acknowledged byte instead, and further duplicate
 // acknowledgements that extend the marked range retransmit the holes they
@@ -346,6 +354,13 @@ type tcpReturnRetransmitState struct {
 	dueCount              int
 
 	dupAckCount int
+	// the duplicate acknowledgements this flow's own retransmissions can
+	// explain: how many packets went again while the guard stood, the
+	// retained end when the last of them went, and when the guard lapses,
+	// one timer after that
+	explainedDupAckCount int
+	explainedDupAckEnd   uint32
+	explainedDupAckNanos int64
 	// the scaled window of the last acceptable acknowledgement, which a
 	// duplicate must repeat
 	ackWindowByteCount uint32
@@ -524,7 +539,9 @@ func (self *tcpReturnRetransmitState) markDeliveredWithLock(seqs []uint32, nowNa
 		}
 	}
 	if wake && self.recoveryPhase == tcpReturnRecoveryPhaseNone && returnRetransmitDupAckThreshold <= self.dupAckCount {
-		self.fastRetransmitWithLock(nowNanos)
+		// the duplicates repeat the head's own sequence, which the source is
+		// missing
+		self.fastRetransmitWithLock(self.segmentAtWithLock(0).seq, nowNanos)
 	}
 	return
 }
@@ -593,6 +610,7 @@ func (self *tcpReturnRetransmitState) markDueWithLock(
 	}
 	segment.due = true
 	segment.dueReason = reason
+	segment.guessed = false
 	self.dueCount += 1
 }
 
@@ -607,7 +625,27 @@ func (self *tcpReturnRetransmitState) beginLossRecoveryWithLock(startNanos int64
 // Fast retransmit, on the duplicates of the head reaching the threshold with
 // no recovery under way: loss recovery to the highest delivered segment, and
 // the holes below the selectively acknowledged range, or the head.
-func (self *tcpReturnRetransmitState) fastRetransmitWithLock(nowNanos int64) {
+//
+// A segment sent again that the source already held answers with a duplicate
+// acknowledgement of its own, and the source's stack sends one for every
+// duplicate segment it receives. Only a burst's guesses past the hole can be
+// such segments; what the acknowledgements showed missing draws no duplicate.
+// Their acknowledgements repeat whatever the source holds in order, which is
+// at most everything retained when the retransmission went, since the path
+// delivers in order. So while a guess's own duplicates can still be arriving,
+// a run of duplicates at or below that end is evidence of nothing unless it is
+// longer than the guesses that explain it. Without this, one recovery's needless
+// retransmissions started the next recovery, whose bursts sent the window
+// again, whose duplicates started the next: a storm that lasted the rest of
+// the flow. A real loss in that range costs the extra duplicates, or the
+// guard's lapse one timer after the last retransmission, and the timer itself
+// is the backstop.
+func (self *tcpReturnRetransmitState) fastRetransmitWithLock(ackNumber uint32, nowNanos int64) {
+	if nowNanos < self.explainedDupAckNanos &&
+		int32(ackNumber-self.explainedDupAckEnd) <= 0 &&
+		self.dupAckCount < returnRetransmitDupAckThreshold+self.explainedDupAckCount {
+		return
+	}
 	self.beginLossRecoveryWithLock(nowNanos)
 	self.recoveryEnd = self.highestDeliveredWithLock()
 	if 0 < self.sackedCount {
@@ -639,6 +677,11 @@ func (self *tcpReturnRetransmitState) markBurstWithLock(windowEnd uint32, nowNan
 			continue
 		}
 		self.markDueWithLock(segment, tcpReturnRetransmitReasonPartialAck, nowNanos)
+		if 0 < index && segment.due {
+			// past the hole at the cumulative acknowledgement, so it is the
+			// burst's guess
+			segment.guessed = true
+		}
 	}
 }
 
@@ -899,8 +942,9 @@ func (self *tcpReturnRetransmitState) ackWithLock(
 	switch {
 	case self.recoveryPhase == tcpReturnRecoveryPhaseNone:
 		// at the threshold, or past it when the duplicates before it came
-		// while nothing was delivered
-		self.fastRetransmitWithLock(nowNanos)
+		// while nothing was delivered, or when this flow's own retransmissions
+		// explained the ones before it
+		self.fastRetransmitWithLock(ackNumber, nowNanos)
 	case 0 < self.sackedCount && (sackChanged || self.dupAckCount == returnRetransmitDupAckThreshold):
 		self.markSackHolesWithLock(nowNanos)
 	case self.dupAckCount == returnRetransmitDupAckThreshold:
@@ -959,6 +1003,22 @@ func (self *tcpReturnRetransmitState) takeDueWithLock(
 	nowNanos int64,
 	build func(packets [][]byte, segment *tcpReturnRetainedSegment) [][]byte,
 ) [][]byte {
+	guessedPacketCount := 0
+	defer func() {
+		if guessedPacketCount == 0 {
+			return
+		}
+		// the duplicates the guesses can draw, for the guard in
+		// fastRetransmitWithLock. A segment the acknowledgements showed
+		// missing draws none: the source is missing it
+		if self.explainedDupAckNanos <= nowNanos {
+			self.explainedDupAckCount = 0
+		}
+		self.explainedDupAckCount += guessedPacketCount
+		tail := self.segmentAtWithLock(self.count - 1)
+		self.explainedDupAckEnd = tail.seq + tail.byteCount
+		self.explainedDupAckNanos = nowNanos + self.baseRtoNanos()
+	}()
 	for index := 0; 0 < self.dueCount && index < self.count; index += 1 {
 		segment := self.segmentAtWithLock(index)
 		if !segment.due {
@@ -971,6 +1031,9 @@ func (self *tcpReturnRetransmitState) takeDueWithLock(
 		builtCount := len(packets)
 		packets = build(packets, segment)
 		builtCount = len(packets) - builtCount
+		if segment.guessed {
+			guessedPacketCount += builtCount
+		}
 		self.retransmitPacketCount += int64(builtCount)
 		self.retransmitByteCount += int64(segment.byteCount)
 		self.reasonCounts[segment.dueReason] += 1

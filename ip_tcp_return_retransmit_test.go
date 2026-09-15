@@ -137,9 +137,11 @@ type tcpReturnTestSource struct {
 
 	// when positive, each acknowledgement an arrival causes reaches the
 	// sequence this long after it, in order, as over a path with this delay;
-	// the harness's pump sends them from `delayedAcks`
+	// the harness's pump sends them from `delayedAcks`, or the test steps
+	// them from `steppedAcks`
 	ackDelay    time.Duration
 	delayedAcks chan tcpReturnTestDelayedAck
+	stepAcks    bool
 
 	stateLock sync.Mutex
 	// while held, nothing is acknowledged; released by ackNow
@@ -184,6 +186,9 @@ type tcpReturnTestSource struct {
 	// scaled units the advertised window has grown by since the handshake;
 	// every acknowledgement carries it
 	windowGrowth uint16
+	// the acknowledgements waiting for the test's stepAcks, in the order the
+	// arrivals caused them
+	steppedAcks []tcpReturnTestDelayedAck
 }
 
 func (self *tcpReturnTestSource) receive(segment tcpReturnTestSegment) {
@@ -236,8 +241,13 @@ func (self *tcpReturnTestSource) receive(segment tcpReturnTestSegment) {
 			return
 		}
 		if 0 < self.ackDelay {
+			delayed := tcpReturnTestDelayedAck{ackNumber: self.rcvNxt, at: segment.at.Add(self.ackDelay)}
+			if self.stepAcks {
+				self.steppedAcks = append(self.steppedAcks, delayed)
+				return
+			}
 			select {
-			case self.delayedAcks <- tcpReturnTestDelayedAck{ackNumber: self.rcvNxt, at: segment.at.Add(self.ackDelay)}:
+			case self.delayedAcks <- delayed:
 			default:
 				self.harness.t.Errorf("delayed acknowledgement queue full")
 			}
@@ -494,7 +504,11 @@ type tcpReturnTestOptions struct {
 	upstreamCloseDelay time.Duration
 	// how long each acknowledgement the source sends takes to arrive; zero
 	// acknowledges inside the delivery callback
-	ackDelay  time.Duration
+	ackDelay time.Duration
+	// with ackDelay, the delayed acknowledgements wait for the test's
+	// stepAcks instead of a pump goroutine, so each is applied with the
+	// sequence's goroutines run to rest, as they run between real arrivals
+	stepAcks  bool
 	configure func(*TcpBufferSettings)
 }
 
@@ -586,13 +600,14 @@ func newTcpReturnRetransmitTestHarness(t *testing.T, options tcpReturnTestOption
 		sack:           options.sack,
 		timestamps:     options.timestamps,
 		ackDelay:       options.ackDelay,
+		stepAcks:       options.stepAcks,
 		rcvNxt:         harness.dataSeq,
 		lastAckNumber:  harness.dataSeq,
 		dropCounts:     map[uint32]int{},
 		stallDurations: map[uint32]time.Duration{},
 		seenCounts:     map[uint32]int{},
 	}
-	if 0 < options.ackDelay {
+	if 0 < options.ackDelay && !options.stepAcks {
 		// far more than any test's arrivals, so the delivery callback never
 		// waits on it
 		harness.source.delayedAcks = make(chan tcpReturnTestDelayedAck, 64*1024)
@@ -717,6 +732,42 @@ func newTcpReturnRetransmitTestHarness(t *testing.T, options tcpReturnTestOption
 
 	t.Cleanup(harness.close)
 	return harness
+}
+
+// Advances `duration` of virtual time, sending each acknowledgement the source
+// queued whose time falls inside it, in the order its arrivals caused them and
+// at that time, with the sequence's goroutines run to rest before the next, as
+// they run between real arrivals. Retransmissions sent during the step arrive
+// and queue their own acknowledgements behind those already waiting, as an
+// in-order path delivers them.
+func (self *tcpReturnRetransmitTestHarness) stepAcks(duration time.Duration) {
+	self.t.Helper()
+	end := time.Now().Add(duration)
+	for {
+		var next tcpReturnTestDelayedAck
+		stepped := func() bool {
+			self.source.stateLock.Lock()
+			defer self.source.stateLock.Unlock()
+			if len(self.source.steppedAcks) == 0 || end.Before(self.source.steppedAcks[0].at) {
+				return false
+			}
+			next = self.source.steppedAcks[0]
+			self.source.steppedAcks = self.source.steppedAcks[1:]
+			return true
+		}()
+		if !stepped {
+			break
+		}
+		if wait := time.Until(next.at); 0 < wait {
+			time.Sleep(wait)
+		}
+		self.source.sendAck(next.ackNumber)
+		synctest.Wait()
+	}
+	if wait := time.Until(end); 0 < wait {
+		time.Sleep(wait)
+	}
+	synctest.Wait()
 }
 
 // A zeroed pooled packet from the source with room for `tcpByteCount` bytes of
@@ -1673,6 +1724,106 @@ func TestTcpReturnRetransmitRealTimeoutRecoversOnTheDuplicateAck(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The round trip of the tests that step the source's acknowledgements through
+// a download.
+const tcpReturnTestStepRoundTrip = 50 * time.Millisecond
+
+// Writes `segmentCount` segments of `payload` from where `written` stands, and
+// returns the new position.
+func (self *tcpReturnRetransmitTestHarness) writeSegments(payload []byte, written int, segmentCount int) int {
+	self.t.Helper()
+	self.write(payload[written*self.segmentByteCount : (written+segmentCount)*self.segmentByteCount])
+	synctest.Wait()
+	return written + segmentCount
+}
+
+// Segments the source was handed more than once, counted apart from the ones
+// its kernel dropped, which is what a needless retransmission costs the return
+// path.
+func (self *tcpReturnRetransmitTestHarness) requireSegmentsSentAgain(
+	segmentCount int,
+	lost map[int]bool,
+) (lostSentAgain int, heldSentAgain int) {
+	self.t.Helper()
+	for segmentIndex := 0; segmentIndex < segmentCount; segmentIndex += 1 {
+		seenCount := self.source.seenCount(self.segmentSeq(segmentIndex))
+		if lost[segmentIndex] {
+			lostSentAgain += seenCount - 2
+			if seenCount < 2 {
+				self.t.Fatalf("lost segment %d delivered %d times, want the original and one retransmission", segmentIndex, seenCount)
+			}
+		} else {
+			heldSentAgain += seenCount - 1
+		}
+	}
+	return
+}
+
+// A run of segments the source's kernel drops with data still flowing behind
+// it. Recovery sends a few segments the source held past the run, and the
+// source's kernel answers every one of them with a duplicate acknowledgement.
+// Those duplicates are not evidence of loss: they repeat what the source holds
+// in order, which is at most what was retained when the retransmissions went.
+// Before this they reached the threshold and began another recovery, whose
+// partial acknowledgements were the ordinary acknowledgements of data in
+// flight, whose bursts sent that data again, whose duplicates began the next
+// recovery: about a window sent again every round trip for the rest of the
+// flow. A real loss after them is still repaired by duplicate acknowledgements
+// once the guard has lapsed, never by the timer here.
+func TestTcpReturnRetransmitDuplicatesOfItsOwnRetransmissionsDoNotStartARecovery(t *testing.T) {
+	const firstCount = 40
+	const roundCount = 20
+	const roundCountPerFlow = 12
+	const lostStart = 1
+	const lostEnd = 9
+	// well past the recovery, so the guard on the duplicates it drew has
+	// lapsed and the duplicates of this one are the only ones that count
+	const laterLostIndex = firstCount + 6*roundCount + 3
+	runTcpReturnRetransmitTest(t, func(t *testing.T) {
+		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{
+			ackDelay: tcpReturnTestStepRoundTrip,
+			stepAcks: true,
+		})
+		lost := map[int]bool{}
+		for segmentIndex := lostStart; segmentIndex < lostEnd; segmentIndex += 1 {
+			lost[segmentIndex] = true
+		}
+		lost[laterLostIndex] = true
+		for segmentIndex := range lost {
+			harness.source.dropCounts[harness.segmentSeq(segmentIndex)] = 1
+		}
+
+		segmentCount := firstCount + roundCountPerFlow*roundCount
+		payload := harness.payload(segmentCount)
+		written := harness.writeSegments(payload, 0, firstCount)
+		for round := 0; round < roundCountPerFlow; round += 1 {
+			written = harness.writeSegments(payload, written, roundCount)
+			harness.stepAcks(tcpReturnTestStepRoundTrip)
+		}
+		// every acknowledgement of the last round, and a recovery after it
+		for range 8 {
+			harness.stepAcks(tcpReturnTestStepRoundTrip)
+		}
+
+		harness.requireStream(payload)
+		lostSentAgain, heldSentAgain := harness.requireSegmentsSentAgain(segmentCount, lost)
+		_, _, packetCount, reasonCounts := harness.retransmitState()
+		t.Logf("retransmissions=%d reasons=%v, %d of them segments the source held", packetCount, reasonCounts, heldSentAgain)
+		if reasonCounts[tcpReturnRetransmitReasonDupAck] != 2 {
+			t.Fatalf("reasons=%v, want one fast retransmit for the run and one for the later loss", reasonCounts)
+		}
+		if lostSentAgain != 0 {
+			t.Fatalf("%d lost segments were sent again more than once", lostSentAgain)
+		}
+		if returnRetransmitMaxBurstSegmentCount < heldSentAgain {
+			t.Fatalf("%d segments the source held were sent again, for %d lost", heldSentAgain, lostEnd-lostStart)
+		}
+		if stats := harness.counters.snapshot(); stats.TimeoutCount != 0 {
+			t.Fatalf("stats=%+v, want every repair on duplicate or partial acknowledgements", stats)
+		}
+	})
 }
 
 // The round trip of the loss-recovery burst tests, above the 200 ms hole
