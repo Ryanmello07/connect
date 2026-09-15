@@ -583,16 +583,16 @@ func (self *pathCarrier) startHop(
 	self.stats = append(self.stats, stats)
 	forwardCtx, forwardCancel := context.WithCancel(ctx)
 	reverseCtx, reverseCancel := context.WithCancel(ctx)
-	runtime := &pathHopRuntime{
+	hopRuntime := &pathHopRuntime{
 		stats:         stats,
 		forwardCancel: forwardCancel,
 		reverseCancel: reverseCancel,
 	}
 	if controlled {
-		runtime.forwardControl = newPathLinkControl()
-		runtime.reverseControl = newPathLinkControl()
+		hopRuntime.forwardControl = newPathLinkControl()
+		hopRuntime.reverseControl = newPathLinkControl()
 	}
-	self.hops = append(self.hops, runtime)
+	self.hops = append(self.hops, hopRuntime)
 	forwardRandom := rand.New(rand.NewPCG(seed, uint64(randomOrdinal)))
 	reverseRandom := rand.New(rand.NewPCG(seed, uint64(randomOrdinal+1)))
 	self.done.Add(2)
@@ -600,17 +600,17 @@ func (self *pathCarrier) startHop(
 		defer self.done.Done()
 		runPathLink(
 			forwardCtx, hop.Forward, forwardRandom, forwardIn, forwardOut,
-			dataByteCount, &self.frozen, &stats.forward, runtime.forwardControl,
+			dataByteCount, &self.frozen, &stats.forward, hopRuntime.forwardControl,
 		)
 	}()
 	go func() {
 		defer self.done.Done()
 		runPathLink(
 			reverseCtx, hop.Reverse, reverseRandom, reverseIn, reverseOut,
-			dataByteCount, &self.frozen, &stats.reverse, runtime.reverseControl,
+			dataByteCount, &self.frozen, &stats.reverse, hopRuntime.reverseControl,
 		)
 	}()
-	return runtime
+	return hopRuntime
 }
 
 // Returns every message a route still holds to the pool, and how many there

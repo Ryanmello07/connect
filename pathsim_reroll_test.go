@@ -212,6 +212,8 @@ func newPathReroll(arm pathArm, carrier *pathCarrier, receiver *Client) *pathRer
 // A new connection's monitor and observer. Nil when the path is too short to
 // monitor, exactly as `newH1PathMonitor` refuses one below MinPathRtt.
 func (self *pathReroll) startMonitor(now time.Time) {
+	self.monitor = nil
+	self.observer = nil
 	monitor := newH1PathMonitor(&self.settings, now, self.pathRtt())
 	if monitor == nil {
 		self.stats.ConnectionsDormant.Add(1)
@@ -429,7 +431,9 @@ func (self *pathReroll) switchLeg(ctx context.Context, now time.Time) {
 	self.result.switchDrops += self.leg.forwardControl.trimNow(ctx, 0, true)
 	routeManager.RemoveTransport(self.receiveTransport)
 	routeManager.RemoveTransport(self.sendTransport)
-	self.observer.setActive(false)
+	if self.observer != nil {
+		self.observer.setActive(false)
+	}
 	self.leg.forwardCancel()
 	self.leg.reverseCancel()
 
@@ -478,7 +482,9 @@ func (self *pathReroll) switchLeg(ctx context.Context, now time.Time) {
 		[]Route{receiveRoute},
 		TransferCarrierProperties{
 			ReceiveReliability: CarrierReliabilityReliable,
-			receiveObserver:    self.observer,
+			// nil when the replacement path is short enough to be dormant,
+			// exactly as the platform transport publishes no observer then
+			receiveObserver: self.observerOrNil(),
 		},
 	)
 	routeManager.UpdateTransport(self.sendTransport, []Route{sendRoute})
