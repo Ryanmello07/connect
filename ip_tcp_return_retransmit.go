@@ -596,11 +596,11 @@ func (self *tcpReturnRetransmitState) retainWithLock(
 //
 // `startNanos` is when the batch's delivery began. A batch that began before
 // the recovery under way was on its way to the source before that recovery's
-// first retransmission, so the recovery point covers it. A batch that began
-// after it is data sent during the recovery, which lies past the point: a hole inside it is
-// one the acknowledgement of that retransmission will stop at, and without
-// this it lay past the point, read as a full recovery, and waited for the
-// timer while its duplicates had already been spent.
+// first retransmission, so the recovery point covers it: a hole inside it is
+// one the acknowledgement of that retransmission stops at. Without this the
+// hole lay past the point, that acknowledgement read as a full recovery, and
+// the hole waited for the timer, its duplicates already spent. A batch that
+// began after the recovery is data sent during it, and stays past the point.
 func (self *tcpReturnRetransmitState) markDeliveredWithLock(
 	seqs []uint32,
 	startNanos int64,
@@ -756,12 +756,12 @@ func (self *tcpReturnRetransmitState) beginLossRecoveryWithLock(startNanos int64
 // at most everything retained when the retransmission went, since the path
 // delivers in order. So while a guess's own duplicates can still be arriving,
 // a run of duplicates at or below that end is evidence of nothing unless it is
-// longer than the guesses that explain it. Without this, one recovery's needless
-// retransmissions started the next recovery, whose bursts sent the window
-// again, whose duplicates started the next: a storm that lasted the rest of
-// the flow. A real loss in that range costs the extra duplicates, or the
-// guard's lapse one timer after the last retransmission, and the timer itself
-// is the backstop.
+// longer than the guesses that explain it. Without this, one recovery's
+// needless retransmissions started the next recovery, whose bursts sent the
+// window again, whose duplicates started the next: a storm that lasted the
+// rest of the flow. A real loss in that range costs the extra duplicates, or
+// the guard's lapse one timer after the last retransmission, and the timer
+// itself is the backstop.
 func (self *tcpReturnRetransmitState) fastRetransmitWithLock(ackNumber uint32, nowNanos int64) {
 	if nowNanos < self.explainedDupAckNanos &&
 		int32(ackNumber-self.explainedDupAckEnd) <= 0 &&
