@@ -2,7 +2,7 @@
 
 A deterministic, virtual-time simulation of the relay path for the transfer layer, and the scenarios that pin the
 findings of THROUGHPUT-RIG-REVIEW.md on it. Files: `pathsim_test.go` (the simulator), `pathsim_scenarios_test.go`
-(S1–S5, S7, S8), `pathsim_inner_tcp_test.go` (S6).
+(S1–S5, S7, S8), `pathsim_inner_tcp_test.go` (S6), `pathsim_reroll_test.go` (S9).
 
 ## What it models
 
@@ -74,6 +74,12 @@ Each scenario prints a `digest` line hashing its integer results; three runs of 
 processes print identical digests (checked when this was written). A digest that moves between two runs of the
 same tree is a new race, not noise.
 
+S9 is the one scenario whose digest is per host rather than per tree. Its re-roll draws a source port from the
+production plan, and the plan draws from the kernel's ephemeral range: 32768–60999 on linux and android,
+49152–65535 elsewhere. The same seed therefore picks 42171 on linux and 60160 on darwin. Both are healthy
+under the arm's hash, so every other integer of the run — convictions, switches, recovery, bytes — is
+identical on the two; only the port, and the digest that hashes it, differ.
+
 ## Running
 
     go test -run TestPathsim -v .                          # fast tier, a few wall seconds
@@ -82,13 +88,19 @@ same tree is a new race, not noise.
 `-v` is needed to see the tables (`go test` buffers a passing package's output). Each scenario logs one table: arm,
 goodput over the offer and steady (second half) in Mb/s, writes, resends, timeout resends (`rto`), selective-gap
 resends (`gap`), probes, duplicates, hop drops, longest gap, head-of-line time, drain time, the window, and flags
-(`STALLED`, `UNDRAINED`, `sized`, `evict=`, `tentative=`, `rdrop=`, `HANDOFF=` and `DEADLINE=` — the last two are
-instrument faults and must not appear).
+(`STALLED`, `UNDRAINED`, `sized`, `evict=`, `tentative=`, `rdrop=`, `reroll=` — convictions, switches and improved
+re-rolls — and `HANDOFF=` and `DEADLINE=`, the last two instrument faults that must not appear).
+
+The whole fast tier is about ten wall seconds. Keep it there: an arm's wall cost is the frames it carries, so a
+long offer at a high rate is what makes it slow, not the virtual seconds themselves.
 
 ## Adding a scenario
 
 1. Build the path from `pathRelayHop(name, roundTrip, bytesPerSecond, queueMessages, loss)` or `pathHop` literals;
-   set `Jitter`/`Reorder`, `BurstLoss`/`BurstLength`, `DropOffered`, or `Trace` on a `pathLink` as needed.
+   set `Jitter`/`Reorder`, `BurstLoss`/`BurstLength`, `DropOffered`, or `Trace` on a `pathLink` as needed. A
+   scenario that has to retire a link mid-run sets `pathArm.Reroll`, which gives every link a `pathLinkControl`
+   (stop the ingress, trim the queue and what is in flight, read what it delivered); without it the links run with
+   a nil control, the code path every other scenario takes.
 2. Build arms with `pathScenarioArm(name, hops, lanes, offer, sizing, configure)`; `configure` edits the two
    `ClientSettings` (window, hold, policies) before the clients are built; `sizing` and `pathReferenceBudget` are the
    process-wide surfaces the clients are constructed under.
@@ -111,6 +123,31 @@ instrument faults and must not appear).
 | S6 `TestPathsimS6InnerSegmentLossIsNotRetransmittedByTheProvider` | §6: the provider's TCP does not retransmit, so a post-delivery loss is a permanent hole | the provider's half yes | needs a client stack under synctest and a post-delivery drop seam for the whole; neither exists yet |
 | S7 `TestPathsimS7HeavyLatencyGrid` | an instrument, not a finding | — | 50–300 ms one way x loss x rule; monotonic in delay without loss, rule above constant everywhere, loss costs everywhere |
 | S8 `TestPathsimS8MultiHop` | an instrument, not a finding | — | two and three hops with queues; no stall without loss, bounded recovery with loss |
+| S9 `TestPathsimS9LossyConnectionReroll` | not in that review: the later relay measurement behind the H1 path re-roll (`transport_h1_path.go`) — one TCP 4-tuple in eight is hashed onto a lossy path member and stays there for the connection's life | collapse and rescue yes, the loss under it no | 5.0 Mb/s against a healthy 303 with 14 resends in 856 writes, so Transfer cannot see it; Observe convicts at 3.50 s and changes no integer; Act re-rolls the source port and reads the healthy rate again 552 ms later; the kernel's own port walk stays inside a 64-port block and the unimproved latch stops it after two tries |
+
+### The connection hash, and what S9 models
+
+S9 is the only scenario whose last hop is a *connection* rather than a wire. The client's websocket is assigned a
+path member by a hash of its synthetic source port, one member in eight is lossy, and the lossy member is a slow,
+deep, blocking socket queue — the measured shape: a few Mb/s with megabytes unsent and no loss Transfer can see.
+Two hash models are offered: `pathHashIndependent`, where neighbouring ports land on unrelated members, and
+`pathHashBlock64`, where contiguous blocks of 64 ports share one, which is what the rig's contiguous bad ports
+looked like. Two source port policies replace a convicted port: the kernel's own next ports, and the production
+`newH1SourcePortPlan` far-random pick.
+
+What decides is production code — `h1PathMonitor`, `h1PathLedger`, `h1RouteObserver` fed by the real `Client.run`
+sampling, `newH1SourcePortPlan` — driven one tick every 500 ms from a sample the scenario builds the way the
+platform transport builds its own. There is no kernel TCP here, so the out-of-order counter that the monitor reads
+as loss evidence is scripted per arm (`KernelOoo`) and the send-side counters are never known. There is no
+websocket and no dial: a re-roll is a leg swap plus a fixed dial gap, break before make. The make-before-break
+drain handoff of the design is not implemented, so S9 has no drain arm and no handoff setting; the break arm's
+recovery time (552 ms) is the number that handoff has to beat.
+
+One detector setting is not the library default. At 16 KiB payloads a connection collapsed to 5 Mb/s carries about
+39 frames a second, so the production 1-in-16 sampling yields about one pack sample per tick, below the default
+`MinTickPackSamples` of 2, and the queue delay would read unknown on every tick. A real client's frames are mostly
+MTU-sized, where the default is met with room to spare. The arms set `MinTickPackSamples` 1 and keep
+`PackSampleEvery` at 16; the frame size, not the detector, is what the simulator cannot reproduce.
 
 Provider standby release and upstream group merge have deterministic unit tests on other branches and are not
 repeated here.
