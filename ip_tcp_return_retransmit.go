@@ -34,9 +34,16 @@ const (
 	returnRetransmitMaxBurstSegmentCount = 128
 	// the most blocks one SACK option carries beside a timestamp option
 	tcpMaxSackBlockCount = 4
-	// the bounds used when the settings leave them zero
+	// the retention cap used when the settings leave it zero
 	defaultReturnRetransmitRetainByteCount = ByteCount(4 * 1024 * 1024)
-	defaultReturnRetransmitTimeout         = 60 * time.Second
+	// the no-progress bound used when the settings leave it zero: the
+	// provider's bound on a source that acknowledges none of its returns
+	// (RemoteUserNatProviderSettings.ReturnSendAbandonTimeout). At 60 s, a
+	// 60 to 120 s gap in the source's connectivity, which the provider waits
+	// out, reset download flows that would have completed when the gap
+	// closed; a source silent for longer with a return parked is released by
+	// the provider anyway. The flow's idle timeout, 300 s, is longer still.
+	defaultReturnRetransmitTimeout = defaultReturnSendAbandonTimeout
 )
 
 // One selective acknowledgement block, [start, end) in sequence space.
@@ -207,7 +214,9 @@ func (self *returnRetransmitCounters) snapshot() ReturnRetransmitStats {
 // cap. Time is bounded by ReturnRetransmitTimeout: when the cumulative
 // acknowledgement has not advanced for that long with delivered segments
 // outstanding, the flow is reset toward the source and closed, never left
-// idle. That is the acceptance contract: a transient loss completes the exact
+// idle. It defaults to the provider's ReturnSendAbandonTimeout, 120 s, so a
+// gap in the source's acknowledgements shorter than the provider's own bound
+// on that source resets nothing. That is the acceptance contract: a transient loss completes the exact
 // byte stream; an unrecoverable one is an explicit, bounded failure.
 //
 // Triggers. Fast retransmit: the third duplicate acknowledgement of one

@@ -1020,6 +1020,48 @@ func TestTcpReturnRetransmitTimesOutWithBackoffThenResets(t *testing.T) {
 	})
 }
 
+// The no-progress bound defaults to the provider's bound on a source that
+// acknowledges none of its returns, and a source whose acknowledgements stop
+// for just under it, as over a connectivity gap the provider waits out, keeps
+// its flow: the acknowledgements resume, the stream completes, and nothing is
+// reset. At 60 s the flow was reset halfway through the same gap.
+func TestTcpReturnRetransmitSurvivesAnAcknowledgementGapTheProviderWaitsOut(t *testing.T) {
+	abandonTimeout := DefaultRemoteUserNatProviderSettings().ReturnSendAbandonTimeout
+	if got := DefaultTcpBufferSettings().ReturnRetransmitTimeout; got != abandonTimeout {
+		t.Fatalf("no-progress bound %s, want the provider's return abandon bound %s", got, abandonTimeout)
+	}
+	runTcpReturnRetransmitTest(t, func(t *testing.T) {
+		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{})
+		if harness.settings.ReturnRetransmitTimeout != abandonTimeout {
+			t.Fatalf("harness bound %s, want the default %s", harness.settings.ReturnRetransmitTimeout, abandonTimeout)
+		}
+		harness.source.holdAcks = true
+		payload := harness.payload(2)
+		harness.write(payload)
+		synctest.Wait()
+
+		time.Sleep(abandonTimeout - time.Second)
+		synctest.Wait()
+		harness.source.ackNow()
+		synctest.Wait()
+
+		harness.requireStream(payload)
+		harness.source.stateLock.Lock()
+		rstReceived := harness.source.rstReceived
+		harness.source.stateLock.Unlock()
+		if rstReceived || harness.runIsDone() {
+			t.Fatalf("the flow ended within the provider's abandon bound: rst=%t", rstReceived)
+		}
+		if stats := harness.counters.snapshot(); stats.AbandonCount != 0 || stats.TimeoutCount == 0 {
+			t.Fatalf("stats=%+v, want the timer's retransmissions through the gap and no abandon", stats)
+		}
+		retainedByteCount, retainedCount, _, _ := harness.retransmitState()
+		if retainedByteCount != 0 || retainedCount != 0 {
+			t.Fatalf("retained after the acknowledgements resumed: %d bytes in %d segments", retainedByteCount, retainedCount)
+		}
+	})
+}
+
 // A source that received every segment but whose acknowledgements a stall
 // held past the timer, and then arrive late: the expiry sends the head once
 // and nothing else follows, whether the late acknowledgements come one per

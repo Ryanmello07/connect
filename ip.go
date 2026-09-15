@@ -3887,7 +3887,10 @@ type TcpBufferSettings struct {
 	ReturnRetransmitRetainByteCount ByteCount
 	// How long the cumulative acknowledgement may stand still with segments
 	// outstanding before the flow is reset toward the source and closed,
-	// rather than left idle. Zero is 60 seconds.
+	// rather than left idle. Zero is the provider's default
+	// ReturnSendAbandonTimeout, 120 seconds, so a gap in the source's
+	// acknowledgements shorter than the provider's own bound on that source
+	// resets nothing.
 	ReturnRetransmitTimeout time.Duration
 	// Tests may hold a newly admitted sequence before it can consume its first
 	// pooled packet. Nil is a production no-op.
@@ -6902,6 +6905,13 @@ func (self *ConnectionState) tcpPacket(flags byte, seq uint32, payload []byte) [
 	return packet
 }
 
+// The default ReturnSendAbandonTimeout: twice Transfer's own acknowledgement
+// bound (`SendBufferSettings.AckTimeout`), and above every acknowledgement gap
+// the shipped tree has been measured to produce (THROUGHPUTFIX §10.3). The
+// inner TCP return retransmission's no-progress bound defaults to it (see
+// defaultReturnRetransmitTimeout).
+const defaultReturnSendAbandonTimeout = 120 * time.Second
+
 func DefaultRemoteUserNatProviderSettings() *RemoteUserNatProviderSettings {
 	return DefaultRemoteUserNatProviderSettingsWithMemoryTarget(0)
 }
@@ -6929,10 +6939,7 @@ func DefaultRemoteUserNatProviderSettingsWithMemoryTarget(targetByteCount ByteCo
 		MaxSourceCount:          maxSourceCount,
 		IngressDispatchTimeout:  0,
 
-		// twice Transfer's own acknowledgement bound (`SendBufferSettings
-		// .AckTimeout`), and above every acknowledgement gap the shipped tree
-		// has been measured to produce (THROUGHPUTFIX §10.3)
-		ReturnSendAbandonTimeout: 120 * time.Second,
+		ReturnSendAbandonTimeout: defaultReturnSendAbandonTimeout,
 	}
 }
 
