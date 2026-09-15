@@ -3873,8 +3873,10 @@ type TcpBufferSettings struct {
 	EnableSyntheticSpeed bool
 	// EnableReturnRetransmit retains each inner TCP segment sent toward the
 	// source until the source's cumulative acknowledgement covers it, and
-	// sends it again on three duplicate acknowledgements, on the holes below
-	// a selective acknowledgement, and on a retransmission timer. Transfer
+	// sends it again on three duplicate acknowledgements, on partial
+	// acknowledgements during loss recovery, on the holes below a selective
+	// acknowledgement, and on a retransmission timer, cut to the current path
+	// mtu. Transfer
 	// delivers the segments losslessly to the source device, but the device
 	// kernel can drop one on the flow's receive socket at high single-flow
 	// rates, and without this that drop is permanent: the source answers with
@@ -5727,8 +5729,10 @@ func (self *TcpSequence) Run() {
 				self.UpdateLastActivityTime()
 
 				// Transfer must not lose these emitted segments. The source TCP stack
-				// can reorder a route crossover, but the user-NAT does not retain data
-				// for retransmission.
+				// can reorder a route crossover, but the retention below repairs a
+				// lost segment only once the source's acknowledgements or the timer
+				// show it missing, a round trip or a timeout later, and not at all
+				// with EnableReturnRetransmit off (see tcpReturnRetransmitState).
 				// packetize and emit one window-sized chunk at a time, so that a
 				// read larger than the receive window cannot stall. each chunk
 				// must be emitted before waiting for window room for the next
