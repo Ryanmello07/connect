@@ -1360,6 +1360,114 @@ func TestTcpReturnRetransmitNoProgressBoundRunsFromTheLastAcknowledgementProgres
 	})
 }
 
+// The deadline of the timer, read under the sequence mutex, from now.
+func (self *tcpReturnRetransmitTestHarness) retransmitDeadline() time.Duration {
+	self.sequence.mutex.Lock()
+	defer self.sequence.mutex.Unlock()
+	return time.Duration(self.sequence.returnRetransmit.rtoDeadlineNanos - monotonicNanos())
+}
+
+// Requires the second delivery of the segment at `segmentIndex`, the timer's
+// retransmission, at exactly `want`.
+func (self *tcpReturnRetransmitTestHarness) requireTimerRetransmissionAt(segmentIndex int, want time.Time) {
+	self.t.Helper()
+	if got := self.requireDelivery(self.segmentSeq(segmentIndex), 1).at; !got.Equal(want) {
+		self.t.Fatalf("segment %d sent again by the timer %s after its deadline", segmentIndex, got.Sub(want))
+	}
+	if _, _, _, reasonCounts := self.retransmitState(); reasonCounts[tcpReturnRetransmitReasonTimeout] == 0 {
+		self.t.Fatalf("reasons=%v, want the timer", reasonCounts)
+	}
+}
+
+// The first round-trip sample brings the timer's deadline in from the initial
+// second to the sampled timer, and a lost tail that only the timer repairs is
+// sent again at that deadline. The worker computed its wait from the initial
+// second and was never woken by the acknowledgement, so it slept out the
+// second and sent the tail 600 ms late.
+func TestTcpReturnRetransmitTimerExpiresAtTheDeadlineTheFirstSampleBringsIn(t *testing.T) {
+	runTcpReturnRetransmitTest(t, func(t *testing.T) {
+		const segmentCount = 8
+		const roundTrip = 100 * time.Millisecond
+		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{})
+		harness.source.holdAcks = true
+		// the tail, with nothing after it to draw a duplicate
+		harness.source.dropCounts[harness.segmentSeq(segmentCount-2)] = 1
+		harness.source.dropCounts[harness.segmentSeq(segmentCount-1)] = 1
+		harness.write(harness.payload(segmentCount))
+		synctest.Wait()
+
+		time.Sleep(roundTrip)
+		harness.source.sendAck(harness.segmentSeq(segmentCount - 2))
+		synctest.Wait()
+		// one sample of 100 ms: max(200 ms, 2 x 100 ms, 100 ms + 4 x 50 ms)
+		rto, baseRto := harness.retransmitTimer()
+		if rto != 3*roundTrip || baseRto != rto {
+			t.Fatalf("timer %s base %s after the first sample, want %s", rto, baseRto, 3*roundTrip)
+		}
+		deadline := time.Now().Add(harness.retransmitDeadline())
+		if want := time.Now().Add(rto); !deadline.Equal(want) {
+			t.Fatalf("deadline %s after the acknowledgement, want %s", time.Until(deadline), rto)
+		}
+
+		time.Sleep(returnRetransmitMaxRto)
+		synctest.Wait()
+		harness.requireTimerRetransmissionAt(segmentCount-2, deadline)
+	})
+}
+
+// Acknowledgement progress drops a backed-off timer to its base, and a lost
+// tail that only the timer repairs is sent again at that base. A stall backs
+// the timer off to 4.8 s; the late acknowledgements of the stalled flight and
+// of a new one decide its probe spurious and sample a round trip, and the new
+// flight's last segments are lost. The worker was sleeping out the 4.8 s wait
+// it computed at the last expiry, and sent the tail more than four seconds
+// late.
+func TestTcpReturnRetransmitTimerExpiresAtTheBaseAfterProgressDropsItsBackoff(t *testing.T) {
+	runTcpReturnRetransmitTest(t, func(t *testing.T) {
+		const flightCount = 8
+		const roundTrip = 100 * time.Millisecond
+		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{})
+		harness.source.holdAcks = true
+		payload := harness.payload(3 * flightCount)
+		harness.write(payload[:flightCount*harness.segmentByteCount])
+		synctest.Wait()
+		time.Sleep(roundTrip)
+		harness.source.sendAck(harness.segmentSeq(flightCount))
+		synctest.Wait()
+
+		// the second flight stalls through four expiries
+		harness.write(payload[flightCount*harness.segmentByteCount : 2*flightCount*harness.segmentByteCount])
+		synctest.Wait()
+		time.Sleep((1+2+4+8)*3*roundTrip + roundTrip)
+		synctest.Wait()
+		if rto, baseRto := harness.retransmitTimer(); rto != 16*baseRto {
+			t.Fatalf("timer %s base %s after four expiries, want 16 times the base", rto, baseRto)
+		}
+
+		// the third flight, whose tail is lost
+		for segmentIndex := 3*flightCount - 3; segmentIndex < 3*flightCount; segmentIndex += 1 {
+			harness.source.dropCounts[harness.segmentSeq(segmentIndex)] = 1
+		}
+		harness.write(payload[2*flightCount*harness.segmentByteCount:])
+		synctest.Wait()
+		time.Sleep(roundTrip / 2)
+		harness.source.sendAck(harness.segmentSeq(3*flightCount - 3))
+		synctest.Wait()
+		rto, baseRto := harness.retransmitTimer()
+		if rto != baseRto || returnRetransmitInitialRto <= rto {
+			t.Fatalf("timer %s base %s after the progress, want the base", rto, baseRto)
+		}
+		deadline := time.Now().Add(harness.retransmitDeadline())
+
+		time.Sleep(2 * returnRetransmitMaxRto)
+		synctest.Wait()
+		harness.requireTimerRetransmissionAt(3*flightCount-3, deadline)
+		if _, _, _, reasonCounts := harness.retransmitState(); reasonCounts[tcpReturnRetransmitReasonPartialAck] != 0 {
+			t.Fatalf("reasons=%v, want the stalled flight's probe decided spurious, with no loss recovery", reasonCounts)
+		}
+	})
+}
+
 // A source that received every segment but whose acknowledgements a stall
 // held past the timer, and then arrive late: the expiry sends the head once
 // and nothing else follows, whether the late acknowledgements come one per

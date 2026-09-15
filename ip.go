@@ -4857,8 +4857,9 @@ func (self *TcpSequence) releaseReturnRetransmitWithLock() {
 }
 
 // Feeds one acknowledgement applySendAckWithLock accepted to the
-// retransmission state, waking the worker when it decided a retransmission
-// and the drain when the ring emptied. The sequence mutex must be held.
+// retransmission state, waking the worker when it decided a retransmission or
+// brought the timer in before the worker's wake, and the drain when the ring
+// emptied. The sequence mutex must be held.
 func (self *TcpSequence) applyReturnRetransmitAckWithLock(tcp *parsedTcp, previousReceiveSeqAck uint32) {
 	state := &self.returnRetransmit
 	windowByteCount := uint32(tcp.windowSize) << self.receiveWindowScale
@@ -4964,6 +4965,7 @@ func (self *TcpSequence) runReturnRetransmitWorker() {
 
 		var abandon bool
 		var waitNanos int64
+		var nowNanos int64
 		var rstPacket []byte
 		var outstandingByteCount int64
 		packets = packets[:0]
@@ -4971,7 +4973,7 @@ func (self *TcpSequence) runReturnRetransmitWorker() {
 			self.mutex.Lock()
 			defer self.mutex.Unlock()
 
-			nowNanos := monotonicNanos()
+			nowNanos = monotonicNanos()
 			abandon, waitNanos = self.returnRetransmit.timerWithLock(nowNanos)
 			if abandon {
 				outstandingByteCount = self.returnRetransmit.retainedByteCount
@@ -5021,7 +5023,9 @@ func (self *TcpSequence) runReturnRetransmitWorker() {
 			case <-self.returnRetransmitSignal:
 			}
 		} else {
-			timer.Reset(time.Duration(waitNanos))
+			// from the wake the clock computed, which the acknowledgement path
+			// compares with, however long the sends above took
+			timer.Reset(time.Duration(max(0, nowNanos+waitNanos-monotonicNanos())))
 			select {
 			case <-self.ctx.Done():
 				return

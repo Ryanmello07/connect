@@ -7,6 +7,7 @@
 package connect
 
 import (
+	"math"
 	"sync/atomic"
 	"time"
 )
@@ -274,7 +275,9 @@ func (self *returnRetransmitCounters) snapshot() ReturnRetransmitStats {
 // ceiling per acknowledgement and each at most once per recovery.
 // The timer: max(200 ms, 2 x srtt, srtt + 4 rttvar) from the inner round
 // trip, one second before a sample exists, doubling on each expiry to an 8 s
-// ceiling and reset by acknowledgement progress; expiry retransmits the first
+// ceiling and reset by acknowledgement progress, which wakes the worker when
+// it brings the deadline in by more than a quarter of the timer, as the first
+// sample and a dropped backoff do; expiry retransmits the first
 // unacknowledged segment only, and an expiry during loss recovery presumes
 // what it already sent again lost and starts the bursts over from one.
 //
@@ -361,6 +364,9 @@ type tcpReturnRetransmitState struct {
 	rttvarNanos      int64
 	rtoNanos         int64
 	rtoDeadlineNanos int64
+	// when the worker next wakes by itself, as the clock last told it; an
+	// acknowledgement that brings the deadline in before this wakes it
+	timerWakeNanos int64
 	// when the cumulative acknowledgement last advanced, or the first segment
 	// was delivered with nothing outstanding
 	progressNanos int64
@@ -757,15 +763,19 @@ func (self *tcpReturnRetransmitState) releaseAckedWithLock(ackNumber uint32, now
 // Applies one acknowledgement the sequence has already validated against its
 // emitted range. `previousAckNumber` is the cumulative acknowledgement before
 // it, `windowByteCount` its window after scaling, and `windowEnd` the
-// greatest window edge the source has advertised. Reports whether a
-// retransmission is now due, which wakes the worker.
+// greatest window edge the source has advertised. Reports whether the worker
+// must run now: a retransmission is due, or progress brought the timer's
+// deadline in well before the wake the worker is sleeping toward, as the first
+// round-trip sample does to the initial second and as progress does to a
+// backed-off timer; the worker sleeps past a deadline by at most a quarter of
+// the timer.
 func (self *tcpReturnRetransmitState) ackWithLock(
 	tcp *parsedTcp,
 	previousAckNumber uint32,
 	windowByteCount uint32,
 	windowEnd uint32,
 	nowNanos int64,
-) (due bool) {
+) (wake bool) {
 	previousWindowByteCount := self.ackWindowByteCount
 	self.ackWindowByteCount = windowByteCount
 	if !self.enabled || self.count == 0 {
@@ -828,7 +838,11 @@ func (self *tcpReturnRetransmitState) ackWithLock(
 		if self.applySackWithLock(tcp) && self.recoveryPhase == tcpReturnRecoveryPhaseLoss {
 			self.markSackHolesWithLock(nowNanos)
 		}
-		return 0 < self.dueCount
+		// by more than a quarter of the timer: a sample's jitter moves the
+		// deadline in by less on many acknowledgements, and a wake for each
+		// would take the mutex from the acknowledgement path at its rate
+		return 0 < self.dueCount ||
+			(0 < self.deliveredCount && self.rtoDeadlineNanos+self.rtoNanos/4 < self.timerWakeNanos)
 	}
 	if 0 < len(tcp.payload) || tcp.syn || tcp.fin || tcp.rst || windowByteCount != previousWindowByteCount {
 		// not a duplicate acknowledgement: it carries something of its own,
@@ -876,8 +890,10 @@ func (self *tcpReturnRetransmitState) ackWithLock(
 // waits for the next of either, negative when nothing delivered is
 // outstanding. An expiry with no answer from the source since the last one
 // probes; an expiry after the probe saw an answer, or during loss recovery,
-// is loss (RFC 5682 §2.1 step 1).
+// is loss (RFC 5682 §2.1 step 1). The wake it returns is remembered, so an
+// acknowledgement that brings the deadline in before it wakes the worker.
 func (self *tcpReturnRetransmitState) timerWithLock(nowNanos int64) (abandon bool, waitNanos int64) {
+	self.timerWakeNanos = math.MaxInt64
 	if !self.enabled || self.deliveredCount == 0 {
 		return false, -1
 	}
@@ -907,7 +923,8 @@ func (self *tcpReturnRetransmitState) timerWithLock(nowNanos int64) (abandon boo
 			self.counters.timeoutCount.Add(1)
 		}
 	}
-	return false, min(self.rtoDeadlineNanos, abandonNanos) - nowNanos
+	self.timerWakeNanos = min(self.rtoDeadlineNanos, abandonNanos)
+	return false, self.timerWakeNanos - nowNanos
 }
 
 // Builds every due segment through `build`, which appends its packets, one or
