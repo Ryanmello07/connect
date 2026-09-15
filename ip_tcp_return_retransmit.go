@@ -80,8 +80,9 @@ const (
 	// a timer expiry sent the head again, and no acknowledgement has
 	// advanced or repeated since; the expiry may be spurious
 	tcpReturnRecoveryPhaseTimeoutProbe
-	// one acknowledgement since the expiry covered exactly the head it sent
-	// again, and the next acknowledgement decides
+	// acknowledgements since the expiry advanced, but no further than the
+	// head it sent again; the next advance past the head, or a duplicate,
+	// decides
 	tcpReturnRecoveryPhaseTimeoutProbeAdvanced
 	// loss recovery: after the third duplicate acknowledgement, or after an
 	// expiry the acknowledgements showed real
@@ -244,12 +245,15 @@ func (self *returnRetransmitCounters) snapshot() ReturnRetransmitStats {
 // partial one and send the window again. So an expiry probes, in the spirit
 // of F-RTO (RFC 5682), and sends nothing beyond the head until the
 // acknowledgements decide. The first to advance past the retransmitted head,
-// or a second to advance with no duplicate between, acknowledges a segment
-// never sent again: the originals arrived, the expiry was spurious, and the
-// probe ends with the timer back at its base, the value the expiry doubled,
-// updated by whatever round trips the late acknowledgements sampled. A
-// duplicate acknowledgement shows a segment missing and turns the probe into
-// loss recovery, retransmitting at once when the head had already advanced.
+// whether or not others advanced to it before, acknowledges bytes never sent
+// again: the originals arrived, the expiry was spurious, and the probe ends
+// with the timer back at its base, the value the expiry doubled, updated by
+// whatever round trips the late acknowledgements sampled. An advance that
+// ends no further than the head decides nothing, since the source may hold
+// the original head or its retransmission; a head sent in pieces for a
+// smaller path mtu draws one such advance per piece. A duplicate
+// acknowledgement shows a segment missing and turns the probe into loss
+// recovery, retransmitting at once when the head had already advanced.
 // Silence decides nothing, so expiries with no answer at all only back off
 // and send the head again; an expiry after the source has answered is loss
 // (RFC 5682 §2.1 step 1), which is how a source that lost everything past the
@@ -739,20 +743,20 @@ func (self *tcpReturnRetransmitState) ackWithLock(
 		case tcpReturnRecoveryPhaseTimeoutProbe, tcpReturnRecoveryPhaseTimeoutProbeAdvanced:
 			if recovered {
 				self.recoveryPhase = tcpReturnRecoveryPhaseNone
-			} else if self.recoveryPhase == tcpReturnRecoveryPhaseTimeoutProbe &&
-				int32(ackNumber-self.probeHeadEnd) <= 0 {
-				// exactly the head the expiry sent again: the source may
-				// hold its original or the retransmission, and nothing yet
-				// says which
+			} else if int32(ackNumber-self.probeHeadEnd) <= 0 {
+				// no further than the head the expiry sent again, which
+				// after a smaller path mtu went in pieces that are
+				// acknowledged one by one: the source may hold its original
+				// or the retransmission, and nothing yet says which
 				self.recoveryPhase = tcpReturnRecoveryPhaseTimeoutProbeAdvanced
 				keepBackoff = true
 			} else {
-				// past the retransmitted head, or a second advance with no
-				// duplicate between: the source holds segments that were
-				// never sent again, so the originals arrived and only their
-				// acknowledgements were late (RFC 5682 §2.1 step 3b). The
-				// expiry was spurious: nothing more is sent, and the base
-				// below is the timer it doubled
+				// past the retransmitted head, so after any advance to it
+				// with no duplicate between: the source holds bytes that
+				// were never sent again, so the originals arrived and only
+				// their acknowledgements were late (RFC 5682 §2.1 step 3b).
+				// The expiry was spurious: nothing more is sent, and the
+				// base below is the timer it doubled
 				self.recoveryPhase = tcpReturnRecoveryPhaseNone
 			}
 		case tcpReturnRecoveryPhaseLoss:

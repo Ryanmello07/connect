@@ -1689,6 +1689,66 @@ func TestTcpReturnRetransmitCutsARetransmissionToTheReportedPathMtu(t *testing.T
 	}
 }
 
+// A path that stopped carrying the configured mtu before a flight left, and
+// the source's report of it after the flight was packetized: the source holds
+// nothing, and no later segment exists to draw a duplicate. The timer's probe
+// sends the head in pieces, and the acknowledgement of each ends no further
+// than the head, so the probe stays undecided with its timer doubled instead
+// of calling the expiry spurious; the second expiry shows the loss real and
+// the rest of the flight recovers in bursts at once, each segment sent again
+// once, in pieces. Read as spurious on the second piece's acknowledgement,
+// each expiry recovered one segment.
+func TestTcpReturnRetransmitProbeHeadAcknowledgedInPiecesDecidesNothing(t *testing.T) {
+	runTcpReturnRetransmitTest(t, func(t *testing.T) {
+		const segmentCount = 8
+		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{})
+		harness.source.stateLock.Lock()
+		harness.source.pathMtu = ipv4MinimumPathMtu
+		harness.source.stateLock.Unlock()
+		start := time.Now()
+		payload := harness.payload(segmentCount)
+		harness.write(payload)
+		synctest.Wait()
+		harness.sequence.applyPathMtu(ipv4MinimumPathMtu)
+
+		time.Sleep(returnRetransmitInitialRto)
+		synctest.Wait()
+		pieces := tcpReturnTestRetransmittedPieces(t, harness, segmentCount, 0)
+		requireTcpReturnTestPiecesAtPathMtu(t, harness, pieces, payload, 0, ipv4MinimumPathMtu, false)
+		if rto, _ := harness.retransmitTimer(); rto != 2*returnRetransmitInitialRto {
+			t.Fatalf("timer %s after the pieces of the head were acknowledged, want the backoff kept at %s", rto, 2*returnRetransmitInitialRto)
+		}
+
+		time.Sleep(2 * returnRetransmitInitialRto)
+		synctest.Wait()
+		harness.requireStream(payload)
+		harness.source.stateLock.Lock()
+		frontierAt := harness.source.frontierAt
+		retransmitted := append([]tcpReturnTestSegment(nil), harness.source.segments[segmentCount:]...)
+		harness.source.stateLock.Unlock()
+		if got, want := frontierAt.Sub(start), 3*returnRetransmitInitialRto; got != want {
+			t.Fatalf("flight recovered at +%s, want +%s at the second expiry", got, want)
+		}
+		for _, piece := range retransmitted {
+			if ipv4MinimumPathMtu < piece.packetByteCount {
+				t.Fatalf("a %d byte packet at %d sent again, above the path mtu", piece.packetByteCount, piece.seq)
+			}
+		}
+		for segmentIndex := 0; segmentIndex < segmentCount; segmentIndex += 1 {
+			harness.requireSeenCount(segmentIndex, 2)
+		}
+		_, _, packetCount, reasonCounts := harness.retransmitState()
+		if packetCount != int64(segmentCount*len(pieces)) ||
+			reasonCounts[tcpReturnRetransmitReasonTimeout] != 2 ||
+			reasonCounts[tcpReturnRetransmitReasonPartialAck] != segmentCount-2 {
+			t.Fatalf("retransmissions=%d reasons=%v, want two heads on the timer and the rest once on partial acknowledgements, %d pieces each", packetCount, reasonCounts, len(pieces))
+		}
+		if stats := harness.counters.snapshot(); stats.TimeoutCount != 2 || stats.AbandonCount != 0 {
+			t.Fatalf("stats=%+v, want two timeouts and no abandon", stats)
+		}
+	})
+}
+
 // (g) Ownership across loss, selective acknowledgement, the FIN and the
 // bound's reset: every pooled buffer the sequence took or shared is back
 // exactly once. The harness reconciles at close; this test says so
