@@ -1887,7 +1887,12 @@ func TestTcpReturnRetransmitParkedDrainEndsOnIdleTimeout(t *testing.T) {
 // acknowledgement covers it: a source that reports segments and then
 // discards them gets every one of them again from retention. Forgetting on
 // selective acknowledgement would leave the discarded segments unrecoverable.
+// Every segment reaches the source before the hole's retransmission does, so
+// the discard takes all of them; with acknowledgements sent inside delivery,
+// the last original could arrive after the discard, and about one run in
+// 1,500 it did and was never needed again.
 func TestTcpReturnRetransmitSackedSegmentsStayRetainedUntilCumulativeAck(t *testing.T) {
+	const segmentCount = 6
 	for _, initialSynSeq := range tcpReturnTestInitialSynSeqs(tcpReturnTestOptions{}, 2, 4) {
 		runTcpReturnRetransmitTest(t, func(t *testing.T) {
 			t.Logf("initial sequence %d", initialSynSeq)
@@ -1896,26 +1901,41 @@ func TestTcpReturnRetransmitSackedSegmentsStayRetainedUntilCumulativeAck(t *test
 			// the hole's retransmission is the next in-order arrival, and the
 			// source drops its whole out-of-order queue when it comes
 			harness.source.renegeOnce = true
+			harness.source.holdAcks = true
 
-			payload := harness.payload(6)
+			payload := harness.payload(segmentCount)
 			harness.write(payload)
 			synctest.Wait()
-			// the reneged segments inside the recovery come back on partial
-			// acknowledgements at once; those past its end wait for the timer,
-			// whose first expiry probes with the first of them, and with no
-			// later segment to draw a duplicate the second expiry, twice the
-			// timer after the answer, shows the loss real and sends the last
-			time.Sleep(3 * returnRetransmitInitialRto)
+			// the source reports every segment past the hole, and the third
+			// duplicate sends the hole
+			harness.source.sendAck(harness.segmentSeq(1))
+			for range returnRetransmitDupAckThreshold {
+				harness.source.sendDuplicateAck()
+			}
+			synctest.Wait()
+			harness.requireSeenCount(1, 2)
+			// the acknowledgement of the hole stops short of the segments the
+			// source reported, and the partial acknowledgements that follow
+			// send each of them again at once
+			harness.source.ackNow()
 			synctest.Wait()
 
 			harness.requireStream(payload)
-			for segmentIndex := 1; segmentIndex < 6; segmentIndex += 1 {
+			harness.requireSeenCount(0, 1)
+			for segmentIndex := 1; segmentIndex < segmentCount; segmentIndex += 1 {
 				harness.requireSeenCount(segmentIndex, 2)
 			}
-			harness.requireSeenCount(0, 1)
-			retainedByteCount, retainedCount, _, _ := harness.retransmitState()
+			retainedByteCount, retainedCount, packetCount, reasonCounts := harness.retransmitState()
 			if retainedByteCount != 0 || retainedCount != 0 {
 				t.Fatalf("retained after full acknowledgement: %d bytes in %d segments", retainedByteCount, retainedCount)
+			}
+			if packetCount != segmentCount-1 ||
+				reasonCounts[tcpReturnRetransmitReasonSackHole] != 1 ||
+				reasonCounts[tcpReturnRetransmitReasonPartialAck] != segmentCount-2 {
+				t.Fatalf("retransmissions=%d reasons=%v, want the hole on sack and each discarded segment once on partial acknowledgements", packetCount, reasonCounts)
+			}
+			if stats := harness.counters.snapshot(); stats.TimeoutCount != 0 {
+				t.Fatalf("stats=%+v, want no timer expiry", stats)
 			}
 		})
 	}
