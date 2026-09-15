@@ -97,13 +97,35 @@ const aadMlsLabel = "URmessage/v1/aad/mls"
 // attack what the product promises rather than what the ciphertext says, and both are a record
 // whose inner aad names a position it is not in.
 //
-// WHAT IT CANNOT DEFEND, stated here because the complement is the part a reader has to be told.
-// AAD_head is NOT bound and CANNOT be in either form: AAD_head contains body_hash = H(ct_body),
-// and ct_body is sealed over the frame this aad is inside. That is MASTER section 8's
-// construction order seen from the inside. The five fields AAD_head carries and AAD_body does not
-// -- is_commit, size_bucket, expire_at, blob_id, H(server_attachment) -- are therefore still
-// authenticated by the group alone, and is_commit is the one the SERVER acts on. Ledger open
-// item 199.
+// WHAT IT CANNOT DEFEND, stated here because the complement is the part a reader has to be told,
+// and the complement is SIX things and not five.
+//
+// AAD_head is NOT bound and CANNOT be in either form: AAD_head contains body_hash = H(ct_body), and
+// ct_body is sealed over the frame this aad is inside. That is MASTER section 8's construction
+// order seen from the inside. The five fields AAD_head carries and AAD_body does not -- is_commit,
+// size_bucket, expire_at, blob_id, H(server_attachment) -- are therefore still authenticated by the
+// group alone, and is_commit is the one the SERVER acts on. Ledger open item 199.
+//
+// AND THE SIXTH IS THE HEAD PLAINTEXT, which this paragraph omitted and which is the one item on
+// the list with a live consumer. ct_head is sealed under the same record_key EVERY member derives,
+// and no field of the inner frame covers what it says. So a member can take another member's
+// GENUINE body -- frame, signature and all -- and re-issue it at the SAME position under a head of
+// its own writing: R1 passes because the frame really is that member's, R2 passes because the
+// position really is that record's, and the record opens to the true sender's plaintext under an
+// attacker's head. The head is not decoration: sdk/urmessage/group.go decodes sent_at_ms out of it,
+// so a head another member wrote is a timestamp another member wrote, and a head that FAILS to
+// decode is three attempts and then a permanent hole. The substitute also lands at the true
+// sender's own stream index, so accepting it walks the ladder past the genuine record and that
+// record stops opening. TestTheHeadPlaintextIsNotBoundByTheFrame measures all of it.
+//
+// IT IS NOT REPAIRED HERE AND THE REASON IS JURISDICTION, not difficulty. Binding it is one field
+// in this preimage -- the sealer holds headPlain before it frames the body and the opener holds it
+// before it unframes one, so the order is not circular the way AAD_head's is -- but aad_mls is
+// MASTER section 8.4.2's construction, written out there as H(label | AAD_body), and a second field
+// in it is a wire change and a spec edit rather than a repair this package may take on its own
+// authority. A naive bind would also hand the SERVER a guessable commitment to the head: AAD_body
+// is public, so H(public | timestamp) is a few million guesses. The bind has to be keyed under
+// record_key, which is one more reason it is a section 8 decision. Open item MG-6.
 //
 // IT TAKES NO alg_id, and that is this package's own gate rather than a simplification.
 // TestEveryAadCallInEitherHalfPassesTheRecordAeadAlgId requires every AADBody call in either half

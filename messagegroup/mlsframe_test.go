@@ -19,9 +19,12 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/urnetwork/connect/message"
+	"github.com/urnetwork/connect/mls"
+	"github.com/urnetwork/connect/mls/syntax"
 )
 
 // ---------------------------------------------------------------------------
@@ -1169,4 +1172,328 @@ func messageIdReferenceU64(v uint64) []byte {
 		out[i] = byte(v >> (56 - 8*i))
 	}
 	return out
+}
+
+// ---------------------------------------------------------------------------
+// the two denial channels a record's ACCEPTANCE and its REFUSAL used to open,
+// and the one that is filed rather than closed
+// ---------------------------------------------------------------------------
+
+// censorshipKeySource lets a member choose the LEAF and the GENERATION an inner frame's sender data
+// names, which is the whole of what the attack below needs.
+//
+// EVERY INPUT IT USES IS GROUP SHARED and that is the finding rather than the fixture. sender data
+// is sealed under the epoch's sender_data_secret, which comes off the GroupHandle and which every
+// member of the group holds, so the leaf and the generation inside it are values ANY member writes.
+// The content is sealed under a key this source invents, so the frame will never open -- which is
+// the point: the refusal has to land AFTER mls has been asked for the victim's key at the forged
+// generation, because that ask is what used to move the victim's ratchet.
+type censorshipKeySource struct {
+	crypto     mls.CryptoProvider
+	generation uint32
+}
+
+func (self *censorshipKeySource) NextMessageKey(mls.ContentType, mls.LeafIndex) ([]byte, []byte, uint32, error) {
+	return bytes.Repeat([]byte{0x5a}, self.crypto.KeySize()),
+		bytes.Repeat([]byte{0x5a}, self.crypto.NonceSize()), self.generation, nil
+}
+
+func (self *censorshipKeySource) MessageKey(mls.ContentType, mls.LeafIndex, uint32) ([]byte, []byte, error) {
+	return nil, nil, errors.New("messagegroup: the forging source is a sender side source only")
+}
+
+func (self *censorshipKeySource) CommitMessageKey(mls.ContentType, mls.LeafIndex, uint32) error {
+	return errors.New("messagegroup: the forging source is a sender side source only")
+}
+
+func (self *censorshipKeySource) EraseMessageKey(mls.ContentType, mls.LeafIndex, uint32) {}
+
+// forgeFrameAtGeneration builds an inner MLS frame whose sender data names leaf and generation of
+// the caller's choosing and whose cleartext authenticated_data is aad.
+func forgeFrameAtGeneration(t *testing.T, handle GroupHandle, leaf uint32, generation uint32, aad []byte) []byte {
+	t.Helper()
+	contextBytes, err := handle.GroupContextBytes()
+	if err != nil {
+		t.Fatalf("GroupContextBytes: %v", err)
+	}
+	context := &mls.GroupContext{}
+	if err := syntax.Unmarshal(contextBytes, context); err != nil {
+		t.Fatalf("unmarshal the group context: %v", err)
+	}
+	crypto, err := mls.NewCryptoProvider(context.CipherSuite)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	senderDataSecret, err := handle.SenderDataSecret()
+	if err != nil {
+		t.Fatalf("SenderDataSecret: %v", err)
+	}
+	authContent := &mls.AuthenticatedContent{
+		WireFormat: mls.WireFormatPrivateMessage,
+		Content: mls.FramedContent{
+			GroupId:           context.GroupId,
+			Epoch:             context.Epoch,
+			Sender:            mls.Sender{SenderType: mls.SenderTypeMember, LeafIndex: mls.LeafIndex(leaf)},
+			AuthenticatedData: append([]byte(nil), aad...),
+			ContentType:       mls.ContentTypeApplication,
+			ApplicationData:   []byte("octets that will never open"),
+		},
+		Auth: mls.FramedContentAuthData{Signature: bytes.Repeat([]byte{0x11}, 64)},
+	}
+	private, err := mls.SealPrivateMessage(crypto, &censorshipKeySource{crypto: crypto, generation: generation},
+		senderDataSecret, authContent, 0)
+	if err != nil {
+		t.Fatalf("SealPrivateMessage: %v", err)
+	}
+	frame, err := mls.MarshalMLSMessage(&mls.MLSMessage{
+		Version: mls.ProtocolVersionMls10, WireFormat: mls.WireFormatPrivateMessage,
+		PrivateMessage: private,
+	})
+	if err != nil {
+		t.Fatalf("MarshalMLSMessage: %v", err)
+	}
+	return frame
+}
+
+// TestAForgedGenerationInTheFrameHeaderCostsTheTrueSenderNothing is the CRITICAL channel of the
+// third pass over MASTER section 8.4, driven end to end through OpenRecord.
+//
+// WHY THE PRE-RATCHET PEEK CANNOT STOP IT, which is the sentence that makes this case necessary
+// rather than a second reading of the two refusals next door. R1 is a function of the frame's
+// sender leaf and R2 is a function of its cleartext authenticated_data, and the FORGER writes both.
+// A member that sets the sender data to the victim's leaf, puts the record at the victim's
+// sender_handle, and sets the frame's aad to the aad of the position it is putting the record at
+// passes both refusals BY CONSTRUCTION. There is a third field in that sender data -- the
+// GENERATION -- that nothing authenticates and nothing above mls can check, and mls reaches it
+// before the content AEAD and before the signature.
+//
+// WHAT IT USED TO BUY. The victim's receiving ratchet stepped to the forged generation, retained
+// the run it passed and pruned it; the content AEAD then failed and the record was refused with
+// "mls: message does not decrypt". Nothing was ERASED and the keys were EVICTED, which is the same
+// outcome for the victim: every generation below a head is consumed, so one forged header cost the
+// victim its next message, two cost it 1,025 of them, and the refusal is taken inside
+// unframeBodyOnLoop -- before this package's own Commit -- so the same record could be sent again
+// at the SAME stream index forever. Measured before the repair: three forged records at one index
+// cost the true sender four of its next four messages, and it never had to have written anything.
+//
+// THE VACUITY GUARD IS THE REFUSAL'S OWN SENTINEL. If the forged record were refused at R1 or R2
+// then mls never saw the generation, this case would be driving the channel that was already
+// closed, and it would pass on a build with the defect. So the refusal is required to be
+// ErrRecordInnerFrame -- mls refusing the frame itself, which is refused BELOW the peek.
+func TestAForgedGenerationInTheFrameHeaderCostsTheTrueSenderNothing(t *testing.T) {
+	pair := newTestPair(t, "forged-generation")
+	pair.trackDurable(t)
+
+	// the true sender writes, and nobody has opened it yet -- a message in flight, the ordinary
+	// case and the one with something to lose.
+	plaintext := []byte("the message being censored")
+	genuine, err := pair.sender.SealRecord(message.RetentionDurable, 0, false,
+		[]byte("head"), plaintext, 0, nil)
+	if err != nil {
+		t.Fatalf("SealRecord: %v", err)
+	}
+	at := genuine.Header.StreamIndex + 1
+
+	aad, err := aadMls(forgeBodyBinding(pair.opener, pair.senderLeaf, at))
+	if err != nil {
+		t.Fatalf("aadMls: %v", err)
+	}
+	frame := forgeFrameAtGeneration(t, pair.opener.handle, pair.senderLeaf, mls.MaxGenerationSkip, aad[:])
+	forged := repairForgeRecord(t, pair.opener, pair.senderLeaf, at,
+		[]byte("a head the attacker chose"), frame)
+
+	if _, _, err := pair.opener.OpenRecord(forged); err == nil {
+		t.Fatal("the forged record OPENED, which is a different and worse finding")
+	} else if !errors.Is(err, ErrRecordInnerFrame) {
+		t.Fatalf("the forged record was refused with %v, want ErrRecordInnerFrame: a refusal at R1 or R2 means mls never saw the forged generation and this case is not driving the channel it names",
+			err)
+	}
+
+	// THE STAKE. The true sender's own message, written before any of this.
+	_, body, err := pair.opener.OpenRecord(genuine)
+	if err != nil {
+		t.Fatalf("the true sender's genuine message is unopenable after ONE forged header: %v. No input an unauthenticated party controls may advance or prune another member's receiving ratchet",
+			err)
+	}
+	if !bytes.Equal(body, plaintext) {
+		t.Fatalf("the genuine message opened to %q, want %q", body, plaintext)
+	}
+}
+
+// TestForgedGenerationsAreRepeatableAtOneStreamIndexAndCostNothing is the amplified form, and it is
+// the one that says the repair holds against a member that keeps going rather than against one
+// header.
+//
+// The refusal is taken before this package's own Commit, so the attacker's stream index is never
+// spent and the same record shape can be re-sent at index 0 forever. On the build this closes each
+// round advanced the victim's MLS receiving head by another MaxGenerationSkip; here each round has
+// to cost nothing, and the victim then writes for the FIRST time -- so the case is pre-emptive,
+// which the lift-and-re-envelope channel could not be.
+func TestForgedGenerationsAreRepeatableAtOneStreamIndexAndCostNothing(t *testing.T) {
+	pair := newTestPair(t, "forged-generation-rounds")
+	pair.trackDurable(t)
+
+	// the attacker moves FIRST. The victim has written nothing at all.
+	const at = uint64(0)
+	aad, err := aadMls(forgeBodyBinding(pair.opener, pair.senderLeaf, at))
+	if err != nil {
+		t.Fatalf("aadMls: %v", err)
+	}
+	const rounds = 3
+	for round := 1; round <= rounds; round += 1 {
+		frame := forgeFrameAtGeneration(t, pair.opener.handle, pair.senderLeaf,
+			uint32(round)*mls.MaxGenerationSkip, aad[:])
+		forged := repairForgeRecord(t, pair.opener, pair.senderLeaf, at,
+			[]byte("a head the attacker chose"), frame)
+		if _, _, err := pair.opener.OpenRecord(forged); err == nil {
+			t.Fatalf("round %d: the forged record OPENED", round)
+		} else if !errors.Is(err, ErrRecordInnerFrame) {
+			t.Fatalf("round %d was refused with %v, want ErrRecordInnerFrame", round, err)
+		}
+	}
+
+	// and NOW the victim writes, for the first time.
+	for wrote := 0; wrote < 4; wrote += 1 {
+		plaintext := fmt.Appendf(nil, "a message written after %d forged records", rounds)
+		record, err := pair.sender.SealRecord(message.RetentionDurable, 0, false,
+			[]byte("head"), plaintext, 0, nil)
+		if err != nil {
+			t.Fatalf("SealRecord %d: %v", wrote, err)
+		}
+		_, body, err := pair.opener.OpenRecord(record)
+		if err != nil {
+			t.Fatalf("message %d of the victim's is unopenable after %d forged records at one stream index: %v",
+				wrote, rounds, err)
+		}
+		if !bytes.Equal(body, plaintext) {
+			t.Fatalf("message %d opened to %q, want %q", wrote, body, plaintext)
+		}
+	}
+}
+
+// TestTheCeremonyDoorSpendsNoneOfTheHandleItNames is MG-5's DENIAL half, which that item filed as
+// an attribution hole and measured only as attributed octets.
+//
+// WHAT THE OTHER HALF IS. openRecordOnLoop ran receivers.Commit for BOTH doors, and the ceremony arm
+// takes no frame check at all -- unframeBodyOnLoop returns a ceremony body unchanged. Every key the
+// two record AEADs use is group shared, so a member can seal a ceremony record at any other member's
+// sender_handle at any index. Accepted, it committed the victim's ladder past the rung the victim's
+// own next record needed: one squatted record per message, no lift, no genuine frame, no race, and
+// the victim's record at that index answering ErrOutOfWindow forever.
+//
+// THE CONTROL IS THE ACCEPTANCE ITSELF. The ceremony record still opens, and to the attacker's own
+// octets -- that is the attribution residual MG-5 files and this case does not repair it. What it
+// requires is that the acceptance spends nothing of the handle it named.
+func TestTheCeremonyDoorSpendsNoneOfTheHandleItNames(t *testing.T) {
+	pair := newTestPair(t, "ceremony-ladder")
+	pair.trackDurable(t)
+
+	// the victim writes first so the index it is about to need is read off its own record rather
+	// than assumed; the record is held back and opened at the end, which is what makes the squat
+	// below a squat rather than a race.
+	plaintext := []byte("the victim's own first message")
+	genuine, err := pair.sender.SealRecord(message.RetentionDurable, 0, false,
+		[]byte("head"), plaintext, 0, nil)
+	if err != nil {
+		t.Fatalf("SealRecord: %v", err)
+	}
+	at := genuine.Header.StreamIndex
+
+	// that index, squatted by a ceremony record the attacker builds. is_commit puts it on the arm
+	// OpenRecord refuses and OpenCeremonyRecord serves.
+	chosen := []byte("octets the attacker chose")
+	squat := repairForgeRecordArm(t, pair.opener, pair.senderLeaf, at, true, nil,
+		[]byte("a head the attacker chose"), chosen)
+	_, body, err := pair.opener.OpenCeremonyRecord(squat)
+	if err != nil {
+		t.Fatalf("the ceremony door refused the squatted record: %v; this case needs the ACCEPTANCE, because it is the acceptance that used to walk the ladder",
+			err)
+	}
+	if !bytes.Equal(body, chosen) {
+		t.Fatalf("the ceremony door answered %q, want %q", body, chosen)
+	}
+
+	// THE STAKE. The victim's own record at that same index.
+	_, got, err := pair.opener.OpenRecord(genuine)
+	if err != nil {
+		t.Fatalf("the victim's own record at stream index %d no longer opens after a ceremony record was ACCEPTED there: %v. A door that authenticates nothing may not spend anything either",
+			at, err)
+	}
+	if !bytes.Equal(got, plaintext) {
+		t.Fatalf("the victim's record opened to %q, want %q", got, plaintext)
+	}
+}
+
+// TestTheApplicationDoorStillSpendsTheRungItOpens is the other side of the case above, and without
+// it that one is satisfied by a build whose ladder never moves at all.
+//
+// A ladder that committed nothing would have no replay guard and no ordering: the same record would
+// open forever. So the arm that IS checked is required to spend its rung, which is what makes "the
+// ceremony arm spends nothing" a statement about the arm rather than about the ladder.
+func TestTheApplicationDoorStillSpendsTheRungItOpens(t *testing.T) {
+	pair := newTestPair(t, "application-ladder")
+	pair.trackDurable(t)
+
+	record, err := pair.sender.SealRecord(message.RetentionDurable, 0, false,
+		[]byte("head"), []byte("a message that spends its rung"), 0, nil)
+	if err != nil {
+		t.Fatalf("SealRecord: %v", err)
+	}
+	if _, _, err := pair.opener.OpenRecord(record); err != nil {
+		t.Fatalf("OpenRecord: %v", err)
+	}
+	if _, _, err := pair.opener.OpenRecord(record); !errors.Is(err, ErrOutOfWindow) {
+		t.Fatalf("a replay of an accepted application record answered %v, want ErrOutOfWindow: the application arm's acceptance must spend the rung it opened",
+			err)
+	}
+}
+
+// TestTheHeadPlaintextIsNotBoundByTheFrame is a FILED residual and not a repair, written as a case
+// so the complement aadMls prints is measured rather than asserted.
+//
+// ct_head is sealed under the same record_key every member derives and no field of the inner frame
+// covers what it says, so a member can take another member's GENUINE body -- frame, signature and
+// all -- and re-issue it at the SAME position under a head of its own. R1 passes because the frame
+// really is that member's; R2 passes because the position really is that record's.
+//
+// WHY IT IS FILED RATHER THAN FIXED is in aadMls's own complement: aad_mls is MASTER section 8.4.2's
+// construction and a second field in it is a wire change and a spec edit. Open item MG-6.
+//
+// THIS CASE GOES RED IF SOMEBODY BINDS IT, and that is the intended way for it to end: a build whose
+// frame covered the head would refuse the substitute, this case would fail, and the person holding
+// the failure would be the person who closed MG-6.
+func TestTheHeadPlaintextIsNotBoundByTheFrame(t *testing.T) {
+	pair := newTestPair(t, "head-not-bound")
+	pair.trackDurable(t)
+
+	plaintext := []byte("the body the sender really wrote")
+	genuine, err := pair.sender.SealRecord(message.RetentionDurable, 0, false,
+		[]byte("the head the sender wrote"), plaintext, 0, nil)
+	if err != nil {
+		t.Fatalf("SealRecord: %v", err)
+	}
+	// the attacker lifts the genuine frame out of the genuine record. The record key is
+	// RecordKeyZero(class_key, leaf) walked to this index, and the class key is group shared.
+	frame := repairLiftFrame(t, pair.opener, pair.senderLeaf, genuine)
+	substituted := []byte("A HEAD THE ATTACKER CHOSE")
+	substitute := repairForgeRecord(t, pair.opener, pair.senderLeaf,
+		genuine.Header.StreamIndex, substituted, frame)
+
+	head, body, err := pair.opener.OpenRecord(substitute)
+	if err != nil {
+		t.Fatalf("MG-6 IS CLOSED AND THIS CASE IS THE RECORD OF IT BEING OPEN: the substitute was refused with %v. Delete this case, take the head plaintext out of aadMls's complement, and close MG-6",
+			err)
+	}
+	if !bytes.Equal(head, substituted) || !bytes.Equal(body, plaintext) {
+		t.Fatalf("the substitute opened to head %q body %q, want head %q body %q",
+			head, body, substituted, plaintext)
+	}
+	t.Logf("RESIDUAL OPEN (MG-6): a record another member built opened with head=%q body=%q at the true sender's own handle and stream index",
+		head, body)
+	// and the second half of the cost: the substitute was ACCEPTED, so it spent the rung, and the
+	// sender's own record at that index is gone.
+	if _, _, err := pair.opener.OpenRecord(genuine); !errors.Is(err, ErrOutOfWindow) {
+		t.Fatalf("the sender's own record answered %v after the substitute was accepted at its index, want ErrOutOfWindow",
+			err)
+	}
 }

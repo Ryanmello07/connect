@@ -36,7 +36,7 @@
 // WHAT IT STILL DOES NOT REACH, so the count above stays a count of what was measured. The
 // RECEIVING half of a restore is not here: the persisted state carries no peer position, and what
 // that costs is held by group_restore_generation_test.go's
-// TestARestoredMemberFollowsAPeerThatMovedPastTheSkipBound and by (*ratchet).peekFor's own comment.
+// TestARestoredMemberIsDeafToAPeerThatMovedPastTheSkipBound and by MaxGenerationSkip's own comment.
 // Reaching it from a cohort would mean a case that sends a thousand messages between two views.
 //
 // MOST CASES HERE HAVE ONE SHAPE: n views of one group, each a DIFFERENT *Group with its own

@@ -481,6 +481,41 @@ belongs to the epoch machinery and not to a record door — and a check taken he
 *peeked* sender leaf would be worse than none, because the sender data a peek reads is sealed under
 a group-shared secret and would read as authentication while authenticating nothing.
 
+### Correction, 2026-09-15: this item had only the ATTRIBUTION half, and the DENIAL half was open
+
+Everything above measures the residual as *"attacker-chosen octets under a victim's
+`sender_handle`"*, which is attribution. There is a second half and it is a **denial**, which is the
+class this arm shares with the record layer's other two channels.
+
+`openRecordOnLoop` ran `receivers.Commit(ratchetKey, header.StreamIndex)` for **both** doors, and the
+ceremony arm takes **no frame check at all** — `unframeBodyOnLoop` returns a ceremony body unchanged.
+Every key the two record AEADs use is group-shared, so a member can seal a ceremony record at any
+other member's `sender_handle` at any index. **Accepted**, that record committed the victim's ladder
+past the rung the victim's own next record needs: one squatted record per message, no lift, no
+genuine frame, no race against a record that already exists, and the victim's record at that index
+answering `ErrOutOfWindow` forever. The gate beside it is named *"a refused record moves no receiver
+ratchet"* and it is true; this was an **accepted** record moving one, on a body nobody signed.
+
+**Repaired in the same commit as MG-6's filing.** `openRecordOnLoop` commits only on the application
+arm. The rule is the one the arm split already states, carried through to the ladder: a **refusal**
+taken on an attacker's claim costs the attacker, and an **acceptance** taken on one costs the victim
+— so a door that authenticates nothing may not spend anything either.
+`TestTheCeremonyDoorSpendsNoneOfTheHandleItNames` measures it, and
+`TestTheApplicationDoorStillSpendsTheRungItOpens` is the control that stops it being satisfied by a
+ladder that never moves.
+
+**What that costs, and it is a behaviour change with a bound.** A ceremony record no longer advances
+the head of the ladder it is on, so a sender's ceremony records sit as skipped rungs until an
+*application* record from that sender walks past them — retained, openable, and pruned by the same
+window as any other gap. A sender that puts more than `DefaultRecordWindowSize` (1024) ceremony
+records on one ladder between two application records puts the later one outside the window, and it
+is refused with `ErrOutOfWindow`. A ceremony record can also now be delivered twice and open twice;
+the ladder was never an authentication on this arm, and what judges these octets is what this item
+already says judges them — a wrap by whether it decrypts to this device, a commit by whether `mls`
+accepts it, and `mls` carries a replay guard of its own. **Nothing calls `OpenCeremonyRecord`
+today**, so no shipping path changes; the consumer that will is the epoch machinery, and choice 2
+below still owes it an answer for the *attribution* half.
+
 ### What a ruling has to choose
 
 1. **Nothing beyond the split.** The ceremony arm stays unauthenticated, `OpenCeremonyRecord` stays
@@ -502,3 +537,68 @@ A `SPEC-LEDGER.md` number, and one sentence in Spec A §5.11 about what a ceremo
 `sender_handle` means. The downstream filter this repair makes redundant —
 `sdk/urmessage/group.go`'s `SkippedCeremony` arm — should stay: it is now belt and braces rather
 than the only thing standing between a forged arm and a rendered message, which is what it was.
+
+
+## MG-6 — the head plaintext is not bound by the inner frame, and one member can re-issue another's body under a head of its own
+
+**Status: OPEN, FILED NOT RULED. Measured on 2026-09-15 in the third pass over MASTER §8.4, in the
+same commit that closed the two denial channels beside it. It is filed rather than repaired because
+the repair is a §8 wire change and not this package's to take.**
+
+### The property
+
+`aad_mls` is MASTER §8.4.2's `H("URmessage/v1/aad/mls" ‖ AAD_body)`, and `AAD_body` carries the six
+fields that fix a record's identity and its position. `ct_head` is sealed under the same
+`record_key[n]` **every member derives**, and **no field of the inner frame covers the head
+plaintext**.
+
+So a member can take another member's **genuine** body — frame, signature and all — and re-issue it
+at the **same position** under a head of its own writing. R1 passes because the frame really is that
+member's; R2 passes because the position really is that record's. Both readings agree, and the
+record opens to the true sender's plaintext under an attacker's head.
+
+### Why the head is not decoration
+
+`sdk/urmessage/group.go` does `sentAtMs, err := decodeHead(headPlain)` — the head carries the message
+timestamp. A head another member wrote is a timestamp another member wrote; a head `decodeHead`
+*rejects* is a `fail()`, three attempts, then `ErrRecordAbandoned` and a permanent hole.
+
+And the substitute is **accepted**, so it spends the rung: the true sender's own record at that index
+answers `ErrOutOfWindow` afterwards. That is the same denial the two channels repaired beside this
+one produce, reached through an acceptance that is legitimate at every check the record layer has.
+
+### The reproduction
+
+`TestTheHeadPlaintextIsNotBoundByTheFrame` in `mlsframe_test.go`. It asserts the substitute **opens**
+and that the genuine record is then out of window, and it says in its own failure message that a
+build which refused the substitute has closed this item and should delete the case.
+
+### What is NOT established
+
+**Reachability is a log-ordering property outside `connect`.** The attacker must first receive the
+victim's record to lift the frame, so the genuine record is already ahead of the substitute in the
+log, and whichever an opener processes first wins. That is a property of the server and of the walk,
+and this item does not claim it.
+
+### What a ruling has to choose
+
+1. **Bind it, keyed.** The order is *not* circular the way `AAD_head`'s is: the sealer holds
+   `headPlain` before it frames the body (`sealRecordOnLoop` takes it as an argument and
+   `newRecordBuilderOnLoop` runs `frameBodyOnLoop` after `ratchet.Next`), and the opener holds it
+   before it unframes one (`ct_head` is opened above `unframeBodyOnLoop`). What it must **not** be is
+   a bare `H(headPlain)`: `AAD_body` is public and `aad_mls` travels in the clear as the frame's
+   `authenticated_data`, so `H(public ‖ timestamp)` hands the **server** a guessable commitment to
+   `sent_at_ms`. It has to be keyed under `record_key`, which both sides hold and no non-member does.
+   That is a change to §8.4.2's construction and therefore a §8 ruling.
+2. **Leave it and say so in §8.** The head becomes explicitly *group-authenticated and not
+   sender-authenticated*, and `sdk` is told that `sent_at_ms` is a claim by the group rather than by
+   the sender — which is a statement a product has to be able to live with, since a reply's parent
+   timestamp and a conversation's ordering are read off it.
+3. **Move the head inside `ct_body`.** No wire field is added and nothing is keyed, but the size
+   ladder moves again and §8.4.4's measured columns are all re-taken.
+
+### What is owed elsewhere
+
+A `SPEC-LEDGER.md` number. Ledger open item 199 is the same question about the other five `AAD_head`
+fields, and this is the sixth — the one with a live consumer. `mlsframe.go`'s
+*"WHAT IT CANNOT DEFEND"* paragraph now prints six and not five.

@@ -58,19 +58,61 @@ refuses on the same field further down. The guard is benign redundancy today, an
 that reports the EPOCH — rather than the entry — as the reason, which is a different sentence for a
 caller. Nothing holds it.
 
-## What the catch-up's retention is worth at realistic occupancy
+## What the retained bounds do to each other at realistic occupancy
 
-`TestTheCatchUpHoldsThisRatchetsWindowToItsOwnBound` and
-`TestOneRatchetsWindowHoldsOneOverItsBoundBetweenAPeekAndTheEraseAfterIt` both run over a tree where
-**one ratchet holds everything**. `MaxRetainedWindowKeys` is declared as `RatchetWindowSize` itself,
-so with a single occupied ratchet the tree-wide bound and the per-ratchet bound evict down to the
-same total and neither case can tell them apart.
+`TestOneRatchetsWindowNeverExceedsItsOwnBound` and the two cases that read
+`stFillPastTheRetainedBound` all run over a tree where **one ratchet holds everything**.
+`MaxRetainedWindowKeys` is declared as `RatchetWindowSize` itself, so with a single occupied ratchet
+the tree-wide bound and the per-ratchet bound evict down to the same total and no case here can tell
+them apart.
 
-What is unmeasured is what the catch-up's retention is worth at a realistic occupancy — several
-members each holding a few skipped generations, one of them falling behind — where the two bounds do
-come apart and the tree-wide one trims a walk the member that made it has not used yet. How much it
-trims is a number nothing here computes. The eviction rule that would decide it (`the fullest window
-pays`) is stated in `MaxRetainedWindowKeys`' own comment and exercised only in the degenerate case.
+What is unmeasured is what the retention is worth at a realistic occupancy — several members each
+holding a few skipped generations, one of them falling behind — where the two bounds do come apart
+and the tree-wide one trims a walk the member that made it has not used yet. How much it trims is a
+number nothing here computes. The eviction rule that would decide it (`the fullest window pays`) is
+stated in `MaxRetainedWindowKeys`' own comment and exercised only in the degenerate case.
+
+> **Corrected 2026-09-15.** This entry named the catch-up, and the catch-up is gone: a generation
+> past `MaxGenerationSkip` is refused without walking anything. What it named was an **occupancy**
+> question and not a censorship one, and that distinction is exactly what this entry got wrong for
+> two rounds — while it stood, a member could push another member's head forward by 1,024 per
+> header, and the only thing written down about that walk was how much memory it used. The question
+> above survives the removal because *accepted* walks still retain; the sentence that did not is
+> the one that treated a bound on the WORK as if it were a bound on the DAMAGE. See
+> `(*ratchet).classify` and `MaxGenerationSkip`.
+
+## The two erases on the two-phase receive path that no case in this tree can see
+
+Both were **measured by deleting them and running the whole of `./mls/`, `./message/` and
+`./messagegroup/` at `-count=1 -timeout 1800s`**, not reasoned about. Both stay, and they are named
+here rather than left for somebody to find, because a clause that cannot be turned red is a clause
+the suite does not hold whatever it looks like.
+
+### The peek's scratch chain
+
+`(*ratchet).peekFor` walks a COPY of the ratchet secret and calls `zeroizeSecret(walking)` on each
+rung as it passes it and once more on the last one. Delete both calls and **nothing goes red** —
+all three package trees stay green. Nothing in the process can reach those slices once
+the call returns, so no runtime assertion can distinguish a walk that erased from one that dropped;
+what the erasure buys is that the run of chain secrets between the head and a generation an
+UNAUTHENTICATED party named does not sit in the heap afterwards, which is a forward-secrecy property
+about the process and not about the type. The gate over that class is
+`TestNoDeclarationReachingTheSecretTreeStoragePutsItBeyondTheCall`, which reads the SOURCE.
+
+### The commit's own erase of the generation it spent
+
+`(*SecretTree).CommitMessageKey` zeroizes the key and nonce `commitFor` hands back before it
+returns. That pair is the generation's last live copy inside the tree — a retained entry is deleted
+from the window as it is handed over, and a walked one never enters it — so dropping it instead of
+erasing it leaves live AEAD key bytes wherever the allocator puts them next.
+
+**Nothing in this package sees the difference, measured.** With both `zeroizeSecret` calls deleted,
+`./mls/`, `./message/` and `./messagegroup/` stay green. The storage is unreachable from the tree by
+construction the moment the call returns, so no test can read it back; what it costs is what every
+erase in this file costs — the process, not the type — and
+`TestNoDeclarationReachingTheSecretTreeStoragePutsItBeyondTheCall` is the gate over that class in the
+SOURCE rather than at runtime. The lines stay for the reason `eraseKey`'s do: the erasure is the
+half a caller omits silently.
 
 ## The arithmetic this source states in prose, and why nothing gates it
 

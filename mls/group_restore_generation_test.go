@@ -337,26 +337,36 @@ func TestLoadGroupRefusesASenderRatchetVectorThisBuildDidNotWrite(t *testing.T) 
 	}
 }
 
-// TestARestoredMemberFollowsAPeerThatMovedPastTheSkipBound is the RECEIVING half of the restore,
+// TestARestoredMemberIsDeafToAPeerThatMovedPastTheSkipBound is the RECEIVING half of the restore,
 // and it is here because the persisted state has nothing in it about that half at all.
 //
 // WHAT THE BLOB CARRIES IS THIS MEMBER'S OWN SENDER POSITION. Where its receiving ratchets for its
 // PEERS stood is not in it, so every peer's head comes back at 0. The earlier disclosure of that
 // called it a lost replay guard rather than key reuse, which is true and is not the whole of it:
 // MEASURED on this settled four, alice Protects 1026 times, live bob opens all of them, bob is
-// restored, alice Protects once more, and bob answered "generation too far ahead: generation 1026,
-// head 0, bound 1024". Nothing in this package moves a receiving head except a message it accepts,
-// so before the catch-up that same refusal was the answer for every later message alice sent in
-// that epoch -- unbounded loss until the next commit, from a member that agrees with everybody
-// about the epoch authenticator.
+// restored, alice Protects once more, and bob answers "generation too far ahead: generation 1026,
+// head 0, bound 1024" -- and answers it again for every later message alice sends in that epoch,
+// because nothing in this package moves a receiving head except a message it ACCEPTS.
 //
-// SO BOTH SENTENCES ARE ASSERTED: the message that lands past the bound is refused, and the NEXT
-// one is not. The second is the whole point; a case that stopped at the refusal would be asserting
-// the defect.
+// THIS CASE USED TO ASSERT THE OPPOSITE OF ITS LAST HALF, and the change is a deliberate loss of
+// behaviour rather than a broken fixture. (*ratchet).peekFor answered a distance past the bound by
+// walking the head forward by MaxGenerationSkip and THEN refusing, so restored bob lost one message
+// and read alice again. That walk was driven by a generation number arriving in sender data sealed
+// under a group shared secret: any member could name any other member's leaf at head+1024 and push
+// that member's head forward, and every generation below a head is classified consumed. One header
+// destroyed the victim's next message, two destroyed 1,025 of them, and it was pre-emptive and
+// repeatable. The resynchronisation and the deletion channel were one walk, so closing the second
+// closed the first. See (*ratchet).classify and MaxGenerationSkip.
+//
+// SO WHAT IS ASSERTED NOW IS THE COST, in full: the message past the bound is refused, the next one
+// is refused, and so is a message a long way further on. A case that stopped at the first refusal
+// could not tell this bound from an off-by-one. What is asserted BESIDE it is that the fixture is
+// otherwise healthy -- live bob, which never fell behind, opens every one of the same messages --
+// so what is being measured is the restore and not something the fixture did to alice.
 //
 // The distance is derived from MaxGenerationSkip rather than typed, so a build that changed the
 // bound moves this fixture with it instead of quietly bringing the gap back inside it.
-func TestARestoredMemberFollowsAPeerThatMovedPastTheSkipBound(t *testing.T) {
+func TestARestoredMemberIsDeafToAPeerThatMovedPastTheSkipBound(t *testing.T) {
 	crypto := testCrypto(t)
 	fixture := testFourMemberGroup(t, crypto, "restore-behind")
 	defer fixture.closeAll()
@@ -398,27 +408,46 @@ func TestARestoredMemberFollowsAPeerThatMovedPastTheSkipBound(t *testing.T) {
 			err, ahead)
 	}
 
-	// and the next one, which is the sentence the disclosure was missing.
-	plaintext := []byte("and the one it does")
-	next, err := alice.group.Protect(nil, plaintext)
+	// and the ones after it, which is the disclosed cost rather than a second reading of the
+	// same refusal. Nothing moves that head, so alice stays unreadable at this member for the
+	// rest of the epoch.
+	for round := 0; round < 3; round += 1 {
+		plaintext := fmt.Appendf(nil, "and the one it still cannot reach %d", round)
+		next, err := alice.group.Protect(nil, plaintext)
+		if err != nil {
+			t.Fatalf("alice's Protect at round %d: %v", round, err)
+		}
+		if _, err := restored.Unprotect(next); !errors.Is(err, ErrRatchetGenerationTooFarAhead) {
+			t.Fatalf("the restored member answered %v at round %d, want ErrRatchetGenerationTooFarAhead: a head that moved on one of these moved on a generation number nobody signed",
+				err, round)
+		}
+		// and live bob, which never fell behind, opens every one of them -- so what is being
+		// observed is the restore and not something the fixture did to alice.
+		opened, err := bob.group.Unprotect(next)
+		if err != nil {
+			t.Fatalf("live bob could not open the same message at round %d: %v", round, err)
+		}
+		if !bytes.Equal(opened.Plaintext, plaintext) {
+			t.Fatalf("live bob opened %q at round %d, want %q", opened.Plaintext, round, plaintext)
+		}
+		if opened.SenderLeaf != alice.leaf {
+			t.Fatalf("live bob read the message as coming from leaf %d, want %d",
+				opened.SenderLeaf, alice.leaf)
+		}
+	}
+	// AND THE RESTORED MEMBER IS NOT SIMPLY BROKEN. It agrees with everybody about the epoch and
+	// it can still SPEAK: its own sender position is what the blob carries, and that half of the
+	// restore is unaffected by any of this.
+	spoken := []byte("the restored member can still speak")
+	sealed, err := restored.Protect(nil, spoken)
 	if err != nil {
-		t.Fatalf("alice's next Protect: %v", err)
+		t.Fatalf("the restored member could not Protect: %v", err)
 	}
-	opened, err := restored.Unprotect(next)
+	heard, err := alice.group.Unprotect(sealed)
 	if err != nil {
-		t.Fatalf("the restored member refused alice's NEXT message as well: %v; a receiving head that does not move on a refusal makes the restored member deaf to that peer for the rest of the epoch",
-			err)
+		t.Fatalf("alice could not open the restored member's message: %v", err)
 	}
-	if !bytes.Equal(opened.Plaintext, plaintext) {
-		t.Fatalf("the restored member opened %q, want %q", opened.Plaintext, plaintext)
-	}
-	if opened.SenderLeaf != alice.leaf {
-		t.Fatalf("the restored member read the message as coming from leaf %d, want %d",
-			opened.SenderLeaf, alice.leaf)
-	}
-	// and live bob, which never fell behind, is unaffected by any of it -- so what is being
-	// observed is the restore and not something the fixture did to alice.
-	if _, err := bob.group.Unprotect(next); err != nil {
-		t.Fatalf("live bob could not open the same message: %v", err)
+	if !bytes.Equal(heard.Plaintext, spoken) {
+		t.Fatalf("alice opened %q, want %q", heard.Plaintext, spoken)
 	}
 }

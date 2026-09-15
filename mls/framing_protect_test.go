@@ -5642,9 +5642,11 @@ type framingKeySource struct {
 	pinned       bool
 	head         map[ContentType]uint32
 	erased       []string
+	committed    []string
 	handed       [][]byte
 	refuseNext   error
 	refuseLookup error
+	refuseCommit error
 }
 
 // framingNewKeySource builds a source whose first generation is start and which advances.
@@ -5706,6 +5708,23 @@ func (self *framingKeySource) MessageKey(contentType ContentType, leaf LeafIndex
 	key, nonce := self.derive(contentType, leaf, generation)
 	self.handed = append(self.handed, nonce)
 	return key, nonce, nil
+}
+
+// CommitMessageKey is the double's second half of the two phase read, and it is recorded
+// SEPARATELY from the erase rather than folded into it.
+//
+// The two are different statements and this file's cases turn on the difference. An erase says one
+// generation's key stopped existing; a commit says the receiving head MOVED, which is the write a
+// forged header used to reach without a signature and which every refusal on the open path is now
+// required to leave alone. A double that appended both to one list would report "the refused open
+// moved nothing" for a build that moved the head and erased nothing, which is exactly the shape the
+// repair this surface exists for had to close.
+func (self *framingKeySource) CommitMessageKey(contentType ContentType, leaf LeafIndex, generation uint32) error {
+	if self.refuseCommit != nil {
+		return self.refuseCommit
+	}
+	self.committed = append(self.committed, fmt.Sprintf("%d/%d/%d", contentType, leaf, generation))
+	return nil
 }
 
 func (self *framingKeySource) EraseMessageKey(contentType ContentType, leaf LeafIndex, generation uint32) {
@@ -5936,9 +5955,15 @@ func TestPrivateMessageSealOpenRoundTripsEveryContentType(t *testing.T) {
 		if err != nil {
 			t.Fatalf("content type %d: open: %v", contentType, err)
 		}
-		if !slices.Equal(openKeys.erased, []string{spent}) {
-			t.Fatalf("content type %d: the open erased %v, want exactly [%s]",
-				contentType, openKeys.erased, spent)
+		// the OPEN commits rather than erases, and the seal above erases rather than commits.
+		// Holding both halves by value is what says the two paths did not swap rules.
+		if !slices.Equal(openKeys.committed, []string{spent}) {
+			t.Fatalf("content type %d: the open committed %v, want exactly [%s]",
+				contentType, openKeys.committed, spent)
+		}
+		if len(openKeys.erased) != 0 {
+			t.Fatalf("content type %d: the open erased %v; the open path spends its generation through the COMMIT, which states where the head stands as well as that the key is gone",
+				contentType, openKeys.erased)
 		}
 		if opened.WireFormat != WireFormatPrivateMessage {
 			t.Errorf("content type %d: opened under wire format %d", contentType, opened.WireFormat)
@@ -6412,6 +6437,64 @@ func TestOpenPrivateMessageAnswersItsKeySourceRefusalVerbatim(t *testing.T) {
 		}
 		if len(keys.erased) != 0 {
 			t.Errorf("a key source refusing with %v: the open erased %v", refusal, keys.erased)
+		}
+		if len(keys.committed) != 0 {
+			t.Errorf("a key source refusing with %v: the open COMMITTED %v, so the receiving head moved on a message that never opened",
+				refusal, keys.committed)
+		}
+	}
+}
+
+// TestOpenPrivateMessageAnswersACommitRefusalRatherThanAcceptingTheMessageTwice is the far end of
+// the two phase read, and it is the one arm of it that a sequential case cannot reach by itself.
+//
+// WHY A COMMIT CAN REFUSE AT ALL after a lookup that succeeded. The two admit exactly the same
+// generations, so nothing about THIS message can have changed between them -- but this type is
+// built for concurrent callers, and a second goroutine opening the same message commits that
+// generation first. The commit that arrives second is then answered ErrRatchetGenerationConsumed,
+// which is the honest sentence: this delivery is a replay of one that has already been accepted.
+//
+// WHAT SWALLOWING IT WOULD COST. The open would return an AuthenticatedContent for a message whose
+// generation is spent, so one message would be accepted twice by two callers that both believe
+// they consumed it. Measured: with the refusal replaced by a discard, the whole of ./mls/,
+// ./message/ and ./messagegroup/ stayed green -- which is why this case is written rather than
+// left to the argument above.
+//
+// The double is driven directly rather than through a race, because a case whose failure depends
+// on a scheduler reports a probability and this one reports a rule.
+func TestOpenPrivateMessageAnswersACommitRefusalRatherThanAcceptingTheMessageTwice(t *testing.T) {
+	crypto := newTestCrypto(t)
+	signed := framingPrivateSignedMember(t)
+	message, err := SealPrivateMessage(crypto, framingNewKeySource(crypto, 0x01, 0),
+		signed.senderDataSecret, signed.authContent, PaddingSizeV1)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	// the control: the same message, the same source, and no refusal on the commit. Without it a
+	// build that refused every open would pass the half below.
+	control := framingNewKeySource(crypto, 0x01, 0)
+	if _, err := OpenPrivateMessage(crypto, control, signed.senderDataSecret, message,
+		StaticSignatureKey(signed.pub), signed.groupContext); err != nil {
+		t.Fatalf("the control open: %v", err)
+	}
+	if len(control.committed) != 1 {
+		t.Fatalf("the control committed %v, want exactly one generation", control.committed)
+	}
+
+	for _, refusal := range []error{ErrRatchetGenerationConsumed, ErrEpochErased} {
+		keys := framingNewKeySource(crypto, 0x01, 0)
+		keys.refuseCommit = fmt.Errorf("another caller got there first: %w", refusal)
+		opened, err := OpenPrivateMessage(crypto, keys, signed.senderDataSecret, message,
+			StaticSignatureKey(signed.pub), signed.groupContext)
+		if !errors.Is(err, refusal) {
+			t.Fatalf("a commit refusing with %v: the open answered %v; a swallowed commit refusal accepts one message twice",
+				refusal, err)
+		}
+		if opened != nil {
+			t.Errorf("a commit refusing with %v: the open answered a message alongside its refusal", refusal)
+		}
+		if len(keys.committed) != 0 {
+			t.Errorf("a commit refusing with %v: the source recorded %v as committed", refusal, keys.committed)
 		}
 	}
 }
@@ -7013,6 +7096,12 @@ func TestARefusedOpenLeavesTheMessageKeyWhereItWasAndAnAcceptedOneErasesIt(t *te
 		if 0 < len(keys.erased) {
 			t.Fatalf("%s: the refused open erased %v, want nothing", row.what, keys.erased)
 		}
+		// AND MOVED NOTHING, which is the half "erases nothing" cannot see. A build whose
+		// lookup advanced the receiving head destroys the true sender's next MaxGenerationSkip
+		// messages without erasing a single key, and passes the line above.
+		if 0 < len(keys.committed) {
+			t.Fatalf("%s: the refused open committed %v, want nothing", row.what, keys.committed)
+		}
 	}
 
 	// THE ACCEPTANCE HALF, and it names the generation. Without it "erases nothing on a refusal"
@@ -7028,10 +7117,10 @@ func TestARefusedOpenLeavesTheMessageKeyWhereItWasAndAnAcceptedOneErasesIt(t *te
 			StaticSignatureKey(signed.pub), signed.groupContext); err != nil {
 			t.Fatalf("the message at generation %d did not open: %v", generation, err)
 		}
-		erased := fmt.Sprintf("%d/%d/%d", contentType, leaf, generation)
-		if !slices.Equal(keys.erased, []string{erased}) {
-			t.Fatalf("an accepted open at generation %d erased %v, want exactly [%s]",
-				generation, keys.erased, erased)
+		spent := fmt.Sprintf("%d/%d/%d", contentType, leaf, generation)
+		if !slices.Equal(keys.committed, []string{spent}) {
+			t.Fatalf("an accepted open at generation %d committed %v, want exactly [%s]",
+				generation, keys.committed, spent)
 		}
 	}
 }

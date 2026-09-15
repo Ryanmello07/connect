@@ -400,15 +400,12 @@ func (self *ratchet) step() (uint32, *generationKeys, error) {
 		return 0, nil, fmt.Errorf("%w: generation %d was the last", ErrRatchetExhausted, self.head)
 	}
 	generation := self.head
-	keys := &generationKeys{
-		key:   self.crypto.DeriveTreeSecret(self.secret, "key", generation, self.crypto.KeySize()),
-		nonce: self.crypto.DeriveTreeSecret(self.secret, "nonce", generation, self.crypto.NonceSize()),
-	}
-	next := self.crypto.DeriveTreeSecret(self.secret, "secret", generation, self.crypto.HashSize())
+	keys := self.keysAt(self.secret, generation)
+	next := self.chainSecretAfter(self.secret, generation)
 	zeroizeSecret(self.secret)
 	self.secret = next
 	if generation == ^uint32(0) {
-		// the counter is not allowed to wrap. head stays where it is so a later keyFor
+		// the counter is not allowed to wrap. head stays where it is so a later classify
 		// still classifies every generation below it as consumed rather than as future.
 		self.exhausted = true
 	} else {
@@ -417,106 +414,196 @@ func (self *ratchet) step() (uint32, *generationKeys, error) {
 	return generation, keys, nil
 }
 
-// peekFor returns the keys for one generation, ratcheting forward and retaining every
-// generation it passes -- INCLUDING the target.
+// keysAt and chainSecretAfter are the two halves of RFC 9420 section 9.1's derivation, each
+// written ONCE.
 //
-// It does not consume. That is the whole difference from keyFor and it is what the framing
-// layer's decrypt path needs: it looks a generation up, opens the AEAD, and erases only when
-// the open succeeded. A lookup that consumed would burn the key on every forged ciphertext,
-// so one bad packet from anyone who can write to the network would permanently lose the real
-// message at that generation.
+// THEY ARE FUNCTIONS BECAUSE THERE ARE NOW TWO WALKS OVER THIS CHAIN and not one. step advances
+// this ratchet through them and peekFor walks a SCRATCH copy through chainSecretAfter without
+// advancing anything, so the same three expansions are reached from two places. Spelled out twice,
+// a peek and a commit could come to derive different keys for one generation -- a transposed
+// label, an argument order, a length taken from a constant on one side and off the provider on the
+// other -- and the failure would arrive as an AEAD tag that does not verify, which this package
+// reports as tampering.
 //
-// The three refusals and their order are keyFor's, because keyFor is now this plus a delete
-// and there is one copy of them rather than two that can drift. A generation below the head
-// is consumed, which is a fact about this receiver; a generation far above it is a bound,
-// which is a fact about what a sender is allowed to ask for. Reversing them would report an
-// old generation as "too far ahead" whenever the head had run past the bound. The exhausted
-// arm is the second half of the first: head does not advance past 2^32-1, so the last
-// generation of an epoch is the one value "below the head" cannot classify.
+// They take the secret they read as an ARGUMENT rather than off the receiver, which is what lets
+// the peek hand over a copy and get scratch behaviour without either function knowing which caller
+// it has. The generation is bound into all three expansions: that binding is what makes a repeated
+// key and nonce pair require two independent defects rather than one, the secret advancing and the
+// generation number advancing would both have to stop.
 //
-// The target is stored in the window and is deliberately NOT pruned against. Two reasons.
-// The bound is on SKIPPED keys -- keys retained for a message that has not arrived -- and the
-// target is the one key in use, so counting it would evict a skipped key that is still wanted
-// to make room for one that is about to be returned. And pruning after the store would
-// ZEROIZE what it evicts, so a target evicted by its own arrival would come back as a well
-// formed Nk zero bytes with a nil error: a key every party in the world can compute, handed
-// to the framing layer as this sender's. The cost is that one ratchet's window can hold
-// RatchetWindowSize+1 entries between a peek and its erase, which is one entry and not a
-// multiple of anything a peer chooses. That peak is measured at the only place it exists,
-// by TestOneRatchetsWindowHoldsOneOverItsBoundBetweenAPeekAndTheEraseAfterIt.
+// The three lengths are read off the provider. Both registered suites fix Nn at 12 and one of them
+// fixes Nk at 32, which is also Nh and also the literal a body would have written down, so inside
+// the registry a read and a constant are the same number.
 //
-// The noinline directive is the erase-helper class's: prune erases through storage that
-// outlives this call, and the directive is what keeps those stores across a boundary the
-// compiler cannot see through.
+// Neither erases anything, which is why neither carries a noinline directive: the storage they
+// read is the caller's, and the caller is the one that knows whether it is a scratch copy to erase
+// or the ratchet's own.
+func (self *ratchet) keysAt(secret []byte, generation uint32) *generationKeys {
+	return &generationKeys{
+		key:   self.crypto.DeriveTreeSecret(secret, "key", generation, self.crypto.KeySize()),
+		nonce: self.crypto.DeriveTreeSecret(secret, "nonce", generation, self.crypto.NonceSize()),
+	}
+}
+
+func (self *ratchet) chainSecretAfter(secret []byte, generation uint32) []byte {
+	return self.crypto.DeriveTreeSecret(secret, "secret", generation, self.crypto.HashSize())
+}
+
+// peekFor returns the keys for one generation and MOVES NOTHING.
+//
+// IT IS THE FORM AN UNAUTHENTICATED GENERATION IS READ THROUGH, and that is the whole reason it
+// exists in this shape. The generation number arrives inside a PrivateMessage's sender data, which
+// is sealed under the epoch's sender_data_secret -- a secret EVERY member of the group holds. So at
+// the moment this ratchet is asked for a key, the only thing established about the number is that a
+// member chose it, and "a member chose it" is exactly the threat model section 9 has to survive:
+// RFC 9420 derives the whole secret tree from encryption_secret, so any member can compute any
+// OTHER member's leaf and hand this function any generation it likes at it.
+//
+// THE PROPERTY, IN THE TERMS IT HAS TO BE HELD IN: no input an unauthenticated party controls may
+// advance or prune another member's receiving ratchet. A peek that FINDS a key is fine -- finding
+// is what the caller asked for. A peek that MUTATES is the defect, and the mutation is not the
+// obvious one. Nothing here erases anything; what the eager form did was ADVANCE the head, and
+// every generation below a head is classified consumed, so a head pushed to 1025 answers
+// ErrRatchetGenerationConsumed for the true sender's next 1,025 messages at that receiver, forever.
+// MEASURED on the shape this replaces: one forged header at head+MaxGenerationSkip cost the victim
+// its next message, two cost it 1,025 of them, and three forged headers at ONE record position cost
+// it four of its next four -- pre-emptively, before the victim had written anything, and
+// repeatably, because the refusal is taken below every caller that would otherwise have consumed a
+// position of its own. The eviction is the second half of the same mutation: the skipped run the
+// walk retained pushed the tree past MaxRetainedWindowKeys, and the next call's pruneRetained
+// zeroized the victim's genuinely retained generations to make room for the attacker's.
+//
+// SO THE WALK IS OVER A COPY. self.secret, self.head and self.window are not written by anything
+// below, and the scratch chain is erased as the walk passes it, so a peek that is never committed
+// has cost this ratchet nothing but cpu -- and the cpu is the same MaxGenerationSkip expansions the
+// eager form already granted for the price of one header, so nothing new is bought either.
+// (*ratchet).commitFor is the other half, and it is reached only after the content AEAD has opened
+// and the sender's signature has verified.
+//
+// IT IS THE SHAPE connect/messagegroup ALREADY SHIPS ONE LAYER UP. (*ReceiverRatchet).PeekFor walks
+// a copy of the record ladder and (*ReceiverRatchet).Commit applies it once the record has opened,
+// for the same reason and against the same attacker. The two receiving ratchets a URmessage record
+// passes through now hold one discipline rather than two, which is what makes the sentence "a
+// refused record moves no receiver ratchet" true of both of them.
+//
+// THE TWO REFUSALS ARE classify's, so the peek and the commit cannot come to disagree about which
+// generations exist. A retained generation is answered from the window and COPIED, because the
+// window has to go on holding it until the message it belongs to has actually opened.
+//
+// The noinline directive is the erase-helper class's: the walk erases every scratch rung it passes
+// and those stores are dead in the compiler's reading.
 //
 //go:noinline
 func (self *ratchet) peekFor(generation uint32) (*generationKeys, error) {
 	if keys, ok := self.window[generation]; ok {
-		return keys, nil
+		return &generationKeys{
+			key:   append([]byte(nil), keys.key...),
+			nonce: append([]byte(nil), keys.nonce...),
+		}, nil
 	}
-	// every generation this ratchet has already produced is a replay, and that includes the
-	// one an exhausted ratchet is parked on. head does not advance past 2^32-1, so the last
-	// generation of an epoch is the single value the "below the head" test cannot classify --
-	// without the second arm it misses the window, passes the skip bound at a distance of
-	// zero, enters the loop and comes back as ErrRatchetExhausted, while every other
-	// generation of the same epoch comes back as ErrRatchetGenerationConsumed. A caller
-	// asking "is this a replay" has to get one answer across the whole range of the counter,
-	// not two that depend on which end of it the epoch reached.
-	//
-	// Exhaustion stays the SENDER's sentinel: nextSenderKeyLocked reaches step directly and
-	// still answers ErrRatchetExhausted, which is the fact that party needs -- there is no
-	// next generation, rekey.
+	if err := self.classify(generation); err != nil {
+		return nil, err
+	}
+	// THE SCRATCH ERASE BELOW DEFENDS NOTHING THIS SUITE CAN SEE, measured: delete both
+	// zeroizeSecret calls and ./mls/, ./message/ and ./messagegroup/ stay green. Nothing in the
+	// process can reach these slices once this call returns, so no runtime assertion tells a walk
+	// that erased from one that dropped. It stays because the run of chain secrets between the head
+	// and a generation an UNAUTHENTICATED party named is exactly what a peek must not leave in the
+	// heap, and the gate over that class reads the SOURCE:
+	// TestNoDeclarationReachingTheSecretTreeStoragePutsItBeyondTheCall. UNOBSERVED.md carries it.
+	walking := append([]byte(nil), self.secret...)
+	for at := self.head; at < generation; at += 1 {
+		next := self.chainSecretAfter(walking, at)
+		zeroizeSecret(walking)
+		walking = next
+	}
+	keys := self.keysAt(walking, generation)
+	zeroizeSecret(walking)
+	return keys, nil
+}
+
+// classify decides whether a generation is answerable AT ALL, and writes nothing.
+//
+// It is one function and not two copies because the peek and the commit have to admit exactly the
+// same set: a commit that refused what the peek served would refuse a message that had already
+// authenticated, and a commit that served what the peek refused would be a second, laxer rule
+// reached by anyone who could get a message past the first.
+//
+// THE ORDER OF THE TWO ARMS IS NOT INTERCHANGEABLE. A generation below the head is consumed, which
+// is a fact about this receiver; a generation far above it is a bound, which is a fact about what a
+// sender is allowed to ask for. Reversing them would report an old generation as "too far ahead"
+// whenever the head had run past the bound. The exhausted arm is the second half of the first: head
+// does not advance past 2^32-1, so the last generation of an epoch is the one value "below the
+// head" cannot classify -- without it that single generation comes back as ErrRatchetExhausted
+// while every other generation of the same epoch comes back as ErrRatchetGenerationConsumed, and a
+// caller asking "is this a replay" has to get one answer across the whole range of the counter.
+// Exhaustion stays the SENDER's sentinel: nextSenderKeyLocked reaches step directly and still
+// answers ErrRatchetExhausted, which is the fact that party needs -- there is no next generation,
+// rekey.
+//
+// THE BOUND REFUSES AND CATCHES UP NO MORE, and that is a deliberate loss of behaviour rather than
+// an omission. A refusal here used to advance the head by MaxGenerationSkip first, so that a
+// receiver restored behind a busy peer resynchronised over a handful of refused messages instead of
+// going deaf to that peer for the epoch. That resynchronisation was driven by a generation number
+// nobody had authenticated, which is the same sentence as "any member can advance any other
+// member's head by MaxGenerationSkip for the price of one header" -- the resynchronisation and the
+// deletion channel were ONE MECHANISM READ FROM TWO ENDS. Its own disclosure argued it granted
+// nothing new, and that argument was true only while the ACCEPTED path advanced the head as well.
+// The accepted path no longer does, so the catch-up became the only grant left and its premise was
+// gone with it. What a lagging receiver does instead is stated at MaxGenerationSkip's declaration
+// and measured by TestARestoredMemberIsDeafToAPeerThatMovedPastTheSkipBound.
+//
+// The caller holds stateLock.
+func (self *ratchet) classify(generation uint32) error {
 	if generation < self.head || (self.exhausted && generation == self.head) {
-		return nil, fmt.Errorf("%w: generation %d, head %d", ErrRatchetGenerationConsumed, generation, self.head)
+		return fmt.Errorf("%w: generation %d, head %d", ErrRatchetGenerationConsumed, generation, self.head)
 	}
 	// generation is at or above head here, so the subtraction cannot wrap.
 	if generation-self.head > MaxGenerationSkip {
-		// AND THE HEAD CATCHES UP BY THE BOUND BEFORE THIS REFUSES, which is what keeps a
-		// receiver that fell behind from being deaf to that sender for the rest of the epoch.
-		//
-		// WHY IT IS NEEDED, measured on a settled group of four: alice Protects 1026 times, live
-		// bob opens all of them, bob is restored from its persisted state -- which carries bob's
-		// OWN sender position and nothing about where bob's receiving ratchets for its peers
-		// stood -- and alice Protects once more. Restored bob answers "generation too far ahead:
-		// generation 1026, head 0, bound 1024". A refusal that left the head at 0 answers that
-		// same sentence for generation 1027, 1028 and every generation alice reaches for the rest
-		// of the epoch, because nothing else in this package moves a receiving head. The
-		// disclosure that called this a lost replay guard was materially incomplete: it is
-		// unbounded message loss until the next commit.
-		//
-		// IT GRANTS NOTHING A SENDER DID NOT ALREADY HAVE, which is the whole reason it is safe to
-		// do it on the refusal path. A generation number reaches this function only after
-		// openSenderData has opened an AEAD under the epoch's sender_data_secret, so the party
-		// choosing it is a member of this group; and that party can already advance any leaf's
-		// head by MaxGenerationSkip for the price of one header, by asking for head+1024 -- which
-		// this function ACCEPTS, steps to, and retains the whole skipped run of. So the work here
-		// is bounded by the same constant the accepted path is bounded by, and the retention is
-		// the same retention: what changes is only that the refusal is no longer free of both.
-		//
-		// THE KEYS IT PASSES ARE RETAINED RATHER THAN DISCARDED, for that same parity. Discarding
-		// them would make a catch-up strictly worse for the honest case than the in-bound skip an
-		// attacker can force -- the generations between the old head and the new one would stop
-		// being openable at all -- so the catch-up is exactly an accepted skip of MaxGenerationSkip
-		// with the target refused at the end of it.
-		if err := self.catchUpLocked(); err != nil {
-			return nil, err
-		}
-		return nil, fmt.Errorf("%w: generation %d, head %d after a catch-up of %d, bound %d",
-			ErrRatchetGenerationTooFarAhead, generation, self.head, MaxGenerationSkip, MaxGenerationSkip)
+		return fmt.Errorf("%w: generation %d, head %d, bound %d",
+			ErrRatchetGenerationTooFarAhead, generation, self.head, MaxGenerationSkip)
 	}
-	// the loop is bounded by the same distance the check above admits, rather than left to
-	// terminate on an argument about step advancing the head. It cannot run away for a
-	// ratchet whose head moves -- at most MaxGenerationSkip+1 steps reach any generation the
-	// check above lets through -- but a head that stopped advancing turns this into a hang,
-	// and a hang a peer reaches by choosing a generation number is the denial of service the
-	// bound exists to prevent. Measured: with step leaving the head where it is, three tests
-	// of this package stop failing and start TIMING OUT, which is the worse of the two.
-	//
-	// The invariant that makes it redundant is asserted rather than argued:
-	// TestRatchetKeysAreNeverRepeatedOverAContiguousSweep holds four thousand consecutive
-	// steps to consecutive generations, and TestRatchetRefusesToWrapTheGenerationCounter
-	// holds the one place the head legitimately stops.
-	for steps := uint32(0); ; steps++ {
+	return nil
+}
+
+// commitFor applies the movement peekFor described, once the message at that generation has
+// AUTHENTICATED, and it is where every write on the receiving path lives.
+//
+// It is the only thing in this package that advances a RECEIVING head. A caller that peeks and
+// never commits has cost this ratchet nothing, which is the whole of what the split buys.
+//
+// The retained generation is handed over and DROPPED, so a second request for it is refused: a
+// window that hands the same generation out twice is a window that survives a replay. The walking
+// case retains every generation it passes and NOT the target -- the target is the one generation
+// this very call consumes, so storing it and deleting it again is the same state reached by two
+// more writes. That is the only observable difference from the split this replaces, and it removes
+// the RatchetWindowSize+1 peak the old peek's own disclosure had to carry.
+//
+// ReceiverKey reaches it directly, because that door has no second call in which a caller says the
+// message opened; CommitMessageKey reaches it after OpenPrivateMessage has verified the signature.
+//
+// The steps guard is kept for the reason the loop it replaces carried one: the bound in classify
+// makes at most MaxGenerationSkip+1 steps reach any generation it admits, but a head that stopped
+// advancing would turn this into a hang, and a hang a peer reaches by choosing a generation number
+// is the denial of service the bound exists to prevent. Measured on the shape this replaces: with
+// step leaving the head where it is, three tests of this package stop failing and start TIMING OUT,
+// which is the worse of the two.
+//
+// The caller holds stateLock.
+//
+// The noinline directive is the erase-helper class's: prune erases through storage that outlives
+// this call.
+//
+//go:noinline
+func (self *ratchet) commitFor(generation uint32) (*generationKeys, error) {
+	if keys, ok := self.window[generation]; ok {
+		delete(self.window, generation)
+		return keys, nil
+	}
+	if err := self.classify(generation); err != nil {
+		return nil, err
+	}
+	for steps := uint32(0); ; steps += 1 {
 		if steps > MaxGenerationSkip {
 			return nil, fmt.Errorf("%w: generation %d, head %d, bound %d: the ratchet stopped advancing",
 				ErrRatchetGenerationTooFarAhead, generation, self.head, MaxGenerationSkip)
@@ -526,72 +613,11 @@ func (self *ratchet) peekFor(generation uint32) (*generationKeys, error) {
 			return nil, err
 		}
 		if stepped == generation {
-			self.window[stepped] = keys
 			return keys, nil
 		}
 		self.window[stepped] = keys
 		self.prune()
 	}
-}
-
-// catchUpLocked advances this ratchet by exactly MaxGenerationSkip generations, retaining and
-// pruning each one it passes exactly as an accepted skip does.
-//
-// IT IS THE ACCEPTED PATH WITH NO TARGET, and it is written as its own function rather than as a
-// second loop inside peekFor so that the bound is stated once: the work a peer can buy with one
-// generation number is MaxGenerationSkip steps whether the number is inside the bound or outside
-// it. A version that jumped the head to the generation ASKED FOR would be the unbounded KDF loop
-// the bound exists to refuse -- a hash ratchet has no way to reach generation n without deriving
-// the n-head secrets between, so "resynchronise to whatever was asked" is four billion expansions
-// for the price of one header.
-//
-// A step that refuses -- the ratchet is exhausted -- stops the catch-up and is answered as itself.
-// That is the honest answer to the caller: there is no generation past 2^32-1 to catch up TO, and
-// ErrRatchetExhausted says the epoch needs a rekey rather than a bigger skip.
-//
-// The caller holds stateLock.
-//
-// The noinline directive is the erase-helper class's, carried for peekFor's reason: prune erases
-// through storage that outlives this call, and the directive is what keeps those stores across a
-// boundary the compiler cannot see through. This declaration is outside the class
-// TestEveryEraseHelperCarriesTheNoInlineDirective derives -- that class is closed under the
-// hand-off through ARGUMENTS and this one takes none -- so the line is this package's convention
-// rather than something that gate demands.
-//
-//go:noinline
-func (self *ratchet) catchUpLocked() error {
-	for steps := uint32(0); steps < MaxGenerationSkip; steps += 1 {
-		stepped, keys, err := self.step()
-		if err != nil {
-			return err
-		}
-		self.window[stepped] = keys
-		self.prune()
-	}
-	return nil
-}
-
-// keyFor is peekFor plus consumption: a generation already handed out is deleted from the
-// window as it is returned, so a replayed message cannot be decrypted a second time out of
-// the retained keys. That deletion is the only thing standing between the window and a real
-// key and nonce reuse, because unlike every other path here the window can hand the SAME
-// pair back twice.
-//
-// ReceiverKey uses this rather than peekFor because it has no erase counterpart: there is no
-// second call in which the caller says the message opened, so the consumption has to happen
-// at the only moment this path has. MessageKey is the other half of that trade and pays for
-// its repeatability with EraseMessageKey.
-//
-// The delete leaves the window exactly as the pre-split keyFor left it -- the target was
-// never counted against the bound there either -- so the retention this file's window tests
-// pin is unchanged by the split.
-func (self *ratchet) keyFor(generation uint32) (*generationKeys, error) {
-	keys, err := self.peekFor(generation)
-	if err != nil {
-		return nil, err
-	}
-	delete(self.window, generation)
-	return keys, nil
 }
 
 // eraseKey zeroizes one retained generation and drops it.
@@ -828,26 +854,36 @@ func (self *SecretTree) ratchetFor(leaf LeafIndex, kind RatchetType) (*ratchet, 
 }
 
 const (
-	// MaxGenerationSkip bounds how far ahead of the current head a receiver will ratchet in
-	// one step. A generation number is attacker supplied, and without a bound a single
-	// uint32 buys four billion KDF calls for the price of one forged header.
+	// MaxGenerationSkip bounds how far ahead of the current head a receiver will derive in one
+	// call. A generation number is attacker supplied, and without a bound a single uint32 buys
+	// four billion KDF calls for the price of one forged header.
 	//
-	// IT IS ALSO WHAT A REFUSAL ADVANCES BY, which is the same number for the same reason. A
-	// generation past the bound is refused and the head catches up by exactly this much before
-	// the refusal returns -- see (*ratchet).peekFor -- so the work one generation number can buy
-	// is this constant whether the number is inside the bound or outside it, and a receiver that
-	// fell behind a busy peer reaches it again after losing
-	// ceil((distance-MaxGenerationSkip)/(MaxGenerationSkip-1)) messages instead of being deaf to
-	// that peer for the rest of the epoch.
+	// IT IS A BOUND ON WORK AND ON NOTHING ELSE, and that sentence is the correction this
+	// declaration exists to carry. A refusal past this bound used to advance the head by exactly
+	// this much before returning, so that a receiver behind a busy peer closed the gap by
+	// MaxGenerationSkip-1 per message it lost instead of going deaf to that peer for the epoch.
+	// The argument for it was that the work a generation number buys is this constant whether the
+	// number is inside the bound or outside it -- true, and a statement about CPU. What it was
+	// silent about is EVICTION: every generation below a head is consumed, so a walk driven by a
+	// number nobody authenticated made another member's messages permanently unopenable, one
+	// header at a time and repeatably. A bound on the work is not a bound on the damage.
 	//
-	// THE DENOMINATOR IS ONE SHORT OF THE CONSTANT because the peer moves as well. A refused
-	// message costs that peer one further send before the next attempt, so the gap closes by
-	// MaxGenerationSkip-1 per message refused and not by MaxGenerationSkip. This sentence read
-	// ceil(distance/MaxGenerationSkip) until it was measured, and so did the disclosure in
-	// (*Group).LoadGroup: the two formulas disagree at seven of the ten distances
-	// TestTheCatchUpLosesTheNumberOfMessagesThisDisclosureStates derives from this constant, and
-	// the case that disclosure names -- a peer 1026 ahead -- is one of the seven, losing ONE
-	// message where the old formula says two.
+	// SO NOTHING WALKS ON A REFUSAL ANY MORE, and the receive path is two phase instead:
+	// (*ratchet).peekFor derives over a scratch copy and writes nothing, and (*ratchet).commitFor
+	// carries every write and is reached only after a signature has verified.
+	//
+	// WHAT A LAGGING RECEIVER DOES NOW, stated here because it is the cost. A receiver whose head
+	// is more than this many generations behind one sender is refused with
+	// ErrRatchetGenerationTooFarAhead and stays refused for every later generation that sender
+	// reaches in this epoch; the epoch's next commit rebuilds the secret tree and every receiving
+	// head starts at 0 again. That arrangement is reached by a RESTORE and not by ordinary
+	// delivery -- the persisted group state carries a member's own sender position and nothing
+	// about where its receiving ratchets for its peers stood -- so the durable repair is to
+	// persist those positions, which is (*Group).LoadGroup's disclosure and not this constant's.
+	// Out of order delivery and lost messages INSIDE the bound are untouched: the window retains
+	// every generation an accepted walk passed, exactly as before.
+	// TestAReceiverPastTheSkipBoundStaysWhereItIs and
+	// TestARestoredMemberIsDeafToAPeerThatMovedPastTheSkipBound measure both halves.
 	MaxGenerationSkip uint32 = 1024
 
 	// RatchetWindowSize bounds the skipped keys retained for out of order receipt BY ONE
@@ -936,17 +972,16 @@ func (self *SecretTree) ReceiverKey(leaf LeafIndex, kind RatchetType, generation
 	if err != nil {
 		return nil, nil, err
 	}
-	keys, err := r.keyFor(generation)
-	// the tree wide bound is applied whether or not the request was served. keyFor retains
+	keys, err := r.commitFor(generation)
+	// the tree wide bound is applied whether or not the request was served. commitFor retains
 	// every generation it steps past, and a request that fails partway through -- an
 	// exhausted ratchet -- has retained them just the same, so a bound applied only on the
 	// success path is one a peer walks around by always failing.
 	//
-	// The keys just handed out are not at risk from this: keyFor deletes the generation it
-	// returns from the window before returning it, so by the time the bound is applied the
-	// answer is no longer an entry anything can evict. That holds across the peekFor split --
-	// peekFor now stores the target as well, and keyFor's delete is what takes it back out
-	// again before this line runs.
+	// The keys just handed out are not at risk from this: commitFor never leaves the target in
+	// the window -- a retained one is deleted as it is handed over and a walked one is never
+	// stored -- so by the time the bound is applied the answer is no longer an entry anything
+	// can evict.
 	self.pruneRetained()
 	if err != nil {
 		return nil, nil, err
@@ -1312,47 +1347,56 @@ func (self *SecretTree) NextMessageKey(contentType ContentType, leaf LeafIndex) 
 	return key, nonce, generation, nil
 }
 
-// MessageKey is the decrypt half. It does NOT consume the generation: the caller opens the
-// AEAD and then calls EraseMessageKey, so a forged ciphertext cannot destroy the key the real
-// message needs. ReceiverKey is the consuming form and keeps its single use semantics,
-// because it has no erase counterpart.
+// MessageKey is the decrypt half, and it is a PEEK: it neither consumes the generation nor moves
+// the ratchet in any other way. CommitMessageKey is the second half, and the pair is "look up,
+// open, AUTHENTICATE, commit".
 //
-// The pair is COPIED out of the window rather than handed out of it, and that is a
-// consequence of the sentence above rather than caution. Every other key source on this type
-// answers with storage nothing else names -- step's keys never enter a window, and keyFor
-// deletes the entry as it returns it -- but this one deliberately leaves the entry where it
-// is, so the slices inside it are still reachable from the lock guarded map after the lock is
-// dropped. Handing those slices out puts the caller's key bytes under three later writers,
-// each of which zeroizes IN PLACE: EraseMessageKey for the same generation, pruneRetained
-// evicting it, and Zeroize at the end of the epoch. Measured on the shape this replaces: two
-// lookups of one generation were handed ONE array, so an erase by either holder turned the
-// other's key into Nk zero bytes it had already been told were good; and a holder of
-// generation 0 watched its key go to zero when a later lookup pushed the tree past
-// MaxRetainedWindowKeys. Both come back with a nil error, which is the same defect the
-// ordering below exists to prevent, reached from the other end. This type is built for
-// concurrent callers -- see the lock discipline gate -- so the aliasing is also a write to
-// key bytes another goroutine is reading, outside stateLock and outside anything the race
-// detector could attribute to a caller.
+// WHAT THE SPLIT IS FOR, stated in the terms the defect it closes has to be stated in: no input an
+// unauthenticated party controls may advance or prune another member's receiving ratchet. The leaf
+// and the generation this method is handed come out of a PrivateMessage's sender data, which is
+// sealed under the epoch's sender_data_secret -- a secret every member of the group holds -- so
+// both are values any member CHOOSES. An earlier shape of this method looked the generation up
+// through a ratcheting peek, which advanced the head to the generation asked for, retained the
+// skipped run and pruned. None of that is an erase and all of it is destruction: every generation
+// below a head is classified consumed, so one header naming another member's leaf at head+1024 made
+// that member's next message permanently unopenable at this receiver, two made 1,025 of them
+// unopenable, and the retained run pushed the tree past MaxRetainedWindowKeys so that the next
+// call's pruneRetained zeroized the victim's genuine skipped keys as well. It was pre-emptive --
+// the victim need never have written anything -- and repeatable at one position, because the
+// refusal that follows is taken below every layer that would otherwise have spent a position of
+// its own. See (*ratchet).peekFor for the measurements and for what an honest lagging receiver now
+// does instead.
 //
-// What the copy does not do is erase itself. The window's entry is still zeroized by
-// EraseMessageKey, and the copy is the caller's to drop -- exactly the terms NextSenderKey's
-// and ReceiverKey's answers already come on, which is the point: one rule for every key this
-// type hands out rather than one method with its own.
+// NOTHING HERE IS A BOUND ON THE DAMAGE, AND THAT IS THE LESSON THE OLD COMMENTARY CARRIED AND
+// MISSED. This file argued at length that what a peer buys with one generation number is bounded
+// by MaxGenerationSkip, and that argument was correct about CPU and about memory and said nothing
+// about eviction. A bound on the WORK is not a bound on the DAMAGE. The repair is not a smaller
+// bound, it is that the work leaves no trace at all unless the message authenticates.
 //
-// The tree wide retained bound is applied on the way IN rather than on the way out. Both
-// paths retain every generation they step past, and both are reachable by anyone who can put
-// a leaf index and a generation number in a header, so neither may leave the aggregate
-// unbounded -- without it a peer materialises every leaf's two ratchets and fills every one
-// of their windows from headers that never had to be authentic, which is a number multiplied
-// by the group size rather than a bound. But the answer here STAYS in the window until the
-// caller erases it, and pruneRetained zeroizes what it evicts, so a bound applied afterwards
-// could hand back Nk zero bytes with a nil error: the copy is taken from the entry, and an
-// entry evicted between the lookup and the copy is copied as zeros. Applied first, the
-// eviction cannot reach a key that does not exist yet, and what the receiver retains is at
-// most MaxRetainedWindowKeys plus the single ratchet this call advanced -- a constant, and
-// still not a multiple of the group size. The ordering is observed by
-// TestMessageKeyNeverAnswersWithKeyMaterialTheRetainedBoundHasZeroized rather than argued for
-// here; it survived this file having only the paragraph.
+// THE ANSWER IS STORAGE NOTHING ELSE NAMES. A retained generation is copied out of the window on
+// the way past, and a walked one is derived into fresh slices, so no key this method hands back is
+// reachable from the lock guarded map afterwards. That is not caution: the window deliberately
+// goes on holding a retained entry until the message it belongs to has opened, so handing the
+// entry itself out would put the caller's key bytes under three later writers, each of which
+// zeroizes IN PLACE -- CommitMessageKey for the same generation, pruneRetained evicting it, and
+// Zeroize at the end of the epoch. Measured on the shape this replaces: two lookups of one
+// generation were handed ONE array, so an erase by either holder turned the other's key into Nk
+// zero bytes it had already been told were good; and a holder of generation 0 watched its key go to
+// zero when a later lookup pushed the tree past MaxRetainedWindowKeys. Both come back with a nil
+// error, which is the same defect the ordering below exists to prevent, reached from the other end.
+// This type is built for concurrent callers -- see the lock discipline gate -- so the aliasing is
+// also a write to key bytes another goroutine is reading, outside stateLock and outside anything
+// the race detector could attribute to a caller.
+//
+// IT NO LONGER APPLIES THE TREE WIDE RETAINED BOUND, and the reason is that it no longer retains
+// anything. The bound exists because a peer that picks leaf indices and generation numbers out of
+// the air used to materialise every leaf's two ratchets AND fill every one of their windows from
+// headers that never had to be authentic -- a number multiplied by the group size rather than a
+// bound. A peek retains nothing, so the only thing an unauthenticated header still grows here is
+// one ratchet per (leaf, kind) through ratchetFor, which is bounded by the tree. What retains is
+// CommitMessageKey and ReceiverKey, and those two apply the bound where the retention is.
+// TestAPeekRetainsNothingAcrossTheWholeTree is that, measured, rather than this
+// paragraph.
 func (self *SecretTree) MessageKey(contentType ContentType, leaf LeafIndex, generation uint32) (key []byte, nonce []byte, err error) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -1363,7 +1407,6 @@ func (self *SecretTree) MessageKey(contentType ContentType, leaf LeafIndex, gene
 	if err != nil {
 		return nil, nil, err
 	}
-	self.pruneRetained()
 	r, err := self.ratchetFor(leaf, kind)
 	if err != nil {
 		return nil, nil, err
@@ -1372,7 +1415,68 @@ func (self *SecretTree) MessageKey(contentType ContentType, leaf LeafIndex, gene
 	if err != nil {
 		return nil, nil, err
 	}
-	return append([]byte(nil), keys.key...), append([]byte(nil), keys.nonce...), nil
+	return keys.key, keys.nonce, nil
+}
+
+// CommitMessageKey is the second half of the two phase read: it applies the movement MessageKey's
+// peek described, and it is reached ONLY after the content AEAD has opened and the sender's
+// signature has verified.
+//
+// IT IS WHERE EVERY RECEIVING-SIDE WRITE LIVES. The head advances to generation+1, every
+// generation the walk passed is retained for out of order delivery, the per ratchet window and the
+// tree wide retained bound are applied, and the generation just used stops existing -- which is
+// the forward secrecy erase the replay guard is built on, reached at the one moment the caller can
+// honestly say the message was real.
+//
+// IT REPLACES EraseMessageKey ON THE OPEN PATH AND SUBSUMES IT. The erase alone was never enough:
+// an erase says "this generation is spent" and says nothing about where the head stands, and it was
+// the HEAD that a forged header moved. A commit states both, at one moment, under one lock.
+// EraseMessageKey stays for the seal path, where NextMessageKey has already consumed and there is
+// nothing to walk.
+//
+// A REFUSAL HERE IS A REPLAY AND IS ANSWERED AS ONE. classify admits exactly what the peek admitted,
+// so the only way a commit refuses a message whose peek succeeded is that something else committed
+// that generation in between -- a concurrent open of the same message, which this type supports by
+// construction. ErrRatchetGenerationConsumed is the honest answer and OpenPrivateMessage returns it
+// rather than accepting the message twice.
+//
+// The keys it takes back are ERASED rather than dropped. The caller already holds its own copy from
+// the peek; this one is the generation's last live copy inside the tree, and leaving it to the
+// allocator is the erase this method exists to perform, omitted silently.
+//
+// The noinline directive is this package's erase-helper class, joined through the hand-off: the
+// names below go to zeroizeSecret, and the stores are dead in the compiler's reading.
+//
+//go:noinline
+func (self *SecretTree) CommitMessageKey(contentType ContentType, leaf LeafIndex, generation uint32) error {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if err := self.refuseIfErased(leaf); err != nil {
+		return err
+	}
+	kind, err := ratchetTypeOf(contentType)
+	if err != nil {
+		return err
+	}
+	r, err := self.ratchetFor(leaf, kind)
+	if err != nil {
+		return err
+	}
+	keys, err := r.commitFor(generation)
+	// the tree wide bound is applied whether or not the commit was served, for ReceiverKey's
+	// reason: a walk that fails partway through has retained what it passed just the same, so a
+	// bound applied only on the success path is one a peer walks around by always failing.
+	self.pruneRetained()
+	if err != nil {
+		return err
+	}
+	// AND THIS ERASE DEFENDS NOTHING THIS SUITE CAN SEE EITHER, measured the same way: with both
+	// lines deleted all three package trees stay green, because the storage is unreachable from the
+	// tree the moment this returns and no case can read it back. It stays for eraseKey's reason --
+	// the erasure is the half a caller omits silently -- and UNOBSERVED.md names it.
+	zeroizeSecret(keys.key)
+	zeroizeSecret(keys.nonce)
+	return nil
 }
 
 // EraseMessageKey is the forward secrecy erase the framing layer's replay guard is built on:

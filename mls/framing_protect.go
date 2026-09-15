@@ -888,15 +888,25 @@ func unmarshalPrivateMessageContent(plaintext []byte, header *PrivateMessage,
 // the retained key bound, the generation counter and its refusal to wrap. Framing holds no key
 // beyond the call it was handed in, which is why there is no method here for giving one back.
 //
-// The three methods are not interchangeable and the split is deliberate. NextMessageKey CONSUMES,
+// The four methods are not interchangeable and the split is deliberate. NextMessageKey CONSUMES,
 // because a sender that dropped an answer must not be able to ask for the same generation twice.
-// MessageKey does NOT, because a receiver has to look a generation up, open the AEAD, and only
-// then say the key is spent -- a lookup that consumed would burn the real message key on the first
-// forged packet anyone on the network cared to send. EraseMessageKey is that second half, and it
-// is total: it is called on paths that never derived a key at all.
+// MessageKey does NOT: it is a PEEK, and it may not advance, retain, evict or erase anything at
+// all, because a receiver has to look a generation up, open the AEAD, verify the signature, and
+// only then say what the message cost. CommitMessageKey is that second half -- the one call on
+// this surface that is allowed to move a receiving ratchet, and the only one reached after the
+// message has authenticated. EraseMessageKey is the seal path's half and it is total: it is called
+// on paths that never derived a key at all.
+//
+// WHY THE PEEK MAY NOT MOVE ANYTHING, in one sentence, because an implementer reading only this
+// interface has no other way to learn it: the leaf and the generation MessageKey is handed come
+// out of sender data sealed under a GROUP SHARED secret, so they are values any member of the
+// group chooses, and a lookup that advanced a head on them let one member make another member's
+// next thousand messages permanently unopenable for the price of one header. See
+// (*SecretTree).MessageKey for the measurements.
 type MessageKeySource interface {
 	NextMessageKey(contentType ContentType, leaf LeafIndex) (key []byte, nonce []byte, generation uint32, err error)
 	MessageKey(contentType ContentType, leaf LeafIndex, generation uint32) (key []byte, nonce []byte, err error)
+	CommitMessageKey(contentType ContentType, leaf LeafIndex, generation uint32) error
 	EraseMessageKey(contentType ContentType, leaf LeafIndex, generation uint32)
 }
 
@@ -1060,7 +1070,7 @@ func sealPrivateMessage(crypto CryptoProvider, keys MessageKeySource, senderData
 // Every AEAD failure on either of the first two collapses into one value, for errDecryptFailed
 // reason.
 //
-// THE ERASE IS LAST AND IT IS A REFUSAL BOUNDARY AND NOT A TIDY-UP. It used to sit between the
+// THE COMMIT IS LAST AND IT IS A REFUSAL BOUNDARY AND NOT A TIDY-UP. It used to sit between the
 // content AEAD and the signature, which is where p6's own sketch drew it, and the sentence that
 // stood here said a message whose AEAD opened came from somebody holding this epoch's keys. That
 // sentence is true and it is not the sentence that matters, because in an MLS group EVERY member
@@ -1073,11 +1083,22 @@ func sealPrivateMessage(crypto CryptoProvider, keys MessageKeySource, senderData
 // "would burn a key on every forged ciphertext, turning one bad packet into a permanently lost
 // message".
 //
-// So the pair is now "look up, open, AUTHENTICATE, erase". What the move costs is that a refused
-// ciphertext can be replayed and refused again -- CPU, and a bounded amount of it, because the
-// retained window is bounded on the way in -- and what it buys is that nothing an attacker can
-// build reaches the erase at all. A replay of a ciphertext that SUCCEEDS is still refused, by the
-// erase this success performs.
+// So the pair is now "look up, open, AUTHENTICATE, commit". What the move costs is that a refused
+// ciphertext can be replayed and refused again -- CPU, and a bounded amount of it -- and what it
+// buys is that nothing an attacker can build reaches the commit at all. A replay of a ciphertext
+// that SUCCEEDS is still refused, by the commit this success performs.
+//
+// AND THE ERASE WAS ONLY HALF OF WHAT HAD TO MOVE, which is the correction this paragraph carries.
+// Moving the erase below the signature closed one denial channel and left a strictly larger one
+// open beside it, because the sentence above is about a key being DESTROYED and the lookup itself
+// was advancing the receiving head. Every generation below a head is consumed, so a member that
+// put its own leaf aside and named the VICTIM's leaf at head+MaxGenerationSkip deleted a whole
+// WINDOW of that victim's messages without reaching the erase, without a signature, and without the
+// message ever being accepted: the refusal it takes is errDecryptFailed a few lines above, which
+// sits over the erase in the old ordering and in this one. The lookup is now a peek that moves
+// nothing and CommitMessageKey carries the movement, so "every refusal above leaves this leaf's
+// ratchet exactly where it was" is a statement about the whole function rather than about its last
+// four lines.
 func OpenPrivateMessage(crypto CryptoProvider, keys MessageKeySource, senderDataSecret []byte,
 	message *PrivateMessage, resolve SignatureKeyResolver, groupContext []byte) (*AuthenticatedContent, error) {
 
@@ -1141,8 +1162,17 @@ func OpenPrivateMessage(crypto CryptoProvider, keys MessageKeySource, senderData
 	if err := VerifyAuthenticatedContent(crypto, pub, authContent, groupContext); err != nil {
 		return nil, err
 	}
-	// LAST. Every refusal above leaves this leaf's ratchet exactly where it was; see the header.
-	keys.EraseMessageKey(message.ContentType, senderData.LeafIndex, senderData.Generation)
+	// LAST, AND IT IS THE ONLY STATEMENT ON THIS PATH THAT MOVES THIS LEAF'S RATCHET. Every
+	// refusal above leaves it exactly where it was -- including the two that come before the
+	// content AEAD, which is the half the erase-ordering repair could not reach; see the header.
+	//
+	// A refusal HERE is a replay: the commit admits exactly what the lookup admitted, so the only
+	// way it refuses now is that another goroutine committed this generation in between, which is
+	// a second open of one message. It is answered rather than swallowed, because swallowing it
+	// would accept that message twice.
+	if err := keys.CommitMessageKey(message.ContentType, senderData.LeafIndex, senderData.Generation); err != nil {
+		return nil, err
+	}
 	return authContent, nil
 }
 

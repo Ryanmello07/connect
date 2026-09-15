@@ -223,7 +223,7 @@ type secretTreeKeyPathDriver struct {
 		published []secretTreeGeneration) (map[uint32]secretTreeAnswer, error)
 	// retainsSkipped is whether walking this path leaves the generations it stepped past in the
 	// tree's retained windows. The sender paths reach step() directly and retain nothing; the
-	// receiver side paths reach peekFor and retain every gap. It is what turns the retained key
+	// receiver side paths reach commitFor and retain every gap. It is what turns the retained key
 	// headroom from a sentence in a comment into a number this runner measures.
 	retainsSkipped bool
 }
@@ -283,11 +283,14 @@ var secretTreeKeyPathDrivers = map[string]secretTreeKeyPathDriver{
 				}
 				collected[want.Generation] = secretTreeAnswer{
 					key: bytes.Clone(key), aeadNonce: bytes.Clone(aeadNonce)}
-				// the pair this path comes on is "look up, open, erase". The lookup does not
-				// consume, so a walk that never erased would hold the published generations as
-				// well as the gaps and would stand at a retention no other path reaches -- and
-				// the erase is what turns a repeatable lookup back into a single use key.
-				tree.EraseMessageKey(contentType, leaf, want.Generation)
+				// the pair this path comes on is "look up, open, AUTHENTICATE, commit". The
+				// lookup does not consume and does not move the ratchet at all, so a walk that
+				// never committed would stand at a head of zero and a retention of zero -- and
+				// the commit is what turns a repeatable lookup back into a single use key AND
+				// what retains the gaps this runner counts.
+				if err := tree.CommitMessageKey(contentType, leaf, want.Generation); err != nil {
+					return nil, fmt.Errorf("committing generation %d: %w", want.Generation, err)
+				}
 			}
 			return collected, nil
 		},

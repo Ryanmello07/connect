@@ -631,6 +631,12 @@ func (self *GroupSession) OpenRecord(record *message.Record) ([]byte, []byte, er
 // the commit arm, which CAN be authenticated by processing the commit and is not authenticated
 // here.
 //
+// AND IT SPENDS NOTHING OF THE SENDER_HANDLE IT NAMES. An acceptance here does not advance that
+// handle's receiver ladder, which is openRecordOnLoop's own discipline and the second half of what
+// this split is for: the attribution half of MG-5 is that these octets are nobody's, and the DENIAL
+// half is that accepting them must not burn the rung the record's apparent sender still needs. A
+// door that authenticates nothing may not spend anything either.
+//
 // It refuses an application record, for the same reason OpenRecord refuses a ceremony one: a door
 // that served both arms would be the single door this split exists to end.
 func (self *GroupSession) OpenCeremonyRecord(record *message.Record) ([]byte, []byte, error) {
@@ -827,10 +833,46 @@ func (self *GroupSession) openRecordOnLoop(record *message.Record,
 	if err != nil {
 		return nil, nil, err
 	}
-	// and only now does the ratchet move. Everything above authenticated, so the stream index
-	// this commit acts on is one a key opened a record at rather than one a header claimed.
-	if err := self.receivers.Commit(ratchetKey, header.StreamIndex); err != nil {
-		return nil, nil, err
+	// and only now does the ratchet move -- ON THE APPLICATION ARM AND ONLY ON IT. Everything
+	// above authenticated, so the stream index this commit acts on is one a signature was taken
+	// over rather than one a header claimed.
+	//
+	// THE CEREMONY ARM COMMITS NOTHING, and that is a rule about what an ACCEPTANCE is allowed to
+	// cost rather than an optimisation. unframeBodyOnLoop returns a ceremony body unchanged --
+	// there is no frame, no signature and no leaf -- and every key the two AEADs above used is
+	// group shared: record_key[n] walks from RecordKeyZero(class_key, leaf_index), and the class
+	// key is held by every member. So a ceremony record that OPENS establishes nothing about who
+	// wrote it, and a member can seal one at any other member's sender_handle and any index it
+	// likes. Committing on that acceptance walked the victim's ladder past the rung the victim's
+	// own next record needs: one squatted ceremony record per message, no lift, no genuine frame,
+	// no race, and the victim's record at that index answering ErrOutOfWindow forever. The gate
+	// beside this one is named "a refused record moves no receiver ratchet" and it is true; this
+	// was an ACCEPTED record moving one on a body nobody signed, which is the same denial reached
+	// from the side that gate does not look at.
+	//
+	// SO THE RULE IS THE ONE THE ARM SPLIT ALREADY STATES, carried through to the ladder: a
+	// REFUSAL taken on an attacker's claim costs the attacker, and an ACCEPTANCE taken on one
+	// costs the victim. OpenRecord's acceptance is taken on R1 and R2 and may spend a rung;
+	// OpenCeremonyRecord's is taken on nothing and may not.
+	//
+	// WHAT IT COSTS, because a commit that stops happening is a behaviour that stops happening. A
+	// ceremony record no longer advances the head of the ladder it is on, so a sender's ceremony
+	// records sit as skipped rungs until an APPLICATION record from that sender walks past them --
+	// retained, openable, and pruned by the same window as any other gap. What that bounds is the
+	// run: a sender that puts more than DefaultRecordWindowSize ceremony records on one ladder
+	// between two application records puts the later one outside the window, and it is refused with
+	// ErrOutOfWindow rather than opened. Nothing calls OpenCeremonyRecord today, so no shipping
+	// path changes; the consumer that will is the epoch machinery, and MG-5 carries this for it.
+	//
+	// AND REPLAY IS THE OTHER HALF OF THE SAME SENTENCE. A ceremony record can now be delivered
+	// twice and open twice. That is not a guard being removed: the ladder was never an
+	// authentication on this arm, and what judges these octets is what MG-5 and this door's own
+	// prose say judges them -- a wrap by whether it decrypts to this device, a commit by whether
+	// mls accepts it, and mls has a replay guard of its own.
+	if wantApplication {
+		if err := self.receivers.Commit(ratchetKey, header.StreamIndex); err != nil {
+			return nil, nil, err
+		}
 	}
 	return headPlain, bodyPlain, nil
 }

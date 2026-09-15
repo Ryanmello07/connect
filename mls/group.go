@@ -2777,34 +2777,34 @@ func LoadGroup(cfg *GroupConfig, epoch uint64, signer SignaturePrivateKey) (*Gro
 	//     member had already opened is opened again, because the head that would have called it
 	//     consumed is back at zero. That is a lost guard and it is not key reuse -- no key of this
 	//     member's own is drawn twice by it.
-	//   - and a peer that is more than MaxGenerationSkip generations ahead is REFUSED, which was
-	//     unbounded message loss until (*ratchet).peekFor learned to catch up. Measured on a
-	//     settled four before that: alice Protects 1026 times, live bob opens all of them, bob is
-	//     restored, alice Protects once more, and bob answers "generation too far ahead:
-	//     generation 1026, head 0, bound 1024" -- and answers it again for every later message
-	//     alice sends in that epoch, because a refusal left the head where it was. It is now
-	//     bounded -- and the bound is NOT ceil(n/MaxGenerationSkip), which is what this paragraph
-	//     stated until somebody ran it. The refusal advances that peer's head by
-	//     MaxGenerationSkip while the peer advances by ONE, the next message it sends, so the gap
-	//     closes by MaxGenerationSkip-1 per message refused: a member behind by n generations
-	//     loses ceil((n-MaxGenerationSkip)/(MaxGenerationSkip-1)) messages from that peer and then
-	//     reads it again, and loses none at all at or below the bound.
-	//     TestTheCatchUpLosesTheNumberOfMessagesThisDisclosureStates measures both formulas at ten
-	//     values of n derived from the constant; they disagree at seven, and the case named above
-	//     is one of the seven -- n=1026 loses ONE message, where ceil(n/MaxGenerationSkip) says
-	//     two.
-	//   - and "loses" is FIRST DELIVERY rather than the epoch, on a condition the sentence that
-	//     stood here did not carry. A refusal moves that peer's head on by MaxGenerationSkip and
-	//     nothing else moves it, so a RETRANSMISSION of the refused message opens on delivery
-	//     ceil(g/MaxGenerationSkip) -- the second one while g is inside 2*MaxGenerationSkip, and
-	//     one further delivery per MaxGenerationSkip past that. The old sentence said it opens on
-	//     the retransmission full stop, and its case drove g=1026, which is inside the window
-	//     where that is true. Measured across it by
-	//     TestTheGenerationTheCatchUpRefusedOpensOnTheDeliveryThisDisclosureStates, at distances
-	//     derived from the constant: g=1026 opens on the second delivery, g=2049 on the third and
-	//     g=10240 on the tenth. Note the denominator: retransmitting one generation closes the gap
-	//     by the whole bound because the peer is not advancing, which is the same reason the LOSS
-	//     above closes it by one less.
+	//   - and a peer that is more than MaxGenerationSkip generations ahead is REFUSED, for the
+	//     rest of the epoch. Measured on a settled four: alice Protects 1026 times, live bob opens
+	//     all of them, bob is restored, alice Protects once more, and bob answers "generation too
+	//     far ahead: generation 1026, head 0, bound 1024" -- and answers it again for every later
+	//     message alice sends in that epoch, because nothing in this package moves a receiving
+	//     head except a message it ACCEPTS.
+	//     TestARestoredMemberIsDeafToAPeerThatMovedPastTheSkipBound drives it to that end.
+	//
+	//     THIS PARAGRAPH USED TO SAY IT WAS BOUNDED, and the bound it described is gone on
+	//     purpose. (*ratchet).peekFor answered a distance past the bound by walking the head
+	//     forward by MaxGenerationSkip and then refusing, so a restored member closed the gap by
+	//     MaxGenerationSkip-1 per message it lost. That walk was driven by a generation number
+	//     arriving inside sender data sealed under a GROUP SHARED secret, which made it a walk any
+	//     member could aim at any other member's receiving ratchet -- and a head pushed forward is
+	//     a run of that member's messages classified consumed and lost permanently. The
+	//     resynchronisation and the deletion channel were one mechanism, and closing the second
+	//     closed the first. See (*ratchet).classify.
+	//
+	//     WHAT THE DURABLE REPAIR IS, so this reads as a gap with an owner rather than as a
+	//     regression. The distance exists because this blob does not carry the receiving
+	//     positions; a blob that carried them would restore a member that is not behind at all,
+	//     and no header from a peer would have to move anything. That is the fix, it is a change
+	//     to the persisted state's shape, and it is not this one.
+	//   - and "loses" IS the epoch for that peer, which is the sentence a retransmission used to
+	//     soften. While a refusal walked the head on by MaxGenerationSkip, retransmitting the
+	//     refused generation opened it on delivery ceil(g/MaxGenerationSkip). Nothing walks on a
+	//     refusal now, so a retransmission is refused exactly as the first delivery was, however
+	//     many times it arrives. The gap closes when the epoch does.
 	//
 	// WHY NOT PERSIST THE PEERS TOO, since the blob could hold them and they are no more secret
 	// than what it already carries -- the encryption secret it rebuilds derives every leaf's every
@@ -2812,8 +2812,13 @@ func LoadGroup(cfg *GroupConfig, epoch uint64, signer SignaturePrivateKey) (*Gro
 	// epoch boundary and inside sealAndRecordLocked, and RECEIVING writes nothing. Bob in the
 	// measured case never sent, so a blob with peer heads in it would have recorded the zeros it
 	// already assumes. Making it true would mean one PutGroupState per message RECEIVED, which is
-	// a durability boundary this package has not chosen; the catch-up is what bounds the cost of
-	// not choosing it.
+	// a durability boundary this package has not chosen.
+	//
+	// THAT COST USED TO BE BOUNDED BY THE CATCH-UP AND IS NOW NOT BOUNDED AT ALL, and this
+	// paragraph says so rather than leaving the old trade standing. The catch-up bounded it by
+	// letting any member walk any other member's receiving head, which is the deletion channel
+	// (*ratchet).classify describes; a durability boundary is the honest price of closing that,
+	// and choosing it is a change to this blob's shape rather than to the ratchet's.
 	if err := secretTree.RestoreSenderRatchets(ownLeaf, blob.SenderRatchets); err != nil {
 		return nil, fmt.Errorf("%w: %w", errGroupStateSenderRatchet, err)
 	}
