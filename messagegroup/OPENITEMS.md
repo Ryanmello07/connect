@@ -386,3 +386,59 @@ anything on anybody, and option 2 is still not this package's to impose on a com
 does not own. **Nothing here is ruled, and the second step is evidence about the COVERAGE direction
 and about nothing else — it is not evidence that this row is smaller than it was.**
 
+
+---
+
+## MG-4 — a member can no longer open its own application record, and no document says so
+
+**Status: OPEN, FILED NOT RULED. Measured on 2026-09-15 while wiring MASTER §8.4. The behaviour is
+correct and inherent to MLS; what is unruled is what the product does about it.**
+
+### The property
+
+MASTER §8.4.1 makes an application record's `ct_body` plaintext `LP(inner) ‖ 0*`, where `inner` is
+an MLS `PrivateMessage` produced by `Protect`. `Protect` consumes a generation of **this leaf's own
+sending ratchet**, and MLS derives no *receiving* ratchet for a member's own leaf — RFC 9420 §9's
+secret tree gives a member one sender ratchet per leaf, and a member never receives its own
+messages. So `Unprotect` of a frame this device produced answers:
+
+```
+mls: ratchet generation already consumed: generation 0, head 1
+```
+
+`GroupSession.OpenRecord` therefore **refuses a record this same session sealed**, with
+`ErrRecordInnerFrame` wrapping that sentence. Before 2026-09-15 it opened.
+
+### The reproduction
+
+`TestASessionCannotOpenItsOwnApplicationRecordAndThatIsMls` in `mlsframe_test.go`. One member seals
+a DURABLE record with no attachment and opens it; the refusal is `ErrRecordInnerFrame`. The control
+beside it is the same session sealing a **commit** record, which carries no inner frame and opens
+exactly as it always did — so the refusal is the frame's and not the record layer's.
+
+### What the specification says, and it is wrong about this
+
+Spec A §5.2's A-27 paragraph reads *"The change adds a second refusal to a case that already
+refused; it does not make a working call stop working."* The measurement behind it was a **second**
+`OpenRecord` of one record, which already refused at the record layer's skipped-key window. **A
+first `OpenRecord` of one's own record was a working call and it has stopped working.** The quoted
+`mls` error in that paragraph — `generation 0, head 1` — is the error a **first** self-`Unprotect`
+answers, so the two cases were conflated.
+
+### What a ruling has to choose
+
+1. **Nothing, and say so.** A sender renders its own message from the copy it kept and never by
+   decrypting the record it wrote; every real MLS application works this way. Then Spec A §5.2's
+   sentence is corrected and §7 says a client's own sent messages come from the local store.
+2. **Give the sealer back its own plaintext.** `SealRecord` would answer what it framed beside the
+   record, which is a change to a signature Spec A §5.2 publishes in a Go block.
+3. **Exempt a record whose `sender_handle` is this member's own from the inner open.** This is the
+   cheap one and it is the dangerous one: it re-opens exactly the forgery MASTER §8.4 closed,
+   narrowed to self-attribution — any member could seal a record attributed to Alice and **Alice's
+   own device** would render it. This row exists partly so that option is written down as refused
+   rather than rediscovered.
+
+### What is owed elsewhere
+
+A `SPEC-LEDGER.md` number, a correction to Spec A §5.2's sentence, and one sentence from the owner
+about where a device's own sent messages are read from. Nothing here is decided.

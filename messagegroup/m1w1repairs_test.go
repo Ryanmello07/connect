@@ -333,7 +333,7 @@ func TestTheHeadCannotBeSealedBeforeTheBodyHashIsBound(t *testing.T) {
 	var err error
 	if postErr := fixture.session.do(func() {
 		builder, err = fixture.session.newRecordBuilderOnLoop(message.RetentionDurable, 0, 0, false,
-			len(bodyPlain), 0, nil)
+			bodyPlain, 0, nil)
 	}); postErr != nil {
 		t.Fatalf("post the builder command: %v", postErr)
 	}
@@ -341,7 +341,7 @@ func TestTheHeadCannotBeSealedBeforeTheBodyHashIsBound(t *testing.T) {
 		t.Fatalf("newRecordBuilderOnLoop: %v", err)
 	}
 	defer builder.zeroize()
-	bodySealed, err := builder.sealBody(bodyPlain)
+	bodySealed, err := builder.sealBody()
 	if err != nil {
 		t.Fatalf("sealBody: %v", err)
 	}
@@ -522,31 +522,62 @@ func repairStageChain(t *testing.T, sources []messagegroupSource) ([]string, map
 // what the record layer does NOT authenticate
 // ---------------------------------------------------------------------------
 
-// doc.go's honest inventory now says the record layer has no sender authentication. This is that
-// sentence as a case, so the day it stops being true the paragraph is what fails.
+// THIS CASE IS NARROWED AND NOT DELETED, and the narrowing is the whole of what MASTER section 8.4
+// bought and did not buy.
 //
-// Every symbol used here is one any member of the group holds: the class key expands from the
-// storage root every member derives, RecordKeyZero takes a leaf index as an INPUT rather than as a
-// credential, SenderHandle likewise, and write_auth is a mac under a group wide key. So a member
-// seals a record attributed to a leaf it does not own and every other member opens it.
-func TestAnyMemberCanWriteARecordAttributedToAnotherLeaf(t *testing.T) {
-	fixture := newTestSession(t, "no-sender-auth")
+// WHAT IT USED TO ASSERT, verbatim: "a member seals a record attributed to a leaf it does not own
+// and every other member opens it." That was true and is not: TestOneMemberCannotForgeAMessageFromAnother
+// in mlsframe_test.go is the same construction refused, by name, at the sender binding. An
+// unchanged case here would be asserting something no longer true.
+//
+// WHAT SURVIVES IS THE ENVELOPE, and it survives because nothing in the ruling touched it. Every
+// symbol below is still one any member holds -- the class key expands from the storage root every
+// member derives, RecordKeyZero takes a leaf index as an INPUT rather than as a credential,
+// SenderHandle likewise, and write_auth is a mac under a group wide key -- so a member still
+// assembles a record at another member's handle and another member's next stream index that
+// message.EncodeRecord accepts and message.VerifyWriteAuth verifies. Every check the SERVER makes
+// passes. What fails is downstream of the server, at an opener, where the body refuses.
+//
+// SO THE RESIDUE IS A DENIAL AND NOT A FORGERY, and that is ledger open item 205: a server that
+// accepts this record has advanced last_stream_index for that (group_id, sender_handle), and its
+// own monotonicity rule then refuses the true sender's next write. The true sender is squatted out
+// of its own stream by a record nobody will ever read. This case is that sentence, so the day the
+// envelope stops being forgeable -- which needs something the body-only ruling explicitly did not
+// do -- this is the paragraph that fails.
+func TestAnyMemberCanStillSquatAnotherLeafsStreamIndex(t *testing.T) {
+	fixture := newTestSession(t, "index-squatting")
 	const otherLeaf = uint32(3)
 	if fixture.handle.OwnLeafIndex() == otherLeaf {
-		t.Fatalf("this device owns leaf %d, which is the leaf this case forges", otherLeaf)
+		t.Fatalf("this device owns leaf %d, which is the leaf this case squats", otherLeaf)
 	}
 	if err := fixture.session.TrackSender(otherLeaf, message.RetentionDurable, 0, 0, 0); err != nil {
 		t.Fatalf("TrackSender for a leaf this device does not own: %v", err)
 	}
 	record := repairForgeRecord(t, fixture.session, otherLeaf, 0,
-		[]byte("forged head"), []byte("forged by another member"))
+		[]byte("squatted head"), []byte("sealed by another member"))
+
+	// THE SERVER'S WHOLE CHECK, and it passes. repairForgeRecord already required
+	// message.EncodeRecord to accept the record, which is the codec's half; this is the mac,
+	// which is the half that is supposed to say who may write.
+	if !message.VerifyWriteAuth(fixture.session.writeKey, fixture.session.serverNonce, record) {
+		t.Fatal("the squatted record's write_auth does not verify, so a server would refuse it and this case is about nothing")
+	}
+	if record.Header.SenderHandle != SenderHandle(fixture.session.groupHandleKey, otherLeaf) {
+		t.Fatal("the squatted record does not carry the other leaf's sender_handle")
+	}
+
+	// AND THE OPENER REFUSES IT, which is the half MASTER section 8.4 closed. The two clauses
+	// together are the finding: the record reaches the stream and never reaches a reader.
 	headPlain, bodyPlain, err := fixture.session.OpenRecord(record)
-	if err != nil {
-		t.Fatalf("a record attributed to a leaf its writer does not own was refused: %v; if the record layer has grown sender authentication, doc.go's inventory is what has to change", err)
+	if err == nil {
+		t.Fatalf("a record attributed to a leaf its writer does not own OPENED, to %q/%q; MASTER section 8.4's sender binding is what refuses it and mlsframe_test.go is where that is asserted by name",
+			headPlain, bodyPlain)
 	}
-	if string(headPlain) != "forged head" || string(bodyPlain) != "forged by another member" {
-		t.Errorf("the forged record opened to %q/%q", headPlain, bodyPlain)
+	if headPlain != nil || bodyPlain != nil {
+		t.Errorf("the refusal returned %d octets of head and %d of body", len(headPlain), len(bodyPlain))
 	}
+	t.Logf("the envelope is still forgeable and the body is not: a server accepts this record (write_auth verifies, the codec accepts it) and every opener refuses it -- %v. Ledger open item 205: the true sender's own next write is then refused for a stream index it never used",
+		err)
 }
 
 // repairForgeRecord seals one record for any leaf, out of the symbols a group member holds.
@@ -638,10 +669,20 @@ func repairForgeRecord(t *testing.T, session *GroupSession, leaf uint32, streamI
 func TestOpenRecordRefusesTheBlobRungAndTheTwoEphValuesTheRulingCreated(t *testing.T) {
 	fixture := newTestSession(t, "open-refusals")
 	fixture.trackOwn(t)
-	genuine := repairForgeRecord(t, fixture.session, fixture.handle.OwnLeafIndex(), 0,
-		[]byte("head"), []byte("body"))
-	// the control: as built, this record opens. Every case below is that record with one header
-	// field moved, so a refusal below is about the field and not about the fixture.
+	// THE CONTROL IS A COMMIT RECORD SINCE MASTER SECTION 8.4, and the substitution is what this
+	// case's own subject needs rather than a convenience. Every refusal below is taken BEFORE the
+	// body is opened -- the blob rung and the ahead window before any key is derived, the missing
+	// ladder at the ratchet -- so what the control has to be is a record this session can open at
+	// all, and after 2026-09-15 that is a record with no application frame in it (MASTER section
+	// 8.4.1's first row; open item MG-4 is the unruled half). A control that no longer opened
+	// would make every refusal below unfalsifiable.
+	genuine, err := fixture.session.SealRecord(message.RetentionDurable, 0, true,
+		[]byte("head"), []byte("body"), 0, nil)
+	if err != nil {
+		t.Fatalf("SealRecord of the control: %v", err)
+	}
+	// as built, this record opens. Every case below is that record with one header field moved,
+	// so a refusal below is about the field and not about the fixture.
 	if _, _, err := fixture.session.OpenRecord(genuine); err != nil {
 		t.Fatalf("the control record does not open: %v", err)
 	}

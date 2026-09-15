@@ -117,19 +117,29 @@
 // implementation anywhere, so a run over this package's test fake proves the record layer and not
 // the client.
 //
-// AND THE RECORD LAYER HAS NO SENDER AUTHENTICATION AT ALL, which belongs in this inventory
-// because it is the absence a reader is least likely to guess from what is here. Every key a
-// record is sealed under is derived from a GROUP wide secret: the class keys expand from the
-// storage root every member holds, record_key[0] takes the leaf index as an INPUT rather than as
-// a credential, sender_handle is likewise computable by every member for every leaf, and
-// RecordHeader carries no signature -- write_auth is a mac under a key spec A hands to the
-// server. So any member of a group can write a record attributed to any other leaf and it opens
-// cleanly at every other member, and this was reproduced from exported symbols alone rather than
-// argued. That may be inherent to spec A rather than a defect in this code, and it is not
-// something this package can repair on its own authority; what would repair it is a signature
-// over the header, which no section declares. It is recorded here so the absence is in the
-// inventory, and a case in seal_test.go holds it so that the day it stops being true this
-// paragraph is what fails.
+// A MEMBER CANNOT FORGE A MESSAGE FROM ANOTHER MEMBER, and that sentence is dated: it became true
+// on 2026-09-15, when the owner ruled MASTER section 8.4 and an application record's ct_body
+// became a real MLS PrivateMessage. It is in this inventory because the paragraph that stood here
+// said the reverse, at length, and was correct when it was written.
+//
+// THE RECORD LAYER STILL AUTHENTICATES NOTHING ABOUT A WRITER ON ITS OWN, and it cannot: every key
+// it seals under is derived from a GROUP wide secret. The class keys expand from the storage root
+// every member holds, record_key[0] takes the leaf index as an INPUT rather than as a credential,
+// sender_handle is likewise computable by every member for every leaf, and RecordHeader carries no
+// signature -- write_auth is a mac under a key spec A hands to the server. What changed is that
+// ct_body's PLAINTEXT is now an MLS frame signed under the writer's own credential, which is the
+// one secret in this system that is not group shared, and OpenRecord refuses the whole record
+// unless the leaf that signed it is the leaf the record's sender_handle names and the frame's aad
+// is this record's own position. mlsframe.go is where both refusals live.
+//
+// WHAT SURVIVES IS THE ENVELOPE, and it is a DENIAL rather than a forgery. A member still
+// assembles a record at another member's handle and another member's next stream index that the
+// codec accepts and whose write_auth verifies, so a server accepts it and advances that sender's
+// last_stream_index -- and the true sender's own next write is then refused for an index it never
+// used. No opener renders it. That is ledger open item 205, it is not something this package can
+// repair on its own authority, and the ruling's scope was the body alone. The five header fields
+// no signature can reach -- is_commit, size_bucket, expire_at, blob_id, H(server_attachment) --
+// are ledger open item 199 for the same reason.
 //
 // TWO CHANGES TO THIS PACKAGE'S EXPORTED SURFACE ARRIVED WITH THE 2026-09-13 RULING, and they are
 // recorded in this inventory because that is where this package says what it is: a renamed

@@ -333,6 +333,45 @@ var (
 	// reaching this means the plaintext authenticated and is still not a padded body -- which
 	// is a sealer and a reader that disagree rather than an attacker.
 	ErrBodyPadding = errors.New("messagegroup: a record body did not unpad")
+	// ------------------------------------------------------------------
+	// MASTER section 8.4, RULED 2026-09-15: the inner MLS frame of an application record
+	// ------------------------------------------------------------------
+
+	// Fires when an application record's ct_body plaintext is not an MLS PrivateMessage this
+	// group can open. MASTER section 8.4.1 makes ct_body's plaintext LP(inner) | 0*, where
+	// inner is one marshalled MLSMessage produced by GroupHandle.Protect, so everything mls
+	// refuses about that frame -- octets that are not an MLSMessage, a wire format that is not
+	// a PrivateMessage, a signature that does not verify under the signing leaf's credential,
+	// an epoch this group is not at, a ratchet generation already consumed -- arrives here
+	// wrapped.
+	//
+	// IT IS WRAPPED AND NOT REPLACED. The mls error is the %w of the second verb, so
+	// errors.Is reaches both this sentinel and whatever mls said, and a caller that wants to
+	// tell "not a frame at all" from "a frame somebody else signed" still can.
+	//
+	// THE SEAL PATH REACHES IT TOO. Protect is what the sealer calls, and a group that cannot
+	// protect -- a closed handle, an exhausted ratchet -- is a record that was never built.
+	ErrRecordInnerFrame = errors.New("messagegroup: an application record's inner MLS frame did not open")
+	// MASTER section 8.4.3's R1, the SENDER binding, and it is the refusal that turns "someone
+	// in this group wrote this" into "Alice wrote this".
+	//
+	// The record layer cannot make that statement on its own: every octet it seals under is
+	// group-shared by construction -- the class keys expand from a storage root every member
+	// derives, record_key[0] takes a leaf index as an INPUT, and sender_handle is computable by
+	// every member for every leaf. The inner frame is signed under the sender's own credential,
+	// which is the one secret in the system that is not group-shared, so this is where the two
+	// answers to "who wrote this" are required to agree.
+	ErrRecordSenderBinding = errors.New("messagegroup: the leaf that signed this record's inner frame is not the leaf its sender_handle names")
+	// MASTER section 8.4.3's R2, the POSITION binding, and it is what makes aad_mls
+	// load-bearing rather than decorative.
+	//
+	// MLS verifies that the sender signed WHATEVER authenticated_data the frame carries; only
+	// this layer knows which aad THIS record's position produces. Without the comparison a
+	// member who cannot forge Alice's signature can still re-envelope a frame Alice signed into
+	// another stream_index -- a replay into a later conversational position -- or into another
+	// retention class, so a DURABLE message self-destructs within the hour or an EPH one never
+	// does.
+	ErrRecordPositionBinding = errors.New("messagegroup: this record's inner frame was signed for a different record's position")
 	// Fires when a record on the blob rung reaches the sealer or the reader. The blob object,
 	// its identifier and its padder are task 20's and none of them exists yet; a record whose
 	// body lives somewhere this package cannot address is refused rather than opened empty.

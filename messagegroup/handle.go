@@ -64,6 +64,11 @@ const (
 	groupHandleKeyInfo   = "gh/v1"
 	senderHandleInfo     = "sh/v1"
 	wrapTargetHandleInfo = "wt/v1"
+	// MASTER section 8.4.5's message_id, RULED 2026-09-15. It is a fourth member of this
+	// family rather than a neighbour of it: it takes group_handle_key for the same reason
+	// sender_handle does, and it is written as its own constant for the reason the three
+	// above it are.
+	messageIdInfo = "mid/v1"
 )
 
 // The widths MASTER section 8 gives: the group handle key is thirty two octets and both handles
@@ -78,6 +83,8 @@ const (
 const (
 	groupHandleKeyBytes = 32
 	handleBytes         = 16
+	// MASTER section 8.4.5 gives message_id as thirty two octets.
+	messageIdBytes = 32
 )
 
 // GroupHandleKey derives group_handle_key from the group's EPOCH ZERO storage root.
@@ -114,6 +121,66 @@ func GroupHandleKey(storageRootEpoch0 []byte) []byte {
 func SenderHandle(groupHandleKey []byte, leaf uint32) [16]byte {
 	refuseShortGroupHandleKey(groupHandleKey)
 	return [16]byte(keyScheduleExpand(groupHandleKey, leafLabelledInfo(senderHandleInfo, leaf), handleBytes))
+}
+
+// MessageId derives MASTER section 8.4.5's identifier for one record.
+//
+//	message_id = HKDF-Expand(group_handle_key,
+//	                         "mid/v1" | LP(group_id) | LP(sender_handle) | u64(stream_index), 32)
+//
+// RULED 2026-09-15, and it is in this file rather than in keyschedule.go because it takes the
+// same key as SenderHandle one derivation up and for the same reason: group_handle_key is the
+// group's one LIFETIME value, fixed at creation and never rotated, so an id expanded from it
+// survives every commit. A reply to a message four epochs old still names it. An id under
+// storage_root[n] would be a different id at every epoch, which is an id the thing it names
+// cannot be found by.
+//
+// IT IS KEYED AND NOT HASHED, and that is the whole of why it takes a key at all. All three
+// inputs are PLAINTEXT record header fields that the message server holds for every record it
+// stores, so an unkeyed digest of them would be an identifier the server computes for free --
+// a join key between any message_id that ever leaves a client and the row it names. Every
+// member already holds group_handle_key or cannot compute its own sender_handle and therefore
+// cannot write at all, so keying costs no distribution.
+//
+// THE THREE INPUTS ARE THE TRIPLE MLS SIGNS, which is the second half of the 2026-09-15 ruling
+// and is what makes this an id rather than a label. (group_id, sender_handle, stream_index) sits
+// inside AAD_body; AAD_body is hashed into aad_mls; aad_mls is the inner frame's
+// authenticated_data, which is inside FramedContentTBS and therefore inside the sender's own
+// signature. Before MASTER section 8.4.1 the same triple was covered by a group-wide key alone,
+// so the id was the GROUP's claim; it is now the SENDER's.
+//
+// NEITHER SIDE NEEDS THE BODY. The sender has the reserved stream_index before it seals, so a
+// reply can name its own parent optimistically; a receiver reads all three fields off the
+// plaintext header, so an EPH row whose ct_body has been erased still has its id for the
+// placeholder that must render in order. That is why the MLS generation is NOT one of the
+// inputs: it lives inside the encrypted SenderData, and an id that needs the body cannot key a
+// row that outlives the body.
+//
+// LP(x) here wraps a BYTE STRING and not an integer, so it carries none of the ambiguity open
+// item M1-8 records about LP(leaf_index): group_id is thirty two octets and sender_handle is
+// sixteen, so the info is 6 + (4+32) + (4+16) + 8 = 70 octets exactly.
+//
+// The SDK spells the answer as sixty four lowercase hex characters (spec A section 7.1). Where a
+// preimage takes LP(message_id) it takes THESE THIRTY TWO OCTETS and never the spelling.
+//
+// It panics on a group handle key of the wrong width, which is SenderHandle's shape and
+// SenderHandle's reason: the published signature has no error, and the alternative is a well
+// formed id derived from a truncated key -- an id every other member of the group would compute
+// differently for the same record.
+func MessageId(groupHandleKey []byte, groupId [32]byte, senderHandle [16]byte,
+	streamIndex uint64) [32]byte {
+
+	refuseShortGroupHandleKey(groupHandleKey)
+	writer := syntax.NewWriter()
+	writer.WriteRaw([]byte(messageIdInfo))
+	writer.WriteOpaqueLP(groupId[:])
+	writer.WriteOpaqueLP(senderHandle[:])
+	writer.WriteUint64(streamIndex)
+	info, err := writer.Bytes()
+	if err != nil {
+		panic(fmt.Errorf("messagegroup: a message id's info could not be built: %w", err))
+	}
+	return [32]byte(keyScheduleExpand(groupHandleKey, info, messageIdBytes))
 }
 
 // WrapTargetHandle derives the handle one device wrap of one epoch is addressed to.

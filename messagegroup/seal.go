@@ -9,6 +9,21 @@
 //	compute write_auth. Every dependency is acyclic, and getting it wrong produces a circular
 //	AAD that appears to work until two implementations disagree.
 //
+// THE ORDER GAINED ONE STAGE AT THE FRONT ON 2026-09-15, and the published signatures did not
+// move. MASTER section 8.4 makes an APPLICATION record's ct_body a real MLS PrivateMessage, so
+// spec A section 5.2's order now reads
+//
+//	reserve stream_index -> build aad_mls -> inner = Protect(aad_mls, bodyPlain) ->
+//	build server_attachment -> encrypt ct_body over LP(inner) | 0* -> ... as before.
+//
+// Protect comes AFTER the reservation because aad_mls is a digest of AAD_body and AAD_body
+// carries stream_index: there is no legal ordering in which the frame is built first. That is why
+// the framing lives inside newRecordBuilderOnLoop rather than in front of it, and why the SIZE
+// BUCKET is chosen after the frame exists -- the rung has to name what is sealed, and the frame is
+// 193 to 198 octets larger than the caller's body. mlsframe.go holds the whole of that stage, and
+// SealRecord's and OpenRecord's signatures are untouched because GroupHandle already declared
+// Protect and Unprotect.
+//
 // The staging types below are that order. recordBuilder is what exists once the attachment is
 // encoded and the stream index is reserved; the only thing it can do is seal the body, and what
 // that answers is a recordBodySealed; the only thing THAT can do is bind body_hash; and so on to
@@ -157,12 +172,12 @@ func (self *GroupSession) sealRecordOnLoop(class message.RetentionClass, ephBuck
 	if err != nil {
 		return nil, err
 	}
-	builder, err := self.newRecordBuilderOnLoop(class, ephBucket, ephWindow, isCommit, len(bodyPlain), expireAt, serverAttachment)
+	builder, err := self.newRecordBuilderOnLoop(class, ephBucket, ephWindow, isCommit, bodyPlain, expireAt, serverAttachment)
 	if err != nil {
 		return nil, err
 	}
 	defer builder.zeroize()
-	bodySealed, err := builder.sealBody(bodyPlain)
+	bodySealed, err := builder.sealBody()
 	if err != nil {
 		return nil, err
 	}
@@ -274,6 +289,17 @@ type recordBuilder struct {
 	header    message.RecordHeader
 	recordKey []byte
 	bucket    message.SizeBucket
+	// THE OCTETS ct_body IS SEALED OVER, which since MASTER section 8.4 are not always the
+	// caller's own body: for an application record they are the marshalled MLS PrivateMessage
+	// frameBodyOnLoop produced, and for a commit, a wrap, an epoch fan out and a completion
+	// marker they are the caller's body unchanged.
+	//
+	// It is carried on the stage rather than passed to sealBody, and that is the same move
+	// bindBodyHash makes one stage down. The bucket is a function of THESE octets and not of
+	// the caller's -- the frame is 193 to 198 octets larger -- so a sealBody that still took
+	// the caller's plaintext could be handed a body the header's size_bucket does not name,
+	// and SizeBucketCtBodyBytes is an equality the codec enforces.
+	bodySeal []byte
 }
 
 // newRecordBuilderOnLoop reserves the stream index and stages the header.
@@ -284,7 +310,7 @@ type recordBuilder struct {
 // through here, and seal_test.go walks the call graph to say so rather than trusting this
 // sentence.
 func (self *GroupSession) newRecordBuilderOnLoop(class message.RetentionClass, ephBucket uint8,
-	ephWindow uint64, isCommit bool, bodyLength int, expireAt uint64,
+	ephWindow uint64, isCommit bool, bodyPlain []byte, expireAt uint64,
 	serverAttachment *message.ServerAttachment) (*recordBuilder, error) {
 
 	// (c): the encoder's answer and not a second nil check. A nil attachment and an
@@ -298,8 +324,14 @@ func (self *GroupSession) newRecordBuilderOnLoop(class message.RetentionClass, e
 	if err != nil {
 		return nil, err
 	}
-	bucket, err := bucketForBody(bodyLength)
-	if err != nil {
+	// THE CHEAP HALF OF THE LADDER REFUSAL, TAKEN BEFORE ANYTHING IS SPENT. It is necessary
+	// and NOT sufficient: the octets actually sealed are 193 to 198 longer than these for an
+	// application record, so the real bucket is computed below, over the frame. What this buys
+	// is that a body no rung could hold under ANY framing costs neither a stream index nor an
+	// MLS generation, which is what it cost before MASTER section 8.4 moved the bucket. The
+	// 198 octet band that fits here and not below is ledger open item 203, and a body in it
+	// spends both.
+	if _, err := bucketForBody(len(bodyPlain)); err != nil {
 		return nil, err
 	}
 	ratchet, err := self.senderRatchetOnLoop(class, retentionWire, ephBucket, ephWindow)
@@ -310,10 +342,36 @@ func (self *GroupSession) newRecordBuilderOnLoop(class message.RetentionClass, e
 	if err != nil {
 		return nil, err
 	}
+	// FROM HERE THE INDEX IS SPENT AND THE RUNG IS THIS FUNCTION'S TO ERASE. The caller's
+	// deferred builder.zeroize() only exists once a builder does, so every refusal below owes
+	// the erasure itself.
+	bodySeal, err := self.frameBodyOnLoop(isCommit, attachmentBytes, message.BodyBinding{
+		GroupId:        self.groupId,
+		SenderHandle:   self.senderHandle,
+		Epoch:          self.epoch,
+		StreamIndex:    streamIndex,
+		RetentionClass: class,
+		EphBucket:      ephBucket,
+		EphWindow:      ephWindow,
+	}, bodyPlain)
+	if err != nil {
+		zeroize(recordKey)
+		return nil, err
+	}
+	// AND THE BUCKET IS A FUNCTION OF WHAT IS SEALED, never of what the caller handed in.
+	// octet_length(ct_body) is unchanged at every rung by this ruling -- the rung is what is
+	// sealed and the frame sits inside it -- which is exactly why the rung has to be chosen
+	// after the frame exists rather than before.
+	bucket, err := bucketForBody(len(bodySeal))
+	if err != nil {
+		zeroize(recordKey)
+		return nil, err
+	}
 	return &recordBuilder{
 		session:   self,
 		recordKey: recordKey,
 		bucket:    bucket,
+		bodySeal:  bodySeal,
 		header: message.RecordHeader{
 			GroupId:        self.groupId,
 			SenderHandle:   self.senderHandle,
@@ -349,12 +407,20 @@ func (self *recordBuilder) zeroize() {
 	zeroize(self.recordKey)
 }
 
-// sealBody pads the plaintext into its rung and seals it under record_key's body half.
+// sealBody pads what this builder was staged with into its rung and seals it under record_key's
+// body half.
+//
+// IT TAKES NO PLAINTEXT ANY MORE, and that is not tidying. Since MASTER section 8.4 the octets
+// ct_body is sealed over are a function of the stream index -- an application record's body is an
+// MLS frame whose authenticated_data is a digest of AAD_body, which carries stream_index -- so
+// they cannot exist before the stage that reserves it. A sealBody still taking a []byte would be
+// a sealBody that could be handed the caller's plaintext under a header whose size_bucket names
+// the frame, which is a record message.EncodeRecord refuses and no reader would ever have seen.
 //
 // The aad is built from a BodyBinding, which is guardrail G4: the builder AADBody is handed has
 // no hash within its reach, so body_hash cannot be put in aad_body by any edit to this line.
-func (self *recordBuilder) sealBody(bodyPlain []byte) (*recordBodySealed, error) {
-	padded, err := padBody(self.bucket, bodyPlain)
+func (self *recordBuilder) sealBody() (*recordBodySealed, error) {
+	padded, err := padBody(self.bucket, self.bodySeal)
 	if err != nil {
 		return nil, err
 	}
@@ -646,6 +712,16 @@ func (self *GroupSession) openRecordOnLoop(record *message.Record) ([]byte, []by
 		return nil, nil, err
 	}
 	bodyPlain, err := unpadBody(header.SizeBucket, padded)
+	if err != nil {
+		return nil, nil, err
+	}
+	// MASTER section 8.4: for an application record what just unpadded is an MLS
+	// PrivateMessage and not the message. Opening it is what answers "Alice wrote this"
+	// rather than "somebody in this group did", and the two refusals it takes are the whole
+	// of what this ruling bought. It runs BEFORE the commit below for the reason
+	// unframeBodyOnLoop's comment gives: a forged envelope that moved the receiver's ladder
+	// would deny the true sender its own next index.
+	bodyPlain, err = self.unframeBodyOnLoop(&header, bodyPlain)
 	if err != nil {
 		return nil, nil, err
 	}

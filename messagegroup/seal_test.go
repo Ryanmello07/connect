@@ -525,7 +525,16 @@ func TestBodyHashIsTheHashOfTheSealedBodyAndIsNotInTheBodyAad(t *testing.T) {
 // rather than by reimplementing checkRecord here.
 func TestASealedRecordIsExactlyItsRungAndIsOneTheCodecAccepts(t *testing.T) {
 	fixture := newTestSession(t, "rungs")
-	for _, bodyLength := range []int{0, 1, 100, 252, 253, 1020, 4092, 16380} {
+	// THE LENGTHS MOVED WITH MASTER SECTION 8.4 AND THE PROPERTY DID NOT. They used to be the
+	// old capacities and their successors -- 252/253, 1020, 4092, 16380 -- and the frame is 193
+	// to 198 octets, so every one of those now lands a rung higher. What is walked is the same
+	// thing it always was: each rung's capacity and the first length that does not fit it, taken
+	// from mlsframe_test.go's MEASURED column rather than from arithmetic on the ladder.
+	lengths := []int{0, 1}
+	for bucket := message.SizeBucket(0); bucket < message.SizeBucketBlob-1; bucket += 1 {
+		lengths = append(lengths, applicationBodyCapacity[bucket], applicationBodyCapacity[bucket]+1)
+	}
+	for _, bodyLength := range lengths {
 		body := bytes.Repeat([]byte{0x5a}, bodyLength)
 		record, err := fixture.session.SealRecord(message.RetentionDurable, 0, false, []byte("head"), body, 0, nil)
 		if err != nil {
@@ -540,11 +549,14 @@ func TestASealedRecordIsExactlyItsRungAndIsOneTheCodecAccepts(t *testing.T) {
 			t.Errorf("a record SealRecord answered is one EncodeRecord refuses: %v", err)
 		}
 		// the rung is the SMALLEST that fits, which is what keeps padding from disclosing more
-		// than the ladder already does.
+		// than the ladder already does. "Fits" is now a statement about the FRAME and not about
+		// the caller's plaintext, which is why the bound is the measured capacity of the rung
+		// below rather than that rung's octet count minus a length prefix.
 		if 0 < record.Header.SizeBucket {
-			smaller := message.SizeBucketBytes(record.Header.SizeBucket - 1)
-			if bodyLength+lpPrefixBytes <= smaller {
-				t.Errorf("a %d octet body went to rung %d and fits rung %d", bodyLength, record.Header.SizeBucket, record.Header.SizeBucket-1)
+			if bodyLength <= applicationBodyCapacity[record.Header.SizeBucket-1] {
+				t.Errorf("a %d octet body went to rung %d and fits rung %d, whose measured capacity is %d",
+					bodyLength, record.Header.SizeBucket, record.Header.SizeBucket-1,
+					applicationBodyCapacity[record.Header.SizeBucket-1])
 			}
 		}
 	}
@@ -637,11 +649,14 @@ func TestASessionWithNoEphRootRefusesExactlyTheEphWireBytes(t *testing.T) {
 
 // The two endpoints of the padding range are where an unpadder is wrong.
 func TestASealedRecordOpensToExactlyWhatWentIn(t *testing.T) {
-	fixture := newTestSession(t, "round-trip")
-	fixture.trackOwn(t)
+	pair := newTestPair(t, "round-trip")
+	pair.trackDurable(t)
 	for bucket := message.SizeBucket(0); bucket < message.SizeBucketBlob; bucket += 1 {
-		rung := message.SizeBucketBytes(bucket)
-		for _, bodyLength := range []int{0, 1, rung - lpPrefixBytes} {
+		// the two endpoints of the range, where an unpadder is wrong. The upper one is the
+		// rung's MEASURED application capacity since MASTER section 8.4 put a 193 to 198 octet
+		// frame inside it; rung - lpPrefixBytes is what ct_body's PLAINTEXT holds and is no
+		// longer what a caller may hand in.
+		for _, bodyLength := range []int{0, 1, applicationBodyCapacity[bucket]} {
 			if bodyLength < 0 {
 				continue
 			}
@@ -650,17 +665,17 @@ func TestASealedRecordOpensToExactlyWhatWentIn(t *testing.T) {
 				body[i] = byte(i*7 + 3)
 			}
 			head := []byte(fmt.Sprintf("head for rung %d length %d", bucket, bodyLength))
-			record, err := fixture.session.SealRecord(message.RetentionDurable, 0, false, head, body, 0, nil)
+			record, err := pair.sender.SealRecord(message.RetentionDurable, 0, false, head, body, 0, nil)
 			if err != nil {
 				t.Fatalf("SealRecord rung %d length %d: %v", bucket, bodyLength, err)
 			}
 			if record.Header.SizeBucket != bucket {
 				// the smallest rung that fits, so only the exact-fit case lands here
-				if bodyLength == rung-lpPrefixBytes {
-					t.Errorf("a body of exactly rung %d's capacity landed on rung %d", bucket, record.Header.SizeBucket)
+				if bodyLength == applicationBodyCapacity[bucket] {
+					t.Errorf("a body of exactly rung %d's measured capacity landed on rung %d", bucket, record.Header.SizeBucket)
 				}
 			}
-			gotHead, gotBody, err := fixture.session.OpenRecord(record)
+			gotHead, gotBody, err := pair.opener.OpenRecord(record)
 			if err != nil {
 				t.Fatalf("OpenRecord rung %d length %d: %v", bucket, bodyLength, err)
 			}
@@ -730,6 +745,16 @@ func TestThePadderAndTheUnpadderAreInverses(t *testing.T) {
 // What it DOES establish is real and is the record layer's half: a record sealed by a session
 // that holds only its own ratchets opens in a session that was never handed them, because both
 // derived the same ladder from the same epoch.
+//
+// AND SINCE MASTER SECTION 8.4 THE RECORD IT CARRIES IS A COMMIT RECORD, which is a narrowing and
+// is stated rather than quietly done. Two sessions over ONE group handle share one MLS group, so
+// the second session's Unprotect of the first's frame meets the same exhausted sending ratchet the
+// first would -- open item MG-4. A commit record carries no application frame at all (MASTER
+// section 8.4.1's first row), so it is the shape in which this case's own subject, the RECORD
+// LAYER's ladder, is still observable through two sessions over one handle. The second clause
+// below asserts the application arm's new refusal, so the narrowing is visible here rather than
+// only in this comment, and TestADurableRecordSealedByTheFounderOpensAtTheJoiner is where the
+// application arm's round trip lives now: two devices, two leaves, a real join.
 func TestARecordSealedByOneSessionOpensInASecondOneOverTheSameEpoch(t *testing.T) {
 	fixture := newTestSession(t, "two-sessions")
 	sender := fixture.session
@@ -744,7 +769,7 @@ func TestARecordSealedByOneSessionOpensInASecondOneOverTheSameEpoch(t *testing.T
 	}
 	for index := range 3 {
 		body := []byte(fmt.Sprintf("message %d", index))
-		record, err := sender.SealRecord(message.RetentionDurable, 0, false, []byte("head"), body, 0, nil)
+		record, err := sender.SealRecord(message.RetentionDurable, 0, true, []byte("head"), body, 0, nil)
 		if err != nil {
 			t.Fatalf("SealRecord %d: %v", index, err)
 		}
@@ -755,6 +780,19 @@ func TestARecordSealedByOneSessionOpensInASecondOneOverTheSameEpoch(t *testing.T
 		if !bytes.Equal(gotHead, []byte("head")) || !bytes.Equal(gotBody, body) {
 			t.Errorf("record %d came back %q / %q", index, gotHead, gotBody)
 		}
+	}
+
+	// AND THE APPLICATION ARM, which is what this case used to carry and no longer can. Two
+	// sessions over ONE handle are one MLS member, so the frame the first sealed is one the
+	// second has no receiving ratchet for -- and the refusal names the frame rather than the
+	// ladder, which is what says the record layer's half above is still doing its work.
+	application, err := sender.SealRecord(message.RetentionDurable, 0, false, []byte("head"), []byte("body"), 0, nil)
+	if err != nil {
+		t.Fatalf("SealRecord of an application record: %v", err)
+	}
+	if _, _, err := receiver.OpenRecord(application); !errors.Is(err, ErrRecordInnerFrame) {
+		t.Errorf("a second session over the same handle opened an application record with %v; two sessions over one handle are one MLS member, so the answer is ErrRecordInnerFrame and open item MG-4 is what is unruled about it",
+			err)
 	}
 }
 
@@ -769,7 +807,7 @@ func TestARecordSealedByOneSessionOpensInASecondOneOverTheSameEpoch(t *testing.T
 // derived and some fail inside an aead; the property is that none of them opens, and which of the
 // two refuses is not what is being asserted.
 func TestEveryFieldOfARecordIsAuthenticatedByTheOpen(t *testing.T) {
-	fixture := newTestSession(t, "authenticated")
+	pair := newTestPair(t, "authenticated")
 	header := reflect.TypeOf(message.RecordHeader{})
 	if header.NumField() == 0 {
 		t.Fatal("message.RecordHeader declares no fields, so this case read nothing")
@@ -780,17 +818,17 @@ func TestEveryFieldOfARecordIsAuthenticatedByTheOpen(t *testing.T) {
 		if !field.IsExported() {
 			continue
 		}
-		fixture.trackOwn(t)
-		record, err := fixture.session.SealRecord(message.RetentionDurable, 0, false,
+		pair.trackDurable(t)
+		record, err := pair.sender.SealRecord(message.RetentionDurable, 0, false,
 			[]byte("head"), []byte("body"), 0, nil)
 		if err != nil {
 			t.Fatalf("SealRecord: %v", err)
 		}
-		if _, _, err := fixture.session.OpenRecord(record); err != nil {
+		if _, _, err := pair.opener.OpenRecord(record); err != nil {
 			t.Fatalf("the unmutated record does not open, so every mutation below would pass over a broken fixture: %v", err)
 		}
-		fixture.trackOwn(t)
-		mutated, err := fixture.session.SealRecord(message.RetentionDurable, 0, false,
+		pair.trackDurable(t)
+		mutated, err := pair.sender.SealRecord(message.RetentionDurable, 0, false,
 			[]byte("head"), []byte("body"), 0, nil)
 		if err != nil {
 			t.Fatalf("SealRecord: %v", err)
@@ -801,7 +839,7 @@ func TestEveryFieldOfARecordIsAuthenticatedByTheOpen(t *testing.T) {
 			continue
 		}
 		moved += 1
-		if _, _, err := fixture.session.OpenRecord(mutated); err == nil {
+		if _, _, err := pair.opener.OpenRecord(mutated); err == nil {
 			t.Errorf("a record whose %s was moved still opened; every field of the header is covered by aad_head, which is MASTER invariant I6",
 				field.Name)
 		}
@@ -810,8 +848,8 @@ func TestEveryFieldOfARecordIsAuthenticatedByTheOpen(t *testing.T) {
 		t.Fatal("no header field was moved at all, so this case asserted nothing")
 	}
 	// and the two ciphertexts, one bit at a time.
-	fixture.trackOwn(t)
-	record, err := fixture.session.SealRecord(message.RetentionDurable, 0, false, []byte("head"), []byte("body"), 0, nil)
+	pair.trackDurable(t)
+	record, err := pair.sender.SealRecord(message.RetentionDurable, 0, false, []byte("head"), []byte("body"), 0, nil)
 	if err != nil {
 		t.Fatalf("SealRecord: %v", err)
 	}
@@ -824,14 +862,14 @@ func TestEveryFieldOfARecordIsAuthenticatedByTheOpen(t *testing.T) {
 	} {
 		for _, offset := range []int{0, 1, len(part.at(record)) - 1} {
 			for _, bit := range []uint{0, 3, 7} {
-				fixture.trackOwn(t)
-				fresh, err := fixture.session.SealRecord(message.RetentionDurable, 0, false, []byte("head"), []byte("body"), 0, nil)
+				pair.trackDurable(t)
+				fresh, err := pair.sender.SealRecord(message.RetentionDurable, 0, false, []byte("head"), []byte("body"), 0, nil)
 				if err != nil {
 					t.Fatalf("SealRecord: %v", err)
 				}
 				octets := part.at(fresh)
 				octets[offset] ^= 1 << bit
-				if _, _, err := fixture.session.OpenRecord(fresh); err == nil {
+				if _, _, err := pair.opener.OpenRecord(fresh); err == nil {
 					t.Errorf("a record with bit %d of %s[%d] flipped still opened", bit, part.name, offset)
 				}
 			}
@@ -880,20 +918,20 @@ func sealMoveHeaderField(field reflect.Value) bool {
 // before a key is derived from it, so a peek that moved the head would let a forged header
 // destroy the honest rungs behind it.
 func TestAnIndexOutsideTheWindowIsRefusedAndMovesNothing(t *testing.T) {
-	fixture := newTestSession(t, "out-of-window")
-	fixture.trackOwn(t)
-	first, err := fixture.session.SealRecord(message.RetentionDurable, 0, false, []byte("head"), []byte("body"), 0, nil)
+	pair := newTestPair(t, "out-of-window")
+	pair.trackDurable(t)
+	first, err := pair.sender.SealRecord(message.RetentionDurable, 0, false, []byte("head"), []byte("body"), 0, nil)
 	if err != nil {
 		t.Fatalf("SealRecord: %v", err)
 	}
 	forged := *first
 	forged.Header = first.Header
 	forged.Header.StreamIndex = first.Header.StreamIndex + uint64(DefaultRecordWindowSize) + 1
-	if _, _, err := fixture.session.OpenRecord(&forged); !errors.Is(err, ErrOutOfWindow) {
+	if _, _, err := pair.opener.OpenRecord(&forged); !errors.Is(err, ErrOutOfWindow) {
 		t.Errorf("a record naming an index past the window answered %v, want ErrOutOfWindow", err)
 	}
 	// and the honest record still opens, which is what says the refusal moved nothing.
-	head, body, err := fixture.session.OpenRecord(first)
+	head, body, err := pair.opener.OpenRecord(first)
 	if err != nil {
 		t.Fatalf("the honest record no longer opens after a forged header was refused: %v", err)
 	}
@@ -903,10 +941,10 @@ func TestAnIndexOutsideTheWindowIsRefusedAndMovesNothing(t *testing.T) {
 	// a hundred forged headers cost nothing durable either, which is the cumulative half: the
 	// committing form moved the head on every ACCEPTED jump, so a hundred of them walked it
 	// thousands of rungs past every honest record behind it.
-	fixture.trackOwn(t)
+	pair.trackDurable(t)
 	honest := []*message.Record{}
 	for range 4 {
-		record, err := fixture.session.SealRecord(message.RetentionDurable, 0, false, []byte("head"), []byte("body"), 0, nil)
+		record, err := pair.sender.SealRecord(message.RetentionDurable, 0, false, []byte("head"), []byte("body"), 0, nil)
 		if err != nil {
 			t.Fatalf("SealRecord: %v", err)
 		}
@@ -916,12 +954,12 @@ func TestAnIndexOutsideTheWindowIsRefusedAndMovesNothing(t *testing.T) {
 		jump := *honest[0]
 		jump.Header = honest[0].Header
 		jump.Header.StreamIndex = honest[0].Header.StreamIndex + uint64(attempt)*16 + 8
-		if _, _, err := fixture.session.OpenRecord(&jump); err == nil {
+		if _, _, err := pair.opener.OpenRecord(&jump); err == nil {
 			t.Fatalf("a forged header at index %d opened", jump.Header.StreamIndex)
 		}
 	}
 	for i, record := range honest {
-		if _, _, err := fixture.session.OpenRecord(record); err != nil {
+		if _, _, err := pair.opener.OpenRecord(record); err != nil {
 			t.Errorf("honest record %d at index %d no longer opens after a hundred forged headers: %v",
 				i, record.Header.StreamIndex, err)
 		}
@@ -1135,9 +1173,9 @@ func TestOpenRecordNeverTrustsTheRecordId(t *testing.T) {
 	}
 	t.Logf("%d declaration(s) on the open path: %v", len(reachable), slices.Sorted(maps.Keys(reachable)))
 
-	fixture := newTestSession(t, "record-id")
-	fixture.trackOwn(t)
-	record, err := fixture.session.SealRecord(message.RetentionDurable, 0, false, []byte("head"), []byte("body"), 0, nil)
+	pair := newTestPair(t, "record-id")
+	pair.trackDurable(t)
+	record, err := pair.sender.SealRecord(message.RetentionDurable, 0, false, []byte("head"), []byte("body"), 0, nil)
 	if err != nil {
 		t.Fatalf("SealRecord: %v", err)
 	}
@@ -1145,7 +1183,7 @@ func TestOpenRecordNeverTrustsTheRecordId(t *testing.T) {
 		t.Errorf("SealRecord set RecordId to %d; it is the server's to assign", record.RecordId)
 	}
 	record.RecordId = 1 << 40
-	if _, _, err := fixture.session.OpenRecord(record); err != nil {
+	if _, _, err := pair.opener.OpenRecord(record); err != nil {
 		t.Errorf("a record whose RecordId the server had assigned did not open: %v", err)
 	}
 }

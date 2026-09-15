@@ -660,6 +660,13 @@ var recordKeyOneWayProbes = map[string]func(secret []byte) [][]byte{
 		return [][]byte{record.CtHead, record.CtBody, record.WriteAuth[:], record.Header.BodyHash[:],
 			record.Header.SenderHandle[:]}
 	},
+	// THE RECORD THIS PROBE OPENS IS A COMMIT RECORD, and the substitution is derived rather
+	// than convenient. Since MASTER section 8.4 an APPLICATION record's ct_body is an MLS frame
+	// and a member has no receiving ratchet for its own leaf, so a one member probe cannot open
+	// what it sealed at all (open item MG-4) and a probe that answered nothing would trip the
+	// empty-answer clause below. A commit record carries no application frame (section 8.4.1's
+	// first row) and takes exactly the same record layer derivations -- the same ladder rung, the
+	// same two AEAD expansions, the same aads -- so what this probe observes is unchanged.
 	"OpenRecord": func(secret []byte) [][]byte {
 		fixture, err := buildProbeSession(secret)
 		if err != nil {
@@ -669,7 +676,7 @@ var recordKeyOneWayProbes = map[string]func(secret []byte) [][]byte{
 		if err := fixture.session.TrackSender(fixture.handle.OwnLeafIndex(), message.RetentionDurable, 0, 0, 0); err != nil {
 			return nil
 		}
-		record, err := fixture.session.SealRecord(message.RetentionDurable, 0, false,
+		record, err := fixture.session.SealRecord(message.RetentionDurable, 0, true,
 			[]byte("head"), []byte("body"), 0, nil)
 		if err != nil {
 			return nil
@@ -679,6 +686,24 @@ var recordKeyOneWayProbes = map[string]func(secret []byte) [][]byte{
 			return nil
 		}
 		return [][]byte{headPlain, bodyPlain}
+	},
+	// MASTER section 8.4.5's message_id, whose key is group_handle_key -- so the rung arrives
+	// as that key and every octet of the identifier is a function of it.
+	"MessageId": func(secret []byte) [][]byte {
+		groupId := [32]byte{}
+		handle := [16]byte{}
+		for i := range groupId {
+			groupId[i] = byte(i)
+		}
+		for i := range handle {
+			handle[i] = byte(0xB0 + i)
+		}
+		produced := [][]byte{}
+		for index := uint64(0); index < 3; index += 1 {
+			id := MessageId(secret, groupId, handle, index)
+			produced = append(produced, id[:])
+		}
+		return produced
 	},
 	"AdvanceEpoch": func(secret []byte) [][]byte {
 		fixture, err := buildProbeSession(testPqSecret())

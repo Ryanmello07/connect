@@ -944,8 +944,8 @@ func TestTheEpochKeysDoorJoinsTheDerivedClassOfGroupSessionMethods(t *testing.T)
 	if !slices.Contains(all, "EpochKeys") {
 		t.Fatal("no method named EpochKeys is declared on *GroupSession, so the door this file tests is not in the class the loop gate holds")
 	}
-	if len(all) != 24 {
-		t.Errorf("%d methods are declared on *GroupSession and the 2026-09-13 seal lift makes it 24; the number moves by one per method, and a method that arrived without moving it arrived without a thought about which file it belongs in",
+	if len(all) != 26 {
+		t.Errorf("%d methods are declared on *GroupSession and MASTER section 8.4's inner frame makes it 26 -- 24 after the 2026-09-13 seal lift, plus frameBodyOnLoop and unframeBodyOnLoop; the number moves by one per method, and a method that arrived without moving it arrived without a thought about which file it belongs in",
 			len(all))
 	}
 	if got := len(perFile["session.go"]); got != 15 {

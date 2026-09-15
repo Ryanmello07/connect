@@ -1890,8 +1890,8 @@ func TestTheAheadRefusalIsReachableAndSeparableAndTheBehindCaseIsNot(t *testing.
 	t.Logf("class: the %d AEAD failure sentinels recordaead.go names, %v", len(names), names)
 
 	const bucket uint8 = 1
-	fixture := newTestSession(t, "ahead-refusal")
-	fixture.installEphRoot(t)
+	pair := newTestPair(t, "ahead-refusal")
+	pair.installEphRoot(t)
 	own := ephWindowNow(t, bucket)
 	if own < 2 {
 		t.Fatalf("the fixture clock falls in window %d on bucket %d, so there is no window behind it to test the other half of the asymmetry with", own, bucket)
@@ -1899,8 +1899,8 @@ func TestTheAheadRefusalIsReachableAndSeparableAndTheBehindCaseIsNot(t *testing.
 
 	// the control: an EPH record at the opener's own window round trips, so every refusal
 	// below is about the window and not about the class.
-	fixture.trackOwnLadder(t, message.RetentionEph, bucket, own)
-	record, err := fixture.session.SealRecord(message.RetentionEph, bucket, false,
+	pair.track(t, message.RetentionEph, bucket, own)
+	record, err := pair.sender.SealRecord(message.RetentionEph, bucket, false,
 		[]byte("head"), []byte("body"), 0, nil)
 	if err != nil {
 		t.Fatalf("sealing an EPH(%d) record at the opener's own window: %v", bucket, err)
@@ -1909,7 +1909,7 @@ func TestTheAheadRefusalIsReachableAndSeparableAndTheBehindCaseIsNot(t *testing.
 		t.Fatalf("the sealer wrote window %d and this opener is in window %d; the control is not at the window this case thinks it is",
 			record.Header.EphWindow, own)
 	}
-	if _, _, err := fixture.session.OpenRecord(record); err != nil {
+	if _, _, err := pair.opener.OpenRecord(record); err != nil {
 		t.Fatalf("the control record does not open: %v", err)
 	}
 
@@ -1927,7 +1927,7 @@ func TestTheAheadRefusalIsReachableAndSeparableAndTheBehindCaseIsNot(t *testing.
 	} {
 		moved := *record
 		moved.Header.EphWindow = one.window
-		_, _, err := fixture.session.OpenRecord(&moved)
+		_, _, err := pair.opener.OpenRecord(&moved)
 		isRefusal := errors.Is(err, ErrEphWindowAhead)
 		if isRefusal != one.refusing {
 			if one.refusing {
@@ -2048,8 +2048,19 @@ func TestAnEphRecordIsSealedUnderItsOwnWindowsKeyAndUnderNoOther(t *testing.T) {
 			continue
 		}
 		gotBody, err := unpadBody(record.Header.SizeBucket, padded)
-		if err != nil || !bytes.Equal(gotBody, bodyPlain) {
-			t.Errorf("bucket %d: ct_body opened to %q (%v)", bucket, gotBody, err)
+		if err != nil {
+			t.Errorf("bucket %d: ct_body opened under the rebuilt rung and did not unpad: %v", bucket, err)
+			continue
+		}
+		// SINCE MASTER SECTION 8.4 WHAT UNPADS IS THE INNER MLS FRAME, not the caller's body,
+		// and this case's subject is the KEY rather than the content: ct_head above still
+		// carries the caller's octets and is compared against them one assertion up. What is
+		// asserted here is that the frame is present -- a body that came back as the plaintext
+		// would be a record the sealer never framed, which is a different defect and one
+		// mlsframe_test.go owns.
+		if len(gotBody) <= len(bodyPlain) || bytes.Equal(gotBody, bodyPlain) {
+			t.Errorf("bucket %d: ct_body unpadded to %d octets and MASTER section 8.4 makes it an MLS frame around the %d octet body",
+				bucket, len(gotBody), len(bodyPlain))
 			continue
 		}
 		opened += 1
@@ -2120,14 +2131,14 @@ func TestAnOpenerTakesTheWireWindowAndNeverRecomputesOne(t *testing.T) {
 		for _, forward := range []uint64{1, 1000} {
 			at := testClock()()
 			now := func() int64 { return at }
-			fixture := newTestSessionAtClock(t, fmt.Sprintf("wire-window-%d-%d", bucket, forward), now)
-			fixture.installEphRoot(t)
+			pair := newTestPairAtClock(t, fmt.Sprintf("wire-window-%d-%d", bucket, forward), now)
+			pair.installEphRoot(t)
 			sealedAt, err := EphWindowAt(bucket, at)
 			if err != nil {
 				t.Fatalf("EphWindowAt(%d): %v", bucket, err)
 			}
-			fixture.trackOwnLadder(t, message.RetentionEph, bucket, sealedAt)
-			record, err := fixture.session.SealRecord(message.RetentionEph, bucket, false,
+			pair.track(t, message.RetentionEph, bucket, sealedAt)
+			record, err := pair.sender.SealRecord(message.RetentionEph, bucket, false,
 				headPlain, bodyPlain, 0, nil)
 			if err != nil {
 				t.Fatalf("bucket %d: seal: %v", bucket, err)
@@ -2147,7 +2158,7 @@ func TestAnOpenerTakesTheWireWindowAndNeverRecomputesOne(t *testing.T) {
 			if movedTo != sealedAt+forward {
 				t.Fatalf("bucket %d: the clock moved to window %d, want %d", bucket, movedTo, sealedAt+forward)
 			}
-			gotHead, gotBody, err := fixture.session.OpenRecord(record)
+			gotHead, gotBody, err := pair.opener.OpenRecord(record)
 			if err != nil {
 				t.Errorf("bucket %d: a record sealed in window %d does not open at an opener in window %d: %v. The opener must take the record's own eph_window off the wire; one it recomputed from its own clock is a different window on every record that crossed a boundary, and the AEAD tag would be the only thing that said so",
 					bucket, sealedAt, movedTo, err)
@@ -2198,16 +2209,18 @@ func TestEverySealableClassRoundTripsAndTheWrapItemOneEightyFiveRefusesDoesNot(t
 		if err != nil {
 			t.Fatalf("wire %#02x: %v", wire, err)
 		}
-		// a session per byte, because each class takes its own ladder and a receiver
-		// ratchet has to be installed at the window the sealer will write.
-		fixture := newTestSession(t, fmt.Sprintf("lift-%02x", wire))
-		fixture.installEphRoot(t)
+		// A PAIR PER BYTE AND NOT A SESSION PER BYTE, since MASTER section 8.4: each class
+		// takes its own ladder and a receiver ratchet has to be installed at the window the
+		// sealer will write, and a member cannot open the application frame it sealed itself
+		// (open item MG-4). So the round trip is between two devices of one group.
+		pair := newTestPair(t, fmt.Sprintf("lift-%02x", wire))
+		pair.installEphRoot(t)
 		window := uint64(0)
 		if class == message.RetentionEph {
 			window = ephWindowNow(t, bucket)
 		}
-		fixture.trackOwnLadder(t, class, bucket, window)
-		record, err := fixture.session.SealRecord(class, bucket, false, headPlain, bodyPlain, 0, nil)
+		pair.track(t, class, bucket, window)
+		record, err := pair.sender.SealRecord(class, bucket, false, headPlain, bodyPlain, 0, nil)
 		if err != nil {
 			t.Errorf("wire %#02x (class %d bucket %d) was refused by the sealer: %v; spec A section 5.3 lifts the class refusal in full",
 				wire, class, bucket, err)
@@ -2217,7 +2230,7 @@ func TestEverySealableClassRoundTripsAndTheWrapItemOneEightyFiveRefusesDoesNot(t
 			t.Errorf("wire %#02x sealed with window %d, want %d -- MASTER section 8's presence rule is zero off EPH(1..5) and the bucket's own window on it",
 				wire, record.Header.EphWindow, window)
 		}
-		gotHead, gotBody, err := fixture.session.OpenRecord(record)
+		gotHead, gotBody, err := pair.opener.OpenRecord(record)
 		if err != nil {
 			t.Errorf("wire %#02x (class %d bucket %d) sealed and does not open: %v", wire, class, bucket, err)
 			continue

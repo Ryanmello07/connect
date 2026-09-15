@@ -542,9 +542,17 @@ func noncerebindCallsTheSetter(parsed *ast.File) bool {
 // its own earlier answer.
 func noncerebindSeal(t *testing.T, fixture *testSession) (*message.Record, []byte, []byte) {
 	t.Helper()
+	return noncerebindSealAt(t, fixture.session)
+}
+
+// noncerebindSealAt is noncerebindSeal over a bare session, for the cases that seal at one member
+// of a pair and open at the other. MASTER section 8.4 makes that the only shape a DURABLE round
+// trip has -- a member cannot open the application frame it sealed itself, open item MG-4.
+func noncerebindSealAt(t *testing.T, session *GroupSession) (*message.Record, []byte, []byte) {
+	t.Helper()
 	headPlain := []byte("a head that the record layer seals")
 	bodyPlain := []byte("a body that the record layer seals, and it is longer than the head")
-	record, err := fixture.session.SealRecord(message.RetentionDurable, 0, false, headPlain, bodyPlain, 0, nil)
+	record, err := session.SealRecord(message.RetentionDurable, 0, false, headPlain, bodyPlain, 0, nil)
 	if err != nil {
 		t.Fatalf("SealRecord: %v", err)
 	}
@@ -913,11 +921,30 @@ func TestEveryRefusalOfTheReauthComesBeforeTheMacAndLeavesTheRecordUnchanged(t *
 // is the view a peer opening this record derives. Both opens are compared against the plaintexts
 // that went IN, so a route that opened nothing is not green.
 func TestARebindAndAReauthChangeNothingAboutOpening(t *testing.T) {
-	fixture := newTestSession(t, "reauth-open")
-	fixture.trackOwn(t)
-	record, headPlain, bodyPlain := noncerebindSeal(t, fixture)
+	// TWO MEMBERS AND TWO RECORDS, and both halves of that changed with MASTER section 8.4.
+	//
+	// TWO MEMBERS because a member cannot open the application frame it sealed itself -- open
+	// item MG-4 -- so the rebind and the re-auth happen at the SENDER, whose write_auth they are
+	// about, and both opens happen at the opener.
+	//
+	// TWO RECORDS because the instrument this case used to run on no longer exists. It opened ONE
+	// record twice, re-installing the receiver ratchet in between, on the argument that
+	// ReceiverRatchets.Track replaces and a fresh ladder is the view a peer derives. That is still
+	// true of the RECORD layer and is now false of the whole open: an MLS generation is consumed
+	// once and nothing re-installs it, so the second open of one record answers "ratchet
+	// generation already consumed" whatever the ratchet table says. So the pair of observations is
+	// two records off ONE sender ladder, sealed before the rebind, opened either side of it --
+	// which asks the same question of the same ciphertexts and additionally asks it of a record
+	// that was re-MAC'd before it was ever opened.
+	pair := newTestPair(t, "reauth-open")
+	pair.trackDurable(t)
+	before, headPlain, bodyPlain := noncerebindSealAt(t, pair.sender)
+	after, afterHeadPlain, afterBodyPlain := noncerebindSealAt(t, pair.sender)
+	if !bytes.Equal(headPlain, afterHeadPlain) || !bytes.Equal(bodyPlain, afterBodyPlain) {
+		t.Fatal("the two records were sealed over different plaintexts, so the two observations are not comparable")
+	}
 
-	beforeHead, beforeBody, err := fixture.session.OpenRecord(record)
+	beforeHead, beforeBody, err := pair.opener.OpenRecord(before)
 	if err != nil {
 		t.Fatalf("OpenRecord before the rebind: %v", err)
 	}
@@ -926,15 +953,14 @@ func TestARebindAndAReauthChangeNothingAboutOpening(t *testing.T) {
 			beforeHead, beforeBody)
 	}
 
-	if err := fixture.session.RebindServerNonce(noncerebindSecondNonce()); err != nil {
+	if err := pair.sender.RebindServerNonce(noncerebindSecondNonce()); err != nil {
 		t.Fatalf("RebindServerNonce: %v", err)
 	}
-	if err := fixture.session.ReauthRecord(record); err != nil {
+	if err := pair.sender.ReauthRecord(after); err != nil {
 		t.Fatalf("ReauthRecord: %v", err)
 	}
 
-	fixture.trackOwn(t)
-	afterHead, afterBody, err := fixture.session.OpenRecord(record)
+	afterHead, afterBody, err := pair.opener.OpenRecord(after)
 	if err != nil {
 		t.Fatalf("OpenRecord after the rebind and the re-auth: %v; the nonce binds write_auth and NOTHING the open path reads, so a record that stopped opening is a re-auth that touched a ciphertext",
 			err)

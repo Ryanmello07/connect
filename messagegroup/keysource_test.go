@@ -5,10 +5,10 @@
 // key, an AEAD nonce or a MAC key by SealRecord or OpenRecord. A written down list of the
 // derivations that produce those octets understates the class the moment a second key source
 // is added, which is the one event this file exists to catch, so the class is closed from the
-// other end instead: THE WHOLE SEALED RECORD IS REBUILT, BYTE FOR BYTE, from three values and
-// nothing else. Every keyed octet of a record is inside a reproduction of that record by
-// definition, so an octet drawn from anywhere this file is not given moves ct_body, ct_head,
-// sender_handle or write_auth, and one of the four comparisons below goes red.
+// other end instead: THE WHOLE SEALED RECORD IS REBUILT, BYTE FOR BYTE, from three values and one
+// opaque blob and nothing else. Every keyed octet of a record is inside a reproduction of that
+// record by definition, so an octet drawn from anywhere this file is not given moves ct_body,
+// ct_head, sender_handle or write_auth, and one of the four comparisons below goes red.
 //
 // THE THREE VALUES, and there are no others:
 //
@@ -22,6 +22,37 @@
 // and CP3b's bar rests on it -- and the first IS the MLS key schedule's output. So a
 // reproduction that succeeds from these three is the statement that every key of the record
 // layer is the MLS key schedule expanded, and nothing else.
+//
+// AND THE FOURTH VALUE, WHICH ARRIVED WITH MASTER SECTION 8.4 ON 2026-09-15 AND IS NOT A KEY:
+//
+//	inner         the marshalled MLS PrivateMessage this record's ct_body carries, handed over
+//	              as OCTETS and treated as OPAQUE. Nothing here parses it, keys anything with
+//	              it, or derives anything from it; it goes into LP(inner) | 0* and is padded.
+//
+// WHY IT HAD TO BE INJECTED RATHER THAN DERIVED, and this is the honest statement of what moved.
+// MASTER section 8.4 makes an application record's ct_body plaintext an MLS frame, and that frame
+// is NOT a function of the three values above: it depends on the group's encryption_secret, on
+// this leaf's ratchet GENERATION, on the device's signing key and on four octets of fresh
+// reuse_guard, so two calls do not even agree with each other. A reproduction that tried to
+// recompute it would be reproducing connect/mls rather than the record layer, and a reproduction
+// that dropped the body would have stopped rebuilding the record. So it is injected, with exactly
+// the standing server_nonce has: a value the fixture hands over, that no key is derived from.
+//
+// WHAT THAT COSTS, STATED RATHER THAN LEFT TO BE NOTICED. This file no longer says anything about
+// the BODY PLAINTEXT's provenance -- the octets inside the frame are outside the reproduction, and
+// a second key source that reached only into Protect is invisible here. What it still says, in
+// full, is that EVERY RECORD LAYER KEY comes from the exporter and nowhere else, which is the CP3b
+// property and is the whole of what this file has ever been for. The compensating control is
+// TestFlippingAnyOctetOfTheInjectedFrameMovesTheBody: the frame is a live input, so a reproduction
+// that ignored it and rebuilt the body from something else would agree with nothing.
+//
+// AND THE RECORDS MOVED OFF THE 256 OCTET RUNG, which is the second thing that ruling cost this
+// file. The three bodies are 100, 101 and 102 octets and were the 256 rung's; the frame around
+// them is 194 octets, so they are now 294, 295 and 296 and the smallest rung that fits them is
+// 1 KiB. keySourceRungBytes, keySourceSizeBucketCode and the ct_body length assertion all move
+// with them. THE BODIES ARE NOT SHRUNK TO 59 TO KEEP THE OLD CONSTANT: the constant is a
+// transcription of where the record lands, and tuning the fixture until the old number came back
+// would be the fixture lying about the ladder.
 //
 // NOTHING ON THE REPRODUCTION'S SIDE OF THE COMPARISON COMES FROM THE MODULE UNDER TEST, and
 // that is the whole of what makes this evidence rather than a tautology. A reproduction that
@@ -87,11 +118,20 @@
 // (5) The read key. message.ReadKey is on neither SealRecord's nor OpenRecord's path -- no
 // record is macd under it -- so it is outside the derived class and outside the reproduction.
 //
-// (6) The OPEN side's derivations directly. What binds them is the last assertion of the first
-// test: the record opens, through the session, to exactly the two plaintexts that went in. A
-// second key source on the open side alone is a record that does not open; a second key source
-// on BOTH sides is a record whose ciphertexts this reproduction does not match. There is no
-// third case.
+// (6) The OPEN side's derivations directly, and WHAT BINDS THEM MOVED ON 2026-09-15. It used to
+// be the last assertion of the first test: the record opens, through the session, to exactly the
+// two plaintexts that went in. It cannot be, because MASTER section 8.4 makes the body an MLS
+// frame and a member has no receiving ratchet for its own leaf, so this one member fixture's own
+// OpenRecord now REFUSES the record it sealed -- open item MG-4.
+//
+// What binds them now is WHERE it refuses, and it is a narrower statement of the same thing.
+// ErrRecordInnerFrame is reached only after openRecordOnLoop has derived the rung, expanded both
+// AEAD halves, opened ct_head, opened ct_body and unpadded the result: every open side derivation
+// has already run and succeeded by the time that sentinel is produced. A second key source on the
+// open side alone therefore does not reach it -- the record fails in an AEAD instead, with a
+// different sentinel -- and a second key source on BOTH sides is a record whose ciphertexts this
+// reproduction does not match. There is still no third case. What is LOST is the plaintext: this
+// file no longer observes that the body came back as the body, because nothing here can open it.
 //
 // ---------------------------------------------------------------------------
 // WHY THE LABELS ARE TRANSCRIBED HERE RATHER THAN READ OFF THE PACKAGE
@@ -123,6 +163,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -189,10 +230,15 @@ const (
 	// value in this block is: the reproduction is held against MASTER and not against what
 	// the record layer put in the field.
 	keySourceDurableEphWindow uint64 = 0
-	// MASTER's size ladder, the 256 octet rung: the bucket TAG and the octet count it names. The
+	// MASTER's size ladder, the 1 KiB rung: the bucket TAG and the octet count it names. The
 	// count fixes octet_length(ct_body), so it is on the same side of the same line.
-	keySourceSizeBucketCode byte = 0x00
-	keySourceRungBytes           = 256
+	//
+	// IT WAS THE 256 OCTET RUNG AND 0x00 UNTIL 2026-09-15. The three bodies are unchanged at
+	// 100, 101 and 102 octets; MASTER section 8.4 put a 194 octet MLS frame around each, and
+	// 294 does not fit 256. The transcription follows the record rather than the record being
+	// tuned to the transcription.
+	keySourceSizeBucketCode byte = 0x01
+	keySourceRungBytes           = 1024
 )
 
 // keySourceShape is every PUBLIC field of one record: what a server, or anybody holding the
@@ -230,7 +276,10 @@ type keySourceShape struct {
 	blobId     []byte
 	attachment []byte
 	headPlain  []byte
-	bodyPlain  []byte
+	// the MLS PrivateMessage ct_body carries, OPAQUE: it is length prefixed and padded and
+	// nothing here reads an octet of it. MASTER section 8.4, and the file header says at
+	// length why it is injected rather than derived and what that costs.
+	innerFrame []byte
 }
 
 // keySourceReproduction is what the three values alone produce: the record's two ciphertexts,
@@ -312,14 +361,17 @@ func reproduceRecordFromTheExporterOutput(t *testing.T, mlsSecret []byte, pqSecr
 		keySourceU64(shape.ephWindow),
 	)
 
-	// LP(plaintext) into a buffer exactly the rung, tail zero. Open item M1-7's scheme, whose
-	// fill is pinned octet by octet in m1w1repairs_test.go rather than guessed at here.
-	if shape.rungBytes < len(shape.bodyPlain)+4 {
-		t.Fatalf("a %d octet body does not fit the %d octet rung this shape names",
-			len(shape.bodyPlain), shape.rungBytes)
+	// LP(the ct_body plaintext) into a buffer exactly the rung, tail zero. Open item M1-7's
+	// scheme, whose fill is pinned octet by octet in m1w1repairs_test.go rather than guessed at
+	// here. Since MASTER section 8.4 the thing being prefixed is the INNER FRAME and not the
+	// application body, and this is the one line in the reproduction that touches it -- a copy,
+	// with no octet of it read.
+	if shape.rungBytes < len(shape.innerFrame)+4 {
+		t.Fatalf("a %d octet inner frame does not fit the %d octet rung this shape names",
+			len(shape.innerFrame), shape.rungBytes)
 	}
 	padded := make([]byte, shape.rungBytes)
-	copy(padded, keySourceLP(shape.bodyPlain))
+	copy(padded, keySourceLP(shape.innerFrame))
 
 	ctBody := keySourceSeal(t, bodyMaterial, aadBody, padded)
 	bodyHash := sha256.Sum256(ctBody)
@@ -429,12 +481,12 @@ func keySourceJoin(parts ...[]byte) []byte {
 
 // keySourceShapeOf reads the PUBLIC half of a sealed record into a shape.
 //
-// It takes the two plaintexts from the CALLER, which is what they are: what went in. Everything
-// else comes off the header, because everything else is a value anybody holding the record can
+// It takes the head plaintext and the inner frame from the CALLER, which is what they are: the two
+// things the reproduction is given rather than deriving. Everything else comes off the header, because everything else is a value anybody holding the record can
 // read without a key -- and the two fields that are NOT such values, sender_handle and
 // body_hash, have nowhere in the shape to go.
 func keySourceShapeOf(t *testing.T, record *message.Record, leaf uint32,
-	headPlain []byte, bodyPlain []byte) keySourceShape {
+	headPlain []byte, innerFrame []byte) keySourceShape {
 
 	t.Helper()
 	header := record.Header
@@ -478,7 +530,7 @@ func keySourceShapeOf(t *testing.T, record *message.Record, leaf uint32,
 		blobId:        header.BlobId,
 		attachment:    header.ServerAttachment,
 		headPlain:     headPlain,
-		bodyPlain:     bodyPlain,
+		innerFrame:    innerFrame,
 	}
 }
 
@@ -501,18 +553,30 @@ type keySourceSealed struct {
 	serverNonce []byte
 	// the sender's leaf index, which is public and is a SHAPE input rather than a key: the
 	// record header carries sender_handle, which is the key schedule's function of it.
-	leaf         uint32
-	records      []*message.Record
-	heads        [][]byte
-	bodies       [][]byte
-	openedHeads  [][]byte
-	openedBodies [][]byte
+	leaf    uint32
+	records []*message.Record
+	heads   [][]byte
+	bodies  [][]byte
+	// the MLS PrivateMessage each record's ct_body carries, read back off the record by the
+	// fixture and handed across as OCTETS. It is the fourth injected value of the file header,
+	// and it crosses this boundary for the same reason server_nonce does: the reproduction
+	// cannot compute it and nothing keys anything with it.
+	innerFrames [][]byte
+	// what the real OpenRecord answered for each record, and whether the sentinel it answered
+	// was the INNER FRAME's. Both are computed inside this fixture because the assertion bodies
+	// may not name a module declaration, and ErrRecordInnerFrame is one. See (6) in the file
+	// header for what this binds and what it stopped binding.
+	openRefusals               []string
+	openRefusedAtTheInnerFrame []bool
 }
 
 // The head plaintext is EIGHTEEN octets on every record, so ct_head is thirty four, and every
-// body lands on the 256 octet rung, so ct_body is two hundred and seventy two. Both widths are
-// asserted rather than left implicit: a reproduction that agreed with a record of the wrong
-// shape would be agreeing about the wrong thing.
+// body lands on the 1 KiB rung, so ct_body is one thousand and forty. Both widths are asserted
+// rather than left implicit: a reproduction that agreed with a record of the wrong shape would be
+// agreeing about the wrong thing.
+//
+// THE SECOND OF THOSE MOVED ON 2026-09-15 and the first did not, which is itself the statement
+// MASTER section 8.4 makes about scope: the head is not framed and its ciphertext is what it was.
 const (
 	keySourceHeadPlainBytes = 18
 	keySourceRecordCount    = 3
@@ -550,21 +614,28 @@ func keySourceSealRecords(t *testing.T, name string) *keySourceSealed {
 		if err != nil {
 			t.Fatalf("SealRecord %d: %v", i, err)
 		}
-		// the OPEN half of the class, run HERE for the same reason. See (6) in the file header
-		// for what it binds: a second key source on the open side alone is a record that does
-		// not open, and a second key source on both sides is a record this reproduction does not
-		// match. The assertion body compares what came back; it does not run the open itself,
-		// because the assertion bodies are inside the gate and the record layer's own open is
-		// the subject rather than the reproduction.
-		openedHead, openedBody, err := fixture.session.OpenRecord(record)
-		if err != nil {
-			t.Fatalf("record %d: OpenRecord: %v", i, err)
-		}
+		// THE FOURTH INJECTED VALUE, read back off the record HERE and nowhere else. It is the
+		// MLS frame MASTER section 8.4 put inside ct_body, and this fixture is the one function
+		// the gate below excludes precisely so that a REAL record can be produced and read; what
+		// crosses the boundary is octets. Extracting it through the record layer's own
+		// derivations does not blind anything: if a second key source moved any of them, the
+		// extraction would still answer the frame that was sealed and the reproduction -- which
+		// derives its rung from the exporter through RFC 5869 -- would rebuild a different
+		// ct_body and go red.
+		inner := keySourceInnerFrameOf(t, fixture, record)
+		// THE OPEN HALF OF THE CLASS, run HERE for the same reason, and it is a REFUSAL now. A
+		// member has no receiving ratchet for its own leaf, so this one member fixture cannot
+		// open the frame it sealed (open item MG-4). What the refusal still binds is in (6) of
+		// the file header: ErrRecordInnerFrame is reached only after the rung was derived, both
+		// AEAD halves expanded, ct_head opened, ct_body opened and the padding read.
+		_, _, openErr := fixture.session.OpenRecord(record)
 		sealed.records = append(sealed.records, record)
 		sealed.heads = append(sealed.heads, head)
 		sealed.bodies = append(sealed.bodies, body)
-		sealed.openedHeads = append(sealed.openedHeads, openedHead)
-		sealed.openedBodies = append(sealed.openedBodies, openedBody)
+		sealed.innerFrames = append(sealed.innerFrames, inner)
+		sealed.openRefusals = append(sealed.openRefusals, fmt.Sprint(openErr))
+		sealed.openRefusedAtTheInnerFrame = append(sealed.openRefusedAtTheInnerFrame,
+			errors.Is(openErr, ErrRecordInnerFrame))
 	}
 	// the group's OWN exporter, under the label MASTER section 7 names, at the width it names.
 	// This is the one secret the reproduction is handed, and it comes off the real mls.Group the
@@ -593,8 +664,56 @@ func keySourceSealRecords(t *testing.T, name string) *keySourceSealed {
 // reproduce rebuilds record i from the three values and the record's public half.
 func (self *keySourceSealed) reproduce(t *testing.T, i int, mlsSecret []byte) keySourceReproduction {
 	t.Helper()
-	shape := keySourceShapeOf(t, self.records[i], self.leaf, self.heads[i], self.bodies[i])
+	return self.reproduceOverFrame(t, i, mlsSecret, self.innerFrames[i])
+}
+
+// reproduceOverFrame is reproduce with the injected frame supplied by the caller, which is what
+// the compensating control needs: the frame is an INPUT, so the only way to show it is a live one
+// is to hand in a different one and require the record to move.
+func (self *keySourceSealed) reproduceOverFrame(t *testing.T, i int, mlsSecret []byte,
+	inner []byte) keySourceReproduction {
+
+	t.Helper()
+	shape := keySourceShapeOf(t, self.records[i], self.leaf, self.heads[i], inner)
 	return reproduceRecordFromTheExporterOutput(t, mlsSecret, self.pqSecret, self.serverNonce, shape)
+}
+
+// keySourceInnerFrameOf reads the MLS frame out of one sealed record's ct_body.
+//
+// It is the record layer's own open, written out here rather than called through OpenRecord,
+// because OpenRecord goes one step further and hands the frame to Unprotect -- which this one
+// member fixture cannot do for its own leaf. What it needs is the step before that: the padded
+// plaintext, unpadded.
+//
+// IT IS INSIDE THE EXCLUDED FUNCTION'S REACH AND NOWHERE ELSE. Only keySourceSealRecords calls it,
+// and the gate at the bottom of this file asserts that the exclusion covers exactly one function
+// and that nothing else in scope reaches into it.
+func keySourceInnerFrameOf(t *testing.T, fixture *testSession, record *message.Record) []byte {
+	t.Helper()
+	recordKey := RecordKeyZero(fixture.session.classKeys.Durable, fixture.handle.OwnLeafIndex())
+	for walked := uint64(0); walked < record.Header.StreamIndex; walked += 1 {
+		recordKey = RecordKeyNext(recordKey)
+	}
+	defer zeroize(recordKey)
+	aadBody, err := message.AADBody(RecordAeadAlgId, record.Header.BodyBinding())
+	if err != nil {
+		t.Fatalf("AADBody while reading the inner frame back: %v", err)
+	}
+	bodyKey, bodyNonce := RecordAeadBody(recordKey)
+	defer zeroize(bodyKey)
+	defer zeroize(bodyNonce)
+	padded, err := openRecordAead(bodyKey, bodyNonce, aadBody, record.CtBody)
+	if err != nil {
+		t.Fatalf("open ct_body while reading the inner frame back: %v", err)
+	}
+	inner, err := unpadBody(record.Header.SizeBucket, padded)
+	if err != nil {
+		t.Fatalf("unpad ct_body while reading the inner frame back: %v", err)
+	}
+	if len(inner) == 0 {
+		t.Fatal("the record's ct_body carries no inner frame, so the fourth injected value is empty")
+	}
+	return inner
 }
 
 // CP3b's bar, standing: no test-only key source anywhere on the path.
@@ -638,24 +757,72 @@ func TestEveryKeyedOctetOfARecordIsReproducibleFromTheExporterAndTheTwoInjectedV
 			t.Errorf("record %d: write_auth rebuilt from the exporter output is %x and the record carries %x; a mac key the exporter does not produce is a mac key from a second key source",
 				i, got.writeAuth, record.WriteAuth)
 		}
-		// and the OPEN half of the class, bound to the same reproduction. See (6) in the file
-		// header: a second key source on the open side alone is a record that does not open. The
-		// open ran in the fixture, which is the one function outside the gate below; what is
-		// compared here is what it answered.
-		// the two halves are reported SEPARATELY and by their octets: a message that named only
-		// the lengths said "opened to 18 and 100 octets, want 18 and 100" under a mutation that
-		// moved a byte, which is a failure a reader has to re-derive before it says anything.
-		if string(sealed.openedHeads[i]) != string(sealed.heads[i]) {
-			t.Errorf("record %d: the head opened to %x and %x is what went in", i,
-				sealed.openedHeads[i], sealed.heads[i])
-		}
-		if string(sealed.openedBodies[i]) != string(sealed.bodies[i]) {
-			t.Errorf("record %d: the body opened to %x and %x is what went in", i,
-				sealed.openedBodies[i], sealed.bodies[i])
+		// and the OPEN half of the class, bound to the same reproduction and NARROWED on
+		// 2026-09-15. See (6) in the file header. The open ran in the fixture, which is the one
+		// function outside the gate below; what is compared here is where it refused.
+		//
+		// WHAT THIS STILL BINDS: ErrRecordInnerFrame is produced only after openRecordOnLoop has
+		// derived the rung, expanded both AEAD halves, opened ct_head, opened ct_body and read
+		// the padding, so a second key source on the open side alone cannot reach it -- the
+		// record would fail in an AEAD, with a different sentinel, and this clause would be red.
+		// WHAT IT NO LONGER BINDS: that the body came back as the body. Nothing in a one member
+		// fixture can open the frame, and the file header says so rather than leaving it to be
+		// inferred.
+		if !sealed.openRefusedAtTheInnerFrame[i] {
+			t.Errorf("record %d: the sealer's own OpenRecord answered %q; it must reach the inner frame and refuse there, because everything the open side derives has already run by that point and a refusal anywhere earlier is a second key source on the open side",
+				i, sealed.openRefusals[i])
 		}
 	}
-	t.Logf("%d records rebuilt byte for byte from Export(%q, nil, %d), pq_secret and server_nonce",
-		len(sealed.records), keySourceExporterLabel, keySourceExporterBytes)
+	t.Logf("%d records rebuilt byte for byte from Export(%q, nil, %d), pq_secret, server_nonce and the injected %d octet inner frame",
+		len(sealed.records), keySourceExporterLabel, keySourceExporterBytes, len(sealed.innerFrames[0]))
+}
+
+// THE COMPENSATING CONTROL the 2026-09-15 repair owes, and it is what stops the fourth injected
+// value from being decoration.
+//
+// The frame is an INPUT the reproduction copies and never reads, which is exactly the shape a
+// reader should be suspicious of: a reproduction that ignored it and rebuilt the body some other
+// way would agree with the record forever. So every octet of it is moved in turn and all three of
+// the record's body-derived outputs are required to move with it -- ct_body because the frame is
+// what is sealed, body_hash because it is H(ct_body), and write_auth because its preimage carries
+// body_hash.
+//
+// ct_head is NOT required to move and that is the point of listing which three are: the head is
+// sealed under its own half of the same rung over a preimage that carries body_hash, so it moves
+// too -- and requiring it here would be requiring the same fact twice. The three named are the
+// ones whose dependence on the injected value is direct.
+func TestFlippingAnyOctetOfTheInjectedFrameMovesTheBody(t *testing.T) {
+	sealed := keySourceSealRecords(t, "the-injected-frame-is-live")
+	base := sealed.reproduce(t, 0, sealed.mlsSecret)
+	record := sealed.records[0]
+	if string(base.ctBody) != string(record.CtBody) || base.bodyHash != record.Header.BodyHash ||
+		base.writeAuth != record.WriteAuth {
+		t.Fatal("the unflipped reproduction is not the record, so nothing this control observes is about the record")
+	}
+	frame := sealed.innerFrames[0]
+	if len(frame) == 0 {
+		t.Fatal("the injected frame is empty, so this control flips nothing")
+	}
+	moved := 0
+	for octet := range frame {
+		flipped := append([]byte(nil), frame...)
+		flipped[octet] ^= 0x01
+		got := sealed.reproduceOverFrame(t, 0, sealed.mlsSecret, flipped)
+		if string(got.ctBody) == string(base.ctBody) {
+			t.Errorf("octet %d of the injected frame does not reach ct_body", octet)
+		}
+		if got.bodyHash == base.bodyHash {
+			t.Errorf("octet %d of the injected frame does not reach body_hash", octet)
+		}
+		if got.writeAuth == base.writeAuth {
+			t.Errorf("octet %d of the injected frame does not reach write_auth", octet)
+		}
+		moved += 1
+	}
+	if moved != len(frame) {
+		t.Errorf("%d octets were flipped and the frame is %d octets", moved, len(frame))
+	}
+	t.Logf("every one of the %d octets of the injected frame moves ct_body, body_hash and write_auth", len(frame))
 }
 
 // The negative control, and it matters as much as the reproduction does.
@@ -709,7 +876,7 @@ func TestFlippingAnyBitOfTheExporterOutputChangesEveryKeyedOctetOfARecord(t *tes
 // The two table values keySourceShapeOf transcribes, held against the package that ships them.
 //
 // IT IS ON THE OTHER SIDE OF THE GATE ON PURPOSE. This is the one place the record layer is
-// asked what it thinks the durable wire byte and the 256 octet rung are, and its answer is
+// asked what it thinks the durable wire byte and the 1 KiB rung are, and its answer is
 // compared against a transcription and thrown away -- it reaches no shape and no preimage. Until
 // this test existed the comparison happened inside keySourceShapeOf and the package's answer WAS
 // the shape's, which put two derivations of the record layer on the reproduction's side.
@@ -730,9 +897,9 @@ func TestTheTranscribedRetentionAndSizeAgreeWithThePackage(t *testing.T) {
 		t.Errorf("the durable class joins to wire byte %#02x and MASTER section 8's table is transcribed here as %#02x",
 			wire, keySourceDurableWire)
 	}
-	if byte(message.SizeBucket256) != keySourceSizeBucketCode {
-		t.Errorf("message.SizeBucket256 is %#02x and this file transcribes the rung's tag as %#02x",
-			byte(message.SizeBucket256), keySourceSizeBucketCode)
+	if byte(message.SizeBucket1K) != keySourceSizeBucketCode {
+		t.Errorf("message.SizeBucket1K is %#02x and this file transcribes the rung's tag as %#02x",
+			byte(message.SizeBucket1K), keySourceSizeBucketCode)
 	}
 	if rung := message.SizeBucketBytes(message.SizeBucket(keySourceSizeBucketCode)); rung != keySourceRungBytes {
 		t.Errorf("size bucket %#02x is %d octets on the ladder and this file transcribes it as %d",

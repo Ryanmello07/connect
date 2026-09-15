@@ -121,12 +121,12 @@ func TestTheEphWindowOffsetAgreesWithTheCodec(t *testing.T) {
 // refused by the session's class check, by its body_hash check or by the ratchet is a record
 // the aead was never asked about, and this property is about the aead.
 func TestFlippingEphWindowOnTheWireBreaksTheRecordAead(t *testing.T) {
-	fixture := newTestSession(t, "ephwindow-aead")
-	fixture.trackOwn(t)
+	pair := newTestPair(t, "ephwindow-aead")
+	pair.trackDurable(t)
 
 	headPlain := []byte("the header plaintext")
 	bodyPlain := []byte("the body plaintext")
-	record, err := fixture.session.SealRecord(message.RetentionDurable, 0, false, headPlain, bodyPlain, 0, nil)
+	record, err := pair.sender.SealRecord(message.RetentionDurable, 0, false, headPlain, bodyPlain, 0, nil)
 	if err != nil {
 		t.Fatalf("SealRecord: %v", err)
 	}
@@ -151,7 +151,7 @@ func TestFlippingEphWindowOnTheWireBreaksTheRecordAead(t *testing.T) {
 			if parsed.Header.EphWindow == 0 {
 				t.Fatalf("%s: the mutation left the parsed window at zero, so it did not land on the field", what)
 			}
-			gotHead, gotBody, err := fixture.session.OpenRecord(parsed)
+			gotHead, gotBody, err := pair.opener.OpenRecord(parsed)
 			if err == nil {
 				t.Fatalf("%s: the record still opened, so the window is outside both aads and an EPH record's header could be spliced onto another class",
 					what)
@@ -175,7 +175,7 @@ func TestFlippingEphWindowOnTheWireBreaksTheRecordAead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the unmutated record does not parse: %v", err)
 	}
-	gotHead, gotBody, err := fixture.session.OpenRecord(reparsed)
+	gotHead, gotBody, err := pair.opener.OpenRecord(reparsed)
 	if err != nil {
 		t.Fatalf("the UNMUTATED record does not open, so nothing above is about the window: %v", err)
 	}

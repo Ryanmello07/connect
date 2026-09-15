@@ -1353,6 +1353,19 @@ type twoEngineChain struct {
 
 func newTwoEngineChain(t *testing.T, name string) *twoEngineChain {
 	t.Helper()
+	return newTwoEngineChainAtClock(t, name, testClock())
+}
+
+// newTwoEngineChainAtClock is newTwoEngineChain with the injected clock supplied by the caller.
+//
+// IT IS NOT A TIMING SENSITIVE SEAM AND MUST NOT BECOME ONE, which is newTestSessionAtClock's own
+// paragraph and its own reason: a caller handing in a closure over a variable it sets itself is
+// fully deterministic, and what it buys is the one property a fixed clock cannot observe -- that
+// an opener takes the record's own eph_window off the wire and never recomputes one. BOTH sessions
+// take the same clock, so a case that wants the two ends in different windows moves the shared
+// variable between the seal and the open.
+func newTwoEngineChainAtClock(t *testing.T, name string, nowMs func() int64) *twoEngineChain {
+	t.Helper()
 	a := newTestEngine(t)
 	b := newTestEngine(t)
 	keyPackage, err := b.engine.NewKeyPackage()
@@ -1405,7 +1418,7 @@ func newTwoEngineChain(t *testing.T, name string) *twoEngineChain {
 	// opened over the chain's own founder would close that handle when it closed.
 	derived := a.createGroup(t, name+"-control")
 	defer derived.Close()
-	control, err := NewGroupSession(derived, pqSecret, nil, newStreamIndexMemory(), testClock(),
+	control, err := NewGroupSession(derived, pqSecret, nil, newStreamIndexMemory(), nowMs,
 		testServerNonce())
 	if err != nil {
 		t.Fatalf("the control session at epoch zero: %v", err)
@@ -1450,12 +1463,12 @@ func newTwoEngineChain(t *testing.T, name string) *twoEngineChain {
 	}
 
 	founderSession, err := NewGroupSession(founder, pqSecret, groupHandleKey, newStreamIndexMemory(),
-		testClock(), testServerNonce())
+		nowMs, testServerNonce())
 	if err != nil {
 		t.Fatalf("the founder's session at epoch 1: %v", err)
 	}
 	joinerSession, err := NewGroupSession(joined, pqSecret, groupHandleKey, newStreamIndexMemory(),
-		testClock(), testServerNonce())
+		nowMs, testServerNonce())
 	if err != nil {
 		t.Fatalf("the joiner's session at epoch 1: %v", err)
 	}
@@ -1539,6 +1552,22 @@ var engineJoinInventoryClaims = []engineJoinInventoryClaim{
 		owes:   []string{"it is a KEY on the seal and " + "open path"},
 		denials: []string{
 			"none of the four " + "is a KEY", "pq_secret is " + "not a key",
+		},
+	},
+	{
+		// THE CLAIM MASTER SECTION 8.4's RULING OF 2026-09-15 CREATED, and the one whose
+		// denial stood in doc.go as a true sentence for as long as it was true. It is the
+		// sharpest case for this gate existing: the paragraph was honest, carefully argued
+		// and correct, and a ruling made it false in one commit. The denials below are the
+		// shapes it took, so a rewrite that restored any of them is red rather than stale.
+		proves: "a member cannot forge a message from another member: the leaf that signed the body's MLS frame must be the leaf the record's sender_handle names",
+		heldBy: "TestOneMemberCannotForgeAMessageFromAnother",
+		owes:   []string{"A MEMBER CANNOT FORGE A " + "MESSAGE FROM ANOTHER MEMBER"},
+		denials: []string{
+			"no sender " + "authentication at all",
+			"attributed to any other " + "leaf and it opens",
+			"opens cleanly at " + "every other member",
+			"the record layer has " + "no sender authentication",
 		},
 	},
 	{

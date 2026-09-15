@@ -1344,6 +1344,16 @@ var theFieldsOfTheEraseClassThatAreNotKeyMaterial = map[string]string{
 	"recordBuilder.header": "the record's own cleartext header. Every field of it is one the message " +
 		"server reads and acts on -- MASTER invariant I6 -- and it is what aad_head and the write_auth " +
 		"preimage are taken over",
+	"recordBuilder.bodySeal": "the octets ct_body is sealed OVER, which are a PLAINTEXT rather than a " +
+		"key and are not always this package's to erase. For an application record they are the MLS " +
+		"PrivateMessage frameBodyOnLoop produced -- already a ciphertext, under the sender's own MLS " +
+		"ratchet -- and for a commit, a wrap, an epoch fan out and a completion marker they are the " +
+		"CALLER'S OWN ARRAY, handed to SealRecord and still the caller's after it returns. An erase here " +
+		"would blank a buffer its owner is holding, which is the defect WelcomeJoiner.KeyPackage is " +
+		"excused against one table over. These are the same octets sealBody took as a PARAMETER before " +
+		"MASTER section 8.4 moved the framing in front of the rung, where no field-based reading could " +
+		"see them: what changed is the representation and not the exposure. The one value on this chain " +
+		"that is key material is recordKey, and zeroize erases it on every exit including the refusals",
 	"connectMlsEngine.cred": "this device's credential, which is its identity public key. It is published " +
 		"in the leaf node of every group this engine founds, every member holds it and every joiner is " +
 		"handed it in its Welcome; Group.cred is excused in the same words",

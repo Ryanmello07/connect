@@ -709,3 +709,86 @@ func (self *aliasingCryptoProvider) SignatureKeyPair() (mls.SignaturePrivateKey,
 }
 
 func (self *aliasingCryptoProvider) Random(n int) []byte { return self.inner.Random(n) }
+
+// ---------------------------------------------------------------------------
+// two members of one group, MASTER section 8.4's fixture
+// ---------------------------------------------------------------------------
+
+// testPair is TWO MEMBERS OF ONE REAL MLS GROUP, and after 2026-09-15 it is the only shape in
+// which a record round trips at all.
+//
+// WHY IT HAD TO EXIST. MASTER section 8.4 makes an application record's ct_body an MLS
+// PrivateMessage, Protect consumes a generation of the sealer's OWN sending ratchet, and MLS
+// derives no receiving ratchet for a member's own leaf -- a member never receives its own
+// messages. So a session cannot open a record it sealed, and every case in this package that
+// sealed and opened through one newTestSession was asserting a round trip that the ruling ends.
+// Open item MG-4 carries the unruled half; this type is what the cases move onto.
+//
+// IT IS newTwoEngineChain AND NOT A SECOND CHAIN. That fixture already founds a group, adds a
+// second device from a real key package, commits, joins from the Welcome and -- the part that
+// makes it worth reusing rather than re-deriving -- holds three controls over the group handle key
+// it hands both sessions, including the one a zeroed key walked through. A second assembly of the
+// same shape would be a second place for those controls to be missing.
+//
+// THE TWO SESSIONS ARE AT EPOCH 1 and not at epoch 0, because an add is a commit. A case that
+// needs epoch zero -- keysource_test.go's reproduction is the one -- cannot use this and says so.
+type testPair struct {
+	chain *twoEngineChain
+	// the member that seals. Its leaf is the one an opener tracks.
+	sender *GroupSession
+	// the member that opens. It is a DIFFERENT device with a DIFFERENT signing key, which is
+	// what makes the inner frame's signature a real check rather than a round trip with itself.
+	opener     *GroupSession
+	senderLeaf uint32
+	openerLeaf uint32
+}
+
+// newTestPair founds the group, adds the second member and answers both sessions.
+func newTestPair(t *testing.T, name string) *testPair {
+	t.Helper()
+	return newTestPairAtClock(t, name, testClock())
+}
+
+// newTestPairAtClock is newTestPair with the injected clock supplied by the caller, and both
+// sessions take the same one. See newTwoEngineChainAtClock's header for why that is not a timing
+// sensitive seam.
+func newTestPairAtClock(t *testing.T, name string, nowMs func() int64) *testPair {
+	t.Helper()
+	chain := newTwoEngineChainAtClock(t, name, nowMs)
+	t.Cleanup(chain.close)
+	return &testPair{
+		chain:      chain,
+		sender:     chain.founderSession,
+		opener:     chain.joinerSession,
+		senderLeaf: chain.founder.OwnLeafIndex(),
+		openerLeaf: chain.joined.OwnLeafIndex(),
+	}
+}
+
+// track installs the opener's receiver ratchet over the sender's ladder for one class key.
+//
+// The WINDOW is a parameter for the reason trackOwnLadder's is: an EPH ladder is rooted at
+// EphKey(eph_root, bucket, window) and two windows of one bucket are two ladders.
+func (self *testPair) track(t *testing.T, class message.RetentionClass, bucket uint8, window uint64) {
+	t.Helper()
+	if err := self.opener.TrackSender(self.senderLeaf, class, bucket, window, 0); err != nil {
+		t.Fatalf("the opener's TrackSender(class %d bucket %d window %d): %v", class, bucket, window, err)
+	}
+}
+
+// trackDurable is track over the class every round trip in this package uses.
+func (self *testPair) trackDurable(t *testing.T) {
+	t.Helper()
+	self.track(t, message.RetentionDurable, 0, 0)
+}
+
+// installEphRoot hands BOTH sessions the epoch's eph_root, which is what any EPH record needs
+// before either end can touch it. One side alone is a record the other cannot key.
+func (self *testPair) installEphRoot(t *testing.T) {
+	t.Helper()
+	for who, session := range map[string]*GroupSession{"the sender": self.sender, "the opener": self.opener} {
+		if err := session.InstallEphRoot(testEphRoot()); err != nil {
+			t.Fatalf("InstallEphRoot at %s: %v", who, err)
+		}
+	}
+}
