@@ -71,6 +71,8 @@ type SendPacketFunction func(provideMode protocol.ProvideMode, packet []byte, ti
 // retains packet must call MessagePoolShareReadOnly; a callee that needs a
 // mutable path must clone it. The callback runs inline and must not block,
 // except when it is the documented final device-TUN injection boundary.
+//
+// Borrows the packet: the caller still owns it after the callback returns.
 type ReceivePacketFunction func(source TransferPath, provideMode protocol.ProvideMode, ipPath *IpPath, packet []byte)
 
 // receive a batch of packets from one flow (same source, provideMode, ipPath)
@@ -451,9 +453,11 @@ func DefaultTcpBufferSettingsWithBufferSize(bufferSize int) *TcpBufferSettings {
 		// wedged flow, so patience is cheap.
 		WriteTimeout:       60 * time.Second,
 		AckCompressTimeout: 50 * time.Millisecond,
-		IdleTimeout:        300 * time.Second,
-		SequenceBufferSize: bufferSize,
-		Mtu:                DefaultMtu,
+		// THROUGHPUTFIX §45.2. The candidate, not a measured optimum.
+		SteadyAckEverySegments: 16,
+		IdleTimeout:            300 * time.Second,
+		SequenceBufferSize:     bufferSize,
+		Mtu:                    DefaultMtu,
 		// large socket reads are split into mtu-sized data packets by `DataPackets`
 		ReadBufferByteCount: int(MemoryScaledByteCount(kib(64), kib(16))),
 		WriteBatchSize:      64,
@@ -475,22 +479,14 @@ func DefaultTcpBufferSettingsWithBufferSize(bufferSize int) *TcpBufferSettings {
 		EnableSyntheticSpeed: true,
 		ConnectSettings:      *DefaultConnectSettings(),
 	}
+	// the upstream socket buffers are the kernel's unless an explicit request
+	// beats its autotuning ceiling on this host (THROUGHPUTFIX §15); nil when
+	// nothing is to be pinned
+	tcpBufferSettings.ConnectSettings.DialControl = upstreamSocketBufferControl(
+		int(tcpBufferSettings.MaxWindowSize),
+		defaultSocketBufferPolicy(),
+	)
 	return tcpBufferSettings
-}
-
-// configureUpstreamTcpConn prepares a connected upstream socket for proxying.
-//
-// The receive buffer is deliberately left to the kernel. The socket is already
-// connected here, so its window clamp was fixed at SYN time from the default
-// buffer (about 64 KB). On Linux an explicit SO_RCVBUF locks receive
-// autotuning, which is the only thing that raises that clamp, so the window
-// advertised to the origin stays at 64 KB for the life of the flow and caps a
-// single download near window/RTT. Autotuning grows it to tcp_rmem's maximum.
-func configureUpstreamTcpConn(tcpConn *net.TCPConn, tcpBufferSettings *TcpBufferSettings) {
-	tcpConn.SetKeepAlive(true)
-	tcpConn.SetNoDelay(true)
-	// the os may silently cap this at system limits.
-	tcpConn.SetWriteBuffer(int(tcpBufferSettings.MaxWindowSize))
 }
 
 // scaledPow2WindowSize scales `maxWindowSize` by the memory budget with a
@@ -572,12 +568,15 @@ const providerMinTcpGlobalLimit = 512
 const providerMinIcmpUserLimit = 64
 const providerMinIcmpGlobalLimit = 128
 
-// DefaultProviderLocalUserNatSettings is the explicit provider/egress profile.
-// A process that installed a memory budget is a constrained device and gets
-// the scaled per-source/aggregate caps. An unbudgeted desktop/server provider
-// preserves the historical unlimited flow counts: silently assigning it the
-// phone's 512-TCP cap resets established provider traffic under ordinary
-// server-scale load. Keeping this choice here makes provider policy explicit
+// DefaultProviderLocalUserNatSettings is the explicit provider/egress profile
+// for a provider without a memory target: the historical unlimited flow
+// counts and the provider-tuned udp idle. Silently assigning a server-scale
+// provider the phone's 512-TCP cap resets established provider traffic under
+// ordinary load, so the caps are never a side effect of the process budget:
+// a provider that installs a budget to size its transfer share (see
+// `transferBudgetShareByteCount`) keeps exactly this profile. Flow caps come
+// from a memory target and nothing else (the sdk device wiring passes the
+// provider share). Keeping this choice here makes provider policy explicit
 // without changing every generic LocalUserNat caller.
 func DefaultProviderLocalUserNatSettings() *LocalUserNatSettings {
 	return DefaultProviderLocalUserNatSettingsWithMemoryTarget(0)
@@ -585,8 +584,8 @@ func DefaultProviderLocalUserNatSettings() *LocalUserNatSettings {
 
 // DefaultProviderLocalUserNatSettingsWithMemoryTarget sizes the provider
 // profile from the owner's provider memory target (the per-device share, see
-// the sdk device wiring). 0 keeps the legacy behavior: process-budget-scaled
-// caps, or unlimited flow counts for an unbudgeted server/desktop provider.
+// the sdk device wiring). 0 is the targetless profile above: unlimited flow
+// counts and the provider udp idle, whether or not a process budget is set.
 func DefaultProviderLocalUserNatSettingsWithMemoryTarget(targetByteCount ByteCount) *LocalUserNatSettings {
 	settings := DefaultLocalUserNatSettings()
 	if 0 < targetByteCount {
@@ -648,18 +647,19 @@ func DefaultProviderLocalUserNatSettingsWithMemoryTarget(targetByteCount ByteCou
 		)
 		return settings
 	}
-	if MemoryBudget() <= 0 {
-		// unbudgeted: keep the unlimited flow counts and give plain-udp NAT
-		// bindings the provider-tuned idle instead of the general short reap
-		settings.UdpBufferSettings.IdleTimeout = providerUdpIdleTimeout
-		return settings
-	}
-	settings.UdpBufferSettings.UserLimit = MemoryScaledCount(512, 64)
-	settings.UdpBufferSettings.GlobalLimit = MemoryScaledCount(2048, 256)
-	settings.TcpBufferSettings.UserLimit = MemoryScaledCount(256, 32)
-	settings.TcpBufferSettings.GlobalLimit = MemoryScaledCount(512, 64)
-	settings.IcmpBufferSettings.UserLimit = MemoryScaledCount(128, 16)
-	settings.IcmpBufferSettings.GlobalLimit = MemoryScaledCount(256, 32)
+	// no target: unlimited flow counts, and plain-udp NAT bindings get the
+	// provider-tuned idle instead of the general short reap. The generic
+	// constructors above install a process-budget-scaled aggregate cap when a
+	// budget is set; that cap is the constrained-device policy and is not the
+	// provider's, so it is cleared here rather than inherited. A provider that
+	// wants bounded tables passes a target.
+	settings.UdpBufferSettings.UserLimit = 0
+	settings.UdpBufferSettings.GlobalLimit = 0
+	settings.UdpBufferSettings.IdleTimeout = providerUdpIdleTimeout
+	settings.TcpBufferSettings.UserLimit = 0
+	settings.TcpBufferSettings.GlobalLimit = 0
+	settings.IcmpBufferSettings.UserLimit = 0
+	settings.IcmpBufferSettings.GlobalLimit = 0
 	return settings
 }
 
@@ -711,6 +711,12 @@ type LocalUserNat struct {
 	cancel    context.CancelFunc
 	clientTag string
 	log       Logger
+
+	// datagrams the kernel dropped at a UDP flow's socket because its
+	// receive buffer was full, summed over every UDP socket this NAT closed
+	// (THROUGHPUTFIX §12). Read from the socket's own counter at close on
+	// Linux; zero elsewhere. Invisible to every layer above the socket.
+	udpKernelReceiveDropCount atomic.Uint64
 
 	sendPackets chan *SendPacket
 	sendLock    sync.Mutex
@@ -919,10 +925,18 @@ func (self *LocalUserNat) addSourceRetirementCallback(callback sourceRetirementF
 	}
 }
 
+// UdpKernelReceiveDropCount is the running total of datagrams the kernel
+// dropped at this NAT's UDP flow sockets, counted as each socket closes.
+func (self *LocalUserNat) UdpKernelReceiveDropCount() uint64 {
+	return self.udpKernelReceiveDropCount.Load()
+}
+
 func (self *LocalUserNat) SecurityPolicyStats(reset bool) SecurityPolicyStats {
 	return SecurityPolicyStats{}
 }
 
+// Takes the packet on success only: a true return transfers ownership, and on
+// false the caller still owns it and must return it.
 func (self *LocalUserNat) SendPacketWithTimeout(source TransferPath, provideMode protocol.ProvideMode,
 	packet []byte, timeout time.Duration) bool {
 	return self.SendPacketsWithTimeout(source, provideMode, [][]byte{packet}, timeout)
@@ -1056,11 +1070,18 @@ func (self *LocalUserNat) stopSending() {
 }
 
 // `SendPacketFunction`
+// Takes the packet on success only: a true return transfers ownership, and on
+// false the caller still owns it and must return it.
 func (self *LocalUserNat) SendPacket(source TransferPath, provideMode protocol.ProvideMode, packet []byte, timeout time.Duration) bool {
 	return self.SendPacketWithTimeout(source, provideMode, packet, timeout)
 }
 
 // `SendPackets` for a batch of packets from one source. see `SendPacketsWithTimeout`.
+//
+// Takes every packet on success only: a true return transfers ownership of all
+// of them, and on false the caller still owns all of them and must return
+// them. The batch is all-or-nothing, so the boolean is not a per-packet
+// result.
 func (self *LocalUserNat) SendPackets(source TransferPath, provideMode protocol.ProvideMode, packets [][]byte, timeout time.Duration) bool {
 	return self.SendPacketsWithTimeout(source, provideMode, packets, timeout)
 }
@@ -1463,6 +1484,8 @@ func (self *LocalUserNat) runSendShard(sendPackets chan *SendPacket) {
 	// callback after this nat's Run starts.
 	udp4Buffer.receiveTransferPacketsCallback = self.receiveTransferPackets
 	udp6Buffer.receiveTransferPacketsCallback = self.receiveTransferPackets
+	udp4Buffer.kernelReceiveDropCount = &self.udpKernelReceiveDropCount
+	udp6Buffer.kernelReceiveDropCount = &self.udpKernelReceiveDropCount
 	tcp4Buffer.receiveTransferPacketsCallback = self.receiveTransferPackets
 	tcp6Buffer.receiveTransferPacketsCallback = self.receiveTransferPackets
 	icmp4Buffer.receiveTransferPacketsCallback = self.receiveTransferPackets
@@ -2594,6 +2617,9 @@ type UdpBuffer[BufferId comparable] struct {
 	sharedLifecycleWake            chan struct{}
 	sharedLifecycleWaitGroup       sync.WaitGroup
 	sequenceWaitGroup              sync.WaitGroup
+	// the owning NAT's kernel receive-drop counter, handed to each sequence
+	// for its socket close; nil leaves the drops uncounted
+	kernelReceiveDropCount *atomic.Uint64
 
 	mutex sync.Mutex
 
@@ -2733,6 +2759,7 @@ func (self *UdpBuffer[BufferId]) udpSend(
 			self.socketReadPoller = newUdpSocketReadPoller(self.ctx, self.udpBufferSettings)
 		}
 		sequence.socketReadPoller = self.socketReadPoller
+		sequence.kernelReceiveDropCount = self.kernelReceiveDropCount
 		sequence.sharedSocketLifecycle =
 			self.socketReadPoller != nil && self.udpBufferSettings.SharedSocketLifecycle
 		sequence.sharedLifecycleWake = self.sharedLifecycleWake
@@ -2962,6 +2989,7 @@ type UdpSequence struct {
 	closeOnce                      sync.Once
 	retirementOperations           *lifecycleAdmission
 	retirementDone                 chan struct{}
+	kernelReceiveDropCount         *atomic.Uint64
 
 	sendMutex sync.Mutex
 	sendItems chan *UdpSendItem
@@ -3230,11 +3258,31 @@ func (self *UdpSequence) openSocket() (net.Conn, error) {
 	self.UpdateLastActivityTime()
 	self.log.V(2).Infof("[init]connect success\n")
 	if udpConn, ok := socket.(*net.UDPConn); ok {
-		// The OS may cap these requests at its configured limits.
+		// Deliberate, and not the TCP case (THROUGHPUTFIX §12): UDP has no
+		// autotuning to lock, so this is a plain request for a larger buffer
+		// than the default. The kernel clamps it to net.core.{r,w}mem_max and
+		// doubles it, so on a stock host every profile gets 425,984, twice
+		// the default; where the operator allows more, the request lands.
+		// A datagram is charged its skb size, about 2,304 bytes for 1,400 of
+		// payload, so the buffer holds about 0.6 of its number in payload.
+		// Drops here are invisible above the socket and are counted at close
+		// (closeSocket).
 		udpConn.SetReadBuffer(int(self.udpBufferSettings.MaxWindowSize))
 		udpConn.SetWriteBuffer(int(self.udpBufferSettings.MaxWindowSize))
 	}
 	return socket, nil
+}
+
+// Closes the flow's upstream socket, first adding the datagrams the kernel
+// dropped at it to the NAT's counter. The read is one getsockopt per flow
+// close, so it costs nothing on the packet path.
+func (self *UdpSequence) closeSocket(socket net.Conn) {
+	if self.kernelReceiveDropCount != nil {
+		if dropCount := udpSocketReceiveDropCount(socket); 0 < dropCount {
+			self.kernelReceiveDropCount.Add(dropCount)
+		}
+	}
+	_ = socket.Close()
 }
 
 func (self *UdpSequence) startSharedSocket() bool {
@@ -3286,7 +3334,7 @@ func (self *UdpSequence) Run() {
 	if err != nil {
 		return
 	}
-	defer socket.Close()
+	defer self.closeSocket(socket)
 	// f, _ := udpConn.File()
 	// fd := SocketHandle(f.Fd())
 	// syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_MTU, self.udpBufferSettings.Mtu)
@@ -3469,7 +3517,7 @@ func (self *UdpSequence) Close() {
 				self.socketReadPoller.unregister(self)
 			}
 			if self.sharedSocket != nil {
-				_ = self.sharedSocket.Close()
+				self.closeSocket(self.sharedSocket)
 			}
 			select {
 			case self.sharedLifecycleWake <- struct{}{}:
@@ -3646,6 +3694,105 @@ type TcpBufferSettings struct {
 	// an ack is sent sooner when the unacked byte count reaches half the window.
 	// zero sends a pure ack on every send seq advance.
 	AckCompressTimeout time.Duration
+	// The steady-state acknowledgement cadence (THROUGHPUTFIX §45.2): one
+	// acknowledgement every this many in-order segments that carry payload,
+	// whatever the window is doing. Zero disables it.
+	//
+	// The half-window signal above is the only fast clock a saturated upload
+	// has, and it keys on the advertised window, so it cannot fire until the
+	// sender holds half a rung in flight. At the ladder's 16 MiB rung that
+	// half is 8 MiB, 67 ms of data at a gigabit, and `AckCompressTimeout`
+	// fires first: the sender's inner round trip becomes the path plus the
+	// compression interval rather than the path. Since a sender is bounded by
+	// its send buffer over that round trip, the timer rather than the window
+	// is the ceiling — 4 MiB over `path + 60 ms` cannot reach a gigabit at any
+	// path length or any memory budget.
+	//
+	// A cadence counted in segments gives the sender a clock that does not
+	// depend on the window having grown. It is what TCP's delayed
+	// acknowledgement does at two; k here can be larger because the only cost
+	// is acknowledgement traffic, and there is no memory consequence at all
+	// since acknowledgements are not retained. At 16 and 1,280 byte segments
+	// that is one acknowledgement per 20 KB, about 6,000 a second at a
+	// gigabit, under 0.3 per cent of the bytes, and the clock it leaves is
+	// 20 KB over the rate, a fraction of a millisecond.
+	//
+	// This is not `QuickackEverySegments` below and does not replace it. That
+	// phase is entered only on evidence that the peer's window is small and is
+	// deliberately bounded so it cannot run in steady state; this rule is the
+	// steady state and nothing else. Both may be on: the signal they share
+	// coalesces, so the pair costs no more than the earlier of them. The
+	// half-window signal and the compression timer remain as backstops for a
+	// sender that stops short of k.
+	//
+	// 16 is the design's starting candidate rather than a measured optimum.
+	// What a campaign measures to set it is k against acknowledgement traffic,
+	// and the shape is expected to be flat above it.
+	SteadyAckEverySegments int
+	// The recovery phase (THROUGHPUTFIX §26). The half-window signal above
+	// keys on the window rung, so it cannot fire while the peer keeps less
+	// than half a rung in flight, which is every slow start and every
+	// post-loss recovery. In exactly that period the compression timer is the
+	// only clock, and since a peer grows its congestion window per
+	// acknowledgement received rather than per byte acknowledged, its recovery
+	// is throttled to one segment of growth per compression interval: a factor
+	// of (RTT + T)/RTT, two at a 50 ms round trip and fifty-one at 1 ms.
+	//
+	// Inside the phase the NAT acknowledges every `QuickackEverySegments`
+	// in-order segments, which restores exponential window growth. One
+	// acknowledgement per burst would give linear growth and take 93 round
+	// trips where doubling takes seven, so the counting rule is the substance
+	// rather than an optimization.
+	//
+	// The phase is entered only on evidence that the peer's window is
+	// genuinely small — loss evidence, connection start, or resumption after
+	// idle — and never on a byte count. A predicate of the form "bytes since
+	// the last acknowledgement are under half the rung" is true at the start
+	// of every interval of every flow and would acknowledge every k segments
+	// of a saturated upload for ever.
+	//
+	// Zero `QuickackEverySegments`, the shipping default, disables the phase
+	// entirely so the tree behaves as it did before §26 and a campaign's trees
+	// stay comparable.
+	QuickackEverySegments int
+	// How much of a new connection counts as start evidence: while the bytes
+	// received on the connection are under this, the peer's window is the ten
+	// segments its stack opens with, against an advertised half-window of
+	// hundreds of kilobytes.
+	StartQuickackByteCount ByteCount
+	// The most one entry may cost, in bytes acknowledged since it. It exists
+	// for a peer that never grows — an application-limited sender that would
+	// otherwise keep the rule alive — rather than for the ordinary case, which
+	// leaves the phase by reaching the half-window.
+	RecoveryQuickackByteBound ByteCount
+	// The first in-order segments after entry are acknowledged at once, one
+	// each, before the every-k rule takes over. With the counting rule in
+	// place a burst leaves at most k-1 segments unacknowledged at its end and
+	// the peer is not stalled by them, because the next round's first counting
+	// acknowledgement covers the tail cumulatively. The one genuine stall is a
+	// burst smaller than k, which is the first round after a timeout, when the
+	// window is a single segment; that round is the critical path of the whole
+	// recovery and must not wait on any timer. This is Linux's quickack, and
+	// it is what demotes the burst-end trigger below to a safety net.
+	QuickackImmediateSegmentCount int
+	// How long a burst with bytes outstanding must be silent before one
+	// acknowledgement is sent regardless of the spacing, for a burst that ends
+	// short of k later in the phase or a peer that stops with data
+	// outstanding. It must exceed the gap between segments of one burst as the
+	// tunnel delivers them, which is the reliable carrier's Pack spacing
+	// rather than the peer's wire spacing, since a burst crosses Transfer in
+	// Packs and arrives in clumps; below that it fires mid-burst, which costs
+	// one extra acknowledgement rather than being a fault. It plus the path's
+	// round trip must stay well under the peer's 200 ms retransmission floor,
+	// or the held acknowledgement fires the same spurious timeout it exists to
+	// avoid. Zero disables it.
+	//
+	// It arms on the first arrival after entry, re-arms on every arrival while
+	// anything is outstanding, and disarms when an acknowledgement covers
+	// everything outstanding. It asks only whether the last arrival was longer
+	// ago than the bound, so a flow with no measured history needs no
+	// estimate.
+	QuiescenceBound time.Duration
 	// ReadPollTimeout time.Duration
 	// WritePollTimeout time.Duration
 	IdleTimeout         time.Duration
@@ -3693,6 +3840,12 @@ type TcpBufferSettings struct {
 	// Tests may hold a newly admitted sequence before it can consume its first
 	// pooled packet. Nil is a production no-op.
 	beforeSequenceRunForTest func()
+	// Tests read the upstream socket the provider proxies through, once it is
+	// connected and configured: which buffers it has and what the kernel says
+	// about its window are only decidable on the real socket, and the flow
+	// owns it for its whole life. Called on the sequence's own goroutine, so
+	// an implementation must not block. Nil is a production no-op.
+	afterUpstreamConnectForTest func(*net.TCPConn)
 
 	ConnectSettings
 }
@@ -4295,6 +4448,17 @@ const (
 	tcpReorderDispositionStale
 )
 
+// Which rule asked for an acknowledgement in steady state (THROUGHPUTFIX
+// §45.2). The half-window rule keys on the window rung; the cadence does not,
+// which is the whole point of it. §26's recovery phase has its own signals and
+// its own rows, and is not reported here.
+type tcpAckClock int
+
+const (
+	tcpAckClockHalfWindow tcpAckClock = iota
+	tcpAckClockSteadyCadence
+)
+
 // TcpSequence owns one user-NAT TCP flow and its bounded crossover reorder state.
 type TcpSequence struct {
 	ctx    context.Context
@@ -4339,9 +4503,21 @@ type TcpSequence struct {
 	// Tests observe exact reorder decisions without using negative socket-read
 	// timeouts. The callback must not block; nil is a production no-op.
 	afterReorderDispositionForTest func(tcpReorderDisposition)
+	// Tests observe which steady-state rule asked for an acknowledgement
+	// (THROUGHPUTFIX §45.2). Called from the send loop under the connection
+	// mutex, where the decision is made. The decision is what a cadence row
+	// has to count: the acknowledgement it leads to is built on another
+	// goroutine, and signals coalesce in a one-deep channel, so the
+	// acknowledgements that leave are not a count of the decisions taken. The
+	// callback must not block; nil is a production no-op.
+	afterAckClockForTest func(tcpAckClock)
 	// Tests may hold a pool-owned pure acknowledgement after construction to force
 	// cancellation at its ownership boundary. Nil is a production no-op.
 	afterPureAckBuildForTest func([]byte)
+	// Counts the acknowledgement goroutine's timer wakes, so a row can show
+	// the burst-end trigger wakes on the quiescence cadence rather than per
+	// arrival (THROUGHPUTFIX §26.10). Nil is a production no-op.
+	afterAckWaitWakeForTest func()
 	// Tests join the pure-acknowledgement worker before inspecting ownership. Nil is a
 	// production no-op.
 	afterPureAckWorkerStopForTest func()
@@ -4603,6 +4779,9 @@ func (self *TcpSequence) initializeSynWithLock(tcp *parsedTcp) {
 }
 
 // Delivers one packet with its explicit recovery owner and current reply key.
+//
+// Takes the packet: it is returned here after the callback, so a caller must
+// not return it and must not use it afterwards.
 func (self *TcpSequence) receivePacket(packet []byte, recoveryMode receiveRecoveryMode) {
 	source, transferKey := self.transferState.get()
 	self.receiveCallback(
@@ -4617,6 +4796,10 @@ func (self *TcpSequence) receivePacket(packet []byte, recoveryMode receiveRecove
 }
 
 // Delivers a drained batch with one stable reply-key and recovery snapshot.
+//
+// Takes every packet in the batch, as receivePacket takes one: they are
+// returned here after the callback, so a caller must not return them and must
+// not use them afterwards.
 func (self *TcpSequence) receiveBatch(packets [][]byte, recoveryMode receiveRecoveryMode) {
 	source, transferKey := self.transferState.get()
 	if self.receiveTransferPacketsCallback != nil &&
@@ -4807,7 +4990,17 @@ func (self *TcpSequence) Run() {
 
 	defer socket.Close()
 	if tcpConn, ok := socket.(*net.TCPConn); ok {
-		configureUpstreamTcpConn(tcpConn, self.tcpBufferSettings)
+		// the default dialer ran the buffer control hook before connecting;
+		// a host-supplied dial is opaque and gets the post-connect subset
+		configureUpstreamTcpConn(
+			tcpConn,
+			int(self.tcpBufferSettings.MaxWindowSize),
+			defaultSocketBufferPolicy(),
+			self.tcpBufferSettings.DialContextSettings == nil,
+		)
+		if self.tcpBufferSettings.afterUpstreamConnectForTest != nil {
+			self.tcpBufferSettings.afterUpstreamConnectForTest(tcpConn)
+		}
 	}
 
 	self.log.V(2).Infof("[init]receive SYN+ACK\n")
@@ -4850,6 +5043,82 @@ func (self *TcpSequence) Run() {
 
 		ackedSendSeq = self.sendSeq
 	}()
+
+	// THROUGHPUTFIX §26. All four are read and written under self.mutex, by
+	// the send loop and the acknowledgement goroutine, exactly as
+	// ackedSendSeq is.
+	//
+	// `recovering` is the phase; `recoveryAckedByteCount` is what it has cost
+	// since its entry, against RecoveryQuickackByteBound; `quiescentNanos` is
+	// when the flow last had nothing outstanding, which is the only thing that
+	// separates a recovering peer from a quiet one.
+	quickackEverySegments := max(0, self.tcpBufferSettings.QuickackEverySegments)
+	recovering := false
+	recoveryAckedByteCount := uint32(0)
+	quiescentNanos := monotonicNanos()
+	// The phase's third exit, quiet for AckCompressTimeout, is not a separate
+	// clearing of `recovering`: its effect is supplied by E3, whose fresh
+	// entry on the next arrival after such a quiet resets every counter. The
+	// behaviour is the same and the state is not, so `recovering` reads true
+	// through a quiet period; anyone exporting it should know that.
+	//
+	// the first segments after entry, acknowledged one each
+	recoveryImmediateSegmentCount := 0
+	// in-order segments carrying payload since the last acknowledgement
+	recoverySegmentCount := 0
+	// when the last in-order segment arrived, which is what the burst-end
+	// trigger asks about; zero means the trigger is disarmed
+	lastArrivalNanos := int64(0)
+
+	// THROUGHPUTFIX §45.2. In-order segments carrying payload since the last
+	// acknowledgement this loop asked for, which is the cadence's whole state.
+	// Read and written under self.mutex, as ackedSendSeq is.
+	//
+	// Only this loop's own decisions reset it. An acknowledgement the
+	// compression timer sends does not, so the cadence is a pure count of
+	// segments and its spacing does not depend on when that timer happens to
+	// fire. The cost of that choice is at most one extra acknowledgement after
+	// a timer acknowledgement, and what it buys is a rule whose behaviour is
+	// the same at every round trip.
+	steadyAckEverySegments := max(0, self.tcpBufferSettings.SteadyAckEverySegments)
+	steadySegmentCount := 0
+
+	// Entry is evidence of a small window and never a byte count: E1 loss
+	// evidence, E2 connection start, E3 resumption after idle. Re-entry after
+	// an exit starts fresh counters, so a peer that loses on every window pays
+	// the bound each time, which is the right outcome for a path that needs
+	// its acknowledgements.
+	// A fresh entry, from not recovering, sets all of the phase's state. While
+	// the phase already runs, connection start and resumption after idle are
+	// conditions rather than events and do nothing: E2 holds on every arrival
+	// of the start window, and re-entering on each would refill the immediate
+	// counter before the arrival consumed it, acknowledging every segment
+	// rather than the first few and then every k, and would zero the bound's
+	// counter so the bound could never end the phase.
+	//
+	// A new loss is a new collapse, so it re-arms the immediate segments, and
+	// it leaves the bound's counter alone: a peer that keeps losing pays the
+	// bound and re-enters afresh (§26.3), rather than holding the phase open
+	// for ever on a go-back-N run of stale arrivals.
+	enterRecoveryWithLock := func(lossEvidence bool) {
+		if quickackEverySegments <= 0 {
+			return
+		}
+		immediateSegmentCount := max(
+			0,
+			self.tcpBufferSettings.QuickackImmediateSegmentCount,
+		)
+		if recovering {
+			if lossEvidence {
+				recoveryImmediateSegmentCount = immediateSegmentCount
+			}
+			return
+		}
+		recovering = true
+		recoveryAckedByteCount = 0
+		recoveryImmediateSegmentCount = immediateSegmentCount
+		recoverySegmentCount = 0
+	}
 
 	// pipelines
 
@@ -5213,7 +5482,23 @@ func (self *TcpSequence) Run() {
 				if err != nil {
 					self.log.Infof("[r]ack err = %s\n", err)
 				}
+				acknowledgedByteCount := self.sendSeq - ackedSendSeq
 				ackedSendSeq = self.sendSeq
+				// nothing is outstanding from here, which is what separates a
+				// recovering peer from a quiet one, and what disarms the
+				// burst-end trigger
+				quiescentNanos = monotonicNanos()
+				lastArrivalNanos = 0
+				if recovering {
+					recoveryAckedByteCount += acknowledgedByteCount
+					// the bound on what one entry may cost, for a peer that
+					// never grows out of the phase by itself
+					if 0 < self.tcpBufferSettings.RecoveryQuickackByteBound &&
+						self.tcpBufferSettings.RecoveryQuickackByteBound <=
+							ByteCount(recoveryAckedByteCount) {
+						recovering = false
+					}
+				}
 			}()
 			if packet == nil {
 				return
@@ -5236,12 +5521,71 @@ func (self *TcpSequence) Run() {
 				// the send loop signals to ack sooner when the unacked byte
 				// count reaches half the window, so the source never stalls
 				// on a full window waiting for the timeout.
-				ackCompressTimer.Reset(self.tcpBufferSettings.AckCompressTimeout)
-				select {
-				case <-ackCompressTimer.C:
-				case <-ackSignal:
-				case <-self.ctx.Done():
-					return
+				//
+				// Inside the recovery phase the wait is also cut short once a
+				// burst with bytes outstanding has been silent for
+				// QuiescenceBound (THROUGHPUTFIX §26.9). The deadline moves
+				// with every arrival, so a wake that finds it has not passed
+				// waits again rather than acknowledging mid-burst.
+				// The wait is capped at QuiescenceBound while the phase is
+				// active, so it wakes on that cadence rather than on arrivals:
+				// over a recovery at a 50 ms round trip that is about a hundred
+				// wakes against a wake per segment. Each firing re-reads the
+				// last-arrival timestamp the send loop stores under the mutex
+				// and either acknowledges or re-arms at the moved deadline.
+				compressDeadlineNanos := monotonicNanos() +
+					int64(self.tcpBufferSettings.AckCompressTimeout)
+				// armed, and whether the burst it watches has already ended
+				burstEndStateWithoutLock := func() (bool, bool) {
+					self.mutex.Lock()
+					defer self.mutex.Unlock()
+					if self.tcpBufferSettings.QuiescenceBound <= 0 || !recovering {
+						return false, false
+					}
+					ended := self.sendSeq != ackedSendSeq &&
+						lastArrivalNanos != 0 &&
+						self.tcpBufferSettings.QuiescenceBound <=
+							time.Duration(monotonicNanos()-lastArrivalNanos)
+					return true, ended
+				}
+				for {
+					remaining := time.Duration(compressDeadlineNanos - monotonicNanos())
+					if remaining <= 0 {
+						break
+					}
+					burstEndArmed, burstEnded := burstEndStateWithoutLock()
+					if burstEndArmed && burstEnded {
+						// Overdue: the burst went silent past the bound while
+						// this goroutine was elsewhere, which the synchronous
+						// admission of a pure ACK can make it. Waiting the
+						// compression interval here is the starvation returning
+						// on the slow acknowledgement path.
+						break
+					}
+					waitTimeout := remaining
+					if burstEndArmed && self.tcpBufferSettings.QuiescenceBound < waitTimeout {
+						waitTimeout = self.tcpBufferSettings.QuiescenceBound
+					}
+					ackCompressTimer.Reset(waitTimeout)
+					select {
+					case <-ackCompressTimer.C:
+						if self.afterAckWaitWakeForTest != nil {
+							self.afterAckWaitWakeForTest()
+						}
+						if burstEndArmed && waitTimeout < remaining {
+							// woken on the burst-end cadence: acknowledge only
+							// once a burst with bytes outstanding has been
+							// silent for the whole bound, and otherwise re-arm
+							// at the deadline the arrivals moved
+							if _, ended := burstEndStateWithoutLock(); !ended {
+								continue
+							}
+						}
+					case <-ackSignal:
+					case <-self.ctx.Done():
+						return
+					}
+					break
 				}
 			}
 		}
@@ -5465,6 +5809,14 @@ func (self *TcpSequence) Run() {
 				// Both retained gaps and bounded-buffer rejection need an immediate
 				// duplicate ACK so ordinary TCP retransmission can recover.
 				sendCurrentAck(false)
+				// E1: a peer sending past a hole has taken a loss event, so its
+				// window is collapsed or halved and the in-order data that
+				// follows must not wait on the compression timer.
+				func() {
+					self.mutex.Lock()
+					defer self.mutex.Unlock()
+					enterRecoveryWithLock(true)
+				}()
 				return true
 			}
 			if end <= 0 {
@@ -5475,6 +5827,12 @@ func (self *TcpSequence) Run() {
 					self.afterReorderDispositionForTest(tcpReorderDispositionStale)
 				}
 				sendCurrentAck(false)
+				// E1: a retransmission is the same loss evidence as a gap.
+				func() {
+					self.mutex.Lock()
+					defer self.mutex.Unlock()
+					enterRecoveryWithLock(true)
+				}()
 				return true
 			}
 
@@ -5563,13 +5921,104 @@ func (self *TcpSequence) Run() {
 					blockingByteCount = uint32(0)
 				}
 
+				outstandingBeforeByteCount := self.sendSeq - ackedSendSeq
 				self.sendSeq += advanceByteCount
 				nextSeq = self.sendSeq
 				ackCond.Broadcast()
-				if 0 < len(payload) && self.windowSize/2 <= self.sendSeq-ackedSendSeq {
+				halfWindowReached := 0 < len(payload) &&
+					self.windowSize/2 <= self.sendSeq-ackedSendSeq
+				// THROUGHPUTFIX §45.2, the steady-state cadence, ahead of the
+				// phase rule below and beside the half-window rule above. The
+				// half-window signal cannot fire until the sender holds half a
+				// rung, so without this a saturated upload is clocked by the
+				// compression timer and is bounded by its send buffer over the
+				// path plus that interval. Counting segments gives it a clock
+				// that does not wait on the window.
+				if !halfWindowReached && 0 < len(payload) && 0 < steadyAckEverySegments {
+					steadySegmentCount += 1
+					if steadyAckEverySegments <= steadySegmentCount {
+						steadySegmentCount = 0
+						select {
+						case ackSignal <- struct{}{}:
+						default:
+						}
+						if self.afterAckClockForTest != nil {
+							self.afterAckClockForTest(tcpAckClockSteadyCadence)
+						}
+					}
+				}
+				if halfWindowReached {
 					select {
 					case ackSignal <- struct{}{}:
 					default:
+					}
+					// the half-window rule is the binding trigger again, so the
+					// peer is out of the small-window region this phase serves
+					recovering = false
+					// an acknowledgement has just been asked for, so the
+					// cadence counts its next k from here
+					steadySegmentCount = 0
+					if self.afterAckClockForTest != nil {
+						self.afterAckClockForTest(tcpAckClockHalfWindow)
+					}
+				} else if 0 < quickackEverySegments && 0 < len(payload) {
+					nowNanos := monotonicNanos()
+					if outstandingBeforeByteCount == 0 {
+						// E3: the flow resumed after a quiet longer than the
+						// compression timeout, which returns a peer's stack to
+						// slow start with no loss involved.
+						if self.tcpBufferSettings.AckCompressTimeout <
+							time.Duration(nowNanos-quiescentNanos) {
+							enterRecoveryWithLock(false)
+						}
+					}
+					// E2: a new connection's window is ten segments against an
+					// advertised half-window of hundreds of kilobytes.
+					if 0 < self.tcpBufferSettings.StartQuickackByteCount &&
+						ByteCount(self.sendSeq-self.initialSynSeq-1) <
+							self.tcpBufferSettings.StartQuickackByteCount {
+						enterRecoveryWithLock(false)
+					}
+					// The counting rule, which is the remedy: inside the phase,
+					// acknowledge every k in-order segments. It is the RFC 1122
+					// receiver, applied only where the peer's window is small.
+					if recovering {
+						// arms the burst-end trigger, and re-arms it on every
+						// arrival while anything is outstanding. The
+						// acknowledgement goroutine reads this timestamp under
+						// the same mutex and re-arms its own timer from it, so
+						// an arrival costs a store rather than a wake
+						// (THROUGHPUTFIX §26.10).
+						lastArrivalNanos = nowNanos
+						if 0 < recoveryImmediateSegmentCount {
+							// the critical path of a recovery is its first
+							// round, a single segment that no counting rule can
+							// reach; it waits on nothing
+							recoveryImmediateSegmentCount -= 1
+							recoverySegmentCount = 0
+							select {
+							case ackSignal <- struct{}{}:
+							default:
+							}
+						} else {
+							// Segments, not bytes. What the rule clocks is the
+							// peer's acknowledgement-counted growth, one step
+							// per acknowledgement received, so the quantity is
+							// acknowledgements per segment received; a byte
+							// rule against peerMss under-acknowledges a peer
+							// whose segments are small. The phase's own exits
+							// bound the cost of a run of tiny segments, since
+							// such a flow is application limited and leaves by
+							// the quiet exit.
+							recoverySegmentCount += 1
+							if quickackEverySegments <= recoverySegmentCount {
+								recoverySegmentCount = 0
+								select {
+								case ackSignal <- struct{}{}:
+								default:
+								}
+							}
+						}
 					}
 				}
 			}()
@@ -6056,9 +6505,9 @@ func DefaultRemoteUserNatProviderSettingsWithMemoryTarget(targetByteCount ByteCo
 		MaxSourceCount:          maxSourceCount,
 		IngressDispatchTimeout:  0,
 
-		// twice the NAT's zero-progress bound for an upstream TCP write
-		// (`TcpBufferSettings.WriteTimeout`), which already tolerates tens of
-		// seconds of acknowledgement starvation on a live flow
+		// twice Transfer's own acknowledgement bound (`SendBufferSettings
+		// .AckTimeout`), and above every acknowledgement gap the shipped tree
+		// has been measured to produce (THROUGHPUTFIX §10.3)
 		ReturnSendAbandonTimeout: 120 * time.Second,
 	}
 }
@@ -6069,15 +6518,19 @@ type RemoteUserNatProviderSettings struct {
 	// sender admissions. Zero retains the default.
 	ReturnSendRetryTimeout time.Duration
 
-	// ReturnSendAbandonTimeout bounds how long a socket-owned TCP return may
-	// go unadmitted before its source is treated as unreachable and released.
-	// A connected destination acknowledges Transfer on receipt, so admission
-	// that makes no progress for this long means the destination is gone.
-	// The check runs after an attempt returns, and one attempt may wait
-	// WriteTimeout, so a release lands up to WriteTimeout later. Nothing is
-	// released while the backend is degraded, when no destination can get a
-	// contract. A non-positive value retries until the source or provider
-	// closes.
+	// ReturnSendAbandonTimeout bounds how long a source whose socket-owned
+	// TCP return is parked may go without acknowledging any of the provider's
+	// returns to it before it is treated as unreachable and released, then
+	// readmitted (THROUGHPUTFIX §10). The clock is per source and advances
+	// only on the destination's acknowledgements, so a client that
+	// acknowledges anything, however slowly and however many flows it has
+	// parked, is never released, and an admitted item never restarts it.
+	// Time the provider spends without a transport is not counted, and
+	// nothing is released while the backend is degraded, when the return
+	// may have no contract. The check runs before an attempt and after a
+	// failed one, and an attempt may wait WriteTimeout, so a release lands
+	// up to WriteTimeout later. A non-positive value retries until the
+	// source or provider closes.
 	ReturnSendAbandonTimeout time.Duration
 
 	// ReturnSendWorkerCount is the number of datagram sender shards used after
@@ -6412,6 +6865,101 @@ type providerSourceLifecycle struct {
 	// Terminal lifecycles are their own pending cleanup nodes, so the status
 	// path allocates no second capacity-sized queue.
 	retirementNext *providerSourceLifecycle
+	// the source's acknowledgement evidence, kept by the provider across the
+	// source's lifecycles (THROUGHPUTFIX §10); nil on a terminal lifecycle
+	evidence *sourceAckEvidence
+}
+
+// The acknowledgement evidence of one source (THROUGHPUTFIX §10): the
+// provider's own record that its socket-owned returns to that client are
+// deliverable. It outlives the source's lifecycles, which are reclaimed
+// whenever the source has no admitted producer, so an acknowledgement that
+// arrives between a flow's items still lands on the source. Bounded with the
+// provider's other per-source maps. All times are monotonicNanos, and every
+// field is atomic: the acknowledgement path is the send sequence goroutine,
+// the readers are parked return producers.
+type sourceAckEvidence struct {
+	// socket-owned returns admitted to Transfer and not yet acknowledged or
+	// failed, and when that count last rose from zero. While something is
+	// outstanding, silence accrues from there or from the last
+	// acknowledgement, whichever is later, so a further admission never
+	// restarts it.
+	outstanding           atomic.Int64
+	outstandingSinceNanos atomic.Int64
+	// when a producer first found its return unadmitted with nothing
+	// outstanding, which is the only silence there is then; cleared by an
+	// admission
+	parkedSinceNanos atomic.Int64
+	// when the destination last acknowledged one of the source's returns
+	lastAckNanos atomic.Int64
+	// when a parked producer last found the provider without a transport,
+	// since the provider's own silence is no evidence about the client
+	carrierAbsentNanos atomic.Int64
+}
+
+// `sendAckTarget` for the source's socket-owned returns: one fewer
+// outstanding, and on success the destination is reachable now. One clock
+// read and two atomic operations per acknowledged item.
+func (self *sourceAckEvidence) sendAckResult(value ByteCount, err error) {
+	if self == nil {
+		return
+	}
+	for {
+		count := self.outstanding.Load()
+		if count <= 0 || self.outstanding.CompareAndSwap(count, count-1) {
+			break
+		}
+	}
+	if err == nil {
+		self.lastAckNanos.Store(monotonicNanos())
+	}
+}
+
+// One more socket-owned return admitted to Transfer.
+func (self *sourceAckEvidence) admitted(nowNanos int64) {
+	if self.outstanding.Add(1) == 1 {
+		self.outstandingSinceNanos.Store(nowNanos)
+	}
+	self.parkedSinceNanos.Store(0)
+}
+
+// A producer found its return unadmitted. With nothing outstanding the start
+// of that stall is the clock's floor, recorded once.
+func (self *sourceAckEvidence) parked(nowNanos int64) {
+	if self.outstanding.Load() <= 0 {
+		self.parkedSinceNanos.CompareAndSwap(0, nowNanos)
+	}
+}
+
+// How long the destination has acknowledged nothing while the provider had a
+// return outstanding or parked for it and a carrier to deliver on: since the
+// latest of the last acknowledgement, the outstanding count last rising from
+// zero (or, with nothing outstanding, the stall's start), and the last
+// observed carrier absence.
+func (self *sourceAckEvidence) silence(nowNanos int64) time.Duration {
+	var sinceNanos int64
+	if 0 < self.outstanding.Load() {
+		sinceNanos = self.outstandingSinceNanos.Load()
+	} else {
+		sinceNanos = self.parkedSinceNanos.Load()
+		if sinceNanos == 0 {
+			return 0
+		}
+	}
+	floorNanos := max(
+		sinceNanos,
+		self.lastAckNanos.Load(),
+		self.carrierAbsentNanos.Load(),
+	)
+	return time.Duration(nowNanos - floorNanos)
+}
+
+// The process-relative monotonic clock behind the evidence stamps, so a
+// wall-clock step on the host cannot read as a silent client.
+var monotonicEpoch = time.Now()
+
+func monotonicNanos() int64 {
+	return int64(time.Since(monotonicEpoch))
 }
 
 type RemoteUserNatProvider struct {
@@ -6461,6 +7009,11 @@ type RemoteUserNatProvider struct {
 	// on the provider packet path. Entries are bounded with
 	// sourceProvideMode and removed on the same arbitrary safe eviction.
 	sourceP2pPriorityRefresh map[Id]time.Time
+	// sourceAckEvidences is the per-source acknowledgement evidence behind
+	// the abandon decision (THROUGHPUTFIX §10): created with a source's first
+	// lifecycle, bounded by MaxSourceCount with the same arbitrary eviction,
+	// removed on an authoritative disconnect
+	sourceAckEvidences map[Id]*sourceAckEvidence
 	// sourceLifecycles contains only active healthy sources and permanent
 	// terminal tombstones. Healthy entries disappear at their final admission;
 	// terminal entries never expire or evict within this provider generation.
@@ -6520,8 +7073,9 @@ type RemoteUserNatProvider struct {
 
 	afterUnreachableSourceReleaseForTest func(Id)
 	backendDegradedForTest               func() bool
-	// returnSendNowForTest replaces the wall clock that times an unadmitted
-	// socket-owned return against ReturnSendAbandonTimeout.
+	hasActiveTransportForTest            func() bool
+	// returnSendNowForTest replaces the clock used to evaluate a source's
+	// acknowledgement silence against ReturnSendAbandonTimeout.
 	returnSendNowForTest func() time.Time
 }
 
@@ -6705,6 +7259,7 @@ func (self *RemoteUserNatProvider) acquireSourceLifecycle(sourceId Id) *provider
 			ctx:        sourceCtx,
 			cancel:     cancel,
 			admissions: newLifecycleAdmission(),
+			evidence:   self.sourceAckEvidenceWithLock(sourceId),
 		}
 		self.sourceLifecycles[sourceId] = sourceLifecycle
 	}
@@ -6938,6 +7493,92 @@ func (self *RemoteUserNatProvider) backendDegraded() bool {
 	return isBackendDegraded()
 }
 
+// Whether the provider's client has a carrier at all. Without one nothing it
+// sends can be acknowledged, so a source's silence is the provider's own.
+func (self *RemoteUserNatProvider) hasActiveTransport() bool {
+	if self.hasActiveTransportForTest != nil {
+		return self.hasActiveTransportForTest()
+	}
+	return self.client.RouteManager().HasActiveTransport()
+}
+
+// The source's acknowledgement evidence, created on first use. Called with
+// stateLock held. At the cap an arbitrary entry is evicted; a source whose
+// evidence is evicted starts a fresh record with its next lifecycle, which
+// reads as nothing outstanding until its next admission.
+func (self *RemoteUserNatProvider) sourceAckEvidenceWithLock(sourceId Id) *sourceAckEvidence {
+	if self.sourceAckEvidences == nil {
+		self.sourceAckEvidences = map[Id]*sourceAckEvidence{}
+	}
+	if evidence := self.sourceAckEvidences[sourceId]; evidence != nil {
+		return evidence
+	}
+	if maxCount := self.settings.MaxSourceCount; 0 < maxCount && maxCount <= len(self.sourceAckEvidences) {
+		for evictSourceId := range self.sourceAckEvidences {
+			delete(self.sourceAckEvidences, evictSourceId)
+			break
+		}
+	}
+	evidence := &sourceAckEvidence{}
+	self.sourceAckEvidences[sourceId] = evidence
+	return evidence
+}
+
+// The evidence a return item is counted against: its source's, for a
+// socket-owned item whose acknowledgement no test target intercepts. Datagram
+// and control items have none; only socket-owned returns are outstanding.
+func (self *RemoteUserNatProvider) returnSendAckEvidence(item *providerReturnItem) *sourceAckEvidence {
+	if self.returnAckTargetForTest != nil ||
+		item.recoveryMode != receiveRecoveryModeTcpSocket ||
+		item.sourceLifecycle == nil {
+		return nil
+	}
+	return item.sourceLifecycle.evidence
+}
+
+// The ack target of a return item: its source's evidence, whose clock the
+// destination's acknowledgement advances. A test target wins.
+func (self *RemoteUserNatProvider) returnSendAckTarget(item *providerReturnItem) sendAckTarget {
+	if self.returnAckTargetForTest != nil {
+		return self.returnAckTargetForTest
+	}
+	if evidence := self.returnSendAckEvidence(item); evidence != nil {
+		return evidence
+	}
+	return nil
+}
+
+// Releases a parked socket-owned return's source when the destination has
+// acknowledged none of the source's returns for ReturnSendAbandonTimeout
+// (THROUGHPUTFIX §10). The clock is the source's evidence: it advances on the
+// destination's acknowledgements and is floored at the start of what is
+// outstanding, so a client that acknowledges anything, however slowly, is
+// never released and an admitted item never restarts it. While the provider
+// has no transport nothing can be acknowledged, so that time is not counted
+// against the client; while the backend is degraded the return may have no
+// contract, likewise. Reports whether the source was released.
+func (self *RemoteUserNatProvider) abandonSilentSource(item *providerReturnItem) bool {
+	abandonTimeout := self.settings.ReturnSendAbandonTimeout
+	evidence := self.returnSendAckEvidence(item)
+	if abandonTimeout <= 0 || evidence == nil {
+		return false
+	}
+	nowNanos := monotonicNanos()
+	if self.returnSendNowForTest != nil {
+		nowNanos = int64(self.returnSendNowForTest().Sub(monotonicEpoch))
+	}
+	if !self.hasActiveTransport() {
+		evidence.carrierAbsentNanos.Store(nowNanos)
+		return false
+	}
+	evidence.parked(nowNanos)
+	if evidence.silence(nowNanos) < abandonTimeout || self.backendDegraded() {
+		return false
+	}
+	self.releaseUnreachableSource(item.source.SourceId, item.sourceLifecycle)
+	return true
+}
+
 // Joins the released generation's producers, then retires its NAT flows and
 // Transfer sequences. Returns the transient retirement owner, or zero if the
 // provider closed first; releasing the owner readmits the NAT source unless
@@ -6988,6 +7629,7 @@ func (self *RemoteUserNatProvider) senderDisconnected(senderClientId Id) {
 		delete(self.sourceProvideMode, senderClientId)
 		delete(self.sourceP2pPriorityRefresh, senderClientId)
 		delete(self.sourceDiagnostics, senderClientId)
+		delete(self.sourceAckEvidences, senderClientId)
 	}()
 }
 
@@ -7385,13 +8027,29 @@ func (self *RemoteUserNatProvider) sourceReturnProvideMode(sourceId Id, fallback
 	return fallback
 }
 
-// Derives the provider's return contract while retaining the receiver-visible
-// lane and encryption session. The authenticated source remains separate.
+// Derives the provider's return contract, reproducing the session the client
+// opened and not the lane it opened on. The authenticated source remains
+// separate.
+//
+// Session identity is the force-stream flag, the encryption role and the
+// encryption companion, all carried through unchanged, plus the contract
+// policy set here from the provide mode. The lane is not part of that
+// identity: it is a receiver-visible ordering domain, and reproducing it made
+// a client at lane zero pin every return to lane zero whatever the provider's
+// own count was, so the count was inert on the download direction — the
+// direction lanes exist for (THROUGHPUTFIX §30.2, measured).
+//
+// Dropping it leaves the return's lane to the provider's own gate, which hashes
+// under the existing capability gate using the flow key the isolation logic
+// already computes, or answers lane zero when the destination has not
+// advertised support or the Pack carries no scheduling key. A control reply
+// with no scheduling key is therefore unaffected and stays on lane zero.
 func providerReplyTransferKey(
 	transferKey TransferKey,
 	provideMode protocol.ProvideMode,
 ) TransferKey {
 	transferKey.CompanionContract = provideMode != protocol.ProvideMode_Network
+	transferKey.LogicalLane = 0
 	return transferKey
 }
 
@@ -7436,10 +8094,12 @@ func providerReturnIpTransferOptions(
 const providerReturnBatchMaxFrames = 16
 const providerReturnBatchMaxBytes = 24 * 1024
 
-// Retries caller-owned socket-return data until Transfer accepts it or the
-// provider closes. Every non-owned callback has one downstream disposition,
-// even for a synthesized or public TCP packet. Failed owned attempts wait a
-// strict pacing floor, including immediate no-route and full-buffer failures.
+// Retries caller-owned socket-return data until Transfer accepts it, the
+// provider closes, or the source has been silent for ReturnSendAbandonTimeout
+// (abandonSilentSource). Every non-owned callback has one downstream
+// disposition, even for a synthesized or public TCP packet. Failed owned
+// attempts wait a strict pacing floor, including immediate no-route and
+// full-buffer failures.
 func (self *RemoteUserNatProvider) retryReturnSend(
 	item *providerReturnItem,
 	packetCount int,
@@ -7450,13 +8110,10 @@ func (self *RemoteUserNatProvider) retryReturnSend(
 	if retryTimeout <= 0 {
 		retryTimeout = 10 * time.Millisecond
 	}
-	abandonTimeout := self.settings.ReturnSendAbandonTimeout
-	now := time.Now
-	if self.returnSendNowForTest != nil {
-		now = self.returnSendNowForTest
-	}
-	startTime := now()
 	for {
+		if self.abandonSilentSource(item) {
+			return false
+		}
 		retry := NewPacedReconnect(retryTimeout)
 		sent := send()
 		if self.afterReturnSendAttemptForTest != nil {
@@ -7466,16 +8123,21 @@ func (self *RemoteUserNatProvider) retryReturnSend(
 				sent:            sent,
 			})
 		}
-		if sent || item.recoveryMode != receiveRecoveryModeTcpSocket {
-			return sent
+		if sent {
+			if evidence := self.returnSendAckEvidence(item); evidence != nil {
+				evidence.admitted(monotonicNanos())
+			}
+			return true
+		}
+		if item.recoveryMode != receiveRecoveryModeTcpSocket {
+			return false
 		}
 		sendCtx := item.sendContext(self.ctx)
 		if sendCtx.Err() != nil {
 			// the attempt failed because the source or provider closed
 			return false
 		}
-		if 0 < abandonTimeout && abandonTimeout <= now().Sub(startTime) && !self.backendDegraded() {
-			self.releaseUnreachableSource(item.source.SourceId, item.sourceLifecycle)
+		if self.abandonSilentSource(item) {
 			return false
 		}
 		if self.beforeTcpReturnSendRetryForTest != nil {
@@ -7534,6 +8196,7 @@ func (self *RemoteUserNatProvider) sendReturnPacket(item *providerReturnItem) bo
 		1,
 		item.packetByteCount,
 	)
+	ackTarget := self.returnSendAckTarget(item)
 	var sent bool
 	if 2 <= self.settings.ProtocolVersion {
 		sent = self.retryReturnSend(item, 1, item.packetByteCount, func() bool {
@@ -7541,7 +8204,7 @@ func (self *RemoteUserNatProvider) sendReturnPacket(item *providerReturnItem) bo
 				protocol.MessageType_IpIpPacketFromProvider,
 				packet,
 				destinationId,
-				self.returnAckTargetForTest,
+				ackTarget,
 				0,
 				writeTimeout,
 				returnOption,
@@ -7581,6 +8244,7 @@ func (self *RemoteUserNatProvider) sendReturnPacket(item *providerReturnItem) bo
 				sendSchedulingKeyOption{key: item.schedulingKey},
 				observeTransportWrite(transportAttribution.observe),
 				recoveryOption,
+				sendAckTargetOption{target: ackTarget},
 			)
 		})
 		if !sent {
@@ -7635,6 +8299,7 @@ func (self *RemoteUserNatProvider) sendReturnBatchWithLimits(
 	destinationId := item.source.SourceId
 	writeTimeout := self.returnWriteTimeout(item)
 	recoveryOption := self.returnSendRecoveryOption(item)
+	ackTarget := self.returnSendAckTarget(item)
 	frames := make([]*protocol.Frame, 0, maxFrames)
 	wrappedShares := make([][]byte, 0, maxFrames)
 	var chunkBytes int64
@@ -7669,6 +8334,7 @@ func (self *RemoteUserNatProvider) sendReturnBatchWithLimits(
 					sendSchedulingKeyOption{key: item.schedulingKey},
 					observeTransportWrite(transportAttribution.observe),
 					recoveryOption,
+					sendAckTargetOption{target: ackTarget},
 				)
 				return admitted
 			},
@@ -7733,6 +8399,9 @@ func (self *RemoteUserNatProvider) sendReturnBatchWithLimits(
 // source/ipPath, so the egress policy is evaluated once. Ownership mirrors
 // the per-packet Receive: each packet is shared read-only into a frame; the
 // share/marshal buffers are freed on the same raw/wrapped rules.
+//
+// Borrows every packet in the batch, as Receive borrows one: a caller that
+// built them still owns them after the call and must return them.
 func (self *RemoteUserNatProvider) ReceiveBatch(
 	source TransferPath,
 	provideMode protocol.ProvideMode,
@@ -7743,6 +8412,8 @@ func (self *RemoteUserNatProvider) ReceiveBatch(
 }
 
 // Returns a public/shared batch with one nonblocking disposition.
+//
+// Borrows every packet in the batch, as receiveTransfer borrows one.
 func (self *RemoteUserNatProvider) receiveTransferBatch(
 	source TransferPath,
 	transferKey TransferKey,
@@ -7969,6 +8640,8 @@ func (self *RemoteUserNatProvider) receiveTransferBatchWithRecovery(
 	self.enqueueReturnItem(item)
 }
 
+// Borrows the packet: it is valid for this call, a share is kept where the
+// frame needs one, and the caller still owns the original afterwards.
 func (self *RemoteUserNatProvider) Receive(
 	source TransferPath,
 	provideMode protocol.ProvideMode,
@@ -7979,6 +8652,8 @@ func (self *RemoteUserNatProvider) Receive(
 }
 
 // Returns one public/shared packet with a nonblocking disposition.
+//
+// Borrows the packet, as Receive does.
 func (self *RemoteUserNatProvider) receiveTransfer(
 	source TransferPath,
 	transferKey TransferKey,
@@ -8003,6 +8678,11 @@ func (self *RemoteUserNatProvider) receiveTransfer(
 }
 
 // Returns one keyed NAT packet without dropping its explicit recovery owner.
+//
+// Borrows the packet. A fixture that builds its own must return it after the
+// call; `MessagePoolCopy` into this entry and no return is a leak of one root
+// per call, which is how two test cells and one adopted helper leaked before
+// the contract was written down.
 func (self *RemoteUserNatProvider) receiveTransferWithRecovery(
 	source TransferPath,
 	transferKey TransferKey,
@@ -8656,6 +9336,23 @@ func (self *RemoteUserNatClient) SendPacket(source TransferPath, provideMode pro
 				nil,
 				0,
 				timeout,
+				// This layer has already parsed the packet for policy and
+				// routing, so it knows the flow and the transfer layer does
+				// not. Telling it costs nothing — the key never crosses the
+				// wire — and it is the provider's own derivation rather than a
+				// second five-tuple hash that would have to agree with it.
+				//
+				// Note what this is and is not. This single-destination client
+				// is not a production path: the only non-test reference in
+				// connect, the SDK or the server is a commented-out line, and
+				// production client traffic goes through the multi client,
+				// which already passes this option at both of its IP send
+				// sites. So this is not a head-of-line fix; it is making the
+				// fixture behave the way production does, which matters
+				// because several cells drive traffic through this layer and
+				// would otherwise measure a queueing behaviour the shipping
+				// path does not have.
+				scheduleIpFlow(&ipPath),
 			)
 			return success
 		}
@@ -8667,7 +9364,13 @@ func (self *RemoteUserNatClient) SendPacket(source TransferPath, provideMode pro
 
 		// the sender will control transfer
 		// note udp is sent with ack because because otherwise the delivery reliability will mulitply with the egress
-		success := self.client.SendMultiHopWithTimeout(frame, destination, func(err error) {}, timeout)
+		success := self.client.SendMultiHopWithTimeout(
+			frame,
+			destination,
+			func(err error) {},
+			timeout,
+			scheduleIpFlow(&ipPath),
+		)
 		if success {
 			// Legacy serialization copied the packet into frame.MessageBytes;
 			// consume the caller's packet only after the queue accepts the copy.

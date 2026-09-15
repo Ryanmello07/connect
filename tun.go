@@ -52,6 +52,60 @@ import (
 
 // const DefaultChannelSize = 64
 
+// The divisor of the process memory budget that gives one of the tun's gVisor
+// TCP buffer maxima. One eighth: 8 MiB at the 64 MiB reference, 32 MiB at 256.
+//
+// THROUGHPUTFIX §43.1, the `tun reservation` row of §44.1's share table, and
+// the third ceiling of §39.2. The receive maximum and the send maximum each
+// draw the share rather than splitting one, because they bind opposite
+// directions: receive is the download binder, reached by gVisor's receive
+// moderation, and send is the upload binder together with the inner
+// acknowledgement clock.
+const tunBudgetShareDivisor = 8
+
+// tunBudgetShareByteCount is the largest a single gVisor TCP receive or send
+// buffer under this tun may auto-tune to: a draw on the process memory budget,
+// proportional to it.
+//
+// It must never be a `MemoryScaledByteCount`, and that distinction is the
+// whole finding rather than a detail of style. That helper's scale returns one
+// at or above the 64 MiB reference and a fraction below, so it can only shrink
+// its argument: every constant written in the local idiom was sized for a
+// reference host, and a provider with eight gigabytes ran a 64 MiB device's
+// buffers. Raising the budget bought nothing here. Since the adjacent lines in
+// this file all scale a constant, copying one is the natural way to write this
+// and `TestTheTunsMaximaAreADrawOnTheBudget` is what holds it: substitute the
+// idiom and it fails at the first budget step above the reference.
+//
+// Whose ceiling this is, because it bounds what the change can reach. Only a
+// client whose inner TCP stack is this tree's gVisor: the hosted, simulated
+// and probe modes. A shipped native desktop, phone or extension creates no
+// gVisor tun at all — its OS tun hands packets to `DeviceLocal.SendPacket` —
+// so the equivalent ceiling there is the operating system's own autotuning
+// maximum, which is the same order (about 4 MiB on macOS, 6 on Linux and
+// Android, up to 16 on Windows) and is not this tree's to set.
+//
+// The floor is this buffer's own working minimum, deliberately not the 4 MiB
+// of §43.1's first form. A floor there is an admission floor rather than a
+// buffer floor, and taking a fraction of a floored reservation inflates small
+// hosts: at an 8 MiB budget it would ask 4 MiB of each maximum, 8 MiB of the
+// two beside the transport total's 3 MiB floor, against the whole budget
+// (§44.2's third constraint). Keeping today's floor makes the draw
+// bit-identical to today's value at every budget where the floor binds, and
+// never below it at any budget.
+//
+// A zero budget is the absence of the surface rather than a small share: an
+// unbudgeted process keeps today's constant, because falling to the floor here
+// would make every unbudgeted host eight times slower at this layer the moment
+// the rule was turned on.
+func tunBudgetShareByteCount() ByteCount {
+	budget := MemoryBudget()
+	if budget <= 0 {
+		return mib(4)
+	}
+	return max(kib(512), budget/tunBudgetShareDivisor)
+}
+
 func DefaultTunSettings() *TunSettings {
 	return DefaultTunSettingsWithBufferSize(1024)
 }
@@ -85,7 +139,10 @@ func DefaultTunSettingsWithBufferSize(bufferSize int) *TunSettings {
 		// tcp buffer auto-tuning ranges for the server/proxy data plane (the shared
 		// stack). Max applies per connection, so it caps per-connection memory; a
 		// memory-constrained IpMux on a private stack shrinks these much further.
-		// default and max are per connection, so scaled by the memory budget.
+		// Default is per connection and scaled by the memory budget; Max is per
+		// connection and a draw on it (`tunBudgetShareByteCount`), so a larger
+		// budget raises the ceiling a single stream can auto-tune to instead of
+		// leaving every host at a 64 MiB device's 4 MiB.
 		// The tunnel path's effective ack rtt runs orders of magnitude above
 		// loopback (userspace relay hops + ack coalescing), so the throughput
 		// of a single stream is window/rtt-bound: the former 256KiB default
@@ -95,12 +152,12 @@ func DefaultTunSettingsWithBufferSize(bufferSize int) *TunSettings {
 		TcpReceiveBuffer: TcpBufferRange{
 			Min:     4 * 1024,
 			Default: int(MemoryScaledByteCount(mib(1), kib(128))),
-			Max:     int(MemoryScaledByteCount(mib(4), kib(512))),
+			Max:     int(tunBudgetShareByteCount()),
 		},
 		TcpSendBuffer: TcpBufferRange{
 			Min:     4 * 1024,
 			Default: int(MemoryScaledByteCount(mib(1), kib(128))),
-			Max:     int(MemoryScaledByteCount(mib(4), kib(512))),
+			Max:     int(tunBudgetShareByteCount()),
 		},
 
 		// cap rto backoff well below the gvisor default (120s). The path under
@@ -159,6 +216,12 @@ type TunSettings struct {
 	// (the default cap is 120s). See DefaultTunSettings for why the tun uses
 	// a small cap.
 	TcpMaxRto time.Duration
+	// TcpMinRto, when positive, sets the floor of the gVisor TCP
+	// retransmission timeout (the stack default is 200ms). The floor bounds
+	// the peer's acknowledgement compression from above: an acknowledgement
+	// held longer than a sender's floor is a spurious retransmission
+	// (THROUGHPUTFIX §22). Zero leaves the stack default.
+	TcpMinRto time.Duration
 
 	// TcpGro enables generic receive offload for Tun.WriteBatch: the tcp
 	// packets of one batch coalesce into super-segments before delivery,
@@ -178,7 +241,12 @@ type TcpBufferRange struct {
 // (header.IPv6MinimumMTU, 1280). A tun below it is IPv4 only.
 const tunIpv6MinimumMtu = int(header.IPv6MinimumMTU)
 
-func newTunStack(tcpReceive TcpBufferRange, tcpSend TcpBufferRange, tcpMaxRto time.Duration) *stack.Stack {
+func newTunStack(
+	tcpReceive TcpBufferRange,
+	tcpSend TcpBufferRange,
+	tcpMaxRto time.Duration,
+	tcpMinRto time.Duration,
+) *stack.Stack {
 	opts := stack.Options{
 		NetworkProtocols: []stack.NetworkProtocolFactory{
 			ipv4.NewProtocolWithOptions(ipv4.Options{AllowExternalLoopbackTraffic: true}),
@@ -224,6 +292,10 @@ func newTunStack(tcpReceive TcpBufferRange, tcpSend TcpBufferRange, tcpMaxRto ti
 	}
 	if 0 < tcpMaxRto {
 		opt := tcpip.TCPMaxRTOOption(tcpMaxRto)
+		s.SetTransportProtocolOption(tcp.ProtocolNumber, &opt)
+	}
+	if 0 < tcpMinRto {
+		opt := tcpip.TCPMinRTOOption(tcpMinRto)
 		s.SetTransportProtocolOption(tcp.ProtocolNumber, &opt)
 	}
 
@@ -809,7 +881,12 @@ func CreateTunWithResolver(ctx context.Context, settings *TunSettings, dnsResolv
 	// each Tun owns a private gVisor stack, destroyed on Close() so all of its
 	// endpoints are reclaimed. (There is no shared stack: it could not reclaim a
 	// closed Tun's connection endpoints, leaking them under Tun churn.)
-	tunStackInstance := newTunStack(settings.TcpReceiveBuffer, settings.TcpSendBuffer, settings.TcpMaxRto)
+	tunStackInstance := newTunStack(
+		settings.TcpReceiveBuffer,
+		settings.TcpSendBuffer,
+		settings.TcpMaxRto,
+		settings.TcpMinRto,
+	)
 
 	// v4 first: consumers that predate dual stack read the tun's address
 	// from the head of this list
@@ -1510,10 +1587,76 @@ func udpDialAddr(addrs []netip.Addr) netip.Addr {
 	return addrs[0]
 }
 
+// A stream connection through the stack that keeps its endpoint, so a test
+// or a measurement can read the stack's view of the connection (congestion
+// window, slow start threshold, smoothed round trip, retransmission timeout)
+// without an accessor the gonet adapter does not provide.
+type TunTcpConn struct {
+	*gonet.TCPConn
+	endpoint tcpip.Endpoint
+}
+
+// TcpInfo reads the stack's TCP info for this connection.
+func (self *TunTcpConn) TcpInfo() (tcpip.TCPInfoOption, error) {
+	var info tcpip.TCPInfoOption
+	if tcpipErr := self.endpoint.GetSockOpt(&info); tcpipErr != nil {
+		return tcpip.TCPInfoOption{}, fmt.Errorf("Could not read tcp info err=%s", tcpipErr)
+	}
+	return info, nil
+}
+
+// creates a tcp endpoint and connects it. This mirrors
+// `gonet.DialContextTCP`, which does not expose the endpoint it creates.
+func (self *Tun) dialTcp(
+	ctx context.Context,
+	remoteAddr tcpip.FullAddress,
+	protoNumber tcpip.NetworkProtocolNumber,
+) (*TunTcpConn, error) {
+	wq := &waiter.Queue{}
+	ep, tcpipErr := self.stack.NewEndpoint(tcp.ProtocolNumber, protoNumber, wq)
+	if tcpipErr != nil {
+		return nil, fmt.Errorf("Could not create tcp endpoint err=%s", tcpipErr)
+	}
+	// registered before connect, which always returns before completing
+	waitEntry, notify := waiter.NewChannelEntry(waiter.WritableEvents)
+	wq.EventRegister(&waitEntry)
+	defer wq.EventUnregister(&waitEntry)
+
+	select {
+	case <-ctx.Done():
+		ep.Close()
+		return nil, ctx.Err()
+	default:
+	}
+	tcpipErr = ep.Connect(remoteAddr)
+	if _, started := tcpipErr.(*tcpip.ErrConnectStarted); started {
+		select {
+		case <-ctx.Done():
+			ep.Close()
+			return nil, ctx.Err()
+		case <-notify:
+		}
+		tcpipErr = ep.LastError()
+	}
+	if tcpipErr != nil {
+		ep.Close()
+		return nil, &net.OpError{
+			Op:   "connect",
+			Net:  "tcp",
+			Addr: &net.TCPAddr{IP: net.IP(remoteAddr.Addr.AsSlice()), Port: int(remoteAddr.Port)},
+			Err:  fmt.Errorf("%s", tcpipErr),
+		}
+	}
+	return &TunTcpConn{
+		TCPConn:  gonet.NewTCPConn(wq, ep),
+		endpoint: ep,
+	}, nil
+}
+
 // dialTcpAddr is one stream connect through the stack to a resolved address.
 func (self *Tun) dialTcpAddr(ctx context.Context, host string, addrPort netip.AddrPort) (net.Conn, error) {
 	fa, pn := self.convertToFullAddr(addrPort)
-	conn, err := gonet.DialContextTCP(ctx, self.stack, fa, pn)
+	conn, err := self.dialTcp(ctx, fa, pn)
 	if err == nil {
 		if self.log.V(1).Enabled() {
 			self.log.Infof("[tun]tcp connect (%s)->%s success\n", host, addrPort)

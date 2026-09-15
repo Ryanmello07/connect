@@ -2,6 +2,7 @@ package connect
 
 import (
 	"container/heap"
+	"slices"
 	"sync"
 )
 
@@ -95,6 +96,7 @@ type transferQueue[T transferQueueItem] struct {
 	budget            *TransferMemoryBudget
 	minByteCount      ByteCount
 	borrowedByteCount ByteCount
+	floorRegistered   bool
 
 	cmp TransferQueueCmpFunction[T]
 }
@@ -112,11 +114,64 @@ func newTransferQueue[T transferQueueItem](cmp TransferQueueCmpFunction[T]) *tra
 	return transferQueue
 }
 
+// Budget is the shared budget this queue borrows above its floor from, or nil
+// when it is bounded only by its own maximum. Read to bound a window by what
+// the budget will lend rather than by a per-queue constant.
+// ObtainableByteCount is the most this queue could hold as the shared pool
+// stands: its guaranteed floor, plus what it has already borrowed, plus what
+// is left unreserved. Zero means there is no shared budget and the caller's
+// own maximum is the only bound.
+//
+// A per-sequence rule that reports the pool's total instead is claiming
+// permission it cannot obtain, which is what a campaign reads when it asks why
+// a provider serving many clients did not reach the number its windows said it
+// would (THROUGHPUTFIX §37.22).
+func (self *transferQueue[T]) ObtainableByteCount() ByteCount {
+	self.stateLock.Lock()
+	budget := self.budget
+	minByteCount := self.minByteCount
+	borrowedByteCount := self.borrowedByteCount
+	self.stateLock.Unlock()
+	if budget == nil {
+		return 0
+	}
+	return minByteCount + borrowedByteCount + budget.Available()
+}
+
+func (self *transferQueue[T]) Budget() *TransferMemoryBudget {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.budget
+}
+
 // setBudget attaches a shared budget with a guaranteed floor. Set before the
 // queue is used; the floor and budget do not change afterwards.
 func (self *transferQueue[T]) setBudget(budget *TransferMemoryBudget, minByteCount ByteCount) {
+	if self.budget != nil && self.floorRegistered {
+		self.budget.removeFloor(self.minByteCount)
+		self.floorRegistered = false
+	}
 	self.budget = budget
 	self.minByteCount = minByteCount
+	if budget != nil {
+		budget.addFloor(minByteCount)
+		self.floorRegistered = true
+	}
+}
+
+// LendableByteCount is what this queue's pool would lend it at full demand:
+// the pool less the floors guaranteed to the other queues attached to it. The
+// static permission ceiling, read now rather than frozen when settings were
+// built. Zero means no shared pool.
+func (self *transferQueue[T]) LendableByteCount() ByteCount {
+	self.stateLock.Lock()
+	budget := self.budget
+	minByteCount := self.minByteCount
+	self.stateLock.Unlock()
+	if budget == nil {
+		return 0
+	}
+	return budget.LendableByteCount(minByteCount)
 }
 
 // updateByteCountWithLock applies a byte count change and maintains the
@@ -197,6 +252,12 @@ func (self *transferQueue[T]) Clear() []T {
 	clear(self.messageIdItems)
 	clear(self.sequenceNumberItems)
 	self.updateByteCountWithLock(-self.byteCount, -self.queueByteCount)
+	// Teardown drops the queue wholesale, so its guaranteed floor is no longer
+	// spoken for and the pool may lend those bytes to the queues that remain.
+	if self.budget != nil && self.floorRegistered {
+		self.budget.removeFloor(self.minByteCount)
+		self.floorRegistered = false
+	}
 	return items
 }
 
@@ -317,6 +378,27 @@ func (self *transferQueue[T]) RemoveFirst() T {
 	delete(self.sequenceNumberItems, item.SequenceNumber())
 	self.updateByteCountWithLock(-item.MessageByteCount(), -item.QueueByteCount())
 	return item
+}
+
+// UnorderedItems appends the queue's items to buf in whatever order the heap
+// holds them. For a caller that only needs to touch every item, which does not
+// pay for the sort AscendingItems does.
+func (self *transferQueue[T]) UnorderedItems(buf []T) []T {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return append(buf[:0], self.orderedItems...)
+}
+
+// AscendingItems appends the queue's items to buf in the queue's own order,
+// smallest first. The backing store is a heap, so only its head is ordered;
+// a caller that needs the whole run in order pays a sort, and passes its own
+// buffer so a hot path does not allocate per call.
+func (self *transferQueue[T]) AscendingItems(buf []T) []T {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	buf = append(buf[:0], self.orderedItems...)
+	slices.SortFunc(buf, self.cmp)
+	return buf
 }
 
 func (self *transferQueue[T]) PeekFirst() T {

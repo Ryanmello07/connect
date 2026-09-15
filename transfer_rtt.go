@@ -213,6 +213,71 @@ func (self *RttWindow) closeSendTime(sendTimeUnixMilli uint64, receiveTime time.
 // sooner. A lane whose samples are spread reports a longer one, so a
 // routine excursion of several times the mean no longer rewrites the whole
 // window; its rare real loss waits longer for it (FLIGHTGATEFIX §25.2).
+// An estimate carried with its own evidence: the value, how many samples back
+// it, and how old the newest of them is.
+//
+// It is a type rather than a duration on purpose. A zero mean over no samples
+// means unsampled and a zero mean over samples means a measured
+// sub-millisecond path, and this program has twice been misled by exactly that
+// ambiguity — once by a deviation timer over an unsampled stall and once by a
+// receive-side precondition. A bare duration lets a caller read the first as
+// the second by accident; this does not. Every other reader on the window
+// folds the unsampled case into a resend floor, which is right for timing and
+// wrong for measurement.
+type RttEstimate struct {
+	Mean time.Duration
+	// Min is the smallest live sample, from the window's monotonic-minimum
+	// deque, taken under the same lock and the same coalesce as the mean so
+	// the two cannot disagree.
+	//
+	// It is what separates added latency from a backlog in one reading. A
+	// minimum near the path's own delay with a mean far above it means
+	// acknowledgements queued behind something, which is a backlog rather
+	// than time added to each one; a minimum as high as the mean means every
+	// acknowledgement genuinely took that long, and the excess is real. On a
+	// real path Min is the path plus fixed processing and Mean − Min is
+	// queueing, ours or the window's own.
+	Min         time.Duration
+	SampleCount int
+	// Age of the newest sample when the estimate was taken. An estimate whose
+	// newest sample is older than the path's behaviour describes a path that
+	// no longer exists, so freshness travels with the value rather than being
+	// inferred from the caller's own clock.
+	NewestSampleAge time.Duration
+}
+
+// Sampled reports whether any sample backs the mean.
+func (self RttEstimate) Sampled() bool {
+	return 0 < self.SampleCount
+}
+
+// Estimate is the window's unscaled mean round trip with its evidence.
+func (self *RttWindow) Estimate() RttEstimate {
+	return self.estimate(time.Now())
+}
+
+func (self *RttWindow) estimate(sampleTime time.Time) RttEstimate {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.coalesceWithLock(sampleTime)
+
+	if self.windowCount == 0 {
+		return RttEstimate{}
+	}
+	newestIndex := (self.windowTailIndex + self.windowCount - 1) % len(self.window)
+	newestSampleAge := sampleTime.Sub(time.Unix(0, self.window[newestIndex].receiveUnixNano))
+	minimum := time.Duration(0)
+	if self.minimumCount != 0 {
+		minimum = self.minimums[self.minimumHeadIndex].rtt
+	}
+	return RttEstimate{
+		Mean:            self.netRtt / time.Duration(self.windowCount),
+		Min:             minimum,
+		SampleCount:     self.windowCount,
+		NewestSampleAge: max(0, newestSampleAge),
+	}
+}
+
 func (self *RttWindow) DeviationRtt() time.Duration {
 	return self.deviationRtt(time.Now())
 }

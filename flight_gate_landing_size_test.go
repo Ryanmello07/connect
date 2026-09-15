@@ -26,6 +26,18 @@ const (
 	// against the struct's 8-byte tail, so it costs its own 8 bytes and no
 	// padding.
 	lanePositionStateByteCount = 8
+	// THROUGHPUTFIX §37.3's receive advertisement: what the receiver said it
+	// can still hold out of order, and whether it said anything at all. It is
+	// a mechanism the landing keeps rather than a field left behind, and it
+	// has to live on this struct because the sender clamps its window to the
+	// latest advertised value and both wire paths decode into it. The count
+	// is the narrow type and the flag packs against the existing bools, so
+	// the pair costs one word rather than two.
+	receiveAdvertisementStateByteCount = 8
+	// one pointer, nil on every acknowledgement that evicted nothing, naming
+	// the items a receiver removed from its hold after acknowledging them
+	// (THROUGHPUTFIX §37.16)
+	evictionNoticeStateByteCount = 8
 )
 
 func TestLandingStructsMatchMergedLessTheDeferState(t *testing.T) {
@@ -33,8 +45,15 @@ func TestLandingStructsMatchMergedLessTheDeferState(t *testing.T) {
 		t.Errorf("sequenceAck is %d bytes, want merged's %d: the ack path carries nothing of this program's",
 			got, want)
 	}
-	if got, want := unsafe.Sizeof(receiveAckMessage{}), uintptr(mergedReceiveAckMessageByteCount); got != want {
-		t.Errorf("receiveAckMessage is %d bytes, want merged's %d", got, want)
+	if got, want := unsafe.Sizeof(receiveAckMessage{}),
+		uintptr(mergedReceiveAckMessageByteCount+
+			receiveAdvertisementStateByteCount+
+			evictionNoticeStateByteCount); got != want {
+		t.Errorf(
+			"receiveAckMessage is %d bytes, want merged's %d plus %d for the receiver's advertised capacity and %d for the eviction notice",
+			got, mergedReceiveAckMessageByteCount,
+			receiveAdvertisementStateByteCount, evictionNoticeStateByteCount,
+		)
 	}
 	want := uintptr(
 		mergedSendItemByteCount + deferStateByteCount + lanePositionStateByteCount)
