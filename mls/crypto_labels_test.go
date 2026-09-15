@@ -1877,6 +1877,20 @@ var labelConstructionsOverAnyProvider = map[string]string{
 	// provider whose hash is 48 and requires it to work there.
 	"openSenderData": "answers a structure it decrypted rather than bytes of its own, and both provider methods it reaches -- ExpandWithLabel and AeadOpen -- fail rather than answer under a wrapper that flips every answer",
 
+	// the pre-ratchet peek, which is openSenderData plus a parse and carries openSenderData's
+	// limit for openSenderData's reason: the two provider methods it reaches are the same two,
+	// and both FAIL under a wrapper that flips every answer rather than answering different
+	// bytes. A row here would report "did not route through its provider" for every possible
+	// implementation, the correct one included.
+	//
+	// It is not unheld. TestProviderHasNoRemainingStubs moves its secret and the region of its
+	// message the sender data is a function of and requires each to change the verdict;
+	// TestEveryConstructionHandedAProviderReadsKdfNhFromIt runs it over a provider whose hash is
+	// 48 and requires it to work there; and TestThePeekAgreesWithTheOpenOnEveryMessageThatOpens
+	// holds both of its answers to the values OpenPrivateMessage authenticates, which nothing
+	// reaching for a provider of its own could satisfy.
+	"PeekPrivateMessageSender": "answers a leaf and the caller's own authenticated_data rather than bytes of its own, and both provider methods it reaches -- ExpandWithLabel and AeadOpen -- fail rather than answer under a wrapper that flips every answer",
+
 	// section 6.3's open, on openSenderData's terms exactly and for the same reason: it reaches
 	// AeadOpen twice through the sender data step and the content step, and under a wrapper that
 	// flips every answer neither key is the key the message was sealed under, so the row has an

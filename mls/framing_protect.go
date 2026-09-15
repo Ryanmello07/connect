@@ -1058,9 +1058,26 @@ func sealPrivateMessage(crypto CryptoProvider, keys MessageKeySource, senderData
 // The order is section 6.3 and is not interchangeable: sender data, then content, then signature.
 // The sender data names the ratchet the content key is in, and the content carries the signature.
 // Every AEAD failure on either of the first two collapses into one value, for errDecryptFailed
-// reason; the erase happens between the second and the third, because a message whose AEAD opened
-// came from somebody holding this epoch keys, and holding the key open across a signature check
-// would leave a replay of the same ciphertext decryptable a second time.
+// reason.
+//
+// THE ERASE IS LAST AND IT IS A REFUSAL BOUNDARY AND NOT A TIDY-UP. It used to sit between the
+// content AEAD and the signature, which is where p6's own sketch drew it, and the sentence that
+// stood here said a message whose AEAD opened came from somebody holding this epoch's keys. That
+// sentence is true and it is not the sentence that matters, because in an MLS group EVERY member
+// holds this epoch's keys: RFC 9420 section 9 derives the whole secret tree from encryption_secret,
+// so any member can compute any OTHER member's message key at any generation and produce a
+// ciphertext that opens under it. An erase before the signature therefore let one member destroy
+// another member's key by sending a ciphertext it built itself -- one ordinary message per message
+// it wanted deleted, permanently, at every receiver that processed it. p4's own argument for why
+// MessageKey does not consume is this same sentence one layer down: an erase on a forged ciphertext
+// "would burn a key on every forged ciphertext, turning one bad packet into a permanently lost
+// message".
+//
+// So the pair is now "look up, open, AUTHENTICATE, erase". What the move costs is that a refused
+// ciphertext can be replayed and refused again -- CPU, and a bounded amount of it, because the
+// retained window is bounded on the way in -- and what it buys is that nothing an attacker can
+// build reaches the erase at all. A replay of a ciphertext that SUCCEEDS is still refused, by the
+// erase this success performs.
 func OpenPrivateMessage(crypto CryptoProvider, keys MessageKeySource, senderDataSecret []byte,
 	message *PrivateMessage, resolve SignatureKeyResolver, groupContext []byte) (*AuthenticatedContent, error) {
 
@@ -1107,7 +1124,6 @@ func OpenPrivateMessage(crypto CryptoProvider, keys MessageKeySource, senderData
 		// distinguishing them would be a decryption oracle.
 		return nil, errDecryptFailed
 	}
-	keys.EraseMessageKey(message.ContentType, senderData.LeafIndex, senderData.Generation)
 
 	content, auth, err := unmarshalPrivateMessageContent(plaintext, message, sender)
 	if err != nil {
@@ -1125,7 +1141,79 @@ func OpenPrivateMessage(crypto CryptoProvider, keys MessageKeySource, senderData
 	if err := VerifyAuthenticatedContent(crypto, pub, authContent, groupContext); err != nil {
 		return nil, err
 	}
+	// LAST. Every refusal above leaves this leaf's ratchet exactly where it was; see the header.
+	keys.EraseMessageKey(message.ContentType, senderData.LeafIndex, senderData.Generation)
 	return authContent, nil
+}
+
+// errPeekWireFormat is what the pre-ratchet peek answers a caller holding octets that are not a
+// PrivateMessage. It is its own value rather than a reuse of errApplicationMustBeCiphertext,
+// because that one is about a message that OPENED and turned out to be handshake content, and this
+// one is about octets that never parsed.
+var errPeekWireFormat = errors.New("mls: the peeked message is not a PrivateMessage")
+
+// PeekPrivateMessageSender answers the two things about a marshalled PrivateMessage that can be
+// read WITHOUT touching a ratchet: the leaf its sender data names, and the authenticated_data its
+// header carries in the clear.
+//
+// WHY IT EXISTS, AND IT IS NOT A SECOND RECEIVE PATH. A caller above MLS may have refusals of its
+// own that are functions of those two fields -- connect/messagegroup's MASTER section 8.4.3 is
+// exactly that, one refusal on the sender leaf and one on the authenticated_data -- and a refusal
+// taken AFTER OpenPrivateMessage is a refusal taken after the erase. That is a denial channel even
+// when the erase itself is correctly placed, because a member can lift another member's genuine
+// frame out of one envelope and put it in another: the frame opens, it authenticates, the caller
+// refuses it for being in the wrong place, and the generation it needed is gone. Reading the two
+// fields first lets the caller refuse before anything is consumed.
+//
+// IT AUTHENTICATES NOTHING AND SAYS SO IN ITS NAME. The leaf comes out of the sender data, which is
+// sealed under a secret every member holds, and the authenticated_data is a cleartext header field.
+// A caller that refuses on these values has refused honestly -- a refusal needs no authentication --
+// but a caller that ACCEPTS on them has accepted an attacker's claim. The two values are therefore
+// the caller's PRE-FILTER and never its answer: both are covered by the signature
+// OpenPrivateMessage verifies (the leaf through FramedContent.Sender, the authenticated_data
+// through FramedContent.AuthenticatedData and through the content AEAD's own AAD), so the caller
+// takes its refusals a second time on what comes back, and the second reading is the one that
+// decides. TestThePeekAgreesWithTheOpenOnEveryMessageThatOpens is that pairing, measured.
+//
+// The sender data open is the same openSenderData OpenPrivateMessage calls, so the two cannot come
+// to disagree about what a leaf index is. No ratchet is reached: the ratchet is keyed on the leaf
+// and the generation this call READS, and reading them is all it does.
+//
+// TWO CLAUSES BELOW DEFEND NOTHING THIS SUITE CAN SEE, and they are named here rather than left for
+// somebody to discover, because a clause that cannot be turned red is a clause the suite does not
+// hold whatever it looks like.
+//
+//   - The wire format COMPARISON is one half of a pair. Deleting it and leaving the arm check
+//     alone leaves the whole of ./mls/ green, because (*MLSMessage).UnmarshalMLS populates the arm
+//     its wire format names and no other, so no octets separate the two. ProcessMessage's own
+//     commentary makes that argument for omitting the arm check where the format gate already
+//     stands; here the arm check is kept anyway, because the alternative to it is a nil
+//     dereference rather than a different refusal, and the comparison is kept because it is the
+//     one of the two that states the RULE rather than the consequence.
+//   - cloneBytes on the answer. Deleting it leaves the suite green, including the gate that
+//     requires no construction to answer over its caller's arrays, because syntax.Unmarshal
+//     already answers storage of its own. That is a property of the CODEC and not of this call,
+//     and the callers of this one refuse on the value and then keep it, so the copy stays.
+func PeekPrivateMessageSender(crypto CryptoProvider, senderDataSecret []byte,
+	marshalled []byte) (senderLeaf LeafIndex, authenticatedData []byte, err error) {
+
+	if crypto == nil {
+		return 0, nil, fmt.Errorf("%w: the sender data is one AEAD open through it", ErrNilCryptoProvider)
+	}
+	parsed, err := ParseMLSMessage(marshalled)
+	if err != nil {
+		return 0, nil, err
+	}
+	if parsed.WireFormat != WireFormatPrivateMessage || parsed.PrivateMessage == nil {
+		return 0, nil, fmt.Errorf("%w: wire format %d", errPeekWireFormat, parsed.WireFormat)
+	}
+	message := parsed.PrivateMessage
+	senderData, err := openSenderData(crypto, senderDataSecret, message.EncryptedSenderData,
+		message, message.Ciphertext)
+	if err != nil {
+		return 0, nil, err
+	}
+	return senderData.LeafIndex, cloneBytes(message.AuthenticatedData), nil
 }
 
 // ---------------------------------------------------------------------------

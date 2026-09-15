@@ -580,6 +580,37 @@ func TestAnyMemberCanStillSquatAnotherLeafsStreamIndex(t *testing.T) {
 		err)
 }
 
+// repairLiftFrame takes the inner MLS frame back out of a record its sender really sealed.
+//
+// It is the attacker's half of re-enveloping, and it needs nothing an ordinary member does not
+// hold: the record key is RecordKeyZero(class_key, leaf) walked to the record's own stream index,
+// and the class key is group shared by construction. That is the same sentence repairForgeRecord
+// makes from the sealing side, read backwards, which is why the two live together.
+func repairLiftFrame(t *testing.T, session *GroupSession, leaf uint32, record *message.Record) []byte {
+	t.Helper()
+	recordKey := RecordKeyZero(append([]byte(nil), session.classKeys.Durable...), leaf)
+	for walked := uint64(0); walked < record.Header.StreamIndex; walked += 1 {
+		recordKey = stepRecordKey(recordKey)
+	}
+	defer zeroize(recordKey)
+	aadBody, err := message.AADBody(RecordAeadAlgId, record.Header.BodyBinding())
+	if err != nil {
+		t.Fatalf("AADBody: %v", err)
+	}
+	bodyKey, bodyNonce := RecordAeadBody(recordKey)
+	defer zeroize(bodyKey)
+	defer zeroize(bodyNonce)
+	padded, err := openRecordAead(bodyKey, bodyNonce, aadBody, record.CtBody)
+	if err != nil {
+		t.Fatalf("a member could not open the record it is lifting a frame out of: %v", err)
+	}
+	frame, err := unpadBody(record.Header.SizeBucket, padded)
+	if err != nil {
+		t.Fatalf("unpadBody: %v", err)
+	}
+	return frame
+}
+
 // repairForgeRecord seals one record for any leaf, out of the symbols a group member holds.
 //
 // It is the open path's own inputs assembled by hand, which is what makes both the sender
@@ -588,6 +619,19 @@ func TestAnyMemberCanStillSquatAnotherLeafsStreamIndex(t *testing.T) {
 // about any of those three has to build the record rather than ask for one.
 func repairForgeRecord(t *testing.T, session *GroupSession, leaf uint32, streamIndex uint64,
 	headPlain []byte, bodyPlain []byte) *message.Record {
+
+	t.Helper()
+	return repairForgeRecordArm(t, session, leaf, streamIndex, false, nil, headPlain, bodyPlain)
+}
+
+// repairForgeRecordArm is repairForgeRecord with MASTER section 8.4.1's arm chosen by the caller.
+//
+// The arm is a PARAMETER here for the same reason it is not one in production: the two fields that
+// pick it are sealed under a key every member derives, so choosing them is exactly what an attacker
+// can do, and a case about the arm has to be able to do it too. attachment is the ENCODED server
+// attachment, which is what the production predicate reads.
+func repairForgeRecordArm(t *testing.T, session *GroupSession, leaf uint32, streamIndex uint64,
+	isCommit bool, attachment []byte, headPlain []byte, bodyPlain []byte) *message.Record {
 
 	t.Helper()
 	classKey := append([]byte(nil), session.classKeys.Durable...)
@@ -600,15 +644,18 @@ func repairForgeRecord(t *testing.T, session *GroupSession, leaf uint32, streamI
 	if err != nil {
 		t.Fatalf("bucketForBody: %v", err)
 	}
-	attachment, err := message.EncodeServerAttachment(nil)
-	if err != nil {
-		t.Fatalf("EncodeServerAttachment: %v", err)
+	if attachment == nil {
+		attachment, err = message.EncodeServerAttachment(nil)
+		if err != nil {
+			t.Fatalf("EncodeServerAttachment: %v", err)
+		}
 	}
 	header := message.RecordHeader{
 		GroupId:          session.groupId,
 		SenderHandle:     SenderHandle(session.groupHandleKey, leaf),
 		Epoch:            session.epoch,
 		StreamIndex:      streamIndex,
+		IsCommit:         isCommit,
 		RetentionClass:   message.RetentionDurable,
 		SizeBucket:       bucket,
 		ServerAttachment: attachment,
@@ -676,6 +723,11 @@ func TestOpenRecordRefusesTheBlobRungAndTheTwoEphValuesTheRulingCreated(t *testi
 	// all, and after 2026-09-15 that is a record with no application frame in it (MASTER section
 	// 8.4.1's first row; open item MG-4 is the unruled half). A control that no longer opened
 	// would make every refusal below unfalsifiable.
+	//
+	// AND IT GOES THROUGH OpenCeremonyRecord, which is the arm split of the second pass: a record
+	// with no inner frame is not what the message door serves. Every refusal below is still taken
+	// through the same openRecordOnLoop body, which is what keeps this case about the header
+	// fields rather than about the door.
 	genuine, err := fixture.session.SealRecord(message.RetentionDurable, 0, true,
 		[]byte("head"), []byte("body"), 0, nil)
 	if err != nil {
@@ -683,14 +735,14 @@ func TestOpenRecordRefusesTheBlobRungAndTheTwoEphValuesTheRulingCreated(t *testi
 	}
 	// as built, this record opens. Every case below is that record with one header field moved,
 	// so a refusal below is about the field and not about the fixture.
-	if _, _, err := fixture.session.OpenRecord(genuine); err != nil {
+	if _, _, err := fixture.session.OpenCeremonyRecord(genuine); err != nil {
 		t.Fatalf("the control record does not open: %v", err)
 	}
 
 	blob := *genuine
 	blob.Header.SizeBucket = message.SizeBucketBlob
 	blob.Header.BlobId = make([]byte, 32)
-	if _, _, err := fixture.session.OpenRecord(&blob); !errors.Is(err, ErrBlobRecordUnsupported) {
+	if _, _, err := fixture.session.OpenCeremonyRecord(&blob); !errors.Is(err, ErrBlobRecordUnsupported) {
 		t.Errorf("OpenRecord of a record on the blob rung answered %v, want ErrBlobRecordUnsupported", err)
 	}
 
@@ -705,7 +757,7 @@ func TestOpenRecordRefusesTheBlobRungAndTheTwoEphValuesTheRulingCreated(t *testi
 	noRoot.Header.RetentionClass = message.RetentionEph
 	noRoot.Header.EphBucket = 1
 	noRoot.Header.EphWindow = ephWindowNow(t, 1)
-	if _, _, err := fixture.session.OpenRecord(&noRoot); !errors.Is(err, ErrNoReceiverRatchet) {
+	if _, _, err := fixture.session.OpenCeremonyRecord(&noRoot); !errors.Is(err, ErrNoReceiverRatchet) {
 		t.Errorf("OpenRecord of an EPH record at a session with no eph ladder answered %v, want ErrNoReceiverRatchet", err)
 	}
 	if err := fixture.session.TrackSender(fixture.handle.OwnLeafIndex(), message.RetentionEph, 1,
@@ -720,7 +772,7 @@ func TestOpenRecordRefusesTheBlobRungAndTheTwoEphValuesTheRulingCreated(t *testi
 	ahead.Header.RetentionClass = message.RetentionEph
 	ahead.Header.EphBucket = 1
 	ahead.Header.EphWindow = 1 << 40
-	if _, _, err := fixture.session.OpenRecord(&ahead); !errors.Is(err, ErrEphWindowAhead) {
+	if _, _, err := fixture.session.OpenCeremonyRecord(&ahead); !errors.Is(err, ErrEphWindowAhead) {
 		t.Errorf("OpenRecord of an EPH record a trillion windows in the future answered %v, want ErrEphWindowAhead", err)
 	}
 }

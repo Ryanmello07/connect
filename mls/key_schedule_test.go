@@ -5376,6 +5376,34 @@ func TestEveryConstructionHandedAProviderReadsKdfNhFromIt(t *testing.T) {
 			}
 			return nil
 		}},
+		// the pre-ratchet peek. What it answers is the caller's own authenticated_data, whose
+		// width is the caller's and not KDF.Nh -- so what this row states is openSenderData's
+		// row's statement and not more: that the call WORKS at either hash width, which for a
+		// construction whose key and nonce come off ExpandWithLabel is the property at risk.
+		{name: "PeekPrivateMessageSender", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
+			signed := framingPrivateSignedContent(t, crypto, framingTestMemberContent())
+			message, sealErr := SealPrivateMessage(crypto, framingNewKeySource(crypto, 0x4b, 0),
+				signed.senderDataSecret, signed.authContent, PaddingSizeV1)
+			if sealErr != nil {
+				t.Fatalf("seal the message the peek row reads, over a provider whose KDF.Nh is %d: %v",
+					crypto.HashSize(), sealErr)
+			}
+			marshalled, marshalErr := MarshalMLSMessage(&MLSMessage{
+				Version:        ProtocolVersionMls10,
+				WireFormat:     WireFormatPrivateMessage,
+				PrivateMessage: message,
+			})
+			if marshalErr != nil {
+				t.Fatalf("marshal the message the peek row reads, over a provider whose KDF.Nh is %d: %v",
+					crypto.HashSize(), marshalErr)
+			}
+			_, aad, peekErr := PeekPrivateMessageSender(crypto, signed.senderDataSecret, marshalled)
+			if peekErr != nil {
+				t.Fatalf("PeekPrivateMessageSender over a provider whose KDF.Nh is %d refused a message it had just sealed: %v",
+					crypto.HashSize(), peekErr)
+			}
+			return [][]byte{aad}
+		}},
 	} {
 		covered = append(covered, testCase.name)
 		overTheNarrowProvider, raised := recoveringRow(func() [][]byte { return testCase.call(t, narrow) })

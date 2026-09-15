@@ -3752,6 +3752,33 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 			}
 			return [][]byte{opened.ReuseGuard[:]}
 		}},
+		// the pre-ratchet peek, whose one answer of bytes is the caller's own
+		// authenticated_data. It is here rather than in the no-bytes table for exactly that
+		// reason: it DOES hand back a byte string, and what this gate asks of it is that the
+		// string is the peek's own storage -- a view onto the marshalled message it was handed
+		// would be a window a caller could edit after the refusal it drove had been taken.
+		{name: "PeekPrivateMessageSender", call: func(take func([]byte) []byte) [][]byte {
+			signed := framingPrivateSignedContent(t, crypto, framingTestMemberContent())
+			message, sealErr := SealPrivateMessage(crypto, framingNewKeySource(crypto, 0x4b, 0),
+				signed.senderDataSecret, signed.authContent, PaddingSizeV1)
+			if sealErr != nil {
+				t.Fatalf("seal the message the peek row reads: %v", sealErr)
+			}
+			marshalled, marshalErr := MarshalMLSMessage(&MLSMessage{
+				Version:        ProtocolVersionMls10,
+				WireFormat:     WireFormatPrivateMessage,
+				PrivateMessage: message,
+			})
+			if marshalErr != nil {
+				t.Fatalf("marshal the message the peek row reads: %v", marshalErr)
+			}
+			_, aad, peekErr := PeekPrivateMessageSender(crypto,
+				take(signed.senderDataSecret), take(marshalled))
+			if peekErr != nil {
+				t.Fatalf("PeekPrivateMessageSender refused a message it had just sealed: %v", peekErr)
+			}
+			return [][]byte{aad}
+		}},
 		// section 6.3.1's serializer, its decoder and its reuse guard, and then section 6.3's
 		// seal and open.
 		//
@@ -4500,6 +4527,7 @@ var providerConstructionValues = map[string]any{
 	"SealPrivateMessage":            SealPrivateMessage,
 	"sealPrivateMessage":            sealPrivateMessage,
 	"OpenPrivateMessage":            OpenPrivateMessage,
+	"PeekPrivateMessageSender":      PeekPrivateMessageSender,
 }
 
 // The name of the interface every gate in this file is written about, in one place so a
@@ -5008,6 +5036,11 @@ func providerPerturbations(t *testing.T, operation string, parameter providerPar
 	// any of them; the rule lives beside the structures it moves, in leaf_node_test.go, and
 	// derives its moves off the value rather than off a field list.
 	if perturbations, handled := providerLeafNodeArgumentPerturbations(t, operation, parameter, argument); handled {
+		return perturbations
+	}
+	// the pre-ratchet peek's marshalled message, whose read region is a PREFIX of the octets it
+	// is handed. The rule lives beside the structure it moves, in framing_protect_test.go.
+	if perturbations, handled := providerPeekedMessagePerturbations(t, operation, parameter, argument); handled {
 		return perturbations
 	}
 	switch argument.Kind() {

@@ -1791,6 +1791,7 @@ var labelledFieldFrontier = []string{
 	"OpenPrivateMessage senderDataSecret (open, so a caller must bound what it sends)",
 	// the exported reference maker, on both of its fields. It adds no "MLS 1.0 " of its own,
 	// so both boundaries are the whole MaxVectorLength rather than the prefix less one
+	"PeekPrivateMessageSender senderDataSecret (open, so a caller must bound what it sends)",
 	"RefHash label (refused here)",
 	"RefHash value (refused here)",
 	"SealPrivateMessage senderDataSecret (open, so a caller must bound what it sends)",

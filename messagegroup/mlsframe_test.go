@@ -188,20 +188,36 @@ func TestASignedFrameCannotBeReEnvelopedIntoAnotherPosition(t *testing.T) {
 // A REFUSED RECORD MOVES NO RECEIVER RATCHET, so the ruling does not turn a forgery it defeats
 // into a denial it causes.
 //
-// THIS CASE EXISTS BECAUSE THE ORDERING IT HOLDS DEFENDED NOTHING WITHOUT IT, measured: moving
-// unframeBodyOnLoop to AFTER receivers.Commit left the whole of ./messagegroup/ green. The
-// ordering is the difference between "this record is refused" and "this record is refused AND the
-// true sender's own next write is refused behind it" -- a forger who cannot write as Alice can
-// still put an envelope at Alice's next index, and an opener that committed its ladder before
-// refusing would walk past the rung Alice's real record needs.
+// THERE ARE TWO RECEIVER RATCHETS AND THIS CASE HOLDS BOTH, which is the repair. It used to hold
+// one. Its first half drives a forged body that is not an MLS frame at all, so the refusal is taken
+// by mls's parser before any key is reached, and what is observed is where the refusal sits
+// relative to receivers.Commit -- this package's own ladder over stream_index. That is real and it
+// is HALF the property the name states. The other half is the MLS ratchet INSIDE the frame, keyed
+// on the sender's leaf and a generation, and a body that never parses can no more reach it than it
+// can reach the signature. Measured, on the shape that reaches it: before this repair, a record
+// carrying a genuine frame moved to the wrong position was refused at R2 -- correctly -- AFTER mls
+// had opened the frame and erased the generation it came at, and the true sender's message at that
+// generation then never opened again at that receiver, ever. One ordinary record per message an
+// attacker wanted deleted.
 //
-// The forged body here is arbitrary octets rather than a signed frame, which is deliberate: what
-// is being observed is WHERE the refusal is taken relative to the commit, and any refusal at the
-// frame reaches that ordering. The signed-frame forgery is
-// TestOneMemberCannotForgeAMessageFromAnother's subject.
+// So half one asks "was the refusal taken before receivers.Commit" and half two asks "was it taken
+// before the MLS erase", and the two are reached by different inputs: half one needs a body mls
+// refuses, half two needs a body mls ACCEPTS and this package refuses. A case that drove only the
+// first reports a property it has only half looked at, which is worse than no case at all, because
+// the name is read as coverage.
+//
+// THE ORDERING IS THE DIFFERENCE between "this record is refused" and "this record is refused AND
+// the true sender's own next write is refused behind it" -- a forger who cannot write as Alice can
+// still put an envelope at Alice's next index, or lift Alice's own frame into a position it was not
+// signed for, and an opener that moved either ladder before refusing would walk past the rung
+// Alice's real record needs.
 func TestARecordRefusedAtTheInnerFrameMovesNoReceiverRatchet(t *testing.T) {
 	pair := newTestPair(t, "refusal-moves-nothing")
 	pair.trackDurable(t)
+
+	// ------------------------------------------------------------------
+	// HALF ONE: this package's ladder over stream_index.
+	// ------------------------------------------------------------------
 
 	// the index A's next record will take, reserved by nobody yet. It is read off a record the
 	// sender seals and throws away rather than written down, so a reserver that started
@@ -239,6 +255,69 @@ func TestARecordRefusedAtTheInnerFrameMovesNoReceiverRatchet(t *testing.T) {
 	if !bytes.Equal(gotBody, []byte("the real one")) {
 		t.Errorf("the true sender's record opened to %q", gotBody)
 	}
+
+	// ------------------------------------------------------------------
+	// HALF TWO: the MLS ratchet inside the frame, which the half above cannot reach.
+	// ------------------------------------------------------------------
+	//
+	// Both of MASTER section 8.4.3's refusals are driven, because "a record that is refused" is
+	// the whole class and a rule held over one member of it is a rule held over one member of it.
+	// Each row takes a record the sender REALLY sealed, lifts its frame out -- which any member
+	// can do, the record key is RecordKeyZero(class_key, leaf) and the class key is group shared --
+	// and re-envelopes that same frame into a record the opener must refuse. The frame is genuine,
+	// so mls opens it, authenticates it and would erase its generation; only this package knows it
+	// is in the wrong place. Then the sender's OWN record, the one the frame was lifted from, is
+	// opened. It must still open.
+	rows := []struct {
+		what     string
+		leafOf   func() uint32
+		index    func(uint64) uint64
+		sentinel error
+	}{
+		{
+			what:     "R2, the same frame re-enveloped at another stream_index",
+			leafOf:   func() uint32 { return pair.senderLeaf },
+			index:    func(at uint64) uint64 { return at + 4 },
+			sentinel: ErrRecordPositionBinding,
+		},
+		{
+			what:     "R1, the same frame re-enveloped under another member's sender_handle",
+			leafOf:   func() uint32 { return pair.openerLeaf },
+			index:    func(at uint64) uint64 { return at },
+			sentinel: ErrRecordSenderBinding,
+		},
+	}
+	for _, row := range rows {
+		genuine, err := pair.sender.SealRecord(message.RetentionDurable, 0, false,
+			[]byte("head"), []byte("a message the sender really wrote"), 0, nil)
+		if err != nil {
+			t.Fatalf("%s: the sender's SealRecord: %v", row.what, err)
+		}
+		lifted := repairLiftFrame(t, pair.opener, pair.senderLeaf, genuine)
+		leaf := row.leafOf()
+		if leaf == pair.openerLeaf {
+			if err := pair.opener.TrackSender(leaf, message.RetentionDurable, 0, 0, 0); err != nil {
+				t.Fatalf("%s: tracking the forger's own ladder: %v", row.what, err)
+			}
+		}
+		moved := repairForgeRecord(t, pair.opener, leaf, row.index(genuine.Header.StreamIndex),
+			[]byte("a head somebody else wrote"), lifted)
+		if _, _, err := pair.opener.OpenRecord(moved); !errors.Is(err, row.sentinel) {
+			t.Fatalf("%s: the re-enveloped record answered %v, want %v; nothing below is about the ordering",
+				row.what, err, row.sentinel)
+		}
+		// THE STAKE. The frame above was the sender's own, at a generation of the sender's own
+		// MLS ratchet. If the refusal was taken after mls opened it, that generation is erased
+		// at this receiver and the sender's genuine record is unopenable for the rest of time.
+		_, gotBody, err := pair.opener.OpenRecord(genuine)
+		if err != nil {
+			t.Fatalf("%s: the sender's OWN record no longer opens after the refusal above: %v. MASTER section 8.4.3's refusals must be taken BEFORE mls consumes the generation, or any member can permanently delete any other member's message with one ordinary record",
+				row.what, err)
+		}
+		if !bytes.Equal(gotBody, []byte("a message the sender really wrote")) {
+			t.Errorf("%s: the sender's own record opened to %q", row.what, gotBody)
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -255,9 +334,11 @@ func TestARecordRefusedAtTheInnerFrameMovesNoReceiverRatchet(t *testing.T) {
 // claim.
 //
 // THE CONTROL IS THE SAME SESSION SEALING A COMMIT RECORD, which MASTER section 8.4.1's first row
-// leaves alone: it carries no application frame, so it opens exactly as it always did. That is
-// what makes this case a statement about the FRAME and not about a record layer that has stopped
-// working.
+// leaves alone: it carries no application frame, so the record layer opens it exactly as it always
+// did. That is what makes this case a statement about the FRAME and not about a record layer that
+// has stopped working. It is asked for through OpenCeremonyRecord, which is where that arm's
+// records go after the second pass -- the door changed, the opening did not, and the control is
+// still the same session getting its own octets back.
 func TestASessionCannotOpenItsOwnApplicationRecordAndThatIsMls(t *testing.T) {
 	fixture := newTestSession(t, "own-application-record")
 	fixture.trackOwn(t)
@@ -278,9 +359,18 @@ func TestASessionCannotOpenItsOwnApplicationRecordAndThatIsMls(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SealRecord of a commit record: %v", err)
 	}
-	gotHead, gotBody, err := fixture.session.OpenRecord(commit)
+	gotHead, gotBody, err := fixture.session.OpenCeremonyRecord(commit)
 	if err != nil {
 		t.Fatalf("a commit record carries no application frame and must open exactly as it always did: %v", err)
+	}
+	// AND THE ARM SPLIT, from both sides: the message door refuses it, and the ceremony door
+	// refuses the application record above. Without the pair, one door that quietly served both
+	// arms would satisfy everything else in this case.
+	if _, _, err := fixture.session.OpenRecord(commit); !errors.Is(err, ErrRecordNotAnApplicationRecord) {
+		t.Errorf("the message door opened a commit record with %v, want ErrRecordNotAnApplicationRecord", err)
+	}
+	if _, _, err := fixture.session.OpenCeremonyRecord(application); !errors.Is(err, ErrRecordNotAnApplicationRecord) {
+		t.Errorf("the ceremony door opened an application record with %v, want ErrRecordNotAnApplicationRecord", err)
 	}
 	if !bytes.Equal(gotHead, []byte("head")) || !bytes.Equal(gotBody, []byte("the octets a commit record carries")) {
 		t.Errorf("the commit record opened to %q/%q", gotHead, gotBody)
@@ -766,6 +856,268 @@ func TestAMessageIdIsComputableBeforeTheSendAndFromTheHeaderAlone(t *testing.T) 
 	}
 	t.Logf("message_id %x, computed by the sender before the send and by an opener from three plaintext header fields",
 		fromOpener)
+}
+
+// driftingHandle is a GroupHandle whose Unprotect answers a DIFFERENT sender leaf, or a different
+// aad, from the one the pre-ratchet peek reads off the same octets.
+//
+// IT EXISTS TO MAKE THE SECOND READING SEPARABLE. unframeBodyOnLoop takes MASTER section 8.4.3's
+// two refusals twice: once on the peek, which moves no ratchet and is therefore where a refusal is
+// free, and once on what Unprotect answers, which is the reading the signature covers and is the
+// one that decides. Over the real engine the two agree by construction -- mls's
+// TestThePeekAgreesWithTheOpenOnEveryMessageThatOpens is that, swept -- so over the real engine,
+// deleting the second reading turns nothing red, and a clause nothing can turn red is a clause the
+// suite does not hold. This is the input that separates them: an engine whose two answers differ.
+//
+// It is not a hypothetical about a hostile engine. It is the shape of the bug the pre-filter could
+// introduce -- a peek that drifted from the open would silently become the whole rule -- and the
+// refusal below is what says the open's answer is still the one being judged.
+type driftingHandle struct {
+	GroupHandle
+	leafDrift uint32
+	aadDrift  bool
+}
+
+// Close is a NO-OP, because three sessions in this case share one handle and a GroupSession closes
+// the handle it was built over. Without it the first row's cleanup would close the group the second
+// row is about, and the second row would report "the group is closed" -- a true sentence about the
+// fixture standing where the property should be.
+func (self *driftingHandle) Close() error { return nil }
+
+func (self *driftingHandle) Unprotect(frame []byte) ([]byte, []byte, uint32, error) {
+	aad, plaintext, senderLeaf, err := self.GroupHandle.Unprotect(frame)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	if self.aadDrift && 0 < len(aad) {
+		aad = append([]byte(nil), aad...)
+		aad[0] ^= 0xff
+	}
+	return aad, plaintext, senderLeaf + self.leafDrift, err
+}
+
+// The second reading is the one that decides, and an engine whose two readings disagree is refused.
+//
+// The control comes first and it is the whole reason the case is readable: the SAME session over
+// the SAME handle with no drift opens the record. So the refusals below are about the drift and not
+// about a fixture that never worked.
+func TestTheReadingThatDecidesIsTheOneTheSignatureCovers(t *testing.T) {
+	chain := newTwoEngineChain(t, "the-reading-that-decides")
+	t.Cleanup(chain.close)
+	senderLeaf := chain.founder.OwnLeafIndex()
+
+	open := func(t *testing.T, drift *driftingHandle, record *message.Record) ([]byte, error) {
+		t.Helper()
+		session, err := NewGroupSession(drift, chain.pqSecret, chain.groupHandleKey,
+			newStreamIndexMemory(), testClock(), testServerNonce())
+		if err != nil {
+			t.Fatalf("a session over the drifting handle: %v", err)
+		}
+		defer session.Close()
+		if err := session.TrackSender(senderLeaf, message.RetentionDurable, 0, 0, 0); err != nil {
+			t.Fatalf("TrackSender: %v", err)
+		}
+		_, bodyPlain, err := session.OpenRecord(record)
+		return bodyPlain, err
+	}
+
+	rows := []struct {
+		what     string
+		drift    *driftingHandle
+		sentinel error
+	}{
+		{what: "no drift, the control", drift: &driftingHandle{GroupHandle: chain.joined}, sentinel: nil},
+		{
+			what:     "Unprotect answers another leaf than the peek read",
+			drift:    &driftingHandle{GroupHandle: chain.joined, leafDrift: 1},
+			sentinel: ErrRecordSenderBinding,
+		},
+		{
+			what:     "Unprotect answers another aad than the peek read",
+			drift:    &driftingHandle{GroupHandle: chain.joined, aadDrift: true},
+			sentinel: ErrRecordPositionBinding,
+		},
+	}
+	for _, row := range rows {
+		record, err := chain.founderSession.SealRecord(message.RetentionDurable, 0, false,
+			[]byte("head"), []byte("a message the sender really wrote"), 0, nil)
+		if err != nil {
+			t.Fatalf("%s: SealRecord: %v", row.what, err)
+		}
+		bodyPlain, err := open(t, row.drift, record)
+		if row.sentinel == nil {
+			if err != nil {
+				t.Fatalf("%s: %v", row.what, err)
+			}
+			if !bytes.Equal(bodyPlain, []byte("a message the sender really wrote")) {
+				t.Fatalf("%s: the control opened to %q", row.what, bodyPlain)
+			}
+			continue
+		}
+		if !errors.Is(err, row.sentinel) {
+			t.Errorf("%s: OpenRecord answered %v, want %v. The pre-ratchet peek is a filter and never the answer; the reading the signature covers is what MASTER section 8.4.3 is taken on",
+				row.what, err, row.sentinel)
+		}
+		if bodyPlain != nil {
+			t.Errorf("%s: the refusal returned %d octets of body", row.what, len(bodyPlain))
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the arm of MASTER section 8.4.1's table, and who picks it
+// ---------------------------------------------------------------------------
+
+// The arm is chosen by two fields no signature covers, so the refusals of MASTER section 8.4.3 were
+// OPT-OUT until the door split. This is that, measured from the attacker's side.
+//
+// isApplicationRecord reads is_commit and the encoded server attachment. Both live in AAD_head,
+// AAD_head is sealed under record_key[n], and record_key[0] is RecordKeyZero(class_key, leaf) --
+// a class key every member holds and a leaf NUMBER. So the member that seals a record decides
+// which row of the table it takes, and before the split a member that did not want to be
+// signature-checked simply set is_commit: OpenRecord answered that member's own octets under
+// whatever sender_handle it liked, with no signature anywhere on the path.
+//
+// WHAT IS ASSERTED IS BOTH HALVES, and the second is the uncomfortable one. The message door now
+// refuses both ceremony arms by name -- that is the repair. The ceremony door still answers the
+// forged octets, because the ceremony arm carries no signature and cannot be authenticated here;
+// that is MEASURED and printed rather than left to a reader, because a case that only showed the
+// refusal would read as though the arm had been closed. Open item MG-5 is what a ruling owes it.
+func TestTheArmOfTheTableIsChosenBySomethingNoSignatureCovers(t *testing.T) {
+	pair := newTestPair(t, "the-arm-is-chosen")
+	forgerSession := pair.opener
+	victimLeaf := pair.senderLeaf
+	opener := pair.sender
+	if err := opener.TrackSender(victimLeaf, message.RetentionDurable, 0, 0, 0); err != nil {
+		t.Fatalf("A tracks its own ladder: %v", err)
+	}
+
+	wrap, err := message.EncodeServerAttachment(&message.ServerAttachment{
+		Kind: message.AttachmentWrap,
+		Wrap: &message.WrapTag{WrapTargetHandle: make([]byte, 16), Epoch: 1},
+	})
+	if err != nil {
+		t.Fatalf("EncodeServerAttachment: %v", err)
+	}
+
+	rows := []struct {
+		what       string
+		isCommit   bool
+		attachment []byte
+		index      uint64
+	}{
+		{what: "is_commit set", isCommit: true, attachment: nil, index: 0},
+		{what: "a server attachment set", isCommit: false, attachment: wrap, index: 1},
+	}
+	for _, row := range rows {
+		body := []byte("OCTETS B CHOSE, ATTRIBUTED TO A")
+		forged := repairForgeRecordArm(t, forgerSession, victimLeaf, row.index,
+			row.isCommit, row.attachment, []byte("a head attributed to A"), body)
+		if forged.Header.SenderHandle != SenderHandle(forgerSession.groupHandleKey, victimLeaf) {
+			t.Fatalf("%s: the forged record does not carry A's sender_handle", row.what)
+		}
+
+		// THE REPAIR. The door that returns a message refuses this record, so no call named for
+		// opening a message can be made to answer octets no member signed.
+		headPlain, bodyPlain, err := opener.OpenRecord(forged)
+		if !errors.Is(err, ErrRecordNotAnApplicationRecord) {
+			t.Errorf("%s: a record B forged at A's handle with no signature anywhere opened at the MESSAGE door with %v; want ErrRecordNotAnApplicationRecord. A rule an attacker can opt out of is not a rule",
+				row.what, err)
+		}
+		if headPlain != nil || bodyPlain != nil {
+			t.Errorf("%s: the refusal returned %d octets of head and %d of body",
+				row.what, len(headPlain), len(bodyPlain))
+		}
+
+		// AND THE PART THAT IS NOT CLOSED, measured rather than described. The ceremony arm has
+		// no signature to check -- Spec A section 5.11 step 5 -- so the ceremony door does answer
+		// the attacker's octets under the victim's handle. Its name is the whole of what says so,
+		// and nothing that renders a message may call it.
+		_, ceremonyBody, err := opener.OpenCeremonyRecord(forged)
+		if err != nil {
+			t.Fatalf("%s: the ceremony door refused a well formed ceremony record: %v", row.what, err)
+		}
+		if !bytes.Equal(ceremonyBody, body) {
+			t.Fatalf("%s: the ceremony door answered %q", row.what, ceremonyBody)
+		}
+		t.Logf("%s: the message door refuses it, and the ceremony door answers %q under a sender_handle B does not own. The ceremony arm is authenticated by nothing and open item MG-5 is what a ruling owes it",
+			row.what, ceremonyBody)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// MASTER section 8.4.5's message_id, and the door it had none of
+// ---------------------------------------------------------------------------
+
+// The sender and an opener compute one id for one record THROUGH THE SESSION, which is the surface
+// the derivation had none of.
+//
+// messagegroup.MessageId has been exported and correct since the ruling and had NO CALLER anywhere
+// in connect or in sdk -- so "both sides derive the same value" was a property of a function rather
+// than of the build, and a reply, a reaction or a read cursor had nothing to name. What is held
+// here is the id coming out of the two sessions that actually have the record: the sender, from the
+// record it just sealed and before any submit, and the opener, from the header it parsed.
+//
+// AND IT IS THE FREE FUNCTION'S ANSWER AND NOT A SECOND DERIVATION. The door supplies the key and
+// the header supplies the other three inputs; a door that expanded anything of its own would be a
+// second implementation of a formula three documents already state.
+func TestTheMessageIdDoorAnswersOneIdAtTheSenderAndAtTheOpener(t *testing.T) {
+	pair := newTestPair(t, "message-id-door")
+	pair.trackDurable(t)
+
+	record, err := pair.sender.SealRecord(message.RetentionDurable, 0, false,
+		[]byte("head"), []byte("a message with an id"), 0, nil)
+	if err != nil {
+		t.Fatalf("SealRecord: %v", err)
+	}
+	fromSender, err := pair.sender.MessageIdOf(&record.Header)
+	if err != nil {
+		t.Fatalf("the sender's MessageIdOf: %v", err)
+	}
+	fromOpener, err := pair.opener.MessageIdOf(&record.Header)
+	if err != nil {
+		t.Fatalf("the opener's MessageIdOf: %v", err)
+	}
+	if fromSender != fromOpener {
+		t.Fatalf("the sender derives %x and the opener derives %x for one record", fromSender, fromOpener)
+	}
+	want := MessageId(pair.chain.groupHandleKey, record.Header.GroupId,
+		record.Header.SenderHandle, record.Header.StreamIndex)
+	if fromSender != want {
+		t.Fatalf("the door answers %x and MASTER section 8.4.5's derivation answers %x; the door must be that formula and not a second one",
+			fromSender, want)
+	}
+	// and the record OPENS, which is what makes the id worth having: an id names a message, and
+	// what says the message is that member's is R1 and R2.
+	if _, gotBody, err := pair.opener.OpenRecord(record); err != nil {
+		t.Fatalf("the record the id names does not open: %v", err)
+	} else if !bytes.Equal(gotBody, []byte("a message with an id")) {
+		t.Fatalf("the record opened to %q", gotBody)
+	}
+	t.Logf("message_id %x, taken through the session at both ends rather than through a formula neither end calls", fromSender)
+
+	// THE INDEX IS AN INPUT, which one id cannot say. Two positions of one sender are two ids.
+	moved := record.Header
+	moved.StreamIndex += 1
+	atNext, err := pair.sender.MessageIdOf(&moved)
+	if err != nil {
+		t.Fatalf("MessageIdOf at the next index: %v", err)
+	}
+	if atNext == fromSender {
+		t.Fatal("two stream indices of one sender answer one id, so the index is not an input")
+	}
+
+	// AND A HEADER FROM ANOTHER GROUP IS REFUSED rather than answered. The formula takes the
+	// group id as an input, so a foreign header would produce a perfectly well formed id under
+	// THIS group's key -- a value no member of either group computes, with no error anywhere.
+	foreign := record.Header
+	foreign.GroupId[0] ^= 0xff
+	if _, err := pair.sender.MessageIdOf(&foreign); !errors.Is(err, ErrRecordNotForThisSession) {
+		t.Errorf("a header naming another group answered %v, want ErrRecordNotForThisSession", err)
+	}
+	if _, err := pair.sender.MessageIdOf(nil); !errors.Is(err, message.ErrRecordNil) {
+		t.Errorf("a nil header answered %v, want message.ErrRecordNil", err)
+	}
 }
 
 // ---------------------------------------------------------------------------

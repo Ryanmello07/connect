@@ -454,6 +454,75 @@ func buildProbeSession(pqSecret []byte) (*testSession, error) {
 	return &testSession{session: session, handle: handle, engine: engine, reserver: reserver}, nil
 }
 
+// buildProbePair is buildProbeSession for the cases that need TWO members of ONE group and cannot
+// call t.Fatalf, which after MASTER section 8.4 is every case that has to OPEN an application
+// record: a member has no receiving ratchet for its own leaf, so one session can never open a
+// record it sealed.
+//
+// It is deliberately the minimum: found, add, commit, merge, join, and one session at each end. The
+// three controls newTwoEngineChainAtClock carries -- the ones that caught a zeroed group_handle_key
+// walking through a green round trip -- are NOT reproduced here, because a control that cannot fail
+// a test is decoration. Anything asserting a property of the fixture itself uses that chain; this
+// answers the one-way probes, whose subject is the ladder and not the join.
+func buildProbePair(pqSecret []byte) (sender *GroupSession, opener *GroupSession,
+	senderLeaf uint32, release func(), err error) {
+
+	a, err := buildTestEngine()
+	if err != nil {
+		return nil, nil, 0, nil, err
+	}
+	b, err := buildTestEngine()
+	if err != nil {
+		return nil, nil, 0, nil, err
+	}
+	keyPackage, err := b.engine.NewKeyPackage()
+	if err != nil {
+		return nil, nil, 0, nil, err
+	}
+	founder, err := a.buildGroup("probe-pair")
+	if err != nil {
+		return nil, nil, 0, nil, err
+	}
+	// group_handle_key is the EPOCH ZERO storage root's expansion and never moves, so it is taken
+	// here -- before the add commits -- and handed to both sessions. A session founded after the
+	// commit would expand a later root and compute a sender_handle nobody else reproduces.
+	mlsSecret, err := founder.Export(engineJoinExporterLabel, nil, engineJoinExporterLength)
+	if err != nil {
+		return nil, nil, 0, nil, err
+	}
+	groupHandleKey := GroupHandleKey(StorageRoot(mlsSecret, pqSecret))
+	if _, err := founder.ProposeAdd(keyPackage); err != nil {
+		return nil, nil, 0, nil, err
+	}
+	_, welcome, ratchetTree, err := founder.Commit(nil)
+	if err != nil {
+		return nil, nil, 0, nil, err
+	}
+	if err := founder.MergePendingCommit(); err != nil {
+		return nil, nil, 0, nil, err
+	}
+	joined, err := b.engine.JoinFromWelcome(welcome, ratchetTree)
+	if err != nil {
+		return nil, nil, 0, nil, err
+	}
+	senderSession, err := NewGroupSession(founder, pqSecret, groupHandleKey, newStreamIndexMemory(),
+		testClock(), testServerNonce())
+	if err != nil {
+		return nil, nil, 0, nil, err
+	}
+	openerSession, err := NewGroupSession(joined, pqSecret, groupHandleKey, newStreamIndexMemory(),
+		testClock(), testServerNonce())
+	if err != nil {
+		senderSession.Close()
+		return nil, nil, 0, nil, err
+	}
+	release = func() {
+		openerSession.Close()
+		senderSession.Close()
+	}
+	return senderSession, openerSession, founder.OwnLeafIndex(), release, nil
+}
+
 // testGroupId is one distinct thirty two octet group id per name.
 func testGroupId(name string) []byte {
 	groupId := make([]byte, 32)

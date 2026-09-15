@@ -172,7 +172,8 @@ func (self *GroupSession) frameBodyOnLoop(isCommit bool, serverAttachment []byte
 	return inner, nil
 }
 
-// unframeBodyOnLoop opens the inner frame and takes MASTER section 8.4.3's two refusals.
+// refuseFrameBindingsOnLoop is MASTER section 8.4.3's two refusals over one reading of a frame's
+// sender leaf and its aad, written once and taken twice.
 //
 // NEITHER REFUSAL IMPLIES THE OTHER, and the whole reason both are written is that each is
 // invisible from the other's side.
@@ -191,10 +192,59 @@ func (self *GroupSession) frameBodyOnLoop(isCommit bool, serverAttachment []byte
 // anybody -- not as a gap attributed to a sender, and not as spec A section 7.4's "malformed",
 // which is a different condition about a body that opened.
 //
+// The caller is the loop goroutine.
+func (self *GroupSession) refuseFrameBindingsOnLoop(header *message.RecordHeader,
+	position [32]byte, senderLeaf uint32, aad []byte) error {
+
+	// R1. The comparison goes through subtle for guardrail G8's reason and not because a
+	// handle is secret: G8 bans the other spelling in a FILE rather than in a kind of
+	// function, so every comparison of octets in this package goes one way.
+	signed := SenderHandle(self.groupHandleKey, senderLeaf)
+	if subtle.ConstantTimeCompare(signed[:], header.SenderHandle[:]) != 1 {
+		return fmt.Errorf("%w: the frame was signed at leaf %d, whose handle is %x, and the record carries %x",
+			ErrRecordSenderBinding, senderLeaf, signed, header.SenderHandle)
+	}
+	// R2, against the aad this record's OWN position produces.
+	if subtle.ConstantTimeCompare(position[:], aad) != 1 {
+		return fmt.Errorf("%w: the frame carries %x and this record's position is %x",
+			ErrRecordPositionBinding, aad, position)
+	}
+	return nil
+}
+
+// unframeBodyOnLoop opens the inner frame and takes MASTER section 8.4.3's two refusals.
+//
+// THE TWO REFUSALS ARE TAKEN TWICE AND THAT IS THE POINT OF THIS FUNCTION'S SHAPE. Once on the
+// frame's PRE-RATCHET reading -- peekInnerFrameSender, which opens only the sender data and reads
+// the cleartext aad, and which moves nothing -- and once on the values Unprotect has authenticated.
+// Only the second decides anything. The first exists because of what sits between them:
+//
+//	mls opens the frame, verifies the signature, and ERASES the message key of the generation
+//	the frame came at. A refusal taken after that has already cost the frame's true sender its
+//	own message.
+//
+// Measured on this tree rather than argued: with the pre-reading removed, a member lifts another
+// member's genuine frame out of a record -- the record key is RecordKeyZero(class_key, leaf) and
+// the class key is group shared, so every member can -- seals it into a record at a different
+// stream_index, and the opener refuses it at R2 AFTER mls has erased the generation. The true
+// sender's own record at that generation then answers "mls: ratchet generation already consumed"
+// at that receiver forever. One ordinary record, at the attacker's own handle and its own index,
+// per message the attacker wants deleted, chosen precisely.
+// TestARecordRefusedAtTheInnerFrameMovesNoReceiverRatchet drives both refusals and is red without
+// the pre-reading.
+//
+// WHY A PRE-READING IS NOT A WEAKER SECOND RULE. The two values it reads are the two values the
+// signature covers: the leaf is the one mls builds its Sender from, and the aad is the cleartext
+// authenticated_data the content AEAD is taken over, so a message that OPENS cannot disagree with
+// its own peek -- mls's TestThePeekAgreesWithTheOpenOnEveryMessageThatOpens is that, swept over
+// every boundary generation. The peek can therefore only ever refuse what the second reading would
+// have refused, and the second reading is still written, still reached and still the answer.
+//
 // AND BOTH RUN BEFORE THE RECEIVER RATCHET COMMITS, which is openRecordOnLoop's own discipline
-// one level out and matters more here than there. A forged envelope at the true sender's next
-// index would otherwise burn that index at every opener, so a refusal that moved the ladder would
-// turn a forgery this file defeats into a denial it causes.
+// one level out. A forged envelope at the true sender's next index would otherwise burn that index
+// at every opener, so a refusal that moved that ladder would turn a forgery this file defeats into
+// a denial it causes. That is the same sentence as the paragraph above, about the other of the two
+// receiver ratchets a record passes through.
 //
 // The caller is the loop goroutine.
 func (self *GroupSession) unframeBodyOnLoop(header *message.RecordHeader,
@@ -203,27 +253,27 @@ func (self *GroupSession) unframeBodyOnLoop(header *message.RecordHeader,
 	if !isApplicationRecord(header.IsCommit, header.ServerAttachment) {
 		return bodyPlain, nil
 	}
-	aad, plaintext, senderLeaf, err := self.handle.Unprotect(bodyPlain)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrRecordInnerFrame, err)
-	}
-	// R1. The comparison goes through subtle for guardrail G8's reason and not because a
-	// handle is secret: G8 bans the other spelling in a FILE rather than in a kind of
-	// function, so every comparison of octets in this package goes one way.
-	signed := SenderHandle(self.groupHandleKey, senderLeaf)
-	if subtle.ConstantTimeCompare(signed[:], header.SenderHandle[:]) != 1 {
-		return nil, fmt.Errorf("%w: the frame was signed at leaf %d, whose handle is %x, and the record carries %x",
-			ErrRecordSenderBinding, senderLeaf, signed, header.SenderHandle)
-	}
-	// R2. The aad this record's OWN position produces, built from the same BodyBinding the
-	// sealer used and by the same function.
+	// the aad this record's position produces, built from the same BodyBinding the sealer used
+	// and by the same function. It is computed once and handed to both readings, so the early
+	// refusal and the deciding one cannot come to disagree about where this record is.
 	position, err := aadMls(header.BodyBinding())
 	if err != nil {
 		return nil, err
 	}
-	if subtle.ConstantTimeCompare(position[:], aad) != 1 {
-		return nil, fmt.Errorf("%w: the frame carries %x and this record's position is %x",
-			ErrRecordPositionBinding, aad, position)
+	peekLeaf, peekAad, err := peekInnerFrameSender(self.handle, bodyPlain)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrRecordInnerFrame, err)
+	}
+	if err := self.refuseFrameBindingsOnLoop(header, position, peekLeaf, peekAad); err != nil {
+		return nil, err
+	}
+	aad, plaintext, senderLeaf, err := self.handle.Unprotect(bodyPlain)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrRecordInnerFrame, err)
+	}
+	// and again, on what the signature covers. This is the reading that decides.
+	if err := self.refuseFrameBindingsOnLoop(header, position, senderLeaf, aad); err != nil {
+		return nil, err
 	}
 	return plaintext, nil
 }

@@ -21,6 +21,7 @@ import (
 	"reflect"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -249,6 +250,78 @@ func providerStubFramingArguments(t *testing.T, fixture CryptoProvider, priv Sig
 	arguments["OpenPrivateMessage.message"] = privateMessage
 	arguments["OpenPrivateMessage.resolve"] = StaticSignatureKey(pub)
 	arguments["OpenPrivateMessage.groupContext"] = encodedGroupContext
+
+	// the pre-ratchet peek, over the SAME message the open row reads, marshalled. It takes the
+	// marshalled form rather than the structure because that is what its one caller holds -- an
+	// application record's ct_body plaintext is a marshalled MLSMessage -- and a base call that
+	// failed to parse would leave every perturbation below it comparing one refusal against
+	// another, which is this gate's own rule two sections up.
+	marshalledPrivateMessage, err := MarshalMLSMessage(&MLSMessage{
+		Version:        ProtocolVersionMls10,
+		WireFormat:     WireFormatPrivateMessage,
+		PrivateMessage: privateMessage,
+	})
+	if err != nil {
+		t.Fatalf("marshal the message the PeekPrivateMessageSender row reads: %v", err)
+	}
+	arguments["PeekPrivateMessageSender.senderDataSecret"] = senderDataSecret
+	arguments["PeekPrivateMessageSender.marshalled"] = marshalledPrivateMessage
+}
+
+// providerPeekedMessagePerturbations moves bytes of PeekPrivateMessageSender's marshalled message,
+// and moves them only where that call READS.
+//
+// THE RULE EXISTS BECAUSE THE READ REGION IS A PREFIX AND SAYING SO IS THE POINT. The peek parses
+// the MLSMessage, opens the sender data and returns the cleartext authenticated_data; the content
+// ciphertext reaches it only through RFC 9420 section 6.3.2's sample, which is its first KDF.Nh
+// octets. So the default byte rule -- first, middle and last of the whole message -- moves two
+// positions that sit inside the content ciphertext's tail, and the peek answers the same thing for
+// them because it is a PEEK and not an open. Reported under the default rule that reads "does not
+// read the marshalled it was handed", which is false of the region it is about.
+//
+// WHAT IS MOVED INSTEAD is every position up to and including the ciphertext's own length prefix:
+// the version, the wire format, the group id, the epoch, the content type, the authenticated_data
+// and the encrypted sender data. Every one of those changes the answer -- the first four and the
+// content type are in the sender data's AAD, the authenticated_data IS the answer, and the sender
+// data is the ciphertext the open takes -- so the property this states is the whole of what the
+// peek claims to read. The boundary is DERIVED from the argument, by parsing it and subtracting
+// the ciphertext's own length, rather than written down: a message that grew a field moves the
+// boundary with it.
+//
+// It is SenderDataKeyNonce.ciphertext's rule one layer out and for the same reason: an argument a
+// construction reads a bounded prefix of is one whose perturbations belong inside that prefix,
+// and where the boundary itself is held is TestTheSenderDataSampleLocatesBothItsOffsetAndItsLength.
+func providerPeekedMessagePerturbations(t *testing.T, operation string, parameter providerParameter,
+	argument reflect.Value) ([]providerPerturbation, bool) {
+
+	t.Helper()
+	if operation != "PeekPrivateMessageSender" || parameter.name != "marshalled" {
+		return nil, false
+	}
+	octets, isBytes := argument.Interface().([]byte)
+	if !isBytes {
+		t.Fatalf("the base argument for %s.%s is a %s rather than octets", operation, parameter.name, argument.Type())
+	}
+	parsed, err := ParseMLSMessage(octets)
+	if err != nil || parsed.PrivateMessage == nil {
+		t.Fatalf("the base argument for %s.%s does not parse as a PrivateMessage, so this rule cannot find its read region: %v",
+			operation, parameter.name, err)
+	}
+	read := len(octets) - len(parsed.PrivateMessage.Ciphertext)
+	if read <= 0 || len(octets) <= read {
+		t.Fatalf("the base argument for %s.%s is %d octets and its ciphertext is %d, so the read region is not a proper prefix",
+			operation, parameter.name, len(octets), len(parsed.PrivateMessage.Ciphertext))
+	}
+	moved := []providerPerturbation{}
+	for _, at := range perturbedPositions(read) {
+		value := append([]byte(nil), octets...)
+		value[at] ^= 0xff
+		moved = append(moved, providerPerturbation{
+			where: "byte " + strconv.Itoa(at) + " of the " + strconv.Itoa(read) + " this call reads",
+			value: reflect.ValueOf(value),
+		})
+	}
+	return moved, true
 }
 
 // providerPublicMessagePerturbations moves the epoch of the message being opened.
@@ -6839,27 +6912,29 @@ func TestPrivateMessageRoundTripsThroughTheRealSecretTreeAtEveryBoundaryGenerati
 	}
 }
 
-// TestOpenPrivateMessageErasesTheMessageKeyAheadOfEveryCheckThatCanStillRefuse is the ordering
-// OpenPrivateMessage's own commentary claims and nothing held.
+// TestARefusedOpenLeavesTheMessageKeyWhereItWasAndAnAcceptedOneErasesIt is the erase ordering,
+// held from the side that decides whether one member can delete another member's message.
 //
-// The claim is that the erase sits between the content open and the signature check, because
-// "holding the key open across a signature check would leave a replay of the same ciphertext
-// decryptable a second time". Measured: with the erase moved to after VerifyAuthenticatedContent,
-// the whole of ./mls/... and ./message/... stayed green. What that costs is every message that
-// DECRYPTS and is then refused -- for its padding at ValSem011 or for its signature at ValSem010
-// -- leaving this epoch's message key alive at that generation, so the ciphertext just refused can
-// be fed back into the same check for as long as the epoch lasts.
+// WHAT THIS CASE USED TO SAY, because the inversion is the finding. It was
+// TestOpenPrivateMessageErasesTheMessageKeyAheadOfEveryCheckThatCanStillRefuse, and it required a
+// replay of a REFUSED ciphertext to answer ErrRatchetGenerationConsumed -- that is, it required the
+// refused open to have consumed the generation. The argument was that holding the key open across
+// the signature check "would leave a replay of the same ciphertext decryptable a second time". A
+// replay of a ciphertext that FAILS is refused again by the same check, so that costs nothing; what
+// the ordering actually bought was a way for any member to destroy any other member's key. RFC 9420
+// section 9 derives the whole secret tree from encryption_secret, which every member holds, so
+// every member can build a ciphertext that opens under any leaf's key at any generation. The erase
+// then ran and the signature refused, and the genuine message at that generation was gone for good.
 //
-// What holds it is the REPLAY and not a count of erasures. A second open of the same octets has to
-// fail because the key is gone, which the real tree says as ErrRatchetGenerationConsumed, and not
-// because the padding is still wrong or the signature still forged -- and that difference is
-// exactly what the moved erase produces. Counting erasures cannot see it either way round: the
-// moved version erases exactly once on the path that succeeds, which is the path every other test
-// here takes.
+// SO BOTH HALVES ARE HELD HERE, and either alone is a gate that reads as coverage it does not have.
+// The refusal half: a replay of a refused ciphertext reaches THE SAME CHECK again, which is only
+// possible if the key survived. The acceptance half: an open that succeeds erases, erases exactly
+// once, and erases the generation the message arrived at -- without which "leaves the key where it
+// was" would be satisfied by a build that never erases at all and has no forward secrecy.
 //
-// Both refusals below the open are swept, because the erase sits ahead of both and an ordering
-// held over one of them is an ordering held half way.
-func TestOpenPrivateMessageErasesTheMessageKeyAheadOfEveryCheckThatCanStillRefuse(t *testing.T) {
+// Both refusals below the content open are swept, because the erase sits behind both now and an
+// ordering held over one of them is an ordering held half way.
+func TestARefusedOpenLeavesTheMessageKeyWhereItWasAndAnAcceptedOneErasesIt(t *testing.T) {
 	crypto := newTestCrypto(t)
 	signed := framingPrivateSignedMember(t)
 	leaf := signed.authContent.Content.Sender.LeafIndex
@@ -6899,20 +6974,31 @@ func TestOpenPrivateMessageErasesTheMessageKeyAheadOfEveryCheckThatCanStillRefus
 				t.Fatalf("%s at generation %d: got %v, want %v", row.what, generation, err, row.sentinel)
 			}
 			replay := open()
-			if errors.Is(replay, row.sentinel) {
-				t.Fatalf("%s at generation %d: a replay of the refused ciphertext reached the same check a second time, so the message key outlived the refusal",
+			if errors.Is(replay, ErrRatchetGenerationConsumed) {
+				t.Fatalf("%s at generation %d: the refused open CONSUMED the generation, so any member can delete any other member's message at that generation by sending one ciphertext it built itself",
 					row.what, generation)
 			}
-			if !errors.Is(replay, ErrRatchetGenerationConsumed) {
-				t.Fatalf("%s at generation %d: a replay answered %v, want ErrRatchetGenerationConsumed",
-					row.what, generation, replay)
+			if !errors.Is(replay, row.sentinel) {
+				t.Fatalf("%s at generation %d: a replay answered %v, want the same refusal %v",
+					row.what, generation, replay, row.sentinel)
+			}
+			// and the genuine message at that generation still opens, which is the whole
+			// stake: the refusal above must have cost its sender nothing.
+			genuine, err := sealPrivateMessage(crypto,
+				framingSecretTreeAt(t, crypto, leaf, contentType, generation),
+				signed.senderDataSecret, signed.authContent, nil)
+			if err != nil {
+				t.Fatalf("%s at generation %d: seal the genuine message: %v", row.what, generation, err)
+			}
+			if _, err := OpenPrivateMessage(crypto, receiver, signed.senderDataSecret, genuine,
+				StaticSignatureKey(signed.pub), signed.groupContext); err != nil {
+				t.Fatalf("%s at generation %d: the GENUINE message at that generation no longer opens: %v. A refused ciphertext must cost the true sender nothing",
+					row.what, generation, err)
 			}
 		}
 	}
 
-	// and the erase names the generation the message arrived at, which the tree above cannot
-	// say: an erase of some OTHER generation leaves this one alive, and the replay would then
-	// refuse for that reason rather than for this one.
+	// THE REFUSAL HALF, counted rather than inferred: a refused open erases nothing at all.
 	for _, row := range rows {
 		message, err := sealPrivateMessage(crypto, framingNewKeySource(crypto, 0x01, 0),
 			signed.senderDataSecret, row.content, row.padding)
@@ -6924,10 +7010,177 @@ func TestOpenPrivateMessageErasesTheMessageKeyAheadOfEveryCheckThatCanStillRefus
 			StaticSignatureKey(signed.pub), signed.groupContext); !errors.Is(err, row.sentinel) {
 			t.Fatalf("%s: got %v, want %v", row.what, err, row.sentinel)
 		}
-		erased := fmt.Sprintf("%d/%d/%d", contentType, leaf, 0)
-		if !slices.Equal(keys.erased, []string{erased}) {
-			t.Fatalf("%s: the refused open erased %v, want exactly [%s]", row.what, keys.erased, erased)
+		if 0 < len(keys.erased) {
+			t.Fatalf("%s: the refused open erased %v, want nothing", row.what, keys.erased)
 		}
+	}
+
+	// THE ACCEPTANCE HALF, and it names the generation. Without it "erases nothing on a refusal"
+	// is satisfied by a build that erases nothing ever, which has no forward secrecy at all.
+	for _, generation := range framingBoundaryGenerations() {
+		message, err := sealPrivateMessage(crypto, framingNewKeySource(crypto, 0x01, generation),
+			signed.senderDataSecret, signed.authContent, nil)
+		if err != nil {
+			t.Fatalf("seal at generation %d: %v", generation, err)
+		}
+		keys := framingNewKeySource(crypto, 0x01, generation)
+		if _, err := OpenPrivateMessage(crypto, keys, signed.senderDataSecret, message,
+			StaticSignatureKey(signed.pub), signed.groupContext); err != nil {
+			t.Fatalf("the message at generation %d did not open: %v", generation, err)
+		}
+		erased := fmt.Sprintf("%d/%d/%d", contentType, leaf, generation)
+		if !slices.Equal(keys.erased, []string{erased}) {
+			t.Fatalf("an accepted open at generation %d erased %v, want exactly [%s]",
+				generation, keys.erased, erased)
+		}
+	}
+}
+
+// TestThePeekAgreesWithTheOpenOnEveryMessageThatOpens is what makes PeekPrivateMessageSender safe
+// to refuse on: the two values it reads before the ratchet are the two values the signature covers.
+//
+// A caller uses the peek to take its own refusals EARLY, and then takes them again on what
+// OpenPrivateMessage answers. That is only a pre-filter rather than a second, weaker rule if the
+// early reading and the authenticated reading are the same reading. They are, by construction --
+// the leaf is the sender data's and the open builds its Sender from the same field, and the
+// authenticated_data is a cleartext header field the content AEAD covers -- and construction is
+// what this case turns into a measurement, over every boundary generation.
+//
+// THE OTHER DIRECTION IS THE ONE THAT MATTERS AND IT IS HERE TOO: a message whose cleartext
+// authenticated_data has been moved does not open at all, so there is no message that opens and
+// disagrees with its own peek.
+func TestThePeekAgreesWithTheOpenOnEveryMessageThatOpens(t *testing.T) {
+	crypto := newTestCrypto(t)
+	signed := framingPrivateSignedMember(t)
+	leaf := signed.authContent.Content.Sender.LeafIndex
+	contentType := signed.authContent.Content.ContentType
+
+	for _, generation := range framingBoundaryGenerations() {
+		message, err := sealPrivateMessage(crypto,
+			framingSecretTreeAt(t, crypto, leaf, contentType, generation),
+			signed.senderDataSecret, signed.authContent, nil)
+		if err != nil {
+			t.Fatalf("seal at generation %d: %v", generation, err)
+		}
+		marshalled, err := MarshalMLSMessage(&MLSMessage{
+			Version:        ProtocolVersionMls10,
+			WireFormat:     WireFormatPrivateMessage,
+			PrivateMessage: message,
+		})
+		if err != nil {
+			t.Fatalf("marshal at generation %d: %v", generation, err)
+		}
+		peekLeaf, peekAad, err := PeekPrivateMessageSender(crypto, signed.senderDataSecret, marshalled)
+		if err != nil {
+			t.Fatalf("peek at generation %d: %v", generation, err)
+		}
+		opened, err := OpenPrivateMessage(crypto,
+			framingSecretTreeAt(t, crypto, leaf, contentType, generation),
+			signed.senderDataSecret, message, StaticSignatureKey(signed.pub), signed.groupContext)
+		if err != nil {
+			t.Fatalf("open at generation %d: %v", generation, err)
+		}
+		if peekLeaf != opened.Content.Sender.LeafIndex {
+			t.Fatalf("at generation %d the peek read leaf %d and the open authenticated leaf %d",
+				generation, peekLeaf, opened.Content.Sender.LeafIndex)
+		}
+		if !bytes.Equal(peekAad, opened.Content.AuthenticatedData) {
+			t.Fatalf("at generation %d the peek read aad %x and the open authenticated %x",
+				generation, peekAad, opened.Content.AuthenticatedData)
+		}
+	}
+
+	// THE PEEK IS NOT A SECOND COPY OF THE FIELD: moving the cleartext authenticated_data moves
+	// the peek's answer AND stops the message opening, so no message both opens and disagrees.
+	message, err := sealPrivateMessage(crypto, framingSecretTreeAt(t, crypto, leaf, contentType, 0),
+		signed.senderDataSecret, signed.authContent, nil)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	moved := *message
+	moved.AuthenticatedData = append(append([]byte(nil), message.AuthenticatedData...), 0x5a)
+	marshalled, err := MarshalMLSMessage(&MLSMessage{
+		Version:        ProtocolVersionMls10,
+		WireFormat:     WireFormatPrivateMessage,
+		PrivateMessage: &moved,
+	})
+	if err != nil {
+		t.Fatalf("marshal the moved message: %v", err)
+	}
+	_, peekAad, err := PeekPrivateMessageSender(crypto, signed.senderDataSecret, marshalled)
+	if err != nil {
+		t.Fatalf("peek the moved message: %v", err)
+	}
+	if bytes.Equal(peekAad, message.AuthenticatedData) {
+		t.Fatal("the peek answered the original authenticated_data for a message whose field was moved")
+	}
+	if _, err := OpenPrivateMessage(crypto, framingSecretTreeAt(t, crypto, leaf, contentType, 0),
+		signed.senderDataSecret, &moved, StaticSignatureKey(signed.pub), signed.groupContext); err == nil {
+		t.Fatal("a message whose cleartext authenticated_data was moved OPENED")
+	}
+}
+
+// PeekPrivateMessageSender refuses what it cannot read, rather than answering a zero leaf.
+//
+// A zero leaf is leaf 0, an ordinary member, so an answer-on-failure here would hand a caller a
+// claim about the founder for octets that were never a message.
+func TestThePeekRefusesEveryShapeItCannotRead(t *testing.T) {
+	crypto := newTestCrypto(t)
+	signed := framingPrivateSignedMember(t)
+	leaf := signed.authContent.Content.Sender.LeafIndex
+	contentType := signed.authContent.Content.ContentType
+	message, err := sealPrivateMessage(crypto, framingSecretTreeAt(t, crypto, leaf, contentType, 0),
+		signed.senderDataSecret, signed.authContent, nil)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	marshalled, err := MarshalMLSMessage(&MLSMessage{
+		Version:        ProtocolVersionMls10,
+		WireFormat:     WireFormatPrivateMessage,
+		PrivateMessage: message,
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	rows := map[string][]byte{
+		"octets that are not an MLSMessage at all": []byte("not a frame"),
+		"an empty body":          {},
+		"a truncated MLSMessage": marshalled[:len(marshalled)/2],
+	}
+	for what, octets := range rows {
+		gotLeaf, gotAad, err := PeekPrivateMessageSender(crypto, signed.senderDataSecret, octets)
+		if err == nil {
+			t.Errorf("%s peeked to leaf %d / aad %x with no error", what, gotLeaf, gotAad)
+		}
+		if gotLeaf != 0 || gotAad != nil {
+			t.Errorf("%s answered leaf %d and %d octets of aad beside its error", what, gotLeaf, len(gotAad))
+		}
+	}
+
+	// A PublicMessage is a well formed MLSMessage this call still refuses, and by a value of its
+	// own: it carries no sender data, so answering anything about its sender would be an
+	// invention rather than a reading. It is the shape that separates "these octets are not a
+	// message" from "these octets are a message of the wrong kind".
+	public, err := MarshalMLSMessage(&MLSMessage{
+		Version:    ProtocolVersionMls10,
+		WireFormat: WireFormatPublicMessage,
+		PublicMessage: &PublicMessage{
+			Content:       signed.authContent.Content,
+			Auth:          signed.authContent.Auth,
+			MembershipTag: bytes.Repeat([]byte{0x11}, crypto.HashSize()),
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal a PublicMessage: %v", err)
+	}
+	if _, _, err := PeekPrivateMessageSender(crypto, signed.senderDataSecret, public); !errors.Is(err, errPeekWireFormat) {
+		t.Errorf("a PublicMessage peeked with %v, want errPeekWireFormat", err)
+	}
+
+	// and a nil provider is refused rather than dereferenced.
+	if _, _, err := PeekPrivateMessageSender(nil, signed.senderDataSecret, marshalled); !errors.Is(err, ErrNilCryptoProvider) {
+		t.Errorf("a nil crypto provider peeked with %v, want ErrNilCryptoProvider", err)
 	}
 }
 

@@ -747,6 +747,66 @@ func (self *connectMlsHandle) Close() error {
 	return self.group.Close()
 }
 
+// peekInnerFrameSender reads the two fields of an inner MLS frame that MASTER section 8.4.3's
+// refusals are functions of, WITHOUT letting the frame touch a receiving ratchet.
+//
+// WHY A SECOND READING OF THE SAME TWO FIELDS EXISTS AT ALL, because a reader's first instinct is
+// that it is redundant with what Unprotect already answers. It is not redundant, it is EARLIER, and
+// the whole value is in the "earlier". mls opens a frame and, on success, erases the message key
+// of the generation the frame came at -- that is RFC 9420's forward secrecy and it is correct. So a
+// refusal taken AFTER Unprotect is taken after the erase, and a member who lifts another member's
+// genuine frame out of one record and seals it into another gets exactly that: the frame opens, it
+// authenticates, R1 or R2 refuses it, and the generation the true sender's own record needed is
+// gone at that receiver for good. One ordinary record per message an attacker wants deleted. With
+// the two fields read first, the record is refused before mls is asked for a key at all.
+//
+// IT AUTHENTICATES NOTHING AND IS NEVER THE ANSWER. The leaf comes out of sender data sealed under
+// a secret every member holds and the aad is a cleartext field, so both are an attacker's claim. A
+// refusal on a claim is honest -- refusing needs no authentication -- but an acceptance on one is
+// not, which is why unframeBodyOnLoop takes both refusals a SECOND time, on the values mls has
+// authenticated, and the second reading is the one that decides. mls's own
+// TestThePeekAgreesWithTheOpenOnEveryMessageThatOpens holds the two readings together, so the
+// pre-filter can never be laxer than the rule it runs in front of.
+//
+// IT LIVES IN THIS FILE and not beside the refusals it serves, because this file is the one place
+// in the package that names connect/mls. The seam is unchanged: GroupHandle grows no method, and
+// this reaches only SenderDataSecret and GroupContextBytes, both already on it -- which is what
+// makes the repair reach every implementation of the interface, including the ones in other
+// repositories, rather than only the adapter below.
+//
+// THE COST, stated because the complement is the part a reader has to be told: the crypto provider
+// is rebuilt per call, out of the ciphersuite in the group context. That is a suite table lookup
+// and a struct, and it is on the open path of every application record. It is written this way
+// rather than cached because a cache on the session would be a fourth piece of epoch state to
+// invalidate, and nothing has measured the call as hot. Ledger item MG-5.
+func peekInnerFrameSender(handle GroupHandle, frame []byte) (senderLeaf uint32, aad []byte, err error) {
+	if handle == nil {
+		return 0, nil, ErrNilGroupHandle
+	}
+	contextBytes, err := handle.GroupContextBytes()
+	if err != nil {
+		return 0, nil, err
+	}
+	context := &mls.GroupContext{}
+	if err := syntax.Unmarshal(contextBytes, context); err != nil {
+		return 0, nil, err
+	}
+	crypto, err := mls.NewCryptoProvider(context.CipherSuite)
+	if err != nil {
+		return 0, nil, err
+	}
+	senderDataSecret, err := handle.SenderDataSecret()
+	if err != nil {
+		return 0, nil, err
+	}
+	defer zeroize(senderDataSecret)
+	leaf, authenticatedData, err := mls.PeekPrivateMessageSender(crypto, senderDataSecret, frame)
+	if err != nil {
+		return 0, nil, err
+	}
+	return uint32(leaf), authenticatedData, nil
+}
+
 // stagedProcessed is what this adapter puts in EngineProcessed.stagedRef: the mls value ApplyCommit
 // needs, and the handle that staged it.
 //

@@ -442,3 +442,63 @@ answers, so the two cases were conflated.
 
 A `SPEC-LEDGER.md` number, a correction to Spec A §5.2's sentence, and one sentence from the owner
 about where a device's own sent messages are read from. Nothing here is decided.
+
+---
+
+## MG-5 — the ceremony arm of MASTER §8.4.1 is authenticated by nothing, and the sealer picks the arm
+
+**Status: OPEN, FILED NOT RULED. Measured on 2026-09-15 in the second pass over MASTER §8.4. Half
+of the finding is repaired in that commit; the half that needs a ruling is here.**
+
+### The property
+
+`isApplicationRecord(is_commit, server_attachment)` is MASTER §8.4.1's table, and it decides whether
+a record's `ct_body` carries an inner MLS frame. Both of its inputs are header fields, both live in
+`AAD_head`, and `AAD_head` is sealed under `record_key[n]` — which
+`RecordKeyZero(class_key, leaf_index)` derives from a class key **every member holds** and a leaf
+**number**. So the member that seals a record chooses which row of the table its record takes, and
+therefore chooses whether §8.4.3's two refusals apply to it at all.
+
+### The reproduction
+
+`TestTheArmOfTheTableIsChosenBySomethingNoSignatureCovers` in `mlsframe_test.go`. A full member seals
+a record at **another member's** `sender_handle`, with `is_commit = 1` and a body of its own
+choosing and no signature anywhere, and again with a server attachment set. Before the repair both
+opened through `OpenRecord`, answering the attacker's octets attributed to the victim.
+
+### What the repair does, and what it does not
+
+`OpenRecord` now serves **only** the arm that carries a frame and refuses the other with
+`ErrRecordNotAnApplicationRecord`; the ceremony arm has its own door, `OpenCeremonyRecord`, whose
+name and prose say that nothing it returns is signed by any member. So a member's choice of arm is
+now a choice between *being checked* and *being refused at the message door* — which is what a rule
+is — and no call named for opening a message can be made to answer unsigned octets.
+
+**It does not authenticate the ceremony arm, and it cannot.** A wrap, an epoch fan out and a
+completion marker carry no signature at all (Spec A §5.11 step 5). A commit record's body *is* an
+`MLSMessage` and **is** signed, but the thing that authenticates it is processing the commit, which
+belongs to the epoch machinery and not to a record door — and a check taken here on the frame's
+*peeked* sender leaf would be worse than none, because the sender data a peek reads is sealed under
+a group-shared secret and would read as authentication while authenticating nothing.
+
+### What a ruling has to choose
+
+1. **Nothing beyond the split.** The ceremony arm stays unauthenticated, `OpenCeremonyRecord` stays
+   the only door onto it, and §8 says in as many words that a ceremony record's `sender_handle` is
+   routing and not attribution.
+2. **Authenticate the commit arm where the commit is processed.** The epoch machinery requires the
+   commit inside a `is_commit = 1` record to be one `mls` accepts *and* to have been signed by the
+   leaf the record's `sender_handle` names, and a record failing that is dropped rather than
+   ceremonially applied. This is the only one of the three rows that admits an authentication at
+   all.
+3. **Move `is_commit` and `H(server_attachment)` under something a member signs.** That is a wire
+   change — `AAD_head` is outside the frame because `body_hash = H(ct_body)` is inside it, which is
+   MASTER §8's construction order — so it is a §8 ruling and not this package's to take. Ledger open
+   item 199 is the same five fields from the other side.
+
+### What is owed elsewhere
+
+A `SPEC-LEDGER.md` number, and one sentence in Spec A §5.11 about what a ceremony record's
+`sender_handle` means. The downstream filter this repair makes redundant —
+`sdk/urmessage/group.go`'s `SkippedCeremony` arm — should stay: it is now belt and braces rather
+than the only thing standing between a forged arm and a rendered message, which is what it was.

@@ -292,7 +292,15 @@ func noncerebindWhere(fileSet *token.FileSet, path string, declaration string, a
 // setter for eph_root, the one key of a session that no derivation can produce. It answers no
 // octets at all -- it takes them -- so it joins the exported class this count pins and does not
 // join the octet answering subset the ban is over.
-const noncerebindExportedSessionMethods = 11
+//
+// MASTER section 8.4's second pass of 2026-09-15 adds the twelfth and thirteenth, and BOTH answer
+// octets, which is why the count and the ban are stated separately. OpenCeremonyRecord is the arm
+// split's other door -- the arm that carries no inner frame had been sharing OpenRecord's, which is
+// what made MASTER section 8.4.3 opt-out. MessageIdOf is the door MASTER section 8.4.5's message_id
+// had none of: the derivation was exported and had no caller anywhere. Neither reaches
+// self.serverNonce, so the banned subset is still empty and the complement this gate prints is
+// still what it narrowed away.
+const noncerebindExportedSessionMethods = 13
 
 // Property 4 -- THE NARROWING, AND IT IS THE ONE PLACE IN THIS FILE WHERE AN EMPTINESS IS THE
 // PROPERTY RATHER THAN A DEFECT IN IT.

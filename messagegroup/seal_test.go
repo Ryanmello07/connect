@@ -773,7 +773,7 @@ func TestARecordSealedByOneSessionOpensInASecondOneOverTheSameEpoch(t *testing.T
 		if err != nil {
 			t.Fatalf("SealRecord %d: %v", index, err)
 		}
-		gotHead, gotBody, err := receiver.OpenRecord(record)
+		gotHead, gotBody, err := receiver.OpenCeremonyRecord(record)
 		if err != nil {
 			t.Fatalf("the second session could not open record %d: %v", index, err)
 		}

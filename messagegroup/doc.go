@@ -132,6 +132,17 @@
 // unless the leaf that signed it is the leaf the record's sender_handle names and the frame's aad
 // is this record's own position. mlsframe.go is where both refusals live.
 //
+// AND THAT SENTENCE HAS AN ARM, which is the correction of 2026-09-15's second pass. It was
+// written without one and was not true of every record: MASTER section 8.4.1's table gives an
+// inner frame to ONE of its three rows, the predicate that picks the row reads is_commit and the
+// server attachment, and both live in AAD_head -- sealed under a record key every member derives.
+// A member who did not want to be signature checked set is_commit, and the sentence above applied
+// to no part of its record. The repair is that the arm now picks a DOOR: OpenRecord serves only
+// the arm that carries a frame and refuses the other with ErrRecordNotAnApplicationRecord, and
+// OpenCeremonyRecord is the arm that carries none. What that closes is a member choosing to be
+// unchecked; what it does not close is the ceremony arm being unauthenticated, which it is by
+// construction and which is open item MG-5.
+//
 // WHAT SURVIVES IS THE ENVELOPE, and it is a DENIAL rather than a forgery. A member still
 // assembles a record at another member's handle and another member's next stream index that the
 // codec accepts and whose write_auth verifies, so a server accepts it and advances that sender's

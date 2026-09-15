@@ -667,7 +667,34 @@ var recordKeyOneWayProbes = map[string]func(secret []byte) [][]byte{
 	// empty-answer clause below. A commit record carries no application frame (section 8.4.1's
 	// first row) and takes exactly the same record layer derivations -- the same ladder rung, the
 	// same two AEAD expansions, the same aads -- so what this probe observes is unchanged.
+	// OpenRecord's probe takes TWO members of one group, because after MASTER section 8.4 an
+	// application record is an MLS frame and no member holds a receiving ratchet for its own
+	// leaf. The rung arrives as the pq_secret both ends are founded on, so both record keys
+	// descend from it and the plaintexts below are functions of it.
 	"OpenRecord": func(secret []byte) [][]byte {
+		sender, opener, senderLeaf, release, err := buildProbePair(secret)
+		if err != nil {
+			return nil
+		}
+		defer release()
+		if err := opener.TrackSender(senderLeaf, message.RetentionDurable, 0, 0, 0); err != nil {
+			return nil
+		}
+		record, err := sender.SealRecord(message.RetentionDurable, 0, false,
+			[]byte("head"), []byte("body"), 0, nil)
+		if err != nil {
+			return nil
+		}
+		headPlain, bodyPlain, err := opener.OpenRecord(record)
+		if err != nil {
+			return nil
+		}
+		return [][]byte{headPlain, bodyPlain}
+	},
+	// OpenCeremonyRecord's probe is the OTHER arm, and one session is enough for it: a commit
+	// record carries no inner frame, so the self-open MASTER section 8.4 ended does not apply.
+	// That asymmetry is the arm split seen from the probe table.
+	"OpenCeremonyRecord": func(secret []byte) [][]byte {
 		fixture, err := buildProbeSession(secret)
 		if err != nil {
 			return nil
@@ -681,11 +708,39 @@ var recordKeyOneWayProbes = map[string]func(secret []byte) [][]byte{
 		if err != nil {
 			return nil
 		}
-		headPlain, bodyPlain, err := fixture.session.OpenRecord(record)
+		headPlain, bodyPlain, err := fixture.session.OpenCeremonyRecord(record)
 		if err != nil {
 			return nil
 		}
 		return [][]byte{headPlain, bodyPlain}
+	},
+	// MessageIdOf's probe is MessageId's one rung further out: the rung arrives as pq_secret,
+	// the session expands group_handle_key from it, and three stream indices of one sender
+	// answer three ids. Three and not one, because an id that ignored the index would answer
+	// the same octets at every position and a single rung could not see it.
+	"MessageIdOf": func(secret []byte) [][]byte {
+		fixture, err := buildProbeSession(secret)
+		if err != nil {
+			return nil
+		}
+		defer fixture.session.Close()
+		handle, err := fixture.session.SenderHandle()
+		if err != nil {
+			return nil
+		}
+		produced := [][]byte{}
+		for index := uint64(0); index < 3; index += 1 {
+			id, err := fixture.session.MessageIdOf(&message.RecordHeader{
+				GroupId:      [32]byte(testGroupId("probe")),
+				SenderHandle: handle,
+				StreamIndex:  index,
+			})
+			if err != nil {
+				return nil
+			}
+			produced = append(produced, id[:])
+		}
+		return produced
 	},
 	// MASTER section 8.4.5's message_id, whose key is group_handle_key -- so the rung arrives
 	// as that key and every octet of the identifier is a function of it.

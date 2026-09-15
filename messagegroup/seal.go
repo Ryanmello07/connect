@@ -597,7 +597,51 @@ func (self *GroupSession) refuseAheadEphWindowOnLoop(header *message.RecordHeade
 //
 // A PARTIAL PLAINTEXT IS NEVER RETURNED BESIDE AN ERROR. On every refusal both slices are nil: a
 // caller that rendered whatever came back would be rendering attacker chosen octets.
+//
+// IT IS THE MESSAGE DOOR AND IT SERVES ONE ARM OF MASTER SECTION 8.4.1's TABLE. A record whose
+// is_commit is set, or which carries a server attachment, is refused here with
+// ErrRecordNotAnApplicationRecord and goes to OpenCeremonyRecord instead. The split is not
+// tidiness and it is not a convenience: the predicate reads two fields out of AAD_head, AAD_head is
+// sealed under a record key every member derives, and a member therefore CHOOSES which arm its
+// record takes. While one door served both arms that choice was a choice about whether MASTER
+// section 8.4.3 applied -- set is_commit and this call answered the member's own octets under
+// whatever sender_handle it liked, with no signature anywhere. Now the choice is between the door
+// that checks and the door that says in its name that it does not, and every body THIS call
+// returns has been through R1 and R2.
 func (self *GroupSession) OpenRecord(record *message.Record) ([]byte, []byte, error) {
+	return self.openRecordThroughDoor(record, true)
+}
+
+// OpenCeremonyRecord is the OTHER arm: a commit announcement, a device wrap, an epoch fan out or a
+// completion marker, and the octets it answers ARE NOT A MESSAGE FROM ANYBODY.
+//
+// READ THAT AS THE CONTRACT AND NOT AS A CAVEAT. These records carry no inner MLS frame -- MASTER
+// section 8.4.1 row one puts the MLS message in the body itself, row three has no frame at all --
+// so nothing on this path is signed under any member's own credential. Every key involved is group
+// shared, which means any member can seal one of these at any other member's sender_handle, and
+// this call will open it and answer that member's chosen octets. That is not a defect being
+// disclosed; it is what the arm IS, and the reason the call is named for ceremony rather than for
+// opening: a caller that renders what comes back as a message from the record's sender_handle has
+// rendered a forgery, and the name is the only place the type system can say so.
+//
+// WHAT IT IS FOR is the epoch machinery -- reading a wrap addressed to this device, following a
+// fan out, seeing a completion marker -- where the octets are judged by something OTHER than who
+// appears to have written them: a wrap is judged by whether it decrypts to this device, a commit by
+// whether mls accepts it. Nothing in this package calls it. Open item MG-5 is what a ruling owes
+// the commit arm, which CAN be authenticated by processing the commit and is not authenticated
+// here.
+//
+// It refuses an application record, for the same reason OpenRecord refuses a ceremony one: a door
+// that served both arms would be the single door this split exists to end.
+func (self *GroupSession) OpenCeremonyRecord(record *message.Record) ([]byte, []byte, error) {
+	return self.openRecordThroughDoor(record, false)
+}
+
+// openRecordThroughDoor is the body both doors share, so the two cannot come to differ about
+// anything except which arm they serve.
+func (self *GroupSession) openRecordThroughDoor(record *message.Record,
+	wantApplication bool) ([]byte, []byte, error) {
+
 	var headPlain []byte
 	var bodyPlain []byte
 	var err error
@@ -606,7 +650,7 @@ func (self *GroupSession) OpenRecord(record *message.Record) ([]byte, []byte, er
 			err = ErrSessionClosed
 			return
 		}
-		headPlain, bodyPlain, err = self.openRecordOnLoop(record)
+		headPlain, bodyPlain, err = self.openRecordOnLoop(record, wantApplication)
 	}); postErr != nil {
 		return nil, nil, postErr
 	}
@@ -614,6 +658,53 @@ func (self *GroupSession) OpenRecord(record *message.Record) ([]byte, []byte, er
 		return nil, nil, err
 	}
 	return headPlain, bodyPlain, nil
+}
+
+// MessageIdOf is MASTER section 8.4.5's message_id for one record, derived from this session's own
+// group_handle_key and from three fields of the record's plaintext header.
+//
+// WHY IT IS A DOOR AND NOT LEFT TO THE FREE FUNCTION. messagegroup.MessageId has been exported and
+// correct since the ruling and had NO CALLER anywhere in connect or in sdk -- the derivation was a
+// property of a function rather than of the build, and a reply, a reaction or a read cursor cannot
+// name a message nothing returns an id for. This is the surface an opener reaches it through: the
+// opener already holds the header it parsed, and the three inputs come off that header rather than
+// out of a caller's own bookkeeping, so the two sides cannot disagree about which record an id is
+// for. The session supplies the key, which is what a caller would otherwise have to carry and could
+// otherwise pass from the wrong epoch -- group_handle_key is the EPOCH ZERO expansion and never
+// moves, and a caller holding a later one would compute an id no other member reproduces.
+//
+// THE SENDER SIDE IS THE SAME CALL. SealRecord answers the record it built, that record's header
+// carries the sender_handle and the stream_index it reserved, and passing it here before the submit
+// gives the sender the id it will need to quote -- which is the whole of what "so a reply can name
+// its own parent optimistically" requires.
+//
+// IT IS NOT AN AUTHENTICATION AND MUST NOT BE READ AS ONE. The key is group shared, so any member
+// can compute any other member's id at any index, including indices nobody has written yet. An id
+// is a NAME. What makes a message's id trustworthy is that the record it names opened, and opening
+// is what R1 and R2 decide.
+func (self *GroupSession) MessageIdOf(header *message.RecordHeader) ([32]byte, error) {
+	if header == nil {
+		return [32]byte{}, message.ErrRecordNil
+	}
+	var id [32]byte
+	var err error
+	if postErr := self.do(func() {
+		if self.closing {
+			err = ErrSessionClosed
+			return
+		}
+		if subtle.ConstantTimeCompare(header.GroupId[:], self.groupId[:]) != 1 {
+			err = fmt.Errorf("%w: group %x", ErrRecordNotForThisSession, header.GroupId)
+			return
+		}
+		id = MessageId(self.groupHandleKey, header.GroupId, header.SenderHandle, header.StreamIndex)
+	}); postErr != nil {
+		return [32]byte{}, postErr
+	}
+	if err != nil {
+		return [32]byte{}, err
+	}
+	return id, nil
 }
 
 // openRecordOnLoop is OpenRecord's body. The caller is the loop goroutine.
@@ -624,11 +715,22 @@ func (self *GroupSession) OpenRecord(record *message.Record) ([]byte, []byte, er
 // moving the ratchet, and the commit happens only after both ciphertexts have authenticated.
 // (*ReceiverRatchet).PeekFor carries the measurement of what the committing form costs when the
 // index turns out to be forged.
-func (self *GroupSession) openRecordOnLoop(record *message.Record) ([]byte, []byte, error) {
+func (self *GroupSession) openRecordOnLoop(record *message.Record,
+	wantApplication bool) ([]byte, []byte, error) {
+
 	if record == nil {
 		return nil, nil, message.ErrRecordNil
 	}
 	header := record.Header
+	// THE ARM, FIRST, because it decides which door this record belongs at and a door that
+	// opened the other arm's records would be the opt-out MASTER section 8.4.3 cannot survive.
+	// It is read off fields no signature covers, which is fine in this direction and only in
+	// this direction: a REFUSAL taken on an attacker's claim costs the attacker, and it is an
+	// ACCEPTANCE taken on one that would cost the victim.
+	if isApplicationRecord(header.IsCommit, header.ServerAttachment) != wantApplication {
+		return nil, nil, fmt.Errorf("%w: is_commit=%v, %d octets of server attachment, and this door opens application=%v",
+			ErrRecordNotAnApplicationRecord, header.IsCommit, len(header.ServerAttachment), wantApplication)
+	}
 	// the group id through subtle and the epoch with ==. Guardrail G8 is a rule about the
 	// SPELLING and its class is derived off this tree's own imports, so every comparison of
 	// OCTETS goes one way whether or not the octets are secret -- a group id is public and is

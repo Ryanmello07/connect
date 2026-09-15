@@ -372,6 +372,31 @@ var (
 	// retention class, so a DURABLE message self-destructs within the hour or an EPH one never
 	// does.
 	ErrRecordPositionBinding = errors.New("messagegroup: this record's inner frame was signed for a different record's position")
+	// Fires when a record reaches the wrong one of the two open doors: a ceremony record at
+	// OpenRecord, or an application record at OpenCeremonyRecord.
+	//
+	// IT IS WHAT MAKES MASTER SECTION 8.4.3 MANDATORY RATHER THAN OPT-OUT. The predicate that
+	// decides whether a record carries an inner frame reads is_commit and the server attachment,
+	// and both of those live in AAD_head, which is sealed under a record key EVERY MEMBER
+	// DERIVES. So whoever seals a record chooses which arm of MASTER section 8.4.1's table it
+	// takes, and before this sentinel existed a member who did not want to be signature-checked
+	// simply set is_commit -- and OpenRecord answered that member's chosen octets under the
+	// victim's sender_handle with no signature anywhere on the path. A rule an attacker can opt
+	// out of is not a rule.
+	//
+	// What closes it is that the arm now selects a DOOR rather than a policy. OpenRecord serves
+	// only the arm that carries a frame, so every body it returns has been signature-checked at
+	// R1 and R2; the other arm is refused here, by name, and a caller that genuinely wants those
+	// octets asks OpenCeremonyRecord for them and is told in that method's own name and prose
+	// that no member signed them. The attacker's choice is therefore between being checked and
+	// being refused, which is what a rule is.
+	//
+	// WHAT IT DOES NOT DO, because the complement is the part a reader has to be told: it does
+	// not authenticate the ceremony arm. It cannot -- a wrap, an epoch fan out and a completion
+	// marker carry no signature at all by Spec A section 5.11 (5), and a commit record's
+	// authentication is the commit's own, which belongs to the epoch machinery and not to this
+	// door. Open item MG-5.
+	ErrRecordNotAnApplicationRecord = errors.New("messagegroup: this record's arm of MASTER section 8.4.1's table is not the one this door opens")
 	// Fires when a record on the blob rung reaches the sealer or the reader. The blob object,
 	// its identifier and its padder are task 20's and none of them exists yet; a record whose
 	// body lives somewhere this package cannot address is refused rather than opened empty.

@@ -265,6 +265,9 @@ var handleLeafIndexReadings = map[string]string{
 	"TrackSender": "LP -- it binds the leaf only through SenderHandle and NewReceiverRatchet, so its " +
 		"reading is theirs, and a receiver installed under a handle the sender does not compute is a ladder nothing routes to",
 	"trackSenderOnLoop": "LP -- TrackSender's body, and the same reading for the same reason",
+	"refuseFrameBindingsOnLoop": "LP -- it binds the leaf only through SenderHandle, because MASTER " +
+		"section 8.4.3's R1 is the comparison of the handle the frame's signer expands to against the " +
+		"handle the record carries, and a second spelling here would refuse every honest record",
 }
 
 func TestEveryLeafIndexDerivationDeclaresItsReadingAndSharesOneHelper(t *testing.T) {
