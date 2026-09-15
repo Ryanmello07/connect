@@ -4859,7 +4859,7 @@ func (self *TcpSequence) applyReturnRetransmitAckWithLock(tcp *parsedTcp, previo
 		state.ackWindowByteCount = windowByteCount
 		return
 	}
-	if state.ackWithLock(tcp, previousReceiveSeqAck, windowByteCount, monotonicNanos()) {
+	if state.ackWithLock(tcp, previousReceiveSeqAck, windowByteCount, self.receiveWindowEnd, monotonicNanos()) {
 		self.signalReturnRetransmit()
 	}
 	if state.count == 0 {

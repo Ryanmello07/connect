@@ -22,6 +22,16 @@ const (
 	// the backoff ceiling. With the no-progress bound this fixes how many
 	// timer retransmissions a silent source costs before it is reset.
 	returnRetransmitMaxRto = 8 * time.Second
+	// the ceiling on a loss-recovery burst, in consecutive segments from the
+	// cumulative acknowledgement. The burst doubles from one per partial
+	// acknowledgement and reaches this on the eighth; from then on recovery
+	// runs at this many segments a round trip. Without SACK nothing says what
+	// the source holds past a hole, so this is also the most one
+	// acknowledgement can resend that it already had: about 190 KB of
+	// full-size segments. At this ceiling the retain cap's worst case, a
+	// purged span of about 2,900 segments, recovers in about 30 round trips,
+	// under a second at 30 ms, where one segment a round trip took 87 s.
+	returnRetransmitMaxBurstSegmentCount = 128
 	// the most blocks one SACK option carries beside a timestamp option
 	tcpMaxSackBlockCount = 4
 	// the bounds used when the settings leave them zero
@@ -194,10 +204,21 @@ func (self *returnRetransmitCounters) snapshot() ReturnRetransmitStats {
 // acknowledgements that extend the marked range retransmit the holes they
 // newly reveal. A partial acknowledgement inside loss recovery, one that
 // advances but not to the recovery's end, retransmits the next hole at once
-// (NewReno, RFC 6582). The timer: max(200 ms, 2 x srtt, srtt + 4 rttvar) from
-// the inner round trip, one second before a sample exists, doubling on each
-// expiry to an 8 s ceiling and reset by acknowledgement progress; expiry
-// retransmits the first unacknowledged segment only.
+// (NewReno, RFC 6582), and not only the hole: a burst of consecutive segments
+// from the cumulative acknowledgement, one on the first partial
+// acknowledgement and doubling on each to a ceiling of 128, never past the
+// recovery point and never a segment this recovery already sent again. The
+// failure this path exists for is a receive socket out of memory, and the
+// kernel then prunes its out-of-order queue when the hole fills, so the
+// source holds nothing past it; one segment per partial acknowledgement
+// would take a round trip per purged segment where a real sender slow-starts
+// the go-back-N. Without SACK a burst may resend a segment the source held,
+// at most the ceiling per acknowledgement and each at most once per recovery.
+// The timer: max(200 ms, 2 x srtt, srtt + 4 rttvar) from the inner round
+// trip, one second before a sample exists, doubling on each expiry to an 8 s
+// ceiling and reset by acknowledgement progress; expiry retransmits the first
+// unacknowledged segment only, and an expiry during loss recovery presumes
+// what it already sent again lost and starts the bursts over from one.
 //
 // An expiry is not by itself loss. The round trip includes Transfer's
 // queueing, so a tunnel stall holds acknowledgements past the timer, and if
@@ -267,6 +288,12 @@ type tcpReturnRetransmitState struct {
 	recoveryEnd uint32
 	// the end of the head the probe's expiry sent again
 	probeHeadEnd uint32
+	// when loss recovery began, or an expiry last restarted it; a segment
+	// sent again since then is in flight and no burst sends it again
+	recoveryStartNanos int64
+	// the consecutive segments the last partial acknowledgement sent from the
+	// cumulative acknowledgement, zero when recovery begins
+	burstSegmentCount int
 
 	rttKnown         bool
 	srttNanos        int64
@@ -489,6 +516,39 @@ func (self *tcpReturnRetransmitState) markDueWithLock(
 	self.dueCount += 1
 }
 
+// Starts loss recovery from the first burst. `startNanos` is when the
+// retransmissions that belong to it began.
+func (self *tcpReturnRetransmitState) beginLossRecoveryWithLock(startNanos int64) {
+	self.recoveryPhase = tcpReturnRecoveryPhaseLoss
+	self.recoveryStartNanos = startNanos
+	self.burstSegmentCount = 0
+}
+
+// Sends the burst of one partial acknowledgement in loss recovery: twice the
+// last burst, from one up to the ceiling, of consecutive delivered segments
+// from the cumulative acknowledgement. A source that pruned its out-of-order
+// queue on the hole fill holds nothing past it, and one segment a round trip
+// would take a round trip per segment of the purged span; a real sender
+// slow-starts that go-back-N instead. The burst stops at the recovery point
+// and at the window edge `windowEnd`, which retention already implies, and
+// skips segments already sent again in this recovery, which are in flight:
+// the acknowledgements for one burst arrive together, and the hole interval,
+// one round trip, would let the later of them resend the burst's tail.
+func (self *tcpReturnRetransmitState) markBurstWithLock(windowEnd uint32, nowNanos int64) {
+	self.burstSegmentCount = min(max(1, 2*self.burstSegmentCount), returnRetransmitMaxBurstSegmentCount)
+	for index := 0; index < min(self.burstSegmentCount, self.deliveredCount); index += 1 {
+		segment := self.segmentAtWithLock(index)
+		end := segment.seq + segment.byteCount
+		if 0 < int32(end-self.recoveryEnd) || 0 < int32(end-windowEnd) {
+			break
+		}
+		if 0 < segment.retransmitCount && self.recoveryStartNanos <= segment.retransmitNanos {
+			continue
+		}
+		self.markDueWithLock(segment, tcpReturnRetransmitReasonPartialAck, nowNanos)
+	}
+}
+
 // Retransmits every unmarked delivered segment below the highest selectively
 // acknowledged byte, each at most once per round trip.
 func (self *tcpReturnRetransmitState) markSackHolesWithLock(nowNanos int64) {
@@ -632,12 +692,14 @@ func (self *tcpReturnRetransmitState) releaseAckedWithLock(ackNumber uint32, now
 
 // Applies one acknowledgement the sequence has already validated against its
 // emitted range. `previousAckNumber` is the cumulative acknowledgement before
-// it and `windowByteCount` its window after scaling. Reports whether a
+// it, `windowByteCount` its window after scaling, and `windowEnd` the
+// greatest window edge the source has advertised. Reports whether a
 // retransmission is now due, which wakes the worker.
 func (self *tcpReturnRetransmitState) ackWithLock(
 	tcp *parsedTcp,
 	previousAckNumber uint32,
 	windowByteCount uint32,
+	windowEnd uint32,
 	nowNanos int64,
 ) (due bool) {
 	previousWindowByteCount := self.ackWindowByteCount
@@ -682,7 +744,7 @@ func (self *tcpReturnRetransmitState) ackWithLock(
 				// a partial acknowledgement: the next hole starts at the
 				// new head, and waiting three more duplicates for it would
 				// wait for data that may never be sent (RFC 6582 §3.2)
-				self.markDueWithLock(self.segmentAtWithLock(0), tcpReturnRetransmitReasonPartialAck, nowNanos)
+				self.markBurstWithLock(windowEnd, nowNanos)
 			}
 		}
 		if !keepBackoff {
@@ -711,20 +773,22 @@ func (self *tcpReturnRetransmitState) ackWithLock(
 	switch self.recoveryPhase {
 	case tcpReturnRecoveryPhaseTimeoutProbe:
 		// the source is missing the head: the expiry was real (RFC 5682
-		// §2.1 step 2a), and the head it sent again is already out
-		self.recoveryPhase = tcpReturnRecoveryPhaseLoss
+		// §2.1 step 2a), and the head it sent again, at the start the
+		// expiry recorded, is already out
+		self.beginLossRecoveryWithLock(self.recoveryStartNanos)
 	case tcpReturnRecoveryPhaseTimeoutProbeAdvanced:
 		// the acknowledgement that covered exactly the head was a partial
-		// one, and the segment after it is missing too (step 3a)
-		self.recoveryPhase = tcpReturnRecoveryPhaseLoss
-		self.markDueWithLock(self.segmentAtWithLock(0), tcpReturnRetransmitReasonPartialAck, nowNanos)
+		// one, and the segment after it is missing too (step 3a): its burst
+		// goes now
+		self.beginLossRecoveryWithLock(self.recoveryStartNanos)
+		self.markBurstWithLock(windowEnd, nowNanos)
 	}
 	if self.dupAckCount < returnRetransmitDupAckThreshold {
 		return 0 < self.dueCount
 	}
 	if self.dupAckCount == returnRetransmitDupAckThreshold || sackChanged {
 		if self.recoveryPhase == tcpReturnRecoveryPhaseNone {
-			self.recoveryPhase = tcpReturnRecoveryPhaseLoss
+			self.beginLossRecoveryWithLock(nowNanos)
 			self.recoveryEnd = self.highestDeliveredWithLock()
 		}
 		if 0 < self.sackedCount {
@@ -761,8 +825,11 @@ func (self *tcpReturnRetransmitState) timerWithLock(nowNanos int64) (abandon boo
 			// acknowledgements back looks the same, so only the head goes
 			self.recoveryPhase = tcpReturnRecoveryPhaseTimeoutProbe
 			self.probeHeadEnd = head.seq + head.byteCount
+			self.recoveryStartNanos = nowNanos
 		default:
-			self.recoveryPhase = tcpReturnRecoveryPhaseLoss
+			// what was sent again before the expiry is presumed lost with
+			// the rest, and the bursts start over from one
+			self.beginLossRecoveryWithLock(nowNanos)
 		}
 		self.recoveryEnd = self.highestDeliveredWithLock()
 		if self.counters != nil {
