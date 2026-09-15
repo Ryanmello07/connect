@@ -4831,8 +4831,10 @@ func (self *TcpSequence) returnPacketSeqs(seqs []uint32, packets [][]byte) []uin
 
 // Marks a delivered batch as sent (see tcpReturnRetransmitState) and wakes the
 // worker when it was the first outstanding delivery, which arms the timer and
-// may retransmit a hole the batch's own duplicates showed.
-func (self *TcpSequence) markReturnDelivered(seqs []uint32) {
+// may retransmit a hole the batch's own duplicates showed. `startNanos` is
+// when the batch's delivery began, which places it against a recovery under
+// way.
+func (self *TcpSequence) markReturnDelivered(seqs []uint32, startNanos int64) {
 	if !self.returnRetransmit.enabled || len(seqs) == 0 {
 		return
 	}
@@ -4840,7 +4842,7 @@ func (self *TcpSequence) markReturnDelivered(seqs []uint32) {
 	func() {
 		self.mutex.Lock()
 		defer self.mutex.Unlock()
-		wake = self.returnRetransmit.markDeliveredWithLock(seqs, monotonicNanos())
+		wake = self.returnRetransmit.markDeliveredWithLock(seqs, startNanos, monotonicNanos())
 	}()
 	if wake {
 		self.signalReturnRetransmit()
@@ -5641,8 +5643,9 @@ func (self *TcpSequence) Run() {
 		// sequences are read first
 		deliverBatch := func() {
 			batchSeqs = self.returnPacketSeqs(batchSeqs, batch)
+			startNanos := monotonicNanos()
 			self.receiveBatch(batch, receiveRecoveryModeTcpSocket)
-			self.markReturnDelivered(batchSeqs)
+			self.markReturnDelivered(batchSeqs, startNanos)
 		}
 
 	read:

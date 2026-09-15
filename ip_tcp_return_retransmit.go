@@ -210,7 +210,9 @@ func (self *returnRetransmitCounters) snapshot() ReturnRetransmitStats {
 // the drain delivers in sequence order. The drain marks a batch only when
 // its callback returns, and the source can answer the batch before that, so a
 // duplicate acknowledgement that arrives while nothing is marked still counts,
-// and fast retransmit follows the marking.
+// and fast retransmit follows the marking; a recovery that began while a batch
+// was being delivered takes its recovery point over that batch, which was on
+// its way before the recovery's first retransmission.
 //
 // Bounds. Retained sequence bytes never exceed the source's advertised window,
 // because the packetizer already stops at the greatest advertised edge and
@@ -527,7 +529,19 @@ func (self *tcpReturnRetransmitState) retainWithLock(
 // batch while the drain is still inside its callback, so the duplicates of a
 // hole at the batch's head can all arrive before this marks the head; they
 // were counted (see ackWithLock), and the head is sent again here.
-func (self *tcpReturnRetransmitState) markDeliveredWithLock(seqs []uint32, nowNanos int64) (wake bool) {
+//
+// `startNanos` is when the batch's delivery began. A batch that began before
+// the recovery under way was on its way to the source before that recovery's
+// first retransmission, so the recovery point covers it. A batch that began
+// after it is data sent during the recovery, which lies past the point: a hole inside it is
+// one the acknowledgement of that retransmission will stop at, and without
+// this it lay past the point, read as a full recovery, and waited for the
+// timer while its duplicates had already been spent.
+func (self *tcpReturnRetransmitState) markDeliveredWithLock(
+	seqs []uint32,
+	startNanos int64,
+	nowNanos int64,
+) (wake bool) {
 	if !self.enabled {
 		return false
 	}
@@ -551,6 +565,12 @@ func (self *tcpReturnRetransmitState) markDeliveredWithLock(seqs []uint32, nowNa
 			if segment.seq == seq {
 				break
 			}
+		}
+	}
+	if self.recoveryPhase != tcpReturnRecoveryPhaseNone && 0 < self.deliveredCount &&
+		startNanos < self.recoveryStartNanos {
+		if end := self.highestDeliveredWithLock(); 0 < int32(end-self.recoveryEnd) {
+			self.recoveryEnd = end
 		}
 	}
 	if wake && self.recoveryPhase == tcpReturnRecoveryPhaseNone && returnRetransmitDupAckThreshold <= self.dupAckCount {

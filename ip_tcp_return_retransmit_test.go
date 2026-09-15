@@ -1768,6 +1768,81 @@ func TestTcpReturnRetransmitRealTimeoutRecoversOnTheDuplicateAck(t *testing.T) {
 	}
 }
 
+// The recovery point is the highest delivered segment, and the drain marks a
+// batch only when its callback returns, so a second hole inside the batch that
+// was being delivered when recovery began lay past the point. The
+// acknowledgement of the first hole's retransmission then stopped at the
+// second hole, read as a full recovery, and the hole waited for the timer:
+// the duplicates that would have shown it had already arrived, during the
+// recovery. Here the drain is held inside the batch that carries the second
+// hole while the first hole's duplicates arrive, and the batch is marked
+// before the acknowledgement of the retransmission comes back, as a real path
+// a round trip away always does.
+func TestTcpReturnRetransmitRecoveryCoversTheBatchItBeganInside(t *testing.T) {
+	const segmentCount = 7
+	const firstHoleIndex = 1
+	const secondHoleIndex = 4
+	const stalledIndex = 6
+	const stall = 20 * time.Millisecond
+	const roundTrip = 10 * time.Millisecond
+	runTcpReturnRetransmitTest(t, func(t *testing.T) {
+		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{
+			configure: func(settings *TcpBufferSettings) {
+				// the whole read goes as one batch
+				settings.WriteBatchSize = 16
+			},
+		})
+		harness.source.holdAcks = true
+		harness.source.dropCounts[harness.segmentSeq(firstHoleIndex)] = 1
+		harness.source.dropCounts[harness.segmentSeq(secondHoleIndex)] = 1
+		payload := harness.payload(segmentCount)
+		written := harness.writeSegments(payload, 0, secondHoleIndex-1)
+		// the drain is held by the last segment's write, so the batch that
+		// carries the second hole is delivered and not yet marked
+		harness.source.stateLock.Lock()
+		harness.source.stallDurations[harness.segmentSeq(stalledIndex)] = stall
+		harness.source.stateLock.Unlock()
+		harness.writeSegments(payload, written, segmentCount-written)
+
+		// the acknowledgements the arrivals before the stall caused
+		time.Sleep(roundTrip)
+		harness.source.sendAck(harness.segmentSeq(firstHoleIndex))
+		for range returnRetransmitDupAckThreshold {
+			harness.source.sendDuplicateAck()
+		}
+		synctest.Wait()
+		harness.requireSeenCount(firstHoleIndex, 2)
+
+		// the stall ends, the batch is marked, and the acknowledgement of the
+		// retransmission comes back and stops at the second hole
+		time.Sleep(stall)
+		synctest.Wait()
+		harness.source.sendAck(harness.segmentSeq(secondHoleIndex))
+		synctest.Wait()
+
+		harness.requireSeenCount(secondHoleIndex, 2)
+		harness.source.ackNow()
+		synctest.Wait()
+		harness.requireStream(payload)
+		for segmentIndex := 0; segmentIndex < segmentCount; segmentIndex += 1 {
+			want := 1
+			if segmentIndex == firstHoleIndex || segmentIndex == secondHoleIndex {
+				want = 2
+			}
+			harness.requireSeenCount(segmentIndex, want)
+		}
+		_, _, packetCount, reasonCounts := harness.retransmitState()
+		if packetCount != 2 ||
+			reasonCounts[tcpReturnRetransmitReasonDupAck] != 1 ||
+			reasonCounts[tcpReturnRetransmitReasonPartialAck] != 1 {
+			t.Fatalf("retransmissions=%d reasons=%v, want the first hole on duplicates and the second on the partial acknowledgement", packetCount, reasonCounts)
+		}
+		if stats := harness.counters.snapshot(); stats.TimeoutCount != 0 {
+			t.Fatalf("stats=%+v, want no timer expiry", stats)
+		}
+	})
+}
+
 // The round trip of the tests that step the source's acknowledgements through
 // a download.
 const tcpReturnTestStepRoundTrip = 50 * time.Millisecond
