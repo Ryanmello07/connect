@@ -28,6 +28,7 @@ import (
 	"testing"
 	"testing/synctest"
 	"time"
+	"unsafe"
 
 	"github.com/urnetwork/connect/protocol"
 )
@@ -2203,6 +2204,107 @@ func TestTcpReturnRetransmitLostFlightRecoversInBurstsAfterTheProbe(t *testing.T
 			}
 			if stats := harness.counters.snapshot(); stats.TimeoutCount != 2 || stats.AbandonCount != 0 {
 				t.Fatalf("stats=%+v, want two timeouts and no abandon", stats)
+			}
+		})
+	}
+}
+
+// The pool roots and ring records the retained set holds, read under the
+// sequence mutex: what the ring can be seen to hold, beside what the state
+// charges against the memory bound.
+func (self *tcpReturnRetransmitTestHarness) retainedMemory() (
+	measuredByteCount int64,
+	chargedByteCount int64,
+	ringSegmentCount int,
+) {
+	self.sequence.mutex.Lock()
+	defer self.sequence.mutex.Unlock()
+	state := &self.sequence.returnRetransmit
+	for index := 0; index < state.count; index += 1 {
+		measuredByteCount += int64(cap(state.segmentAtWithLock(index).packet))
+	}
+	measuredByteCount += int64(len(state.segments)) * int64(unsafe.Sizeof(tcpReturnRetainedSegment{}))
+	return measuredByteCount, state.retainedMemoryByteCount, len(state.segments)
+}
+
+// The record size the memory bound is charged in is the compiler's.
+func TestTcpReturnRetainedSegmentRecordByteCount(t *testing.T) {
+	if got, want := unsafe.Sizeof(tcpReturnRetainedSegment{}), uintptr(tcpReturnRetainedSegmentByteCount); got != want {
+		t.Fatalf("a retained segment is %d bytes, and the memory bound charges %d", got, want)
+	}
+}
+
+// Retention holds whole pool roots, one per packetized segment, so the cap in
+// sequence bytes says nothing about the memory a flow keeps: a segment of a
+// few bytes, which a source can force with small window openings or an origin
+// that trickles, holds a 268-byte root and a ring record for one byte of
+// sequence space. The memory bound holds whatever the segment size: the flow
+// stops packetizing at three times the cap in pool roots and ring records,
+// where before a 4 KiB cap held 1.4 MB, 356 times it. The ring also returns
+// its records when the retained set empties, instead of keeping the peak for
+// the life of the flow.
+func TestTcpReturnRetransmitRetainedMemoryStaysWithinTheCap(t *testing.T) {
+	const capByteCount = 16 * 1024
+	for _, chunkByteCount := range []int{1, 64, tcpReturnTestSegmentByteCount} {
+		runTcpReturnRetransmitTest(t, func(t *testing.T) {
+			t.Logf("chunks of %d bytes", chunkByteCount)
+			harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{
+				configure: func(settings *TcpBufferSettings) {
+					settings.ReturnRetransmitRetainByteCount = capByteCount
+				},
+			})
+			harness.source.holdAcks = true
+			payload := harness.payload(64)
+			writeDone := make(chan struct{})
+			go func() {
+				defer close(writeDone)
+				for offset := 0; offset+chunkByteCount <= len(payload); offset += chunkByteCount {
+					// written directly, so that a failed test's teardown
+					// closing the pipe ends this goroutine quietly
+					if _, err := harness.upstream.Write(payload[offset : offset+chunkByteCount]); err != nil {
+						return
+					}
+				}
+			}()
+			synctest.Wait()
+
+			select {
+			case <-writeDone:
+				t.Fatalf("chunks of %d bytes: the whole payload was consumed with nothing acknowledged", chunkByteCount)
+			default:
+			}
+			measuredByteCount, chargedByteCount, ringSegmentCount := harness.retainedMemory()
+			retainedByteCount, retainedCount, _, _ := harness.retransmitState()
+			t.Logf("chunks of %d bytes: %d segments holding %d sequence bytes in %d bytes of memory, ring %d",
+				chunkByteCount, retainedCount, retainedByteCount, measuredByteCount, ringSegmentCount)
+			if measuredByteCount != chargedByteCount {
+				t.Fatalf("chunks of %d bytes: the ring holds %d bytes and the bound is charged %d", chunkByteCount, measuredByteCount, chargedByteCount)
+			}
+			// the bound, passed by at most the ring's last doubling
+			maxByteCount := int64(returnRetransmitRetainMemoryFactor*capByteCount) +
+				int64(ringSegmentCount/2)*int64(unsafe.Sizeof(tcpReturnRetainedSegment{}))
+			if maxByteCount < measuredByteCount {
+				t.Fatalf("chunks of %d bytes: retention holds %d bytes of memory for %d sequence bytes, above the bound %d", chunkByteCount, measuredByteCount, retainedByteCount, maxByteCount)
+			}
+			if capByteCount < retainedByteCount {
+				t.Fatalf("chunks of %d bytes: retained %d sequence bytes, above the cap", chunkByteCount, retainedByteCount)
+			}
+
+			harness.source.ackNow()
+			select {
+			case <-writeDone:
+			case <-time.After(2 * time.Second):
+				t.Fatalf("chunks of %d bytes: the writes did not complete after acknowledgements freed space", chunkByteCount)
+			}
+			synctest.Wait()
+			harness.requireStream(payload[:len(payload)/chunkByteCount*chunkByteCount])
+			retainedByteCount, retainedCount, _, _ = harness.retransmitState()
+			if retainedByteCount != 0 || retainedCount != 0 {
+				t.Fatalf("chunks of %d bytes: retained after full acknowledgement: %d bytes in %d segments", chunkByteCount, retainedByteCount, retainedCount)
+			}
+			measuredByteCount, chargedByteCount, ringSegmentCount = harness.retainedMemory()
+			if 16 < ringSegmentCount || measuredByteCount != chargedByteCount {
+				t.Fatalf("chunks of %d bytes: the emptied ring keeps %d records holding %d bytes", chunkByteCount, ringSegmentCount, measuredByteCount)
 			}
 		})
 	}

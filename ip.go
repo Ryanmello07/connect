@@ -3887,10 +3887,13 @@ type TcpBufferSettings struct {
 	// advertised window; a burst beyond it waits for acknowledgements as it
 	// waits for the window. Retained bytes are the bytes in flight, so a cap
 	// the window would pass is a rate ceiling of the cap over the inner round
-	// trip. Zero is the flow's MaxWindowSize, which the memory budget already
-	// scales, so by default the cap never binds below the flow's own window;
-	// a smaller value trades that rate for memory on a provider that cannot
-	// keep twice it in pool buffers per flow (see tcpReturnRetransmitState).
+	// trip. The pool roots and ring records the retained set holds are bounded
+	// with it, at three times the cap, which full-size segments stay under and
+	// which is what bounds a flow whose segments are small. Zero is the flow's
+	// MaxWindowSize, which the memory budget already scales, so by default the
+	// cap never binds below the flow's own window; a smaller value trades that
+	// rate for memory on a provider that cannot keep three times it in pool
+	// buffers per flow (see tcpReturnRetransmitState).
 	ReturnRetransmitRetainByteCount ByteCount
 	// How long the cumulative acknowledgement may stand still with segments
 	// outstanding before the flow is reset toward the source and closed,

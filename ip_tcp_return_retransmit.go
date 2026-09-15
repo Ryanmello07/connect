@@ -36,6 +36,18 @@ const (
 	returnRetransmitMaxBurstSegmentCount = 128
 	// the most blocks one SACK option carries beside a timestamp option
 	tcpMaxSackBlockCount = 4
+	// what one retained segment's ring record costs, checked against the
+	// compiler's size in TestTcpReturnRetainedSegmentRecordByteCount
+	tcpReturnRetainedSegmentByteCount = 96
+	// the memory bound as a multiple of the retention cap. A retained
+	// segment holds the whole pool root its packet came from, which is one
+	// size class: about 2 KiB for any packet above 256 bytes, and 256 bytes
+	// below that. Full segments at the default mtu therefore cost about twice
+	// their sequence bytes, and this leaves room for the ring and for the
+	// short segment that ends each socket read. A segment of a few bytes,
+	// which a source can force with small window openings, costs hundreds of
+	// times its own sequence bytes, and this is what bounds it.
+	returnRetransmitRetainMemoryFactor = 3
 	// the no-progress bound used when the settings leave it zero: the
 	// provider's bound on a source that acknowledges none of its returns
 	// (RemoteUserNatProviderSettings.ReturnSendAbandonTimeout). At 60 s, a
@@ -226,17 +238,31 @@ func (self *returnRetransmitCounters) snapshot() ReturnRetransmitStats {
 // before the window: 4 MiB at 100 ms is about 335 Mb/s. The cap therefore
 // defaults to the flow's own maximum window, MaxWindowSize, which the settings
 // already hold as the most packet data one sequence keeps in memory, and binds
-// only where a source advertises more than that.
+// only where a source advertises more than that, or where the memory bound
+// below binds first.
 //
 // Memory. Without retention a delivered buffer goes back to the pool when
 // Transfer acknowledges it; with it, when the source's kernel does. In steady
 // flow the extra is what is sent between those two acknowledgements. While a
 // hole stands the kernel acknowledges nothing past it, and the extra grows to
-// everything sent since, up to the window and the cap, until the repair. A
-// share holds its whole pool buffer, and a full segment at the default mtu
-// fills about half of its 2 KiB class, so the memory is about twice the
-// retained bytes, more for the short segment that ends a read: per flow about
-// twice the cap, and across flows nothing but the flow count bounds the sum.
+// everything sent since, up to the window and the cap, until the repair.
+//
+// Sequence bytes do not measure that memory. A share holds the whole pool
+// root its packet came from, one size class: about 2 KiB for any packet above
+// 256 bytes and 256 bytes below that, plus a ring record. Full segments at the
+// default mtu cost about twice their sequence bytes; a segment of a few bytes
+// costs hundreds of times its own, and a source can force those without the
+// origin's help, by opening its window a few bytes at a time. So the pool
+// roots and the ring are bounded beside the sequence bytes, at
+// returnRetransmitRetainMemoryFactor times the cap, which is what the cap's
+// worth of full-size segments costs with room to spare for the ring and the
+// short segment that ends each socket read. The bound is read as a ceiling on
+// the next chunk's sequence bytes, so retention passes it by at most one
+// socket read and the ring's last doubling; a flow whose path mtu has been
+// cut far below the packet pool's class binds on memory before the cap. The
+// ring gives its records back when the retained set empties, rather than
+// keeping the peak for the life of the flow. Across flows nothing but the
+// flow count bounds the sum.
 //
 // Constrained providers. MaxWindowSize scales with the process memory budget
 // (DefaultTcpBufferSettingsWithBufferSize): 16 MiB unbudgeted, 8 MiB at the
@@ -248,7 +274,8 @@ func (self *returnRetransmitCounters) snapshot() ReturnRetransmitStats {
 // enough for a phone's provider share would impose the rate ceiling above on
 // every flow and still not bound the sum across flows, which only an
 // aggregate bound charged to that share could. A host that must keep less per
-// flow sets the cap, or MaxWindowSize with it.
+// flow sets the cap, or MaxWindowSize with it; both the sequence bytes and the
+// memory follow it.
 //
 // Time is bounded by ReturnRetransmitTimeout: when the cumulative
 // acknowledgement has not advanced for that long with delivered segments
@@ -347,24 +374,28 @@ func (self *returnRetransmitCounters) snapshot() ReturnRetransmitStats {
 // worker that builds and sends retransmissions runs on its own goroutine and
 // takes that mutex only to select and build.
 type tcpReturnRetransmitState struct {
-	enabled         bool
-	retainByteCount int64
-	timeout         time.Duration
+	enabled               bool
+	retainByteCount       int64
+	retainMemoryByteCount int64
+	timeout               time.Duration
 	// shared with the owning NAT, nil when nothing counts
 	counters *returnRetransmitCounters
 
 	// circular, in sequence order from head; the delivered prefix first
-	segments              []tcpReturnRetainedSegment
-	head                  int
-	count                 int
-	deliveredCount        int
-	retainedByteCount     int64
-	sackedCount           int
-	highestSackedEnd      uint32
-	appliedSackBlocks     [tcpMaxSackBlockCount]tcpSackBlock
-	appliedSackBlockCount int
-	finRetained           bool
-	dueCount              int
+	segments       []tcpReturnRetainedSegment
+	head           int
+	count          int
+	deliveredCount int
+	// the sequence bytes retained, and the pool roots and ring records that
+	// hold them, each against its own bound
+	retainedByteCount       int64
+	retainedMemoryByteCount int64
+	sackedCount             int
+	highestSackedEnd        uint32
+	appliedSackBlocks       [tcpMaxSackBlockCount]tcpSackBlock
+	appliedSackBlockCount   int
+	finRetained             bool
+	dueCount                int
 
 	dupAckCount int
 	// the duplicate acknowledgements this flow's own retransmissions can
@@ -423,6 +454,7 @@ func newTcpReturnRetransmitState(tcpBufferSettings *TcpBufferSettings) tcpReturn
 		// the flow's maximum window, so the cap never binds below it
 		state.retainByteCount = int64(tcpBufferSettings.MaxWindowSize)
 	}
+	state.retainMemoryByteCount = returnRetransmitRetainMemoryFactor * state.retainByteCount
 	if state.timeout <= 0 {
 		state.timeout = defaultReturnRetransmitTimeout
 	}
@@ -435,15 +467,36 @@ func (self *tcpReturnRetransmitState) segmentAtWithLock(index int) *tcpReturnRet
 
 func (self *tcpReturnRetransmitState) appendWithLock(segment tcpReturnRetainedSegment) {
 	if self.count == len(self.segments) {
-		grown := make([]tcpReturnRetainedSegment, max(16, 2*len(self.segments)))
-		for index := 0; index < self.count; index += 1 {
-			grown[index] = *self.segmentAtWithLock(index)
-		}
-		self.segments = grown
-		self.head = 0
+		self.resizeWithLock(max(16, 2*len(self.segments)))
 	}
 	self.segments[(self.head+self.count)%len(self.segments)] = segment
 	self.count += 1
+}
+
+// Moves the ring to a backing array of `byteCount` records, which must hold
+// what it carries, and charges the change against the memory bound.
+func (self *tcpReturnRetransmitState) resizeWithLock(segmentCount int) {
+	resized := make([]tcpReturnRetainedSegment, segmentCount)
+	for index := 0; index < self.count; index += 1 {
+		resized[index] = *self.segmentAtWithLock(index)
+	}
+	self.retainedMemoryByteCount += int64(segmentCount-len(self.segments)) * tcpReturnRetainedSegmentByteCount
+	self.segments = resized
+	self.head = 0
+}
+
+// Returns the ring's backing array to what it carries, so a flow that held a
+// window of segments through one loss episode does not keep the records for
+// the rest of its life. Halving at a quarter full leaves room to grow again
+// without copying on every append.
+func (self *tcpReturnRetransmitState) shrinkWithLock() {
+	segmentCount := len(self.segments)
+	for 16 < segmentCount && self.count <= segmentCount/4 {
+		segmentCount /= 2
+	}
+	if segmentCount < len(self.segments) {
+		self.resizeWithLock(segmentCount)
+	}
 }
 
 // Removes the head and returns the pool share it held, so the caller decides
@@ -457,6 +510,7 @@ func (self *tcpReturnRetransmitState) popWithLock() (segment tcpReturnRetainedSe
 		self.head = 0
 	}
 	self.retainedByteCount -= int64(segment.byteCount)
+	self.retainedMemoryByteCount -= int64(cap(segment.packet))
 	if segment.delivered {
 		self.deliveredCount -= 1
 	}
@@ -471,12 +525,19 @@ func (self *tcpReturnRetransmitState) popWithLock() (segment tcpReturnRetainedSe
 
 // Sequence bytes the cap still allows; unbounded when disabled, or when
 // neither the settings nor a maximum window give a cap and the window alone
-// bounds retention.
+// bounds retention. The memory the retained set holds is bounded beside the
+// sequence bytes, in memory bytes read as a ceiling on the next chunk's
+// sequence bytes: one chunk is at most one socket read, so retention passes
+// its memory bound by at most that read's segments and the ring's last
+// doubling.
 func (self *tcpReturnRetransmitState) roomWithLock() int64 {
 	if !self.enabled || self.retainByteCount <= 0 {
 		return int64(1) << 62
 	}
-	return self.retainByteCount - self.retainedByteCount
+	return min(
+		self.retainByteCount-self.retainedByteCount,
+		self.retainMemoryByteCount-self.retainedMemoryByteCount,
+	)
 }
 
 // The end of the newest delivered segment, which is the highest sequence the
@@ -516,6 +577,9 @@ func (self *tcpReturnRetransmitState) retainWithLock(
 	}
 	self.appendWithLock(segment)
 	self.retainedByteCount += int64(segment.byteCount)
+	// the whole pool root the share holds, whatever part of it the payload
+	// fills
+	self.retainedMemoryByteCount += int64(cap(segment.packet))
 }
 
 // Marks retained segments as handed to the return path, by the sequences the
@@ -590,6 +654,7 @@ func (self *tcpReturnRetransmitState) releaseAllWithLock() {
 			MessagePoolReturn(segment.packet)
 		}
 	}
+	self.shrinkWithLock()
 	self.recoveryPhase = tcpReturnRecoveryPhaseNone
 	self.dupAckCount = 0
 	self.appliedSackBlockCount = 0
@@ -900,6 +965,7 @@ func (self *tcpReturnRetransmitState) releaseAckedWithLock(
 		}
 	}
 	self.appliedSackBlockCount = keptCount
+	self.shrinkWithLock()
 	return
 }
 
