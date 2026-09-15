@@ -941,6 +941,10 @@ func (self *ApiMultiClientGenerator) NewClientContext(
 	// publishes its extender addresses through the same monitor (K1)
 	extenderIpsMonitor := NewMonitorValue[uint64](0)
 	settings.ExtenderIpsMonitor = extenderIpsMonitor
+	// likewise one H1 path queue delay baseline, so a migration replacement's
+	// first connection is judged against the path's history and not its own
+	// first, possibly already queued, frames
+	settings.h1PathBaseline = newH1QueueDelayBaseline(&settings.H1PathReroll)
 	transport, _, policyVersion := self.createPlatformTransport(client, args.ClientAuth, settings)
 	auth := *args.ClientAuth
 	self.transportLock.Lock()

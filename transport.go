@@ -643,6 +643,16 @@ type PlatformTransportSettings struct {
 	// Nil outside package tests. Replaces plain-H3 name resolution so the
 	// family race can be driven against chosen addresses.
 	resolveH3AddrsForTest func(ctx context.Context, address string, ipFamily int) ([]*net.UDPAddr, error)
+
+	// The H1 path queue delay baseline, shared by every transport built from
+	// these settings. An owner that replaces transports across generations
+	// (the window's migration) installs one so a new connection is judged
+	// against the path's history. Nil gives the transport a baseline of its
+	// own.
+	h1PathBaseline *h1QueueDelayBaseline
+	// Nil outside package tests. Scripts the H1 path connections of the
+	// transport; see h1PathTestHooks.
+	h1PathTestHooks *h1PathTestHooks
 }
 
 func DefaultPlatformTransportSettings() *PlatformTransportSettings {
@@ -980,6 +990,10 @@ type PlatformTransport struct {
 	// attempt failed because the hostname does not resolve; the group reads
 	// it to release the standby early. See noteDialError.
 	unresolvable atomic.Bool
+
+	// the queue delay baseline of every H1 connection of this transport:
+	// settings.h1PathBaseline, or one of its own. Immutable after construction.
+	h1PathBaseline *h1QueueDelayBaseline
 }
 
 // newPlatformQuicConfig keeps H3's memory and path-MTU behavior explicit and
@@ -1386,6 +1400,12 @@ func NewPlatformTransportWithTargetMode(
 	}
 	if transport.extenderIpsMonitor == nil {
 		transport.extenderIpsMonitor = NewMonitorValue[uint64](0)
+	}
+	transport.h1PathBaseline = settings.h1PathBaseline
+	if transport.h1PathBaseline == nil {
+		// about a kilobyte; kept even when the settings are Off so the
+		// transport needs no nil check
+		transport.h1PathBaseline = newH1QueueDelayBaseline(&settings.H1PathReroll)
 	}
 	transport.ipFamily = normalizeIpFamily(settings.IpFamily)
 	transport.enabled.Store(!settings.StartDisabled)
@@ -1966,6 +1986,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 	// (NextReconnectTime); a failed re-dial clears it, so retries fall back to
 	// the serialized NextConnectTime pacing.
 	hadConnection := false
+	// numbers the connections of this transport from zero, for the H1 path
+	// monitor's test hooks
+	connectionOrdinal := 0
 
 	for {
 		// stand down while a strictly better mode is active
@@ -1993,6 +2016,11 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 		// Written by the single dial below and read by the connection it
 		// produced, both on this goroutine.
 		var dialExtenderIp netip.Addr
+		// the websocket dial of the connection, without the legacy in-band
+		// auth. A TCP connect, a TLS handshake and the upgrade take at least
+		// three round trips; the H1 path monitor's dormant gate reads a third
+		// of it. Written and read on this goroutine, like dialExtenderIp.
+		var dialDuration time.Duration
 		connect := func() (*websocket.Conn, error) {
 			header := http.Header{}
 			if self.settings.V2H1Auth {
@@ -2003,6 +2031,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				self.applyIntentHeader(header)
 			}
 
+			dialStart := time.Now()
 			ws, _, dialerInfo, err := self.clientStrategy.WsDialContextWithDialer(
 				self.dialContext(self.ctx),
 				self.platformUrl,
@@ -2011,6 +2040,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			if err != nil {
 				return nil, err
 			}
+			dialDuration = time.Since(dialStart)
 			if dialerInfo != nil {
 				dialExtenderIp = dialerInfo.ExtenderIp
 			}
@@ -2146,6 +2176,32 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			handleCtx, handleCancel := context.WithCancel(self.ctx)
 			defer handleCancel()
 
+			// payload messages delivered by the reader and written by the
+			// writer; the inactive-drain watchdog and the H1 path monitor read
+			// them
+			var readCounter atomic.Uint64
+			var writeCounter atomic.Uint64
+			// read only by the H1 path monitor
+			var readByteCounter atomic.Uint64
+			var receiveFullCounter atomic.Uint64
+			var speedTestActive atomic.Bool
+			// nil, and free, for a short path, a control-only transport or
+			// mode Off (transport_h1_path_connection.go)
+			pathConnection := self.newH1PathConnection(
+				ws,
+				dialExtenderIp,
+				dialDuration,
+				connectionOrdinal,
+				h1PathCounters{
+					readMessageCount:  &readCounter,
+					writeMessageCount: &writeCounter,
+					readByteCount:     &readByteCounter,
+					receiveFullCount:  &receiveFullCounter,
+					speedTestActive:   &speedTestActive,
+				},
+			)
+			defer pathConnection.close()
+
 			// The connection owns every worker it starts. Registration happens
 			// synchronously before cleanup can Wait, and the outer wrapper keeps
 			// panic rescue handlers inside the owned lifetime.
@@ -2162,19 +2218,38 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			// re-dials over the new path immediately (see Kick). the ws.Close
 			// is what unblocks a reader/writer parked in a socket call that
 			// handleCancel alone cannot wake.
+			// The same worker ticks the H1 path monitor of a far connection,
+			// and stops its ticker for good once the monitor goes dormant.
 			kick := self.kickMonitor.NotifyChannel()
 			startConnectionWorker(func() {
-				select {
-				case <-handleCtx.Done():
-				case <-kick:
-					self.log.Infof("[t]kick: closing connection for re-dial\n")
-					handleCancel()
-					ws.Close()
+				var ticker *time.Ticker
+				var tick <-chan time.Time
+				if pathConnection != nil {
+					ticker = time.NewTicker(pathConnection.tickInterval())
+					defer ticker.Stop()
+					tick = ticker.C
+				}
+				for {
+					select {
+					case <-handleCtx.Done():
+						return
+					case <-kick:
+						self.log.Infof("[t]kick: closing connection for re-dial\n")
+						handleCancel()
+						ws.Close()
+						return
+					case <-tick:
+						if handleCtx.Err() != nil {
+							return
+						}
+						if decision := pathConnection.tick(time.Now()); decision.dormant {
+							ticker.Stop()
+							tick = nil
+						}
+					}
 				}
 			})
 
-			var readCounter atomic.Uint64
-			var writeCounter atomic.Uint64
 			send := make(chan []byte, self.settings.TransportBufferSize)
 			receive := make(chan []byte, self.settings.TransportBufferSize)
 			controlSend := make(chan []byte, self.settings.TransportBufferSize)
@@ -2262,6 +2337,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				[]Route{receive},
 				TransferCarrierProperties{
 					ReceiveReliability: CarrierReliabilityReliable,
+					receiveObserver:    pathConnection.observerOrNil(),
 				},
 			)
 			self.setRegistered(true)
@@ -2608,12 +2684,14 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 								switch message[0] {
 								case TransportControlSpeedStart:
 									speedTest = true
+									speedTestActive.Store(true)
 									// echo
 									if !self.offerH1Control(handleCtx.Done(), controlSend, message) {
 										return
 									}
 								case TransportControlSpeedStop:
 									speedTest = false
+									speedTestActive.Store(false)
 									// echo
 									if !self.offerH1Control(handleCtx.Done(), controlSend, message) {
 										return
@@ -2638,6 +2716,13 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 							}
 							continue
 						}
+						// the offer takes the message; its length is kept first
+						messageByteCount := len(message)
+						if pathConnection != nil && cap(receive) <= len(receive) {
+							// the consumer is behind, so this tick's delivery
+							// says nothing about the path
+							receiveFullCounter.Add(1)
+						}
 						open, delivered := self.offerReceive(
 							handleCtx.Done(),
 							TransportModeH1,
@@ -2650,6 +2735,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 						}
 						if delivered {
 							readCounter.Add(1)
+							readByteCounter.Add(uint64(messageByteCount))
 						}
 						if delivered && self.log.V(2).Enabled() {
 							self.log.Infof("[tr]%s<-\n", clientId)
@@ -2687,6 +2773,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 		} else {
 			c()
 		}
+		connectionOrdinal += 1
 		// the connection ran and died: the next dial is a reconnect
 		hadConnection = true
 
