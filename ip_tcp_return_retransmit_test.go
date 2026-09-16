@@ -615,8 +615,14 @@ type tcpReturnTestOptions struct {
 	// what the sequence requires before it reads a block (RFC 2018 §2).
 	// Without it no block from this source is read at all, however the source
 	// sends it
-	sack       bool
-	timestamps bool
+	sack bool
+	// one half of that negotiation alone, for the rows that pin it: the SYN
+	// offers sack-permitted where the settings do not allow it, and the
+	// settings allow it where the SYN is silent. Neither negotiates anything,
+	// and the SYN-ACK offers nothing either way
+	sourceOffersSack  bool
+	settingsAllowSack bool
+	timestamps        bool
 	// zero is the default well inside the sequence space; see
 	// tcpReturnTestInitialSynSeqWrappingAfter for a flow that wraps
 	initialSynSeq uint32
@@ -697,7 +703,7 @@ func newTcpReturnRetransmitTestHarness(t *testing.T, options tcpReturnTestOption
 	settings.ReadBufferByteCount = 8 * segmentByteCount
 	// off by default, as production has it, so only a row that asks for the
 	// negotiation reaches the selective paths
-	settings.EnableReturnRetransmitSack = options.sack
+	settings.EnableReturnRetransmitSack = options.sack || options.settingsAllowSack
 	if options.configure != nil {
 		options.configure(settings)
 	}
@@ -725,7 +731,7 @@ func newTcpReturnRetransmitTestHarness(t *testing.T, options tcpReturnTestOption
 	}
 	harness.source = &tcpReturnTestSource{
 		harness:        harness,
-		sack:           options.sack,
+		sack:           options.sack || options.sourceOffersSack,
 		timestamps:     options.timestamps,
 		ackDelay:       options.ackDelay,
 		stepAcks:       options.stepAcks,
@@ -843,7 +849,7 @@ func newTcpReturnRetransmitTestHarness(t *testing.T, options tcpReturnTestOption
 		// its echo past the SYN's and no row could tell a current echo
 		binary.BigEndian.PutUint32(synOptions[8:12], tcpReturnTestSourceTimestampValue())
 	}
-	if options.sack {
+	if options.sack || options.sourceOffersSack {
 		// sack-permitted, which the SYN-ACK answers only where the settings
 		// let it, and two NOPs so the options stay a whole header word
 		synOptions = append(synOptions, 4, 2, 1, 1)
@@ -870,6 +876,10 @@ func newTcpReturnRetransmitTestHarness(t *testing.T, options tcpReturnTestOption
 	if harness.synAckSackPermitted != options.sack {
 		harness.close()
 		t.Fatalf("syn-ack offered sack-permitted=%t, want %t", harness.synAckSackPermitted, options.sack)
+	}
+	if returnSackPermitted := harness.returnSackPermitted(); returnSackPermitted != options.sack {
+		harness.close()
+		t.Fatalf("the return path took sack-permitted=%t from the handshake, want %t", returnSackPermitted, options.sack)
 	}
 	// the handshake's acknowledgement, which established flows apply directly
 	harness.source.ackNow()
@@ -1068,6 +1078,14 @@ func (self *tcpReturnRetransmitTestHarness) explainedDupAckCount() int {
 	self.sequence.mutex.Lock()
 	defer self.sequence.mutex.Unlock()
 	return self.sequence.returnRetransmit.explainedDupAckCount
+}
+
+// Whether the handshake left the return path reading selective blocks, read
+// under the sequence mutex.
+func (self *tcpReturnRetransmitTestHarness) returnSackPermitted() bool {
+	self.sequence.mutex.Lock()
+	defer self.sequence.mutex.Unlock()
+	return self.sequence.returnRetransmit.sackPermitted
 }
 
 func (self *tcpReturnRetransmitTestHarness) recoveryPhase() tcpReturnRecoveryPhase {
@@ -1615,6 +1633,68 @@ func TestTcpReturnRetransmitSackHolesStopAtTheHighestSelectiveByte(t *testing.T)
 			t.Fatalf("stats=%+v, want no timer expiry", stats)
 		}
 	})
+}
+
+// Half a negotiation is none of one, in both directions, and this is what
+// holds the selective path off a default build. The setting is off in
+// production, and every ordinary source - Linux, macOS, Windows - offers
+// sack-permitted in its SYN, so the first row is what the feature does today
+// on every flow: the SYN-ACK must offer nothing back, the return path must not
+// take the option, and the blocks such a source sends must draw the head
+// alone. The second row is the source's half missing, where offering
+// sack-permitted to a source that never asked for it would be the violation
+// (RFC 2018 §2).
+//
+// The two are separate fields here for the same reason: with one field driving
+// both halves, the whole of the settings half could be dropped from the
+// sequence and no row could tell.
+func TestTcpReturnRetransmitHalfANegotiationReadsNoBlock(t *testing.T) {
+	// as many segments as the crafted rows, so an unbounded mark would be
+	// plain
+	const segmentCount = 300
+	for _, half := range []struct {
+		name    string
+		options tcpReturnTestOptions
+	}{
+		{"the setting off and a source that offers sack-permitted", tcpReturnTestOptions{sourceOffersSack: true}},
+		{"the setting on and a source that does not", tcpReturnTestOptions{settingsAllowSack: true}},
+	} {
+		runTcpReturnRetransmitTest(t, func(t *testing.T) {
+			// the harness checks the SYN-ACK and the return path's own flag
+			// against the whole negotiation, which neither half is
+			harness := newTcpReturnRetransmitTestHarness(t, half.options)
+			harness.source.holdAcks = true
+			payload := harness.payload(segmentCount)
+			harness.write(payload)
+			synctest.Wait()
+
+			// the same crafted acknowledgements the negotiated rows answer
+			// with a burst of holes: one block over the newest retained
+			// segment, which would mark every delivered segment below it
+			crafted := []tcpSackBlock{{
+				start: harness.segmentSeq(segmentCount - 1),
+				end:   harness.segmentSeq(segmentCount),
+			}}
+			for range returnRetransmitDupAckThreshold {
+				harness.source.sendCraftedSackAck(harness.dataSeq, crafted)
+			}
+			synctest.Wait()
+			_, _, packetCount, reasonCounts := harness.retransmitState()
+			if packetCount != 1 || reasonCounts[tcpReturnRetransmitReasonDupAck] != 1 {
+				t.Fatalf("%s: retransmissions=%d reasons=%v, want the head alone on its duplicate acknowledgements",
+					half.name, packetCount, reasonCounts)
+			}
+
+			// and the flow is unharmed: the source acknowledges the flight it
+			// had all along and the ring empties
+			harness.source.ackNow()
+			synctest.Wait()
+			harness.requireStream(payload)
+			if retainedByteCount, retainedCount, _, _ := harness.retransmitState(); retainedByteCount != 0 || retainedCount != 0 {
+				t.Fatalf("%s: retained after the acknowledgement: %d bytes in %d segments", half.name, retainedByteCount, retainedCount)
+			}
+		})
+	}
 }
 
 // Selective blocks are read only where the handshake negotiated
