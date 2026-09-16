@@ -16,20 +16,34 @@ import (
 // another socket of the machine between the draw and the bind, so a random
 // hands out a fresh port on each draw and records it: the bound port is the
 // last port handed out, and never one the kernel chose.
+//
+// A test that binds a port and connects it leaves the port in TIME_WAIT for
+// the next half minute, and the plan binds without SO_REUSEADDR, so the port
+// is not bindable again in that window. A random therefore draws its own ports
+// rather than a sequence every test and every run of the binary repeats, and
+// it offers only a port it could bind at the draw. Without both, the second
+// run of these tests spends all h1SourcePortBindAttempts on the ports the
+// first run bound and the socket falls back to the kernel's own port, which is
+// the one outcome they are here to rule out.
 
-// A random for a plan that hands out distinct ports of the ephemeral range and
-// records them. Safe for concurrent use.
+// draws probed before one settles for a port it could not bind
+const testingBindablePortDraws = 64
+
+// A random for a plan that hands out distinct bindable ports of the ephemeral
+// range and records them. Safe for concurrent use.
 type testingH1SourcePortRandom struct {
 	stateLock sync.Mutex
 	random    *mathrandv2.Rand
+	ipVersion int
 	// replaces the draw when set; returns a port
 	nextPort     func(drawIndex int) int
 	offeredPorts []int
 }
 
-func newTestingH1SourcePortRandom(seed uint64) *testingH1SourcePortRandom {
+func newTestingH1SourcePortRandom(ipVersion int) *testingH1SourcePortRandom {
 	return &testingH1SourcePortRandom{
-		random: mathrandv2.New(mathrandv2.NewPCG(seed, 11)),
+		random:    mathrandv2.New(mathrandv2.NewPCG(mathrandv2.Uint64(), mathrandv2.Uint64())),
+		ipVersion: ipVersion,
 	}
 }
 
@@ -37,9 +51,17 @@ func (self *testingH1SourcePortRandom) intN(n int) int {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	lowPort, _ := h1EphemeralPortRange()
-	port := lowPort + self.random.IntN(n)
+	port := 0
 	if self.nextPort != nil {
 		port = self.nextPort(len(self.offeredPorts))
+	} else {
+		port = lowPort + self.random.IntN(n)
+		for range testingBindablePortDraws {
+			if testingPortIsBindable(self.ipVersion, port) {
+				break
+			}
+			port = lowPort + self.random.IntN(n)
+		}
 	}
 	self.offeredPorts = append(self.offeredPorts, port)
 	return port - lowPort
@@ -109,7 +131,7 @@ func TestH1SourcePortDialerBindsPlannedPort(t *testing.T) {
 
 		settings := DefaultH1PathRerollSettings()
 		stats := &h1PathStats{}
-		random := newTestingH1SourcePortRandom(uint64(ipVersion))
+		random := newTestingH1SourcePortRandom(ipVersion)
 		plan := newH1SourcePortPlan(&settings, nil, random.intN, stats)
 		ctx := withH1SourcePortPlan(context.Background(), plan)
 
@@ -169,10 +191,9 @@ func TestH1SourcePortDialerFallsBackWhenPortBusy(t *testing.T) {
 
 		// a port of the ephemeral range, held for the whole dial
 		lowPort, highPort := h1EphemeralPortRange()
-		portRandom := mathrandv2.New(mathrandv2.NewPCG(uint64(ipVersion), 13))
 		var busyListener net.Listener
 		for range 64 {
-			port := lowPort + portRandom.IntN(highPort-lowPort+1)
+			port := lowPort + mathrandv2.IntN(highPort-lowPort+1)
 			busyListener, err = net.Listen(testTcpNetwork(ipVersion), testLoopbackHostPort(ipVersion, port))
 			if err == nil {
 				break
@@ -186,7 +207,7 @@ func TestH1SourcePortDialerFallsBackWhenPortBusy(t *testing.T) {
 
 		settings := DefaultH1PathRerollSettings()
 		stats := &h1PathStats{}
-		random := newTestingH1SourcePortRandom(uint64(ipVersion))
+		random := newTestingH1SourcePortRandom(ipVersion)
 		random.nextPort = func(drawIndex int) int {
 			return busyPort
 		}
@@ -236,7 +257,7 @@ func TestPinnedDirectStrategyAppliesSourcePortPlan(t *testing.T) {
 
 		settings := DefaultH1PathRerollSettings()
 		stats := &h1PathStats{}
-		random := newTestingH1SourcePortRandom(uint64(ipVersion))
+		random := newTestingH1SourcePortRandom(ipVersion)
 		plan := newH1SourcePortPlan(&settings, nil, random.intN, stats)
 		conn, err := dialContextSettings.DialContext(withH1SourcePortPlan(ctx, plan), "tcp", listener.Addr().String())
 		if err != nil {
@@ -285,11 +306,11 @@ func TestPlatformTransportH1PathRerollDialUsesPlannedSourcePort(t *testing.T) {
 		radius := settings.H1PathReroll.SourcePortExcludeRadius
 		lowPort, highPort := h1EphemeralPortRange()
 
-		random := newTestingH1SourcePortRandom(uint64(ipVersion))
+		random := newTestingH1SourcePortRandom(ipVersion)
 		var planLock sync.Mutex
 		unplannedDraws := 0
 		nearDraws := map[int]int{}
-		farPort := lowPort
+		farPort := lowPort + mathrandv2.IntN(highPort-lowPort+1)
 		random.nextPort = func(drawIndex int) int {
 			excludedPorts := rig.ledger.excluded()
 			planLock.Lock()
@@ -303,8 +324,24 @@ func TestPlatformTransportH1PathRerollDialUsesPlannedSourcePort(t *testing.T) {
 				nearDraws[len(excludedPorts)] += 1
 				return latestPort + 1 + nearDraws[len(excludedPorts)]%radius
 			}
-			// distinct ports spread over the range
-			farPort = lowPort + (farPort-lowPort+7919)%(highPort-lowPort+1)
+			// Distinct bindable ports spread over the range, each outside
+			// every excluded window. A far draw inside a window is rejected
+			// like a near one, and the pick then scans to the first port past
+			// the window, which the plan never drew.
+			excluded := func(port int) bool {
+				for _, excludedPort := range excludedPorts {
+					if distance := port - excludedPort; -radius <= distance && distance <= radius {
+						return true
+					}
+				}
+				return false
+			}
+			for range testingBindablePortDraws {
+				farPort = lowPort + (farPort-lowPort+7919)%(highPort-lowPort+1)
+				if !excluded(farPort) && testingPortIsBindable(ipVersion, farPort) {
+					break
+				}
+			}
 			return farPort
 		}
 		settings.h1PathTestHooks.sourcePortRandom = random.intN
@@ -352,4 +389,82 @@ func TestPlatformTransportH1PathRerollDialUsesPlannedSourcePort(t *testing.T) {
 			t.Fatal("the transport is not connected after the re-rolls")
 		}
 	})
+}
+
+// Whether a plan could bind this port right now. The plan binds the wildcard
+// address without SO_REUSEADDR, so the probe does too; the probe socket never
+// connects, so it leaves no TIME_WAIT entry of its own.
+func testingPortIsBindable(ipVersion int, port int) bool {
+	domain := syscall.AF_INET
+	var sockaddr syscall.Sockaddr = &syscall.SockaddrInet4{Port: port}
+	if ipVersion == 6 {
+		domain = syscall.AF_INET6
+		sockaddr = &syscall.SockaddrInet6{Port: port}
+	}
+	fd, err := syscall.Socket(domain, syscall.SOCK_STREAM, syscall.IPPROTO_TCP)
+	if err != nil {
+		return false
+	}
+	defer syscall.Close(fd)
+	return syscall.Bind(fd, sockaddr) == nil
+}
+
+// The random hands the plan only ports a plan could bind. Nothing else keeps a
+// repeated run of these tests off the ports the previous run left in
+// TIME_WAIT: the plan binds without SO_REUSEADDR and gives up after
+// h1SourcePortBindAttempts, and the socket then takes the kernel's own port,
+// which on linux and darwin is next to the port the test just convicted.
+func TestTestingH1SourcePortRandomOffersOnlyBindablePorts(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		lowPort, _ := h1EphemeralPortRange()
+		// hold every port of a narrow window but the last, the way a previous
+		// run's TIME_WAIT entries hold the ports it bound
+		windowPortCount := 4
+		for port := lowPort; port < lowPort+windowPortCount-1; port += 1 {
+			listener, err := net.Listen(testTcpNetwork(ipVersion), testLoopbackHostPort(ipVersion, port))
+			if err != nil {
+				// held by something else, which is the same thing
+				continue
+			}
+			defer listener.Close()
+		}
+		bindablePorts := map[int]bool{}
+		for port := lowPort; port < lowPort+windowPortCount; port += 1 {
+			if testingPortIsBindable(ipVersion, port) {
+				bindablePorts[port] = true
+			}
+		}
+		if len(bindablePorts) == 0 || windowPortCount <= len(bindablePorts) {
+			t.Fatalf("%d of the ports %d-%d are bindable, want some held and one free",
+				len(bindablePorts), lowPort, lowPort+windowPortCount-1)
+		}
+
+		random := newTestingH1SourcePortRandom(ipVersion)
+		for range 20 {
+			port := lowPort + random.intN(windowPortCount)
+			if !bindablePorts[port] {
+				t.Fatalf("the random offered port %d, which no plan can bind; bindable %v", port, bindablePorts)
+			}
+		}
+	})
+}
+
+// Two randoms of one process draw their own ports. A shared sequence takes the
+// ports of every test that draws it out of the range together, one TIME_WAIT
+// entry per run, so the next run spends its bind attempts on them.
+func TestTestingH1SourcePortRandomDrawsAreNotShared(t *testing.T) {
+	lowPort, highPort := h1EphemeralPortRange()
+	portCount := highPort - lowPort + 1
+	first := newTestingH1SourcePortRandom(4)
+	second := newTestingH1SourcePortRandom(4)
+	sameDraws := 0
+	drawCount := 8
+	for range drawCount {
+		if first.intN(portCount) == second.intN(portCount) {
+			sameDraws += 1
+		}
+	}
+	if sameDraws == drawCount {
+		t.Fatalf("two randoms drew the same %d ports: %v", drawCount, first.offered())
+	}
 }
