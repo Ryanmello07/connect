@@ -107,7 +107,17 @@ instrument faults and must not appear).
 The inner TCP cells (`pathsim_inner_tcp_test.go`) sit beside this rather than inside it: they measure bytes,
 counts and repair times rather than a rate, so they build their own arms (`runPathInnerArm`) and print their own
 table and digest, and the ceiling's censor rule — which is about rates — does not apply to them. They still run on
-one P inside a bubble, drain the carrier, and print a digest that three runs must agree on.
+one P inside a bubble, drain the carrier, and print a digest that three runs must agree on. Their columns are arm,
+delivered bytes, whether the stream is the origin's exactly, the repair time, the time to the whole download, the
+segments the device saw twice (`retx`), its kernel's drops (`loss`), the most it held out of order and what it
+still holds, the transfer layer's own resends (`tresend`) and its timeout resends (`trto`), and the segments
+delivered.
+
+The inner repair is on by default (`EnableReturnRetransmit`), and both shapes of the finding are pinned on purpose:
+S6 asks for the repair off and keeps the pre-fix wedge, which is the evidence behind the rig review's open-wedge
+section, and S9 runs the same loss with the repair off and on. Neither half stands for the other, so a change that
+turns one of them into the other's shape — flipping S6 to the default, or dropping S9's disabled arm — loses the
+comparison rather than updating it.
 
 ## Scenarios and findings
 
@@ -118,10 +128,10 @@ one P inside a bubble, drain the carrier, and print a digest that three runs mus
 | S3 `TestPathsimS3WindowRuleRegimes` | §1: the rule loses on the short path, gains at 100 ms for one flow, loses for eight | long/1 yes; short/1 as a ramp only; short/8 and long/8 no | short one flow 0.48x over a 2 s offer and 0.87x over 8 s but equal at steady state (the rig lost at steady state); 3.96x long one flow; equal at short eight; 4.12x at long eight where the rig's budgeted client read 0.62x |
 | S4 `TestPathsimS4RelayQueueOverflowVersusWindow` | §1: a larger window into the relay queue costs drops, not throughput | yes | the dropped and resent shares of the sender's writes rise 2 -> 4 -> 8 MiB on both flow counts, and the counts too at eight lanes, where the offered load is the same at every window; one flow at 4 MiB now keeps 0.94 of its rate, every drop costing exactly one gap resend under the receiver's budgeted wake (0.18 before it, the rig 0.43), and collapses at 8 MiB (0.14); the eight-lane 8 MiB arm carries a 9 s timeout-path tail, explained in the test |
 | S5 `TestPathsimS5SilentReneging` | REPORT §3.11c: the evicting receiver withdraws acknowledgements | withdrawal yes, 60 s stall no | committed-prefix withdraws none, the old policy withdraws 101 and is re-fetched by ack-tail probes; both collapse under the overrun and neither drain is asserted faster |
-| S6 `TestPathsimS6InnerSegmentLossIsNotRetransmittedByTheProvider` | §6: without the inner repair the provider's TCP does not retransmit, so a post-delivery loss is a permanent hole | the provider's half yes | one sequence, no transfer layer, `EnableReturnRetransmit` off: the pre-fix shape, kept legible beside S9 |
+| S6 `TestPathsimS6InnerSegmentLossIsNotRetransmittedByTheProvider` | §6: without the inner repair the provider's TCP does not retransmit, so a post-delivery loss is a permanent hole | the provider's half yes | one sequence, no transfer layer, `EnableReturnRetransmit` asked for off against the default: the pre-fix shape, kept legible beside S9's repaired one. 65 segments to the window edge, the dropped one emitted once, nothing at all in the sixty seconds after the window closed |
 | S7 `TestPathsimS7HeavyLatencyGrid` | an instrument, not a finding | — | 50–300 ms one way x loss x rule; monotonic in delay without loss, rule above constant everywhere, loss costs everywhere |
 | S8 `TestPathsimS8MultiHop` | an instrument, not a finding | — | two and three hops with queues; no stall without loss, bounded recovery with loss |
-| S9 `TestPathsimS9InnerSegmentLossRepairedByTheProvider` | §6: the same loss over the whole path, with the provider's inner repair off and on | yes | the provider's nat and origin, a transfer client each side, a modelled device kernel that drops one delivered segment inside the tun write. Off: the download stops 7 KiB in with 62 KiB held out of order, nothing sent again. On: one retransmission, the hole filled in one round trip, the bytes exact. Four losses cost five retransmissions, not a storm. No arm's transfer layer resends or fills a gap, which is the finding |
+| S9 `TestPathsimS9InnerSegmentLossRepairedByTheProvider` | §6: the same loss over the whole path, with the provider's inner repair off and on | yes | the provider's nat and origin, a transfer client each side, a modelled device kernel that drops one delivered segment inside the tun write. Off: the download stops 7 KiB in with 62 KiB held out of order, nothing sent again. On: one retransmission, the hole filled in one round trip and asserted inside six, the queue behind it drained, the device's whole 64 KiB window back, the bytes exact. Four losses cost five retransmissions, not a storm. No arm's transfer layer resends or fills a gap, which is the finding; only the wedged arm leaves a route unanswered long enough for one timeout resend (`trto`), which repairs nothing the device is missing |
 
 Provider standby release and upstream group merge have deterministic unit tests on other branches and are not
 repeated here.
