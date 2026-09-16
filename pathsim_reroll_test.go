@@ -352,7 +352,12 @@ func (self *pathReroll) tick(ctx context.Context, now time.Time) {
 		sample.queueDelay = observerTick.queueDelay
 		sample.queueDelaySamples = observerTick.samples
 	}
+	// the arms run one direction, so the receiver reads no ack of its own and
+	// the receive rule's ack corroboration has nothing to read: the queue delay
+	// stands alone here, as it does on a route whose peer answers elsewhere
 	sample.ackRttMin = observerTick.ackRttMin
+	sample.ackRtt = observerTick.ackRtt
+	sample.ackRttSamples = observerTick.ackSamples
 	if self.scenario.KernelOoo != nil {
 		known, advanced := self.scenario.KernelOoo(self.tickOrdinal, self.lossy)
 		if advanced {

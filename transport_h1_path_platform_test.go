@@ -93,8 +93,12 @@ func (self *testingH1PathRig) hooks() *h1PathTestHooks {
 				startTime = sample.now
 				self.startTimes[connectionOrdinal] = startTime
 			}
-			// a loopback kernel or ack round trip would make every connection dormant
+			// a loopback kernel or ack round trip would make every connection
+			// dormant, and a loopback ack carries none of the queue the class
+			// scripts, so it would deny every collapsed tick
 			sample.ackRttMin = 0
+			sample.ackRtt = 0
+			sample.ackRttSamples = 0
 			sample.minRtt = testingH1PathRtt
 			class := self.class(connectionOrdinal, tickIndex)
 			if class == testingH1PathReal {
