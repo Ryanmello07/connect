@@ -1039,10 +1039,12 @@ func (self *h1PathLedger) excluded() []int {
 // the connection each count the fields their doc comments name. Safe for
 // concurrent use.
 type h1PathStats struct {
-	ConnectionsMonitored        atomic.Uint64
-	ConnectionsDormant          atomic.Uint64
-	KernelUnavailable           atomic.Uint64
-	Ticks                       atomic.Uint64
+	ConnectionsMonitored atomic.Uint64
+	ConnectionsDormant   atomic.Uint64
+	KernelUnavailable    atomic.Uint64
+	Ticks                atomic.Uint64
+	// ticks whose queue delay reached the threshold and whose fresh ack round
+	// trip did not: the sender's clock and ours disagree about the queue
 	RxAckDeniedTicks            atomic.Uint64
 	RxConvictions               atomic.Uint64
 	TxConvictions               atomic.Uint64

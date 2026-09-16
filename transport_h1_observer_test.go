@@ -483,10 +483,18 @@ func TestH1RouteObserverAckRttUsesOwnClock(t *testing.T) {
 	now := h1PathTestOrigin
 
 	observer.observeAck(h1ObserverTestTagMs(now.Add(-105*time.Millisecond)), now)
-	if tick := observer.takeTick(now); tick.ackRttMin != 105*time.Millisecond || tick.known {
+	if tick := observer.takeTick(now); tick.ackRttMin != 105*time.Millisecond ||
+		tick.ackRtt != 105*time.Millisecond || tick.ackSamples != 1 || tick.known {
 		t.Fatalf("tick = %+v, want an ack round trip of 105 ms and no queue delay", tick)
 	}
-	// 300 ms acks every 10 s: the 105 ms minimum holds for the 10 min window
+	// a tick with no ack of its own reports none, and the window minimum stands
+	if tick := observer.takeTick(now); tick.ackRttMin != 105*time.Millisecond ||
+		tick.ackRtt != 0 || tick.ackSamples != 0 {
+		t.Fatalf("tick without an ack = %+v, want the window minimum alone", tick)
+	}
+	// 300 ms acks every 10 s: the 105 ms minimum holds for the 10 min window,
+	// while each tick reports its own 300 ms, which is where the receive rule
+	// reads the queue the acks are sitting behind
 	for elapsed := 10 * time.Second; elapsed <= 10*time.Minute; elapsed += 10 * time.Second {
 		at := now.Add(elapsed)
 		observer.observeAck(h1ObserverTestTagMs(at.Add(-300*time.Millisecond)), at)
@@ -494,8 +502,12 @@ func TestH1RouteObserverAckRttUsesOwnClock(t *testing.T) {
 		if settings.AckRttWindow <= elapsed {
 			want = 300 * time.Millisecond
 		}
-		if tick := observer.takeTick(at); tick.ackRttMin != want {
+		tick := observer.takeTick(at)
+		if tick.ackRttMin != want {
 			t.Fatalf("at %s the ack round trip = %s, want %s", elapsed, tick.ackRttMin, want)
+		}
+		if tick.ackRtt != 300*time.Millisecond || tick.ackSamples != 1 {
+			t.Fatalf("at %s the tick's own ack round trip = %s over %d acks, want 300 ms over 1", elapsed, tick.ackRtt, tick.ackSamples)
 		}
 	}
 }
