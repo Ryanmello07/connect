@@ -46,6 +46,9 @@ type testingH1PathRig struct {
 	ledger *h1PathLedger
 	// the class of each sample, by connection ordinal and tick index
 	class func(connectionOrdinal int, tickIndex int) testingH1PathClass
+	// when it returns true the sample hook fails, standing in for any error
+	// under the monitor tick; nil never fails
+	samplePanic func(connectionOrdinal int, tickIndex int) bool
 	// the dial round trip of each connection
 	dialRtt time.Duration
 
@@ -92,6 +95,9 @@ func (self *testingH1PathRig) hooks() *h1PathTestHooks {
 			if !ok {
 				startTime = sample.now
 				self.startTimes[connectionOrdinal] = startTime
+			}
+			if self.samplePanic != nil && self.samplePanic(connectionOrdinal, tickIndex) {
+				panic("h1 path monitor tick")
 			}
 			// a loopback kernel or ack round trip would make every connection
 			// dormant, and a loopback ack carries none of the queue the class
@@ -776,6 +782,58 @@ func TestPlatformTransportH1PathOverrideOffStopsTheNextConnection(t *testing.T) 
 	stats := rig.stats.snapshot()
 	if stats.ConnectionsMonitored != 1 || stats.ConnectionsDormant != 0 || stats.Rerolls != 0 {
 		t.Fatalf("stats = %+v, want only the first connection monitored", stats)
+	}
+}
+
+// The watcher that ticks the monitor is also what closes the connection for a
+// kick, so an error under the tick stops the monitor and nothing else: the
+// connection carries on, its ticker stops, and a later kick still closes it and
+// re-dials. Without the containment the whole watcher unwinds and the
+// connection rides on with nothing left to close it.
+func TestPlatformTransportH1PathMonitorErrorLeavesTheConnectionKickable(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	platform := newTestingPlatformServer(t)
+	rig := newTestingH1PathRig(testingH1PathCollapsedAlways)
+	// every tick of the first connection fails inside the monitor
+	rig.samplePanic = func(connectionOrdinal int, tickIndex int) bool {
+		return connectionOrdinal == 0
+	}
+	settings := testingH1PathTransportSettings(H1PathRerollModeObserve, rig)
+	transport := testingPlatformTransport(t, ctx, platform.url, settings)
+
+	if !waitForCondition(15*time.Second, func() bool {
+		return 1 <= rig.stats.snapshot().MonitorStopped
+	}) {
+		t.Errorf("stats = %+v, want the monitor error counted once", rig.stats.snapshot())
+	}
+	if !transport.IsConnected() {
+		t.Error("the connection went down with its monitor")
+	}
+	// the ticker is stopped for good, so no further sample is taken
+	sampleCount := len(rig.connectionRealSamples(0))
+	time.Sleep(10 * settings.H1PathReroll.TickInterval)
+	if after := len(rig.connectionRealSamples(0)); after != sampleCount {
+		t.Errorf("the monitor took %d more samples after it failed", after-sampleCount)
+	}
+	if dials := rig.dials(); len(dials) != 1 {
+		t.Fatalf("connections %v, want [0]: the failure re-dialed on its own", dials)
+	}
+
+	// the kick the watcher owes: it closes this connection and the loop
+	// re-dials, which is exactly what a dead watcher can no longer do
+	transport.Kick()
+	if !waitForCondition(15*time.Second, func() bool {
+		return 2 <= len(rig.dials())
+	}) {
+		t.Fatalf("connections %v after a kick, want the connection with the failed monitor closed and re-dialed", rig.dials())
+	}
+	if !waitForCondition(15*time.Second, transport.IsConnected) {
+		t.Fatal("the transport never reconnected after the kick")
+	}
+	if stats := rig.stats.snapshot(); stats.MonitorStopped != 1 {
+		t.Errorf("stats = %+v, want exactly one stopped monitor", stats)
 	}
 }
 

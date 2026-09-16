@@ -2261,7 +2261,23 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 						if handleCtx.Err() != nil {
 							return
 						}
-						decision := pathConnection.tick(time.Now())
+						// This goroutine is also what a kick uses to close the
+						// connection, so the monitor must not be able to take
+						// it with it: an error under tick stops the monitor and
+						// leaves the watcher running. Without this the whole
+						// worker would unwind into HandleError's recovery and
+						// the connection would ride on, registered and
+						// carrying traffic, with nothing left to close it on a
+						// network change.
+						var decision h1PathDecision
+						if err := HandleError(func() {
+							decision = pathConnection.tick(time.Now())
+						}); err != nil {
+							pathConnection.monitorStopped(err)
+							ticker.Stop()
+							tick = nil
+							continue
+						}
 						if decision.action == h1PathActionReroll {
 							rerolled.Store(true)
 							self.log.Infof(
@@ -2280,7 +2296,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 						}
 					}
 				}
-			})
+			}, handleCancel)
 
 			send := make(chan []byte, self.settings.TransportBufferSize)
 			receive := make(chan []byte, self.settings.TransportBufferSize)

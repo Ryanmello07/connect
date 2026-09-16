@@ -336,6 +336,20 @@ func (self *h1PathConnection) close() {
 	self.observer.setActive(false)
 }
 
+// The monitor failed and this connection will not tick again: the observer
+// stops sampling and the failure is counted, so an Observe rollout can tell a
+// detector that died from one that saw nothing. The connection is left alone --
+// the watcher that calls this is also what closes the websocket for a network
+// change, so it keeps running with the monitor switched off.
+func (self *h1PathConnection) monitorStopped(err any) {
+	if self == nil {
+		return
+	}
+	self.observer.setActive(false)
+	self.stats.MonitorStopped.Add(1)
+	self.transport.log.Infof("[t]h1 path monitor stopped: %s\n", err)
+}
+
 // Takes one sample and returns the monitor's decision with the connection's
 // action. A dormant decision means the connection will never tick again.
 func (self *h1PathConnection) tick(now time.Time) h1PathDecision {

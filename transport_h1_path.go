@@ -1042,7 +1042,10 @@ type h1PathStats struct {
 	ConnectionsMonitored atomic.Uint64
 	ConnectionsDormant   atomic.Uint64
 	KernelUnavailable    atomic.Uint64
-	Ticks                atomic.Uint64
+	// connections whose monitor failed and was stopped, leaving the connection
+	// itself running
+	MonitorStopped atomic.Uint64
+	Ticks          atomic.Uint64
 	// ticks whose queue delay reached the threshold and whose fresh ack round
 	// trip did not: the sender's clock and ours disagree about the queue
 	RxAckDeniedTicks            atomic.Uint64
@@ -1106,6 +1109,7 @@ type H1PathRerollStatsSnapshot struct {
 	ConnectionsMonitored        uint64
 	ConnectionsDormant          uint64
 	KernelUnavailable           uint64
+	MonitorStopped              uint64
 	Ticks                       uint64
 	RxAckDeniedTicks            uint64
 	RxConvictions               uint64
@@ -1134,6 +1138,7 @@ func (self *h1PathStats) snapshot() H1PathRerollStatsSnapshot {
 		ConnectionsMonitored:        self.ConnectionsMonitored.Load(),
 		ConnectionsDormant:          self.ConnectionsDormant.Load(),
 		KernelUnavailable:           self.KernelUnavailable.Load(),
+		MonitorStopped:              self.MonitorStopped.Load(),
 		Ticks:                       self.Ticks.Load(),
 		RxAckDeniedTicks:            self.RxAckDeniedTicks.Load(),
 		RxConvictions:               self.RxConvictions.Load(),
