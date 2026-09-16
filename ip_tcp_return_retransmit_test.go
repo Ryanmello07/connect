@@ -1035,6 +1035,14 @@ func (self *tcpReturnRetransmitTestHarness) burstRunSegmentCount() int {
 	return self.sequence.returnRetransmit.burstSegmentCount
 }
 
+// Where the flow stands in repairing its return path, read under the sequence
+// mutex.
+func (self *tcpReturnRetransmitTestHarness) recoveryPhase() tcpReturnRecoveryPhase {
+	self.sequence.mutex.Lock()
+	defer self.sequence.mutex.Unlock()
+	return self.sequence.returnRetransmit.recoveryPhase
+}
+
 // Requires the source's reassembled stream to be exactly `want`, the bytes
 // from the first data byte, and every delivery to carry them at its offset.
 func (self *tcpReturnRetransmitTestHarness) requireStream(want []byte) {
@@ -2900,6 +2908,68 @@ func TestTcpReturnRetransmitAReorderedSegmentIsSentAgainOnlyOnce(t *testing.T) {
 	})
 }
 
+// A recovery whose head is a segment this recovery never sent again, ended as
+// spurious. A source that reports holding the head and a segment well above
+// it, and reports nothing between, leaves the holes below its highest
+// selective byte to be sent again and the head itself alone: it is marked,
+// which is what stops it. When the source then acknowledges the head, the
+// recovery is answered by bytes that were never sent again, so the head was
+// never missing and the recovery was spurious, and it ends there rather than
+// reading every later acknowledgement of data in flight as a partial one and
+// sending that data again. This is the arm of that rule where the head has no
+// retransmission at all rather than one too young to be the answer, which is
+// the reordering the sibling above covers.
+func TestTcpReturnRetransmitAHeadNeverSentAgainEndsTheRecovery(t *testing.T) {
+	const segmentCount = 8
+	// what the source reports holding: the head, and one segment well above
+	// it that puts the holes between them below its highest selective byte
+	const highestHeldIndex = 4
+	runTcpReturnRetransmitTest(t, func(t *testing.T) {
+		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{})
+		// nothing is acknowledged, so the whole flight is retained
+		harness.source.holdAcks = true
+		payload := harness.payload(segmentCount)
+		harness.write(payload)
+		synctest.Wait()
+
+		blocks := []tcpSackBlock{
+			{start: harness.dataSeq, end: harness.segmentSeq(1)},
+			{start: harness.segmentSeq(highestHeldIndex), end: harness.segmentSeq(highestHeldIndex + 1)},
+		}
+		for range returnRetransmitDupAckThreshold {
+			harness.source.sendCraftedSackAck(harness.dataSeq, blocks)
+		}
+		synctest.Wait()
+		if _, _, packetCount, _ := harness.retransmitState(); packetCount != highestHeldIndex-1 {
+			t.Fatalf("retransmissions=%d on the third duplicate, want the %d holes between the two reported segments", packetCount, highestHeldIndex-1)
+		}
+		if phase := harness.recoveryPhase(); phase != tcpReturnRecoveryPhaseLoss {
+			t.Fatalf("recovery phase %d after the third duplicate, want loss recovery", phase)
+		}
+
+		// the source acknowledges the head it reported holding, which this
+		// recovery never sent again
+		harness.source.sendAck(harness.segmentSeq(1))
+		synctest.Wait()
+		if phase := harness.recoveryPhase(); phase != tcpReturnRecoveryPhaseNone {
+			t.Fatalf("recovery phase %d after an acknowledgement of a head that was never sent again, want the recovery ended as spurious", phase)
+		}
+
+		// and the rest of the flight, which is data in flight rather than a
+		// recovery's partial acknowledgements, costs nothing more
+		harness.source.ackNow()
+		synctest.Wait()
+		harness.requireStream(payload)
+		_, _, packetCount, reasonCounts := harness.retransmitState()
+		if packetCount != highestHeldIndex-1 || reasonCounts[tcpReturnRetransmitReasonSackHole] != packetCount {
+			t.Fatalf("retransmissions=%d reasons=%v over the flow, want the %d holes once each", packetCount, reasonCounts, highestHeldIndex-1)
+		}
+		if stats := harness.counters.snapshot(); stats.TimeoutCount != 0 {
+			t.Fatalf("stats=%+v, want no timer expiry", stats)
+		}
+	})
+}
+
 // A run of segments the source's kernel drops with data still flowing behind
 // it. Recovery sends a few segments the source held past the run, and the
 // source's kernel answers every one of them with a duplicate acknowledgement.
@@ -3223,6 +3293,65 @@ func TestTcpReturnRetransmitBurstRunHasACeilingAndRestartsAtOne(t *testing.T) {
 			t.Fatalf("stats=%+v, want every repair on duplicate or partial acknowledgements", stats)
 		}
 	})
+}
+
+// The burst stops at the window edge it is given, as well as at the recovery
+// point. No sequence supplies an edge that binds: the packetizer emits only
+// what fits inside the greatest edge the source has advertised, which never
+// moves back (ip.go, receiveWindowEnd), every emitted byte is retained, and
+// the edge the acknowledgement path hands the burst is that same greatest
+// edge, so every retained segment ends at or below it and the recovery point
+// is reached first. The stop is therefore unreachable through a sequence and
+// is pinned here on the state alone, against the day a caller passes an edge
+// of its own.
+func TestTcpReturnRetransmitBurstStopsAtTheWindowEdge(t *testing.T) {
+	const segmentCount = 8
+	const segmentByteCount = 1000
+	const initialSeq = uint32(1000)
+	segmentSeq := func(segmentIndex int) uint32 {
+		return initialSeq + uint32(segmentIndex*segmentByteCount)
+	}
+	for _, c := range []struct {
+		name         string
+		windowEnd    uint32
+		wantDueCount int
+	}{
+		{
+			name: "an edge inside the retained set",
+			// the end of the third segment, which is where the burst stops
+			windowEnd:    segmentSeq(3),
+			wantDueCount: 3,
+		},
+		{
+			name:         "an edge past it, which is the only edge a sequence gives",
+			windowEnd:    segmentSeq(segmentCount),
+			wantDueCount: segmentCount,
+		},
+	} {
+		settings := DefaultTcpBufferSettingsWithBufferSize(8)
+		state := newTcpReturnRetransmitState(settings)
+		seqs := []uint32{}
+		for segmentIndex := 0; segmentIndex < segmentCount; segmentIndex += 1 {
+			// no packet: nothing here builds one, so nothing is retained of
+			// the pool either
+			state.retainWithLock(nil, segmentSeq(segmentIndex), 0, segmentByteCount, false)
+			seqs = append(seqs, segmentSeq(segmentIndex))
+		}
+		state.markDeliveredWithLock(seqs, 0, 0)
+		state.beginLossRecoveryWithLock(0)
+		state.recoveryEnd = segmentSeq(segmentCount)
+		state.burstSegmentCount = segmentCount
+		state.markBurstWithLock(c.windowEnd, 1, 0)
+
+		if state.dueCount != c.wantDueCount {
+			t.Fatalf("%s: %d segments due of %d retained, want %d", c.name, state.dueCount, state.count, c.wantDueCount)
+		}
+		for segmentIndex := 0; segmentIndex < segmentCount; segmentIndex += 1 {
+			if due := state.segmentAtWithLock(segmentIndex).due; due != (segmentIndex < c.wantDueCount) {
+				t.Fatalf("%s: segment %d due=%v, want the burst to stop at %d", c.name, segmentIndex, due, c.wantDueCount)
+			}
+		}
+	}
 }
 
 // The pool roots and ring records the retained set holds, read under the
