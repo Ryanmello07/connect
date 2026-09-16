@@ -279,7 +279,9 @@ func TestPathsimS6InnerSegmentLossIsNotRetransmittedByTheProvider(t *testing.T) 
 // the transfer layer can see it. That is the rig's measurement — on physical
 // hosts at about 800 Mb/s one run in five loses a segment on the device's
 // receive socket — and every arm below asserts the transfer layer resent
-// nothing, which is what makes the inner repair the only repair there is.
+// nothing of its own and filled no gap of its own, and that the arms the
+// repair keeps moving leave no route unacknowledged either, which is what
+// makes the inner repair the only repair there is.
 //
 // The arms are the fix off and on over the same path and the same drops, plus
 // a control with no drop at all. The device's kernel is Linux-like: it
@@ -295,11 +297,11 @@ func TestPathsimS6InnerSegmentLossIsNotRetransmittedByTheProvider(t *testing.T) 
 // Produced (fast tier, a 50 ms round trip over one 1 Gb/s relay hop, a 64 KiB
 // device buffer, a 1 MiB origin in 1,005 segments of 1,060 bytes):
 //
-//	arm                delivered  exact   repair     done  retx  loss   maxooo      ooo
-//	off/one loss            7KiB     no        —        —     0     1    63415    63415
-//	on/one loss          1024KiB    yes   50.0ms  866.1ms     1     1    63415        0
-//	on/four losses       1024KiB    yes   50.0ms    1.06s     5     4    64475        0
-//	on/no loss           1024KiB    yes        —  825.5ms     0     0        0        0
+//	arm                delivered  exact   repair     done  retx  loss   maxooo      ooo  trto
+//	off/one loss            7KiB     no        —        —     0     1    63415    63415     1
+//	on/one loss          1024KiB    yes   50.0ms  866.1ms     1     1    63415        0     0
+//	on/four losses       1024KiB    yes   50.0ms    1.06s     5     4    64475        0     0
+//	on/no loss           1024KiB    yes        —  825.5ms     0     0        0        0     0
 //
 // With the repair off the flow wedges exactly as the rig's did: the device
 // answers every later segment with a duplicate acknowledgement, the provider
@@ -309,7 +311,9 @@ func TestPathsimS6InnerSegmentLossIsNotRetransmittedByTheProvider(t *testing.T) 
 // Nothing repairs it: the device is never handed a segment twice. The transfer
 // layer's one timeout resend in that arm, after two seconds of silence on a
 // route with a retained item, is not a repair — the receive sequence already
-// holds that item, and the device's kernel is handed nothing by it.
+// holds that item, and the device's kernel is handed nothing by it. It is the
+// `trto` column above, asserted per arm and carried in the digest, so that the
+// one number this paragraph is about cannot change unseen.
 //
 // With the repair on the same drop costs one retransmission and exactly one
 // round trip, the queue behind the hole drains, and the origin's bytes arrive
@@ -693,12 +697,12 @@ type pathInnerResult struct {
 // The integer facts of an arm, hashed; three runs must print the same.
 func (self pathInnerResult) digest() string {
 	hash := fnv.New64a()
-	fmt.Fprintf(hash, "%d|%v|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d",
+	fmt.Fprintf(hash, "%d|%v|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d",
 		self.deliveredByteCount, self.exact, self.repairTime, self.completeTime,
 		self.segmentCount, self.retransmitted, self.lossCount, self.maxOooByteCount,
 		self.oooByteCount, self.providerStats.PacketCount, self.providerStats.ByteCount,
 		self.providerStats.TimeoutCount, self.transferWrites, self.transferResends,
-		self.transferGapResends, self.carrierDrops,
+		self.transferGapResends, self.transferTimeoutResends, self.carrierDrops,
 	)
 	return fmt.Sprintf("%016x", hash.Sum64())
 }
@@ -712,7 +716,7 @@ func (self pathInnerResult) row() string {
 	if 0 < self.repairTime {
 		repair = formatPathDuration(self.repairTime)
 	}
-	return fmt.Sprintf("%-24s %9s %6s %8s %8s %5d %5d %8d %8d %6d %8d",
+	return fmt.Sprintf("%-24s %9s %6s %8s %8s %5d %5d %8d %8d %6d %5d %8d",
 		self.arm,
 		fmt.Sprintf("%dKiB", self.deliveredByteCount/1024),
 		complete,
@@ -723,6 +727,7 @@ func (self pathInnerResult) row() string {
 		self.maxOooByteCount,
 		self.oooByteCount,
 		self.transferResends,
+		self.transferTimeoutResends,
 		self.segmentCount,
 	)
 }
@@ -952,8 +957,8 @@ func runPathInnerArm(t *testing.T, arm pathInnerArm) pathInnerResult {
 // reached the device and what it cost, in bytes and counts.
 func reportPathInnerScenario(t *testing.T, scenario string, results []pathInnerResult) {
 	t.Helper()
-	header := fmt.Sprintf("%-24s %9s %6s %8s %8s %5s %5s %8s %8s %6s %8s",
-		"arm", "delivered", "exact", "repair", "done", "retx", "loss", "maxooo", "ooo", "tresend", "segments")
+	header := fmt.Sprintf("%-24s %9s %6s %8s %8s %5s %5s %8s %8s %6s %5s %8s",
+		"arm", "delivered", "exact", "repair", "done", "retx", "loss", "maxooo", "ooo", "tresend", "trto", "segments")
 	lines := []string{scenario, header}
 	digests := []string{}
 	for _, result := range results {
@@ -988,6 +993,10 @@ func TestPathsimS9InnerSegmentLossRepairedByTheProvider(t *testing.T) {
 			t.Errorf("S9: %s: the transfer layer resent %d items and filled %d gaps of its own; a loss above its delivery cannot be visible to it",
 				result.arm, result.transferResends, result.transferGapResends)
 		}
+		if arms[index].returnRetransmit && 0 < result.transferTimeoutResends {
+			t.Errorf("S9: %s: the transfer layer sent %d items again on an unacknowledged route; a flow the inner repair keeps moving leaves no route unanswered for its timeout",
+				result.arm, result.transferTimeoutResends)
+		}
 		if 0 < result.carrierDrops {
 			t.Errorf("S9: %s: the carrier dropped %d messages; the only loss in this cell is the device's kernel drop",
 				result.arm, result.carrierDrops)
@@ -1012,6 +1021,16 @@ func TestPathsimS9InnerSegmentLossRepairedByTheProvider(t *testing.T) {
 	if off.oooByteCount < pathInnerClientWindow/2 || off.oooByteCount != off.maxOooByteCount {
 		t.Errorf("S9: the disabled arm left %d bytes queued out of order behind the hole, of %d at its peak; the queue is supposed to fill the device's buffer and stay there",
 			off.oooByteCount, off.maxOooByteCount)
+	}
+	// its one timeout resend is the wedge seen from below Transfer, not a
+	// repair: the route carrying the last delivered item goes unacknowledged
+	// for two seconds because the device answers nothing new, and the receive
+	// sequence already holds the item it sends again, so the device's kernel
+	// is handed nothing by it - which is what the arm's own retransmitted
+	// count of zero above says from the device's side
+	if off.transferTimeoutResends != 1 {
+		t.Errorf("S9: the disabled arm's transfer layer sent %d items again on an unacknowledged route, want the one the wedged route costs",
+			off.transferTimeoutResends)
 	}
 
 	// On: the same drop over the same path costs one retransmission and a
