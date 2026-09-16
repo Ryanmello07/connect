@@ -355,7 +355,16 @@ func (self *returnRetransmitCounters) snapshot() ReturnRetransmitStats {
 // acknowledgement through must outlast twice the timer to read as loss.
 //
 // The round trip is sampled by the time from a segment's delivery to the
-// acknowledgement that covers it, from segments never retransmitted (Karn).
+// acknowledgement that covers it, and only from an acknowledgement that
+// covers no retransmitted segment at all. A retransmission's own
+// acknowledgement does not say which copy it answers (Karn, RFC 6298 §3), and
+// the segments behind the hole it filled are no better: their acknowledgement
+// was held back by that hole, so their time from delivery measures the
+// repair, not the path. Linux draws the same line with
+// FLAG_RETRANS_DATA_ACKED. Sampling them set srtt to the repair time on the
+// first loss of a flow - 1.05 s on a 50 ms path, a timer of 3.15 s - and the
+// timer stayed seconds wide for the rest of the flow, over every later tail
+// loss.
 // Every hole is sent at most once per max(srtt, 200 ms), whatever triggers
 // it, so a run of duplicate acknowledgements costs one segment; the timer
 // bypasses that limit, being a limit itself. Nothing is ever retransmitted
@@ -915,21 +924,26 @@ func (self *tcpReturnRetransmitState) applySackWithLock(tcp *parsedTcp) (changed
 }
 
 // Releases every segment the cumulative acknowledgement covers and samples the
-// round trip from the newest released segment that was never retransmitted.
-// Reports what it released, which the partial-acknowledgement rule reads: how
-// many of the released segments this recovery had sent again, and how many it
-// had not, which are segments the source held past the hole.
+// round trip from the newest released segment, unless the acknowledgement
+// covers a retransmitted segment, when it samples nothing (see the type
+// header). Reports what it released, which the partial-acknowledgement rule
+// reads: how many of the released segments this recovery had sent again, and
+// how many it had not, which are segments the source held past the hole.
 func (self *tcpReturnRetransmitState) releaseAckedWithLock(
 	ackNumber uint32,
 	nowNanos int64,
 ) (resentCount int, heldCount int) {
 	sampleNanos := int64(-1)
+	resentAcked := false
 	for 0 < self.count {
 		segment := self.segmentAtWithLock(0)
 		if 0 < int32(segment.seq+segment.byteCount-ackNumber) {
 			break
 		}
-		if segment.delivered && segment.retransmitCount == 0 {
+		if 0 < segment.retransmitCount {
+			// nothing this acknowledgement covers measures the path
+			resentAcked = true
+		} else if segment.delivered {
 			sampleNanos = nowNanos - segment.sentNanos
 		}
 		if 0 < segment.retransmitCount && self.recoveryStartNanos <= segment.retransmitNanos {
@@ -942,7 +956,7 @@ func (self *tcpReturnRetransmitState) releaseAckedWithLock(
 			MessagePoolReturn(released.packet)
 		}
 	}
-	if 0 <= sampleNanos {
+	if 0 <= sampleNanos && !resentAcked {
 		self.updateRttWithLock(sampleNanos)
 	}
 	if 0 < self.count && self.segmentAtWithLock(0).sacked {

@@ -2125,6 +2125,49 @@ func TestTcpReturnRetransmitTimerSmoothsItsSamplesAboveTheFloor(t *testing.T) {
 	}
 }
 
+// An acknowledgement that covers a retransmitted segment measures the repair,
+// not the path, so it samples no round trip at all (RFC 6298 §3, and Linux's
+// FLAG_RETRANS_DATA_ACKED). The retransmission's own acknowledgement does not
+// say which copy it answers, which is Karn's rule, and the segments behind it
+// are no better: their acknowledgement was held back by the hole in front of
+// them, so the time from their delivery is the hole's repair time. Here a
+// 50 ms flow loses its head, the timer repairs it a second later, and the
+// acknowledgement that follows covers the repair and the segment that waited
+// behind it. Sampled, that one acknowledgement set srtt to 1.05 s and the
+// timer to 3.15 s, and the timer was still seconds wide after the next
+// exchanges: every later tail loss on the flow waited that long.
+func TestTcpReturnRetransmitTakesNoRoundTripSampleAcrossARepairedHole(t *testing.T) {
+	const roundTrip = 50 * time.Millisecond
+	runTcpReturnRetransmitTest(t, func(t *testing.T) {
+		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{ackDelay: roundTrip})
+		// the head is lost with one segment behind it, too few duplicates to
+		// repair it, so the timer does
+		harness.source.dropCounts[harness.segmentSeq(0)] = 1
+		payload := harness.payload(4)
+		harness.writeSegments(payload, 0, 2)
+
+		time.Sleep(returnRetransmitInitialRto + roundTrip)
+		synctest.Wait()
+		harness.requireSeenCount(0, 2)
+		if rto, baseRto := harness.retransmitTimer(); baseRto != returnRetransmitInitialRto || rto != baseRto {
+			t.Fatalf("timer %s base %s after the repair was acknowledged, want the initial %s, from no sample at all", rto, baseRto, returnRetransmitInitialRto)
+		}
+
+		// the first acknowledgement that measures the path alone
+		harness.writeSegments(payload, 2, 2)
+		time.Sleep(roundTrip)
+		synctest.Wait()
+		harness.requireStream(payload)
+		rto, baseRto := harness.retransmitTimer()
+		if want := 4 * roundTrip; baseRto != want || rto != baseRto {
+			t.Fatalf("timer %s base %s after two %s samples, want %s, the floor on a path this fast", rto, baseRto, roundTrip, want)
+		}
+		if stats := harness.counters.snapshot(); stats.TimeoutCount != 1 {
+			t.Fatalf("stats=%+v, want the one expiry that repaired the head", stats)
+		}
+	})
+}
+
 // A source that received every segment but whose acknowledgements a stall
 // held past the timer, and then arrive late: the expiry sends the head once
 // and nothing else follows, whether the late acknowledgements come one per
