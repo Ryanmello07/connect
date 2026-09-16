@@ -687,6 +687,9 @@ func (self *tcpReturnRetransmitState) releaseAllWithLock() {
 	self.recoveryPhase = tcpReturnRecoveryPhaseNone
 	self.dupAckCount = 0
 	self.appliedSackBlockCount = 0
+	// beside the rest of the recovery bookkeeping, so nothing retained after
+	// this is held back by an interval that belonged to what was discarded
+	self.sackBurstSegmentCount = 0
 }
 
 // The timer before backoff (RFC 6298 §2, with the 2 x srtt floor).
