@@ -379,6 +379,7 @@ func (self *returnRetransmitCounters) snapshot() ReturnRetransmitStats {
 // clock before it may set srtt, and a source could otherwise write the timer
 // it prefers. That check is a rule with its own tests and it belongs with the
 // spurious-recovery detection this leaves open, not beside the rule above.
+//
 // Every hole is sent at most once per max(srtt, 200 ms), whatever triggers
 // it, so a run of duplicate acknowledgements costs one segment; the timer
 // bypasses that limit, being a limit itself. Nothing is ever retransmitted
@@ -883,9 +884,9 @@ func (self *tcpReturnRetransmitState) markSackHolesWithLock(nowNanos int64) {
 		if 0 <= int32(segment.seq-self.highestSackedEnd) {
 			break
 		}
-		dueCount := self.dueCount
+		previousDueCount := self.dueCount
 		self.markDueWithLock(segment, tcpReturnRetransmitReasonSackHole, nowNanos)
-		if dueCount < self.dueCount {
+		if previousDueCount < self.dueCount {
 			self.sackBurstSegmentCount += 1
 		}
 	}
