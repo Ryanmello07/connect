@@ -3,6 +3,7 @@ package connect
 import (
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -646,6 +647,67 @@ func TestReceiveDispositionCarriesObserverOnlyForPublishingRoute(t *testing.T) {
 			disposition.transportType != TransportTypeH1 ||
 			disposition.reliability != CarrierReliabilityReliable {
 			t.Fatalf("%s disposition = %+v", c.name, disposition)
+		}
+	}
+}
+
+// A provider's platform websocket carries packs from every client it serves,
+// so the pack sources on one route routinely outnumber the slots that hold a
+// baseline. Every source behind that socket waits in the same queue, so any
+// stable few of them measure it; while the slots rotated, none of them did. A
+// source that came back after an eviction was given no floor, took the rel it
+// was showing at that moment -- under a standing queue, the queue itself -- as
+// its floor, and the queue delay then read zero, whatever the path was doing.
+// Frames of different sources interleave as they arrive, so the order is
+// shuffled each tick: it is the rotation, not one arrangement of it, that the
+// rule has to survive.
+func TestH1RouteObserverReadsAQueueBehindMoreSourcesThanSlots(t *testing.T) {
+	settings := DefaultH1PathRerollSettings()
+	const transit = 50 * time.Millisecond
+	const queue = 6 * time.Second
+	// ten ticks of an empty socket, then the queue for the rest of the session
+	const quietTicks = 10
+	const tickCount = 120
+	const samplesPerSource = 2
+
+	for _, sourceCount := range []int{1, 4, 5, 6, 8, 32} {
+		random := rand.New(rand.NewPCG(7, uint64(sourceCount)))
+		baseline := newH1QueueDelayBaseline(&settings)
+		observer := newH1RouteObserver(baseline, 1)
+		sourceIds := []Id{}
+		for i := 0; i < sourceCount; i += 1 {
+			sourceIds = append(sourceIds, NewId())
+		}
+		queuedTicks := 0
+		readTicks := 0
+		for k := 1; k <= tickCount; k += 1 {
+			now := h1PathTestOrigin.Add(time.Duration(k) * h1PathTestStep)
+			rel := transit
+			if quietTicks < k {
+				rel += queue
+			}
+			random.Shuffle(len(sourceIds), func(i int, j int) {
+				sourceIds[i], sourceIds[j] = sourceIds[j], sourceIds[i]
+			})
+			for _, sourceId := range sourceIds {
+				for i := 0; i < samplesPerSource; i += 1 {
+					observer.observePack(sourceId, h1ObserverTestTagMs(now.Add(-rel)), now)
+				}
+			}
+			tick := observer.takeTick(now)
+			if k <= quietTicks {
+				continue
+			}
+			readTicks += 1
+			if tick.known && settings.MinTickPackSamples <= tick.samples && queue/2 <= tick.queueDelay {
+				queuedTicks += 1
+			}
+		}
+		if queuedTicks != readTicks {
+			t.Errorf(
+				"%d sources: %d of %d ticks read the standing %s queue; want every one of them",
+				sourceCount, queuedTicks, readTicks, queue,
+			)
 		}
 	}
 }

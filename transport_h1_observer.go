@@ -33,6 +33,18 @@ import (
 // and not against its own first, possibly already queued, frames. A wall clock
 // step resets it.
 //
+// The baseline holds a slot per source and there are fewer slots than a
+// provider's websocket has clients. A slot is therefore sticky: a source that
+// keeps sending holds its slot for the connection's life, and a new source
+// takes only a free slot or one whose source has been silent for the whole
+// baseline window. Rotating the slots instead would give a source that came
+// back neither buckets nor floor, so the rel it showed at that moment -- under
+// a standing queue, the queue itself -- became its floor and the queue delay
+// read zero for every source, forever. Which sources hold the slots does not
+// matter: every source behind one socket waits in the same queue, so any
+// stable few of them measure it. The observer follows the same rule, so its
+// tick is spent on the sources whose baseline can read a queue.
+//
 // The baseline is a rolling minimum, and a rolling minimum cannot see a queue
 // that outlives its window: a connection stuck on a lossy path for its whole
 // life delivers no unqueued frame after the first minutes, the standing queue
@@ -49,8 +61,7 @@ import (
 //
 // Both types are safe for concurrent use.
 
-// sources tracked per baseline and per observer tick, least recently used
-// replaced
+// sources tracked per baseline and per observer tick
 const h1QueueDelaySourceCount = 4
 
 // the queue delay baseline keeps at most this many buckets
@@ -201,8 +212,38 @@ func (self *h1QueueDelayBaseline) sourceWithLock(sourceId Id) *h1QueueDelaySourc
 	return nil
 }
 
+// Takes a slot for a source the baseline does not hold: a free one, else the
+// slot of the source that has been silent longest, once that silence has run a
+// whole bucket. Returns nil when every slot is held by a source that is still
+// sending, and the source is then not measured at all. The silence bar is what
+// bounds how long a socket whose talkers have changed reads no queue delay,
+// and it is a whole bucket because a slot given away is a floor thrown away.
+func (self *h1QueueDelayBaseline) admitWithLock(sourceId Id, now time.Time) *h1QueueDelaySource {
+	var source *h1QueueDelaySource
+	for i := range self.sources {
+		if !self.sources[i].used {
+			source = &self.sources[i]
+			break
+		}
+		if self.bucketDuration <= now.Sub(self.sources[i].lastUse) &&
+			(source == nil || self.sources[i].lastUse.Before(source.lastUse)) {
+			source = &self.sources[i]
+		}
+	}
+	if source == nil {
+		return nil
+	}
+	*source = h1QueueDelaySource{
+		sourceId: sourceId,
+		used:     true,
+		floorMs:  math.MaxInt64,
+	}
+	return source
+}
+
 // Folds one tick's minimum rel for the source into its buckets and returns the
-// baseline, which includes that minimum.
+// baseline, which includes that minimum. math.MaxInt64 when every slot is held
+// by another live source.
 func (self *h1QueueDelayBaseline) observe(sourceId Id, minRelMs int64, now time.Time) int64 {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -210,20 +251,9 @@ func (self *h1QueueDelayBaseline) observe(sourceId Id, minRelMs int64, now time.
 	epoch := self.epochWithLock(now, self.bucketDuration)
 	source := self.sourceWithLock(sourceId)
 	if source == nil {
-		source = &self.sources[0]
-		for i := range self.sources {
-			if !self.sources[i].used {
-				source = &self.sources[i]
-				break
-			}
-			if self.sources[i].lastUse.Before(source.lastUse) {
-				source = &self.sources[i]
-			}
-		}
-		*source = h1QueueDelaySource{
-			sourceId: sourceId,
-			used:     true,
-			floorMs:  math.MaxInt64,
+		source = self.admitWithLock(sourceId, now)
+		if source == nil {
+			return math.MaxInt64
 		}
 	}
 	source.buckets.advanceWithLock(self.bucketCount, epoch)
@@ -349,6 +379,8 @@ func (self *h1QueueDelayBaseline) clockSteps() uint64 {
 type h1ObserverSlot struct {
 	sourceId Id
 	used     bool
+	// the baseline holds a slot for the source, so its samples can read a queue
+	tracked  bool
 	minRelMs int64
 	count    int
 }
@@ -361,6 +393,9 @@ type h1ObserverTick struct {
 	samples int
 	// packs ignored because their tag predates the latest re-roll
 	stale int
+	// packs of a source the baseline does not hold, read while every slot was
+	// held by one it does
+	unslotted int
 	// the minimum ack round trip over AckRttWindow; zero is unknown
 	ackRttMin time.Duration
 	// the minimum ack round trip of this tick's own acks, valid when
@@ -380,11 +415,16 @@ type h1RouteObserver struct {
 	frameCount atomic.Uint32
 	active     atomic.Bool
 
-	stateLock  sync.Mutex
-	slots      [h1QueueDelaySourceCount]h1ObserverSlot
-	ackMinMs   int64
-	ackCount   int
-	staleCount int
+	stateLock      sync.Mutex
+	slots          [h1QueueDelaySourceCount]h1ObserverSlot
+	ackMinMs       int64
+	ackCount       int
+	staleCount     int
+	unslottedCount int
+	// the sources the baseline held a slot for when it last read one of their
+	// ticks; their samples are the only ones a queue can be read from
+	trackedSourceIds [h1QueueDelaySourceCount]Id
+	trackedCount     int
 	// the baseline's clock step count at this observer's previous tick
 	clockStepCount uint64
 }
@@ -420,9 +460,50 @@ func (self *h1RouteObserver) setActive(active bool) {
 	self.active.Store(active)
 }
 
+func (self *h1RouteObserver) trackedWithLock(sourceId Id) bool {
+	for i := 0; i < self.trackedCount; i += 1 {
+		if self.trackedSourceIds[i] == sourceId {
+			return true
+		}
+	}
+	return false
+}
+
+// Records whether the baseline held a slot for the source when it read the
+// source's latest tick. A source that stops appearing keeps its place: it is
+// the baseline that holds the slot, and only the baseline's refusal says the
+// source lost it. The list is as long as the baseline's, so a refused source
+// leaving room for an admitted one keeps it true even when a source is dropped
+// without ever being read again.
+func (self *h1RouteObserver) noteTrackedWithLock(sourceId Id, tracked bool) {
+	for i := 0; i < self.trackedCount; i += 1 {
+		if self.trackedSourceIds[i] != sourceId {
+			continue
+		}
+		if tracked {
+			return
+		}
+		copy(self.trackedSourceIds[i:], self.trackedSourceIds[i+1:self.trackedCount])
+		self.trackedCount -= 1
+		return
+	}
+	if !tracked {
+		return
+	}
+	if self.trackedCount < h1QueueDelaySourceCount {
+		self.trackedSourceIds[self.trackedCount] = sourceId
+		self.trackedCount += 1
+		return
+	}
+	copy(self.trackedSourceIds[0:], self.trackedSourceIds[1:])
+	self.trackedSourceIds[h1QueueDelaySourceCount-1] = sourceId
+}
+
 // Folds one sampled pack into the tick's minimum rel for its source. A tag at or
-// before the source's latest re-roll mark counts as stale and nothing else. When
-// all slots are taken, the slot with the fewest samples is replaced.
+// before the source's latest re-roll mark counts as stale and nothing else. A
+// source the baseline holds takes a free slot, else the slot of one it does not
+// hold, so the tick is spent on the sources whose baseline can read a queue; a
+// source the baseline does not hold takes only a free slot.
 func (self *h1RouteObserver) observePack(sourceId Id, tagSendTimeMs uint64, readTime time.Time) {
 	if tagSendTimeMs == 0 || math.MaxInt64 < tagSendTimeMs {
 		// no tag
@@ -438,6 +519,7 @@ func (self *h1RouteObserver) observePack(sourceId Id, tagSendTimeMs uint64, read
 		self.staleCount += 1
 		return
 	}
+	tracked := self.trackedWithLock(sourceId)
 	var slot *h1ObserverSlot
 	for i := range self.slots {
 		if self.slots[i].used && self.slots[i].sourceId == sourceId {
@@ -446,22 +528,35 @@ func (self *h1RouteObserver) observePack(sourceId Id, tagSendTimeMs uint64, read
 		}
 	}
 	if slot == nil {
-		slot = &self.slots[0]
 		for i := range self.slots {
 			if !self.slots[i].used {
 				slot = &self.slots[i]
 				break
 			}
-			if self.slots[i].count < slot.count {
+		}
+	}
+	if slot == nil && tracked {
+		for i := range self.slots {
+			if self.slots[i].tracked {
+				continue
+			}
+			if slot == nil || self.slots[i].count < slot.count {
 				slot = &self.slots[i]
 			}
 		}
+	}
+	if slot == nil {
+		self.unslottedCount += 1
+		return
+	}
+	if !slot.used || slot.sourceId != sourceId {
 		*slot = h1ObserverSlot{
 			sourceId: sourceId,
 			used:     true,
 			minRelMs: math.MaxInt64,
 		}
 	}
+	slot.tracked = tracked
 	slot.minRelMs = min(slot.minRelMs, relMs)
 	slot.count += 1
 }
@@ -493,6 +588,7 @@ func (self *h1RouteObserver) takeTick(now time.Time) h1ObserverTick {
 	var ackMinMs int64
 	var ackCount int
 	var staleCount int
+	var unslottedCount int
 	var previousClockStepCount uint64
 	func() {
 		self.stateLock.Lock()
@@ -502,11 +598,13 @@ func (self *h1RouteObserver) takeTick(now time.Time) h1ObserverTick {
 		ackMinMs = self.ackMinMs
 		ackCount = self.ackCount
 		staleCount = self.staleCount
+		unslottedCount = self.unslottedCount
 		previousClockStepCount = self.clockStepCount
 		self.slots = [h1QueueDelaySourceCount]h1ObserverSlot{}
 		self.ackMinMs = math.MaxInt64
 		self.ackCount = 0
 		self.staleCount = 0
+		self.unslottedCount = 0
 	}()
 
 	_, clockStepCount := self.baseline.checkClockStep(now)
@@ -518,6 +616,7 @@ func (self *h1RouteObserver) takeTick(now time.Time) h1ObserverTick {
 		}()
 		return h1ObserverTick{
 			stale:     staleCount,
+			unslotted: unslottedCount,
 			ackRttMin: self.baseline.ackRttMin(now),
 		}
 	}
@@ -527,6 +626,7 @@ func (self *h1RouteObserver) takeTick(now time.Time) h1ObserverTick {
 	}
 	tick := h1ObserverTick{
 		stale:     staleCount,
+		unslotted: unslottedCount,
 		ackRttMin: self.baseline.ackRttMin(now),
 	}
 	if 0 < ackCount {
@@ -539,6 +639,16 @@ func (self *h1RouteObserver) takeTick(now time.Time) h1ObserverTick {
 			continue
 		}
 		baseMs := self.baseline.observe(slot.sourceId, slot.minRelMs, now)
+		func() {
+			self.stateLock.Lock()
+			defer self.stateLock.Unlock()
+			self.noteTrackedWithLock(slot.sourceId, baseMs != math.MaxInt64)
+		}()
+		if baseMs == math.MaxInt64 {
+			// no slot in the baseline, so nothing to read the minimum against
+			tick.unslotted += slot.count
+			continue
+		}
 		if tick.known && slot.count <= tick.samples {
 			continue
 		}
