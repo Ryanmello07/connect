@@ -3595,14 +3595,17 @@ func TestTcpReturnRetransmitTheGuardCreditsAtMostTwoBurstsOfItsOwn(t *testing.T)
 // three on top of them; the next duplicate is believed and the repair goes.
 // A credit of one burst would start the repair at half this run, and a credit
 // of four bursts, or the uncapped count this recovery would otherwise leave
-// at 399, would not start it inside twice the run.
+// at 398, would not start it inside twice the run: each of those reads as its
+// own number here rather than as never.
 //
-// Two bursts is what a recovery can still have unanswered: a burst goes at
-// most once per partial acknowledgement and no further than the ceiling, the
-// path delivers in order, so the guesses whose duplicates have not yet
-// arrived when a run begins are the bursts in flight. The source here reports
-// more duplicates than the segments it was sent, which is what makes the run
-// reach the credit at all.
+// A burst goes only on an acknowledgement that advances, so a run at a
+// standing one can only be answering guesses that went before the advances
+// stopped; two bursts at the ceiling is the bound taken for that (see
+// returnRetransmitMaxExplainedDupAckCount). The source below repeats an
+// acknowledgement it has long passed, which is what makes a run this long
+// reach the credit at all: no receiver of the flight it was sent has that
+// many duplicates to give, and the rows that measure a compliant one never
+// pass 140.
 func TestTcpReturnRetransmitTheGuardAbsorbsTwoBurstsOfDuplicatesAndNoMore(t *testing.T) {
 	const recoverySegmentCount = 400
 	const laterSegmentCount = 100
