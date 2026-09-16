@@ -871,6 +871,23 @@ func (self *tcpReturnRetransmitState) fastRetransmitWithLock(ackNumber uint32, n
 // already sent again in this recovery, which are in flight: the
 // acknowledgements for one burst arrive together, and the hole interval, one
 // round trip, would let the later of them resend the burst's tail.
+//
+// These bursts keep no per-interval budget of their own, unlike the selective
+// walk below, and need none: one goes per acknowledgement that advances, the
+// walk covers the run from the head of the ring, the head moves only as those
+// acknowledgements release segments, and markDueWithLock sends a hole again at
+// most once an interval. So an interval's bursts send again at most the
+// segments its acknowledgements released and one run beyond them - measured on
+// a 600-segment flight advanced a segment at a time, 50 acknowledgements draw
+// 101 retransmissions, 100 draw 201, 299 draw 427, which is that bound exactly,
+// and 500 draw 600, the retained set once each. The selective walk needs a
+// budget because a block costs the source nothing and redraws the same retained
+// set every interval; a burst costs it a cumulative acknowledgement, and what
+// that releases never comes back. A ceiling per interval here would also cost
+// the recovery this exists for: where the round trip is shorter than the
+// interval's 200 ms floor an interval carries several bursts, so the 16 MiB
+// window's purged span would go from about 100 round trips, 3 s at 30 ms, to
+// 91 intervals, about 18 s.
 func (self *tcpReturnRetransmitState) markBurstWithLock(windowEnd uint32, nowNanos int64, ackedResentCount int) {
 	self.burstSegmentCount = min(
 		max(1, self.burstSegmentCount+ackedResentCount),

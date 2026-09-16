@@ -1635,6 +1635,73 @@ func TestTcpReturnRetransmitSackHolesStopAtTheHighestSelectiveByte(t *testing.T)
 	})
 }
 
+// What one hole interval of partial-acknowledgement bursts costs, on the path
+// every flow runs: no block, no negotiation, and a source that moves its
+// cumulative acknowledgement a segment at a time so that every burst grows.
+// The walk covers the run from the head of the ring, the head moves only as
+// acknowledgements release segments, and a hole goes again at most once an
+// interval, so an interval's bursts send again at most the segments its
+// acknowledgements released and one run beyond them. That is the bound the
+// selective walk needs a budget of its own to have (markSackHolesWithLock):
+// there a block costs the source nothing and redraws the same retained set
+// every interval, here each segment of it costs the source a cumulative
+// acknowledgement, and what that acknowledgement releases never comes back.
+func TestTcpReturnRetransmitPartialAckBurstsStayWithinTheSegmentsTheyRelease(t *testing.T) {
+	// the flight of the crafted rows, and no sleeps anywhere below, so every
+	// acknowledgement of a row falls in one hole interval
+	const segmentCount = 600
+	for _, row := range []struct {
+		advanceCount    int
+		wantPacketCount int64
+	}{
+		// two segments an acknowledgement while the run is doubling: the one
+		// the acknowledgement uncovered and the one the run grew by
+		{50, 101},
+		{100, 201},
+		// the run reaches the ceiling, and the bound is exactly the released
+		// segments and one of them
+		{299, 427},
+		// and it never passes the retained set, whatever is released
+		{500, 600},
+	} {
+		runTcpReturnRetransmitTest(t, func(t *testing.T) {
+			harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{})
+			// nothing is acknowledged until the loop below, so the whole
+			// flight is retained
+			harness.source.holdAcks = true
+			payload := harness.payload(segmentCount)
+			harness.write(payload)
+			synctest.Wait()
+			for range returnRetransmitDupAckThreshold {
+				harness.source.sendCraftedSackAck(harness.dataSeq, nil)
+			}
+			synctest.Wait()
+			for segmentIndex := 1; segmentIndex <= row.advanceCount; segmentIndex += 1 {
+				harness.source.sendCraftedSackAck(harness.segmentSeq(segmentIndex), nil)
+				synctest.Wait()
+			}
+
+			_, retainedCount, packetCount, reasonCounts := harness.retransmitState()
+			if bound := int64(row.advanceCount + returnRetransmitMaxBurstSegmentCount); bound < packetCount {
+				t.Fatalf("%d acknowledgements drew %d retransmissions in one interval, want at most the %d they released and one burst",
+					row.advanceCount, packetCount, bound)
+			}
+			if packetCount != row.wantPacketCount ||
+				reasonCounts[tcpReturnRetransmitReasonDupAck] != 1 ||
+				reasonCounts[tcpReturnRetransmitReasonPartialAck] != row.wantPacketCount-1 {
+				t.Fatalf("%d acknowledgements drew %d retransmissions %v, want %d on the hole and the bursts",
+					row.advanceCount, packetCount, reasonCounts, row.wantPacketCount)
+			}
+			// what the bursts cost the source: each acknowledgement it sent
+			// released a segment, and the ring never grows back
+			if wantRetainedCount := segmentCount - row.advanceCount; retainedCount != wantRetainedCount {
+				t.Fatalf("%d segments retained after %d acknowledgements, want %d released",
+					retainedCount, row.advanceCount, wantRetainedCount)
+			}
+		})
+	}
+}
+
 // Half a negotiation is none of one, in both directions, and this is what
 // holds the selective path off a default build. The setting is off in
 // production, and every ordinary source - Linux, macOS, Windows - offers
