@@ -1430,11 +1430,13 @@ func h1PathDefaultLedger() *h1PathLedger {
 	return h1PathDefaultLedgerValue
 }
 
-// Charges one re-roll to the rolling daily budget. Everything that spends a
-// break-before-make disconnect and is not resolved as improved passes through
-// here, so the budget counts disconnects and not verdicts.
-func (self *h1PathLedger) chargeDayWithLock(now time.Time) {
-	self.dayChargedTimes[self.dayChargedNext] = now
+// Charges one re-roll to the rolling daily budget, at the moment it stopped
+// being judgeable rather than the moment the ledger noticed. Everything that
+// spends a break-before-make disconnect and is not resolved as improved passes
+// through here, so the budget counts disconnects and not verdicts. The ring is
+// a set of times with no order, so the charges need not arrive in order.
+func (self *h1PathLedger) chargeDayWithLock(chargeTime time.Time) {
+	self.dayChargedTimes[self.dayChargedNext] = chargeTime
 	self.dayChargedNext = (self.dayChargedNext + 1) % h1PathDayRingSize
 }
 
