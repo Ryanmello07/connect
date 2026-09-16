@@ -241,7 +241,8 @@ type H1PathRerollSettings struct {
 	LossWindowTicks int
 	RxLossMinTicks  int
 	TxLossMinTicks  int
-	// kernel unsent bytes at or above this make a send-side tick backlogged
+	// the floor on kernel unsent bytes for a backlogged send-side tick; the
+	// backlog must also take at least the queue delay threshold to drain
 	SendBacklogByteCount ByteCount
 	// the queue delay baseline is the minimum over BaselineBucketCount buckets
 	// (at most 16)
@@ -629,9 +630,15 @@ func (self *h1PathMonitor) tick(sample h1PathSample) h1PathDecision {
 	}
 	txByteRate := float64(txAckedByteCount) / seconds
 	txThinByteRate := self.thinByteRate(pathRtt, sample.sndMss)
+	// the backlog bar is a duration, the same one the receive side applies to
+	// its queue delay: a saturated uplink is always backlogged, slower than
+	// thin and retransmitting, and only the time its own send queue takes to
+	// drain separates it from a collapse. The byte floor keeps a slow but
+	// healthy upload, whose whole queue is small, off the rule.
 	txCollapsed := !excluded &&
 		txKnown &&
 		uint64(settings.SendBacklogByteCount) <= sample.txNotSent &&
+		txByteRate*queueDelayThreshold.Seconds() <= float64(sample.txNotSent) &&
 		0 < txAckedByteCount &&
 		txByteRate < txThinByteRate
 	txClean := !excluded &&

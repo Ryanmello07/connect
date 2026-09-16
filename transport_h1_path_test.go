@@ -1011,3 +1011,79 @@ func TestH1PathLogTicksEnvironment(t *testing.T) {
 		t.Fatal("the settings did not turn on the tick log")
 	}
 }
+
+// A saturated uplink is backlogged, slower than thin and retransmitting, which
+// is every property the send-side rule reads. What separates it from a
+// collapse is how long the backlog takes to drain: the same queue-delay
+// threshold the receive side applies, measured on the socket's own send queue.
+func TestH1PathMonitorNeverConvictsASaturatedUplink(t *testing.T) {
+	// the websocket writer keeps the send buffer full; the uplink is saturated
+	// so the kernel retransmits, and every rate is under the thin rate
+	uplink := func(ackedByteRate float64, notSent uint64, rtt time.Duration) func(k int) h1PathTickShape {
+		return func(k int) h1PathTickShape {
+			return h1PathTickShape{
+				rxByteRate:      20_000,
+				txKnown:         true,
+				txAckedByteRate: ackedByteRate,
+				txNotSent:       notSent,
+				txRetrans:       true,
+				minRtt:          rtt,
+			}
+		}
+	}
+	cases := []struct {
+		name     string
+		shape    func(k int) h1PathTickShape
+		convicts bool
+	}{
+		{
+			// 2.5 MB/s against a thin rate of 3.67 MB/s at 101 ms
+			name:  "20 Mb/s uplink, 400 KiB unsent",
+			shape: uplink(2_500_000, 400*1024, 101*time.Millisecond),
+		},
+		{
+			name:  "20 Mb/s uplink, exactly the backlog floor unsent",
+			shape: uplink(2_500_000, 256*1024, 101*time.Millisecond),
+		},
+		{
+			name:  "10 Mb/s uplink, 300 KiB unsent",
+			shape: uplink(1_250_000, 300*1024, 101*time.Millisecond),
+		},
+		{
+			// a thin rate of 9.27 MB/s at 40 ms is above the whole uplink
+			name:  "25 Mb/s uplink at 40 ms, 400 KiB unsent",
+			shape: uplink(3_125_000, 400*1024, 40*time.Millisecond),
+		},
+		{
+			// darwin counts in-flight data in the send buffer, so two round
+			// trips of a 20 Mb/s uplink read as 493 KiB unsent
+			name:  "darwin send buffer holding two round trips at 20 Mb/s",
+			shape: uplink(2_500_000, 505_000, 101*time.Millisecond),
+		},
+		{
+			// 4 MiB takes 1.68 s to drain, past the 1.01 s threshold
+			name:     "20 Mb/s uplink, 4 MiB unsent",
+			shape:    uplink(2_500_000, 4*1024*1024, 101*time.Millisecond),
+			convicts: true,
+		},
+	}
+	for _, c := range cases {
+		settings := DefaultH1PathRerollSettings()
+		monitor, stats := newH1PathTestMonitor(t, &settings, 105*time.Millisecond)
+		decisions := runH1PathMonitorShape(monitor, 60, c.shape)
+		ticks := h1PathConvictionTicks(decisions)
+		snapshot := stats.snapshot()
+		if c.convicts {
+			if len(ticks) == 0 {
+				t.Errorf("%s: no conviction, want the drain time past the threshold to convict", c.name)
+			}
+			continue
+		}
+		if len(ticks) != 0 {
+			t.Errorf("%s: conviction ticks = %v, want none", c.name, ticks)
+		}
+		if snapshot.TxConvictions != 0 || snapshot.RxConvictions != 0 {
+			t.Errorf("%s: stats = %+v", c.name, snapshot)
+		}
+	}
+}
