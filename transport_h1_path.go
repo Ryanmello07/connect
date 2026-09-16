@@ -1041,7 +1041,10 @@ func (self *h1PathLedger) excluded() []int {
 type h1PathStats struct {
 	ConnectionsMonitored atomic.Uint64
 	ConnectionsDormant   atomic.Uint64
-	KernelUnavailable    atomic.Uint64
+	// connections whose transport buffers nothing, so every tick would be
+	// excluded by our own back pressure
+	ConnectionsUnbuffered atomic.Uint64
+	KernelUnavailable     atomic.Uint64
 	// connections whose monitor failed and was stopped, leaving the connection
 	// itself running
 	MonitorStopped atomic.Uint64
@@ -1108,6 +1111,7 @@ func (self *h1PathStats) recordConfidence(confidence h1PathConfidence) {
 type H1PathRerollStatsSnapshot struct {
 	ConnectionsMonitored        uint64
 	ConnectionsDormant          uint64
+	ConnectionsUnbuffered       uint64
 	KernelUnavailable           uint64
 	MonitorStopped              uint64
 	Ticks                       uint64
@@ -1137,6 +1141,7 @@ func (self *h1PathStats) snapshot() H1PathRerollStatsSnapshot {
 	return H1PathRerollStatsSnapshot{
 		ConnectionsMonitored:        self.ConnectionsMonitored.Load(),
 		ConnectionsDormant:          self.ConnectionsDormant.Load(),
+		ConnectionsUnbuffered:       self.ConnectionsUnbuffered.Load(),
 		KernelUnavailable:           self.KernelUnavailable.Load(),
 		MonitorStopped:              self.MonitorStopped.Load(),
 		Ticks:                       self.Ticks.Load(),

@@ -59,10 +59,14 @@ import (
 //     the loop re-dials without the reconnect backoff.
 // Clean ticks after a re-roll resolve it as improved (noteClean).
 //
+// A transport whose receive channel is unbuffered (TransportBufferSize 0) is
+// not monitored either: our own consumer paces every delivery there, so no tick
+// describes the path.
+//
 // The connection is owned by the watcher goroutine, which runH1 joins before
 // close. Every method is nil-safe, so runH1 needs no check for an unmonitored
 // connection. The connection counts ConnectionsMonitored, ConnectionsDormant at
-// the dial gate, KernelUnavailable (once per connection: no kernel socket, or
+// the dial gate, ConnectionsUnbuffered, KernelUnavailable (once per connection: no kernel socket, or
 // its first read failed), SuppressedObserve and the ledger's refusals,
 // Rerolls, Improved and Unimproved; runH1 counts RerollDials, and a re-roll
 // dial's source port plan counts SourcePortBinds and SourcePortFallbacks, one
@@ -264,6 +268,17 @@ func (self *PlatformTransport) newH1PathConnection(
 	settings := &self.settings.H1PathReroll
 	hooks := self.settings.h1PathTestHooks
 	stats := self.h1PathStats()
+
+	if self.settings.TransportBufferSize <= 0 {
+		// An unbuffered receive channel makes our own consumer the pacer of
+		// every delivery: the reader's full test, cap <= len, holds for every
+		// message, so every tick is excluded and none can be read as the
+		// path's. The monitor would be inert for the connection's life and
+		// still pay for its ticks, its kernel reads and the per-frame
+		// sampling, so there is no connection to tick at all.
+		stats.ConnectionsUnbuffered.Add(1)
+		return nil
+	}
 
 	dialRtt := dialDuration / 3
 	if hooks != nil && hooks.dialRtt != nil {

@@ -287,6 +287,37 @@ func TestPlatformTransportH1PathDormantOnShortPath(t *testing.T) {
 	})
 }
 
+// A transport that buffers nothing paces every delivery from our own consumer,
+// so the reader's full test holds for every message and no tick could ever be
+// read as the path's. Such a connection is not monitored at all rather than
+// monitored inertly: no observer, no ticker, no kernel read.
+func TestPlatformTransportH1PathUnbufferedTransportIsNotMonitored(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	platform := newTestingPlatformServer(t)
+	rig := newTestingH1PathRig(testingH1PathCollapsedAlways)
+	settings := testingH1PathTransportSettings(H1PathRerollModeAct, rig)
+	settings.TransportBufferSize = 0
+	transport := testingPlatformTransport(t, ctx, platform.url, settings)
+
+	if !waitForCondition(15*time.Second, transport.IsConnected) {
+		t.Fatal("the transport never connected")
+	}
+	observer, published := testingH1PathPublishedObserver(transport)
+	if !published || observer != nil {
+		t.Fatalf("published = %t, observer = %p: want the receive route without an observer", published, observer)
+	}
+	time.Sleep(10 * settings.H1PathReroll.TickInterval)
+	stats := rig.stats.snapshot()
+	if stats.ConnectionsUnbuffered != 1 || stats.ConnectionsMonitored != 0 || stats.ConnectionsDormant != 0 {
+		t.Fatalf("stats = %+v, want exactly one unbuffered connection", stats)
+	}
+	if stats.Ticks != 0 || 0 < len(rig.connectionDecisions(0)) {
+		t.Fatalf("stats = %+v with %d decisions: an unbuffered connection is still ticking", stats, len(rig.connectionDecisions(0)))
+	}
+}
+
 // A far dial publishes its observer on the receive route for exactly the
 // connection's lifetime, and the observer stops sampling at close.
 func TestPlatformTransportH1PathObserverPublishedOnFarPath(t *testing.T) {
