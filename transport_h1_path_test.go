@@ -223,6 +223,42 @@ func TestH1PathMonitorCountsHowEachTickWasRead(t *testing.T) {
 		t.Fatalf("stats = %+v, want the ack collapsing ticks the pack tags could not read", snapshot)
 	}
 
+	// a tick that collapses on the ack alone is read as collapsed and also
+	// carries no readable pack tags: the first three counters are disjoint and
+	// summable against Ticks, the fourth crosses them
+	monitor, stats = newH1PathTestMonitor(t, &settings, 105*time.Millisecond)
+	runH1PathMonitorShape(monitor, tickCount, func(k int) h1PathTickShape {
+		shape := h1PathHeldCollapseShape(k)
+		shape.queueDelaySamples = 0
+		if k%5 == 0 {
+			// both at once: a stuck speed test on a tick our own back
+			// pressure also closed
+			shape.receiveFull = true
+			shape.speedTestActive = true
+		}
+		return shape
+	})
+	snapshot = stats.snapshot()
+	read := snapshot.TicksUnread + snapshot.TicksReceiveFull + snapshot.TicksCollapsed
+	if snapshot.Ticks < read {
+		t.Fatalf("stats = %+v, want the three readings to sum within Ticks", snapshot)
+	}
+	if snapshot.TicksUnread == 0 || snapshot.TicksCollapsed == 0 {
+		t.Fatalf("stats = %+v, want both unread ticks and collapses in the run", snapshot)
+	}
+	if snapshot.TicksReceiveFull != 0 {
+		t.Fatalf(
+			"stats = %+v, want a tick that was unread and back pressured counted once",
+			snapshot,
+		)
+	}
+	if snapshot.TicksQueueDelayUnknown != tickCount-1 {
+		t.Fatalf(
+			"stats = %+v, want every tick counted unreadable whatever else decided it",
+			snapshot,
+		)
+	}
+
 	// the measured collapse: every tick past the queue threshold is collapsed,
 	// and the convictions are a small part of them
 	monitor, stats = newH1PathTestMonitor(t, &settings, 105*time.Millisecond)

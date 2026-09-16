@@ -785,19 +785,6 @@ func (self *h1PathMonitor) tick(sample h1PathSample) h1PathDecision {
 	unread := sample.speedTestActive || sample.standingDown
 	receiveFull := prev.receiveFullCount != sample.receiveFullCount
 	excluded := receiveFull || unread
-	// An accepted tick that reached no verdict is not the same reading as a
-	// healthy one, and nothing said which it was: an Observe rollout could not
-	// tell a fleet with no collapse from one that was never able to classify a
-	// tick. The sharpest case is a speed test whose SpeedStop is never
-	// delivered, which leaves speedTestActive set and the connection blind for
-	// the rest of its life with no signal at all.
-	if unread {
-		self.stats.TicksUnread.Add(1)
-	}
-	if receiveFull {
-		self.stats.TicksReceiveFull.Add(1)
-	}
-
 	rxByteCount := h1PathCounterDelta(prev.readByteCount, sample.readByteCount)
 	if prev.rxBytesKnown && sample.rxBytesKnown {
 		rxByteCount = h1PathCounterDelta(prev.rxBytes, sample.rxBytes)
@@ -811,6 +798,11 @@ func (self *h1PathMonitor) tick(sample h1PathSample) h1PathDecision {
 	)
 	queueDelayKnown := 0 < sample.queueDelaySamples &&
 		settings.MinTickPackSamples <= sample.queueDelaySamples
+	// Deliberately not one of the three disjoint readings above: the receive
+	// rule can still convict on the ack round trip alone, so a tick that
+	// collapsed may also be one whose pack tags could not be read. An Observe
+	// rollout needs to see that the primary signal was unavailable whether or
+	// not the tick collapsed, so this one counts across the others.
 	if !queueDelayKnown {
 		self.stats.TicksQueueDelayUnknown.Add(1)
 	}
@@ -876,7 +868,20 @@ func (self *h1PathMonitor) tick(sample h1PathSample) h1PathDecision {
 		txKnown &&
 		demandByteCount <= float64(txAckedByteCount) &&
 		txThinByteRate <= txByteRate
-	if rxCollapsed || txCollapsed {
+	// An accepted tick that reached no verdict is not the same reading as a
+	// healthy one, and nothing said which it was: an Observe rollout could not
+	// tell a fleet with no collapse from one that was never able to classify a
+	// tick. The sharpest case is a speed test whose SpeedStop is never
+	// delivered, which leaves speedTestActive set and the connection blind for
+	// the rest of its life with no signal at all. A tick falls in exactly one
+	// of these three, by the first thing that decided it, so they can be summed
+	// against Ticks and what they leave is the ticks read that found nothing.
+	switch {
+	case unread:
+		self.stats.TicksUnread.Add(1)
+	case receiveFull:
+		self.stats.TicksReceiveFull.Add(1)
+	case rxCollapsed || txCollapsed:
 		self.stats.TicksCollapsed.Add(1)
 	}
 
@@ -1291,16 +1296,24 @@ type h1PathStats struct {
 	// itself running
 	MonitorStopped atomic.Uint64
 	Ticks          atomic.Uint64
-	// ticks the speed test echo or a stand down kept out of both verdicts, and
-	// ticks our own back pressure kept out of a conviction. With Ticks they
-	// separate a connection that saw no collapse from one that never looked
+	// How each accepted tick was read. These three are disjoint -- a tick is
+	// counted by the first thing that decided it -- so they sum to at most
+	// Ticks and what they leave is the ticks that were read and found nothing.
+	// With Ticks they separate a connection that saw no collapse from one that
+	// never looked.
+	//
+	// The speed test echo or a stand down kept the tick out of both verdicts,
+	// and our own back pressure kept it out of a conviction
 	TicksUnread      atomic.Uint64
 	TicksReceiveFull atomic.Uint64
-	// accepted ticks with too few pack samples to read a queue delay
-	TicksQueueDelayUnknown atomic.Uint64
-	// accepted ticks a direction collapsed in, whether or not the window ever
+	// a direction collapsed in the tick, whether or not the window ever
 	// reached a conviction
 	TicksCollapsed atomic.Uint64
+	// accepted ticks with too few pack samples to read a queue delay. This one
+	// crosses the three above rather than joining them: the receive rule can
+	// convict on the ack round trip alone, so a tick can both collapse and
+	// carry no readable pack tags, and a rollout needs to see both
+	TicksQueueDelayUnknown atomic.Uint64
 	// ticks whose queue delay reached the threshold and whose fresh ack round
 	// trip did not: the sender's clock and ours disagree about the queue
 	RxAckDeniedTicks            atomic.Uint64
