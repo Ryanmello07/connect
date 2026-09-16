@@ -1179,15 +1179,17 @@ func TestPlatformTransportH1PathObserveModeNeverRedials(t *testing.T) {
 
 // A planned re-roll dial whose bind falls back keeps the kernel's port, which
 // on linux is a few ports from the one just convicted -- inside the window the
-// plan exists to avoid, so the 4-tuple never moved. The replacement's own
-// collapse is then no evidence about the re-roll: it is suppressed by its
-// source port, the earlier re-roll is not counted unimproved, and the epoch is
-// not latched by a draw that never happened.
+// plan exists to avoid, so the 4-tuple never moved. The replacement is
+// suppressed by its source port, because spending another re-roll would draw
+// from the same broken plan. The re-roll that produced it is charged
+// unimproved all the same: it spent a break-before-make disconnect and moved
+// nothing, and a device that can never move its source port would otherwise
+// pay one disconnect an epoch for ever against no budget at all.
 //
 // The fallback is forced the way a full ephemeral range would: an exclude
 // radius that covers the range leaves the plan no port to pick, so the dial
 // gets the kernel's.
-func TestPlatformTransportH1PathUnmovedSourcePortSpendsNothing(t *testing.T) {
+func TestPlatformTransportH1PathUnmovedSourcePortChargesButDoesNotReroll(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -1218,14 +1220,17 @@ func TestPlatformTransportH1PathUnmovedSourcePortSpendsNothing(t *testing.T) {
 	if stats.Rerolls != 1 || stats.SourcePortFallbacks == 0 || stats.SourcePortBinds != 0 {
 		t.Fatalf("stats = %+v, want one re-roll whose plan fell back", stats)
 	}
-	if stats.SuppressedSourcePort < 2 || stats.Unimproved != 0 || stats.Improved != 0 {
-		t.Fatalf("stats = %+v, want the unmoved convictions to resolve nothing", stats)
+	if stats.SuppressedSourcePort < 2 || stats.Unimproved != 1 || stats.Improved != 0 {
+		t.Fatalf("stats = %+v, want the unmoved re-roll charged unimproved once", stats)
 	}
-	// the re-roll stays pending until it ages out unresolved, so the epoch is
-	// not latched
-	if state := testingH1PathLedgerSnapshot(rig.ledger); state.pendingCount != 1 ||
-		state.epochUnimproved != 0 || !state.latchUntil.IsZero() {
-		t.Fatalf("ledger = %+v, want the re-roll still pending and the epoch clean", state)
+	if stats.ConnectionsConvicted != 2 {
+		t.Fatalf("stats = %+v, want both connections counted convicted once each", stats)
+	}
+	// the re-roll is resolved rather than left to age out, and one unimproved
+	// re-roll is under the latch
+	if state := testingH1PathLedgerSnapshot(rig.ledger); state.pendingCount != 0 ||
+		state.epochUnimproved != 1 || !state.latchUntil.IsZero() {
+		t.Fatalf("ledger = %+v, want the re-roll resolved and the epoch under the latch", state)
 	}
 }
 

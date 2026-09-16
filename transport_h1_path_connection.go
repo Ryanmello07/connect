@@ -53,13 +53,13 @@ import (
 // In Observe a conviction is counted and logged, at most once per
 // ConvictionLogInterval per connection. In Act, a conviction goes through the
 // process ledger, keyed by the transport's route manager:
-//   - a connection whose own local port is inside the window the ledger
-//     excluded is suppressed first: its planned dial did not move the 4-tuple,
-//     so it is neither evidence about the re-roll that produced it nor a reason
-//     to spend another;
 //   - noteConviction, which counts an earlier re-roll on the same route
 //     manager as unimproved when this conviction lands in its improvement
 //     window;
+//   - a connection whose own local port is inside the window the ledger
+//     excluded is suppressed there: its planned dial did not move the 4-tuple,
+//     so it is no reason to spend another re-roll, but the one that produced it
+//     is charged like any other that did not improve;
 //   - an observe-only connection stops there and is observed;
 //   - allow, which may refuse (latched, daily budget, device spacing,
 //     unconfirmed budget, provider gate), counted by reason;
@@ -77,10 +77,10 @@ import (
 // connection. The connection counts ConnectionsMonitored, ConnectionsDormant at
 // the dial gate, ConnectionsUnbuffered, KernelUnavailable (once per connection:
 // no kernel socket, or its first read failed), SourcePortUnmoved,
-// MonitorStopped, SuppressedObserve and the ledger's refusals, Rerolls,
-// Improved and Unimproved; runH1 counts RerollDials, and a re-roll dial's
-// source port plan counts SourcePortBinds and SourcePortFallbacks, one per
-// socket it plans.
+// MonitorStopped, ConnectionsConvicted on its first conviction,
+// SuppressedObserve and the ledger's refusals, Rerolls, Improved and
+// Unimproved; runH1 counts RerollDials, and a re-roll dial's source port plan
+// counts SourcePortBinds and SourcePortFallbacks, one per socket it plans.
 
 // The per-connection counters runH1 keeps for the monitor. The reader and the
 // writer update them; the watcher reads them.
@@ -146,6 +146,9 @@ type h1PathConnection struct {
 	lastLogTime time.Time
 	// clean ticks since the connection started or last convicted
 	cleanTicks int
+	// this connection has convicted at least once, so ConnectionsConvicted
+	// counts it once however long it goes on convicting
+	convicted bool
 }
 
 // Whether the connection's effective mode applies, and whether it may only
@@ -522,26 +525,33 @@ func (self *h1PathConnection) decide(now time.Time, decision *h1PathDecision) {
 	switch {
 	case decision.convicted:
 		self.cleanTicks = 0
+		if !self.convicted {
+			self.convicted = true
+			self.stats.ConnectionsConvicted.Add(1)
+		}
 		if !act {
 			self.observe(decision)
-			break
-		}
-		if self.sourcePortUnmoved {
-			// The dial that replaced a convicted connection kept a port inside
-			// the excluded window, so this connection is in the same
-			// neighbourhood -- on a path that hashes blocks of adjacent ports,
-			// the same member. It is not the replacement the ledger is waiting
-			// for: its collapse is no evidence about that re-roll, and spending
-			// another re-roll here would draw from the same broken plan. The
-			// pending entry ages out unresolved instead of latching the epoch.
-			decision.action = h1PathActionSuppressed
-			decision.reason = h1PathReasonSourcePort
-			self.stats.recordSuppression(h1PathReasonSourcePort)
 			break
 		}
 		ledger := self.ledger()
 		if ledger.noteConviction(key, self.settings, now) {
 			self.stats.Unimproved.Add(1)
+		}
+		if self.sourcePortUnmoved {
+			// The dial that replaced a convicted connection kept a port inside
+			// the excluded window, so this connection is in the same
+			// neighbourhood -- on a path that hashes blocks of adjacent ports,
+			// the same member. Spending another re-roll here would draw from
+			// the same broken plan, so the conviction is suppressed. It is
+			// charged first, though: the re-roll it is judging spent a
+			// break-before-make disconnect and did not move the 4-tuple, which
+			// is the definition of unimproved, and leaving it to age out
+			// unresolved let a device that cannot move its source port at all
+			// pay a disconnect per epoch for ever, against no budget.
+			decision.action = h1PathActionSuppressed
+			decision.reason = h1PathReasonSourcePort
+			self.stats.recordSuppression(h1PathReasonSourcePort)
+			break
 		}
 		if self.observeOnly {
 			self.observe(decision)

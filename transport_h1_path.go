@@ -1464,7 +1464,12 @@ type h1PathStats struct {
 	// connections whose monitor failed and was stopped, leaving the connection
 	// itself running
 	MonitorStopped atomic.Uint64
-	Ticks          atomic.Uint64
+	// connections that convicted at least once, counted once each. RxConvictions
+	// counts verdicts, and one stuck connection produces one every two seconds
+	// for as long as it stays stuck, so only this one reads against
+	// ConnectionsMonitored as a share of sessions
+	ConnectionsConvicted atomic.Uint64
+	Ticks                atomic.Uint64
 	// How each accepted tick was read. These three are disjoint -- a tick is
 	// counted by the first thing that decided it -- so they sum to at most
 	// Ticks and what they leave is the ticks that were read and found nothing.
@@ -1572,6 +1577,7 @@ type H1PathRerollStatsSnapshot struct {
 	ConnectionsUnbuffered       uint64
 	KernelUnavailable           uint64
 	MonitorStopped              uint64
+	ConnectionsConvicted        uint64
 	Ticks                       uint64
 	TicksUnread                 uint64
 	TicksReceiveFull            uint64
@@ -1612,6 +1618,7 @@ func (self *h1PathStats) snapshot() H1PathRerollStatsSnapshot {
 		ConnectionsUnbuffered:       self.ConnectionsUnbuffered.Load(),
 		KernelUnavailable:           self.KernelUnavailable.Load(),
 		MonitorStopped:              self.MonitorStopped.Load(),
+		ConnectionsConvicted:        self.ConnectionsConvicted.Load(),
 		Ticks:                       self.Ticks.Load(),
 		TicksUnread:                 self.TicksUnread.Load(),
 		TicksReceiveFull:            self.TicksReceiveFull.Load(),
