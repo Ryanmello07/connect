@@ -245,9 +245,13 @@ type H1PathRerollSettings struct {
 	// backlog must also take at least the queue delay threshold to drain
 	SendBacklogByteCount ByteCount
 	// the queue delay baseline is the minimum over BaselineBucketCount buckets
-	// (at most 16)
+	// (at most 16), and may rise above the smallest delay a source ever showed
+	// by at most BaselineRisePerMinute for each minute since it showed it, so a
+	// collapse that outlives the buckets does not become its own baseline.
+	// Non-positive leaves the buckets alone
 	BaselineBucketDuration time.Duration
 	BaselineBucketCount    int
+	BaselineRisePerMinute  time.Duration
 	// the ack echo round trip is the minimum over this window
 	AckRttWindow time.Duration
 
@@ -304,6 +308,7 @@ func DefaultH1PathRerollSettings() H1PathRerollSettings {
 		SendBacklogByteCount:       kib(256),
 		BaselineBucketDuration:     10 * time.Second,
 		BaselineBucketCount:        12,
+		BaselineRisePerMinute:      100 * time.Millisecond,
 		AckRttWindow:               10 * time.Minute,
 		CleanTicks:                 20,
 		ImprovementWindow:          120 * time.Second,

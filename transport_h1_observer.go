@@ -31,6 +31,20 @@ import (
 // and not against its own first, possibly already queued, frames. A wall clock
 // step resets it.
 //
+// The baseline is a rolling minimum, and a rolling minimum cannot see a queue
+// that outlives its window: a connection stuck on a lossy path for its whole
+// life delivers no unqueued frame after the first minutes, the standing queue
+// becomes the baseline and the queue delay reads zero. Each source therefore
+// also keeps the smallest rel it ever saw, and the baseline may rise above
+// that floor only by BaselineRisePerMinute for each minute since it was set.
+// The floor absorbs the two clocks' relative drift many times over (100 ms a
+// minute is 1667 ppm against the tens of ppm two disciplined clocks reach), and
+// a real queue of q stays visible for (q - threshold) / rise rather than for
+// one window. What the floor cannot absorb is a backward clock step on the
+// sender, which reads exactly like a queue for as long: the receive rule
+// answers that with the ack round trip, measured on this client's own clock
+// (transport_h1_path.go).
+//
 // Both types are safe for concurrent use.
 
 // sources tracked per baseline and per observer tick, least recently used
@@ -106,6 +120,10 @@ type h1QueueDelaySource struct {
 	used     bool
 	buckets  h1MinBuckets
 	lastUse  time.Time
+	// the smallest rel ever seen for the source, and when it was seen; the
+	// buckets may rise above it only at the rise rate. math.MaxInt64 is unset
+	floorMs   int64
+	floorTime time.Time
 	// tags at or below this are from before the latest re-roll
 	freshAfterTagMs uint64
 }
@@ -118,6 +136,9 @@ type h1QueueDelayBaseline struct {
 	bucketDuration    time.Duration
 	bucketCount       int
 	ackBucketDuration time.Duration
+	// how far the baseline may rise above a source's floor in a minute;
+	// non-positive keeps the buckets alone
+	risePerMinute time.Duration
 
 	stateLock sync.Mutex
 	// set by the first observation; bucket epochs count from here
@@ -140,6 +161,7 @@ func newH1QueueDelayBaseline(settings *H1PathRerollSettings) *h1QueueDelayBaseli
 		bucketDuration:    max(time.Millisecond, settings.BaselineBucketDuration),
 		bucketCount:       bucketCount,
 		ackBucketDuration: max(time.Millisecond, settings.AckRttWindow/h1AckRttBucketCount),
+		risePerMinute:     max(0, settings.BaselineRisePerMinute),
 	}
 }
 
@@ -153,6 +175,19 @@ func (self *h1QueueDelayBaseline) epochWithLock(now time.Time, bucketDuration ti
 		return 0
 	}
 	return int64(elapsed / bucketDuration)
+}
+
+// The source's baseline: the minimum of its buckets, held down by the floor,
+// which the buckets may rise above only at the rise rate. math.MaxInt64 when
+// the source has observed nothing.
+func (self *h1QueueDelayBaseline) baselineWithLock(source *h1QueueDelaySource, now time.Time) int64 {
+	baseMs := source.buckets.minWithLock(self.bucketCount)
+	if self.risePerMinute <= 0 || source.floorMs == math.MaxInt64 {
+		return baseMs
+	}
+	elapsed := max(0, now.Sub(source.floorTime))
+	riseMs := self.risePerMinute.Milliseconds() * int64(elapsed) / int64(time.Minute)
+	return min(baseMs, source.floorMs+riseMs)
 }
 
 func (self *h1QueueDelayBaseline) sourceWithLock(sourceId Id) *h1QueueDelaySource {
@@ -186,12 +221,19 @@ func (self *h1QueueDelayBaseline) observe(sourceId Id, minRelMs int64, now time.
 		*source = h1QueueDelaySource{
 			sourceId: sourceId,
 			used:     true,
+			floorMs:  math.MaxInt64,
 		}
 	}
 	source.buckets.advanceWithLock(self.bucketCount, epoch)
 	source.buckets.addWithLock(self.bucketCount, minRelMs)
 	source.lastUse = now
-	return source.buckets.minWithLock(self.bucketCount)
+	if minRelMs < source.floorMs {
+		// a lower rel is the path with less queue than we have ever seen, so it
+		// replaces the floor and restarts the rise from here
+		source.floorMs = minRelMs
+		source.floorTime = now
+	}
+	return self.baselineWithLock(source, now)
 }
 
 // For every source with a baseline, marks tags up to 2 x pathRtt past the
@@ -209,7 +251,7 @@ func (self *h1QueueDelayBaseline) markReroll(now time.Time, pathRtt time.Duratio
 			continue
 		}
 		source.buckets.advanceWithLock(self.bucketCount, epoch)
-		baseMs := source.buckets.minWithLock(self.bucketCount)
+		baseMs := self.baselineWithLock(source, now)
 		if baseMs == math.MaxInt64 {
 			continue
 		}
@@ -285,6 +327,8 @@ func (self *h1QueueDelayBaseline) checkClockStep(now time.Time) (bool, uint64) {
 	for i := range self.sources {
 		if self.sources[i].used {
 			self.sources[i].buckets.resetWithLock(self.bucketCount, self.sources[i].buckets.epoch)
+			self.sources[i].floorMs = math.MaxInt64
+			self.sources[i].floorTime = time.Time{}
 		}
 	}
 	if self.ackBuckets.set {

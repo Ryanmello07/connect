@@ -382,6 +382,58 @@ func TestH1RouteObserverExcludesPreRerollTags(t *testing.T) {
 	}
 }
 
+// The baseline may rise above a source's floor only at BaselineRisePerMinute.
+// The rate is the whole trade: a queue of q stays visible for
+// (q - threshold) / rate, and a backward clock step of s on the sender holds a
+// queue delay that is not there for s / rate.
+func TestH1QueueDelayBaselineRisesAtTheSettingsRate(t *testing.T) {
+	// 200 ms of transit on the first tick, then a 6 s standing queue
+	queueDelayAt := func(settings *H1PathRerollSettings, elapsed time.Duration) time.Duration {
+		baseline := newH1QueueDelayBaseline(settings)
+		observer := newH1RouteObserver(baseline, 1)
+		sourceId := NewId()
+		delay := time.Duration(0)
+		for k := 1; k <= int(elapsed/h1PathTestStep); k += 1 {
+			now := h1PathTestOrigin.Add(time.Duration(k) * h1PathTestStep)
+			rel := 200 * time.Millisecond
+			if 1 < k {
+				rel += 6 * time.Second
+			}
+			for i := 0; i < 4; i += 1 {
+				observer.observePack(sourceId, h1ObserverTestTagMs(now.Add(-rel)), now)
+			}
+			tick := observer.takeTick(now)
+			if !tick.known {
+				t.Fatalf("the tick at %s is unknown", now.Sub(h1PathTestOrigin))
+			}
+			delay = tick.queueDelay
+		}
+		return delay
+	}
+
+	settings := DefaultH1PathRerollSettings()
+	for _, c := range []struct {
+		elapsed    time.Duration
+		queueDelay time.Duration
+	}{
+		// inside the bucket window the floor is not the binding half
+		{elapsed: time.Minute, queueDelay: 6 * time.Second},
+		{elapsed: 10*time.Minute + h1PathTestStep, queueDelay: 5 * time.Second},
+		{elapsed: 30*time.Minute + h1PathTestStep, queueDelay: 3 * time.Second},
+	} {
+		if delay := queueDelayAt(&settings, c.elapsed); delay != c.queueDelay {
+			t.Errorf("the queue delay at %s = %s, want %s", c.elapsed, delay, c.queueDelay)
+		}
+	}
+
+	// without a rate the buckets are the whole baseline, and a queue that
+	// outlives them reads as none at all
+	settings.BaselineRisePerMinute = 0
+	if delay := queueDelayAt(&settings, 5*time.Minute); delay != 0 {
+		t.Errorf("without a rise rate the queue delay at 5m = %s, want the buckets to have followed the queue", delay)
+	}
+}
+
 func TestH1QueueDelayBaselineWallClockStepResets(t *testing.T) {
 	settings := DefaultH1PathRerollSettings()
 	sourceId := NewId()

@@ -1167,3 +1167,81 @@ func TestH1PathMonitorLossDenialRestartsTheSendLossWindow(t *testing.T) {
 		t.Fatalf("conviction ticks = %v, want the first once retransmits arrive at tick 20", ticks)
 	}
 }
+
+// A connection stuck on the lossy member for its whole life is the case this
+// work targets, and it is the hardest one for a queue delay measured against a
+// rolling minimum: once the uncongested minima age out of the baseline window
+// the standing queue becomes its own baseline and the delay reads zero. The
+// connection is then classified healthy for the rest of its life, which in
+// Observe truncates the fleet measurement at one baseline window and in Act
+// means a conviction the ledger refused once can never be made again.
+func TestH1PathSessionLongCollapseStaysVisible(t *testing.T) {
+	const sessionDuration = 20 * time.Minute
+	const standingQueue = 6 * time.Second
+	// the queue appears when the session's first bulk flow fills the far socket
+	const queueStart = 5 * time.Second
+	const transit = 200 * time.Millisecond
+
+	settings := DefaultH1PathRerollSettings()
+	baseline := newH1QueueDelayBaseline(&settings)
+	observer := newH1RouteObserver(baseline, 1)
+	monitor, _ := newH1PathTestMonitor(t, &settings, 105*time.Millisecond)
+	sourceId := NewId()
+
+	sample := h1PathSample{
+		rxBytesKnown: true,
+		rxOooKnown:   true,
+		minRtt:       105 * time.Millisecond,
+		rcvMss:       1448,
+		sndMss:       1448,
+	}
+	convictions := 0
+	lastConviction := time.Duration(0)
+	lastQueueDelay := time.Duration(0)
+	for k := 1; k <= int(sessionDuration/h1PathTestStep); k += 1 {
+		now := h1PathTestOrigin.Add(time.Duration(k) * h1PathTestStep)
+		elapsed := now.Sub(h1PathTestOrigin)
+		rel := transit
+		if queueStart <= elapsed {
+			rel += standingQueue
+		}
+		for i := 0; i < 4; i += 1 {
+			observer.observePack(sourceId, h1ObserverTestTagMs(now.Add(-rel)), now)
+		}
+		tick := observer.takeTick(now)
+
+		// 0.5 MB/s against a thin rate of 3.53 MB/s, out-of-order every tick
+		sample.now = now
+		sample.readMessageCount += 16
+		sample.writeMessageCount += 1
+		sample.readByteCount += uint64(500_000 * h1PathTestStep.Seconds())
+		sample.rxBytes = sample.readByteCount
+		sample.rxOoo += 3
+		sample.queueDelay = 0
+		sample.queueDelaySamples = 0
+		if tick.known {
+			sample.queueDelay = tick.queueDelay
+			sample.queueDelaySamples = tick.samples
+		}
+		sample.ackRttMin = tick.ackRttMin
+		if queueStart <= elapsed {
+			lastQueueDelay = sample.queueDelay
+		}
+		if decision := monitor.tick(sample); decision.convicted {
+			convictions += 1
+			lastConviction = elapsed
+		}
+	}
+	if lastQueueDelay < 3*time.Second {
+		t.Errorf(
+			"the queue delay after %s of a standing %s queue = %s, want the baseline to still hold it",
+			sessionDuration, standingQueue, lastQueueDelay,
+		)
+	}
+	if lastConviction < 15*time.Minute {
+		t.Errorf(
+			"the last of %d convictions was %s into a %s collapse, want one in the last quarter of the session",
+			convictions, lastConviction, sessionDuration,
+		)
+	}
+}
