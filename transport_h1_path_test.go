@@ -1452,3 +1452,83 @@ func TestH1PathSenderClockStepDoesNotConvictASlowLink(t *testing.T) {
 		t.Error("the measured collapse was not convicted")
 	}
 }
+
+// A full receive route means our own consumer set the tick's rate, so the tick
+// cannot convict. It can still be clean: back pressure only ever lowers the
+// delivered rate, so a tick that cleared the thin rate cleared it in spite of
+// us. The cost of voiding it instead is paid after a re-roll, where CleanTicks
+// clean ticks are what resolves the re-roll as improved: at 200 Mb/s a 32-slot
+// receive route drains a frame every 140 us, so one 4.5 ms pause in the
+// client's own receive loop fills it, and on a busy client almost every tick
+// carries one.
+func TestH1PathMonitorCleanTicksSurviveReceiveBackpressure(t *testing.T) {
+	cleanTicks := func(decisions []h1PathDecision) int {
+		clean := 0
+		for _, decision := range decisions {
+			if decision.clean {
+				clean += 1
+			}
+		}
+		return clean
+	}
+	settings := DefaultH1PathRerollSettings()
+
+	// 200 Mb/s with the receive route full in every tick
+	monitor, _ := newH1PathTestMonitor(t, &settings, 105*time.Millisecond)
+	decisions := runH1PathMonitorShape(monitor, 60, func(k int) h1PathTickShape {
+		return h1PathTickShape{
+			rxByteRate:        25_000_000,
+			queueDelay:        4 * time.Millisecond,
+			queueDelaySamples: 400,
+			receiveFull:       true,
+		}
+	})
+	if clean := cleanTicks(decisions); clean != 59 {
+		t.Errorf("%d of 59 ticks clean with the receive route full, want every one", clean)
+	}
+
+	// the same back pressure still holds a collapse shape off the rule, and a
+	// tick under the thin rate is not clean either way
+	monitor, stats := newH1PathTestMonitor(t, &settings, 105*time.Millisecond)
+	decisions = runH1PathMonitorShape(monitor, 60, func(k int) h1PathTickShape {
+		shape := h1PathCollapseShape(k)
+		shape.queueDelay = 6 * time.Second
+		shape.receiveFull = true
+		return shape
+	})
+	if ticks := h1PathConvictionTicks(decisions); len(ticks) != 0 {
+		t.Errorf("a collapse shape behind our own back pressure convicted at ticks %v", ticks)
+	}
+	if clean := cleanTicks(decisions); clean != 0 {
+		t.Errorf("%d ticks under the thin rate were clean", clean)
+	}
+	if snapshot := stats.snapshot(); snapshot.RxConvictions != 0 || snapshot.TxConvictions != 0 {
+		t.Errorf("stats = %+v", snapshot)
+	}
+
+	// a speed test and a stand down are different: their bytes are not counted
+	// at all, so no verdict can read the tick
+	for _, c := range []struct {
+		name  string
+		shape func(k int) h1PathTickShape
+	}{
+		{
+			name: "speed test",
+			shape: func(k int) h1PathTickShape {
+				return h1PathTickShape{rxByteRate: 25_000_000, speedTestActive: true}
+			},
+		},
+		{
+			name: "standing down",
+			shape: func(k int) h1PathTickShape {
+				return h1PathTickShape{rxByteRate: 25_000_000, standingDown: true}
+			},
+		},
+	} {
+		monitor, _ := newH1PathTestMonitor(t, &settings, 105*time.Millisecond)
+		decisions := runH1PathMonitorShape(monitor, 60, c.shape)
+		if clean := cleanTicks(decisions); clean != 0 {
+			t.Errorf("%s: %d ticks clean, want none", c.name, clean)
+		}
+	}
+}

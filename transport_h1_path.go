@@ -506,9 +506,11 @@ type h1PathDecision struct {
 //     thin;
 //   - tx collapsed: not excluded, kernel tx known, unsent at least
 //     SendBacklogByteCount, acked bytes advancing below thin;
-//   - clean: not excluded, demand, and a direction at or above thin;
-//   - excluded, for both directions: the receive channel was full, the speed
-//     test echo is active, or the transport is standing down H1;
+//   - clean: demand, a direction at or above thin, and no tick whose bytes
+//     were not counted (the speed test echo, a stand down);
+//   - excluded from collapsing, for both directions: the receive channel was
+//     full, the speed test echo is active, or the transport is standing down
+//     H1;
 //   - a direction convicts with ConvictTicks of the last WindowTicks collapsed,
 //     the connection at least MinConnectionAge old, and loss evidence over the
 //     last LossWindowTicks: rx is confirmed by out-of-order data in
@@ -626,9 +628,15 @@ func (self *h1PathMonitor) tick(sample h1PathSample) h1PathDecision {
 	// demand scales with the tick's length, so a tick after an idle gap does
 	// not pass on bytes that trickled in over the whole gap
 	demandByteCount := float64(settings.MinTickByteCount) * seconds / tickInterval.Seconds()
-	excluded := prev.receiveFullCount != sample.receiveFullCount ||
-		sample.speedTestActive ||
-		sample.standingDown
+	// A full receive route means our own consumer set this tick's rate: the
+	// reader stalls, the window closes and the far socket queues, so the tick
+	// cannot convict. It can still be clean, because back pressure only lowers
+	// the delivered rate -- a tick that cleared the thin rate cleared it in
+	// spite of us -- and a re-roll needs clean ticks to resolve as improved. A
+	// speed test and a stand down are different: their bytes are not counted at
+	// all, so neither verdict can read the tick.
+	unread := sample.speedTestActive || sample.standingDown
+	excluded := prev.receiveFullCount != sample.receiveFullCount || unread
 
 	rxByteCount := h1PathCounterDelta(prev.readByteCount, sample.readByteCount)
 	if prev.rxBytesKnown && sample.rxBytesKnown {
@@ -665,7 +673,7 @@ func (self *h1PathMonitor) tick(sample h1PathSample) h1PathDecision {
 		rxDemand &&
 		rxQueued &&
 		rxByteRate < rxThinByteRate
-	rxClean := !excluded && rxDemand && rxThinByteRate <= rxByteRate
+	rxClean := !unread && rxDemand && rxThinByteRate <= rxByteRate
 
 	txKnown := prev.txKnown && sample.txKnown
 	txAckedByteCount := uint64(0)
@@ -685,7 +693,7 @@ func (self *h1PathMonitor) tick(sample h1PathSample) h1PathDecision {
 		txByteRate*queueDelayThreshold.Seconds() <= float64(sample.txNotSent) &&
 		0 < txAckedByteCount &&
 		txByteRate < txThinByteRate
-	txClean := !excluded &&
+	txClean := !unread &&
 		txKnown &&
 		demandByteCount <= float64(txAckedByteCount) &&
 		txThinByteRate <= txByteRate
