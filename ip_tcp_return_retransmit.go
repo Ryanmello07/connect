@@ -32,7 +32,9 @@ const (
 	// full-size segments. At this ceiling the default cap's worst case at the
 	// 16 MiB maximum window, a purged span of about 11,600 segments of 1,448
 	// bytes, recovers in about 100 round trips, 3 s at 30 ms, where one
-	// segment a round trip took nearly 6 minutes.
+	// segment a round trip took nearly 6 minutes. The selective holes below
+	// share this ceiling and not that period: they go once per hole interval,
+	// which at that round trip is the 200 ms floor (markSackHolesWithLock).
 	returnRetransmitMaxBurstSegmentCount = 128
 	// the most blocks one SACK option carries beside a timestamp option
 	tcpMaxSackBlockCount = 4
@@ -894,12 +896,17 @@ func (self *tcpReturnRetransmitState) markBurstWithLock(windowEnd uint32, nowNan
 // are skipped by the one-per-hole-interval rule rather than counted against
 // the ceiling, so the walk goes on past them to the next unsent ones. A
 // source that moves its single block down the flight drew the whole retained
-// set per interval that way, one burst per acknowledgement. Over the interval
-// the rate is the one the partial-acknowledgement bursts keep, which have one
-// partial acknowledgement per round trip to grow on, and the same period one
-// hole waits between its own retransmissions; the holes a burst leaves are
-// marked by the next trigger, so a purged span still recovers in a burst per
-// interval rather than a segment per round trip.
+// set per interval that way, one burst per acknowledgement. The ceiling is
+// the one the partial-acknowledgement bursts keep, and the period is not:
+// those go once per partial acknowledgement, which is once per round trip,
+// and this goes once per hole interval, max(srtt, 200 ms), which at a 30 ms
+// round trip is the 200 ms floor. So the worst case costs about six times
+// what the ceiling's own comment says for the bursts: the 16 MiB window's
+// 11,586 segments are 91 intervals, about 18 s at the floor, against the 3 s
+// of 100 round trips at 30 ms. What it replaces is a segment per round trip,
+// nearly six minutes for that span, and the holes a burst leaves are marked
+// by the next trigger, so a purged span still recovers in a burst per
+// interval.
 //
 // A loss recovery that begins inside a spent interval still marks its first
 // hole (beginLossRecoveryWithLock). Without that reserve a second loss
