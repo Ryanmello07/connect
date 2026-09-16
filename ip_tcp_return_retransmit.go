@@ -37,20 +37,21 @@ const (
 	// which at that round trip is the 200 ms floor (markSackHolesWithLock).
 	returnRetransmitMaxBurstSegmentCount = 128
 	// the most duplicate acknowledgements the storm guard credits to this
-	// flow's own guesses (see fastRetransmitWithLock). The path delivers in
-	// order, so the duplicates a guess draws reach this flow before the
-	// acknowledgement of anything sent after it: what a run of duplicates at
-	// a standing acknowledgement can still be answering is the bursts that
-	// were in flight when the run began, and no burst goes until the previous
-	// one is acknowledged past, so that is two of them at the ceiling above.
-	// Uncapped the count grew with every burst of a recovery instead, because
-	// each take pushes the guard's window out: a 702-segment recovery left it
-	// at 701, and a real loss below the retained end then waited for the
-	// timer, because the flight past its hole does not carry 704 duplicates
-	// to spend. Measured on a source that acknowledges every arrival, the
-	// cap repairs that loss on duplicates where the uncapped count waited for
-	// the timer (150-250 ms against 300-400 ms at a 50 ms path, 2.4 s against
-	// 5.0 s at a 200 ms one), for the same number of retransmissions.
+	// flow's own guesses (see fastRetransmitWithLock). A burst goes only on an
+	// acknowledgement that advances, so a run of duplicates at a standing one
+	// can only be answering guesses that went before the advances stopped:
+	// what is still unanswered is the last round trip of them, and two bursts
+	// at the ceiling above is the bound taken for that. Uncapped the count
+	// grew with every burst of a recovery instead, because each take pushes
+	// the guard's window out: a 702-segment recovery left it at 701, and a
+	// real loss below the retained end then waited for the timer, because the
+	// flight past its hole does not carry 704 duplicates to spend. Measured
+	// on a source that acknowledges every arrival: the cap repairs that loss
+	// on duplicates where the uncapped count waited for the timer, 150-250 ms
+	// against 300-400 ms at a 50 ms path and 2.4 s against 5.0 s at a 200 ms
+	// one, for the same number of retransmissions - and no such source drew a
+	// run past 140 duplicates in any shape tried, so the cap is above what
+	// the guard was ever asked to absorb.
 	returnRetransmitMaxExplainedDupAckCount = 2 * returnRetransmitMaxBurstSegmentCount
 	// the most blocks one SACK option carries beside a timestamp option
 	tcpMaxSackBlockCount = 4
