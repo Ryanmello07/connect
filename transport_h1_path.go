@@ -254,6 +254,10 @@ type H1PathRerollSettings struct {
 	BaselineRisePerMinute  time.Duration
 	// the ack echo round trip is the minimum over this window
 	AckRttWindow time.Duration
+	// an ack round trip is evidence about the receive queue for this long
+	// after it was read; a receive collapse whose fresh ack round trip holds
+	// no queue is denied. Non-positive turns the check off
+	AckEvidenceWindow time.Duration
 
 	// clean ticks after a re-roll that count it as improved
 	CleanTicks int
@@ -310,6 +314,7 @@ func DefaultH1PathRerollSettings() H1PathRerollSettings {
 		BaselineBucketCount:        12,
 		BaselineRisePerMinute:      100 * time.Millisecond,
 		AckRttWindow:               10 * time.Minute,
+		AckEvidenceWindow:          5 * time.Second,
 		CleanTicks:                 20,
 		ImprovementWindow:          120 * time.Second,
 		DeviceRerollSpacing:        2 * time.Second,
@@ -365,6 +370,10 @@ type h1PathSample struct {
 	queueDelaySamples int
 	// the minimum ack echo round trip over AckRttWindow; zero is unknown
 	ackRttMin time.Duration
+	// the ack echo round trip of this tick, valid when ackRttSamples is
+	// positive
+	ackRtt        time.Duration
+	ackRttSamples int
 
 	rxBytesKnown bool
 	rxBytes      uint64
@@ -478,6 +487,10 @@ type h1PathDecision struct {
 	lossKnownTicks  int
 	queueDelay      time.Duration
 	queueDelayKnown bool
+	// the latest ack round trip over the path round trip, and whether one was
+	// fresh enough to read
+	ackQueue      time.Duration
+	ackQueueKnown bool
 	// delivered bytes per second in the direction evaluated
 	byteRate     float64
 	thinByteRate float64
@@ -489,7 +502,8 @@ type h1PathDecision struct {
 //   - thr = max(QueueDelayFloor, QueueDelayRttMultiple x pathRtt), and
 //     thin = ThinSegmentsPerRtt x mss / max(pathRtt, RttFloor);
 //   - rx collapsed: not excluded, demand, queue delay known and at least thr,
-//     rate below thin;
+//     no fresh ack round trip below thr over the path round trip, rate below
+//     thin;
 //   - tx collapsed: not excluded, kernel tx known, unsent at least
 //     SendBacklogByteCount, acked bytes advancing below thin;
 //   - clean: not excluded, demand, and a direction at or above thin;
@@ -506,8 +520,9 @@ type h1PathDecision struct {
 // collapsed ring, so it is evaluated again after ConvictTicks more collapsed
 // ticks against a loss window that kept its history.
 //
-// The monitor counts Ticks, the conviction counters, SuppressedLossDenied and
-// ConnectionsDormant when a tick makes it dormant. Not safe for concurrent use.
+// The monitor counts Ticks, RxAckDeniedTicks, the conviction counters,
+// SuppressedLossDenied and ConnectionsDormant when a tick makes it dormant.
+// Not safe for concurrent use.
 type h1PathMonitor struct {
 	settings *H1PathRerollSettings
 	stats    *h1PathStats
@@ -517,6 +532,9 @@ type h1PathMonitor struct {
 	primed  bool
 	dormant bool
 	prev    h1PathSample
+	// the latest ack round trip and when it was read
+	ackRtt     time.Duration
+	ackRttTime time.Time
 
 	rxCollapsedRing uint16
 	txCollapsedRing uint16
@@ -576,6 +594,10 @@ func (self *h1PathMonitor) tick(sample h1PathSample) h1PathDecision {
 	if self.dormant {
 		return h1PathDecision{dormant: true}
 	}
+	if 0 < sample.ackRttSamples {
+		self.ackRtt = sample.ackRtt
+		self.ackRttTime = sample.now
+	}
 	pathRtt := self.pathRtt(&sample)
 	if pathRtt < settings.MinPathRtt {
 		// a short path never re-rolls, and stops costing ticks
@@ -621,10 +643,27 @@ func (self *h1PathMonitor) tick(sample h1PathSample) h1PathDecision {
 	)
 	queueDelayKnown := 0 < sample.queueDelaySamples &&
 		settings.MinTickPackSamples <= sample.queueDelaySamples
+	// The queue delay is read against the sender's clock, so a backward step of
+	// that clock reads exactly like a standing queue and nothing in the pack
+	// tags can tell the two apart. The ack echo carries our own send time, and
+	// an ack rides the same route as the packs, so a queue that holds the packs
+	// holds the acks with it: the measured collapse runs an ack round trip of
+	// 6-10 s against a 101 ms path. A fresh ack round trip with no queue in it
+	// therefore denies the tick; a tick with no recent ack says nothing either
+	// way and the queue delay stands alone.
+	ackQueueKnown := 0 < settings.AckEvidenceWindow &&
+		!self.ackRttTime.IsZero() &&
+		sample.now.Sub(self.ackRttTime) <= settings.AckEvidenceWindow
+	ackQueue := self.ackRtt - pathRtt
+	rxQueued := queueDelayKnown &&
+		queueDelayThreshold <= sample.queueDelay &&
+		(!ackQueueKnown || queueDelayThreshold <= ackQueue)
+	if queueDelayKnown && !rxQueued && ackQueueKnown && queueDelayThreshold <= sample.queueDelay {
+		self.stats.RxAckDeniedTicks.Add(1)
+	}
 	rxCollapsed := !excluded &&
 		rxDemand &&
-		queueDelayKnown &&
-		queueDelayThreshold <= sample.queueDelay &&
+		rxQueued &&
 		rxByteRate < rxThinByteRate
 	rxClean := !excluded && rxDemand && rxThinByteRate <= rxByteRate
 
@@ -662,6 +701,8 @@ func (self *h1PathMonitor) tick(sample h1PathSample) h1PathDecision {
 		clean:           rxClean || txClean,
 		queueDelay:      sample.queueDelay,
 		queueDelayKnown: queueDelayKnown,
+		ackQueue:        ackQueue,
+		ackQueueKnown:   ackQueueKnown,
 		byteRate:        rxByteRate,
 		thinByteRate:    rxThinByteRate,
 		pathRtt:         pathRtt,
@@ -994,6 +1035,7 @@ type h1PathStats struct {
 	ConnectionsDormant          atomic.Uint64
 	KernelUnavailable           atomic.Uint64
 	Ticks                       atomic.Uint64
+	RxAckDeniedTicks            atomic.Uint64
 	RxConvictions               atomic.Uint64
 	TxConvictions               atomic.Uint64
 	ConfirmedConvictions        atomic.Uint64
@@ -1055,6 +1097,7 @@ type H1PathRerollStatsSnapshot struct {
 	ConnectionsDormant          uint64
 	KernelUnavailable           uint64
 	Ticks                       uint64
+	RxAckDeniedTicks            uint64
 	RxConvictions               uint64
 	TxConvictions               uint64
 	ConfirmedConvictions        uint64
@@ -1082,6 +1125,7 @@ func (self *h1PathStats) snapshot() H1PathRerollStatsSnapshot {
 		ConnectionsDormant:          self.ConnectionsDormant.Load(),
 		KernelUnavailable:           self.KernelUnavailable.Load(),
 		Ticks:                       self.Ticks.Load(),
+		RxAckDeniedTicks:            self.RxAckDeniedTicks.Load(),
 		RxConvictions:               self.RxConvictions.Load(),
 		TxConvictions:               self.TxConvictions.Load(),
 		ConfirmedConvictions:        self.ConfirmedConvictions.Load(),

@@ -38,7 +38,9 @@ type h1PathTickShape struct {
 	// zero keeps the 105 ms default; negative leaves the kernel value unknown
 	minRtt    time.Duration
 	ackRttMin time.Duration
-	mss       int
+	// the tick's own ack echo round trip; zero leaves the tick without an ack
+	ackRtt time.Duration
+	mss    int
 }
 
 // Feeds the monitor the shape at each tick index and returns every decision.
@@ -80,6 +82,11 @@ func runH1PathMonitorShape(
 		sample.speedTestActive = tickShape.speedTestActive
 		sample.standingDown = tickShape.standingDown
 		sample.ackRttMin = tickShape.ackRttMin
+		sample.ackRtt = tickShape.ackRtt
+		sample.ackRttSamples = 0
+		if 0 < tickShape.ackRtt {
+			sample.ackRttSamples = 1
+		}
 		switch {
 		case tickShape.minRtt < 0 || tickShape.kernelUnknown:
 			sample.minRtt = 0
@@ -1243,5 +1250,205 @@ func TestH1PathSessionLongCollapseStaysVisible(t *testing.T) {
 			"the last of %d convictions was %s into a %s collapse, want one in the last quarter of the session",
 			convictions, lastConviction, sessionDuration,
 		)
+	}
+}
+
+// The queue delay is read against the sender's clock, and nothing in a pack
+// tag separates a standing queue from a sender whose clock stepped back: both
+// add a constant to every rel. The ack echo carries our own send time and
+// rides the same route as the packs, so a queue that holds the packs holds the
+// acks with it. A fresh ack round trip with no queue in it is therefore the
+// receive rule's only defence against a clock step, and the rule falls back to
+// the queue delay alone when no ack was read.
+func TestH1PathMonitorRequiresTheAckRoundTripToCorroborateAQueue(t *testing.T) {
+	// 18 Mb/s under a thin rate of 3.53 MB/s, ordinary wi-fi reordering, and a
+	// 2 s queue delay: every other input of a receive conviction
+	slowLink := func(ackRtt time.Duration) func(k int) h1PathTickShape {
+		return func(k int) h1PathTickShape {
+			return h1PathTickShape{
+				rxByteRate:        2_250_000,
+				queueDelay:        2 * time.Second,
+				queueDelaySamples: 4,
+				rxOooAdvance:      true,
+				ackRtt:            ackRtt,
+			}
+		}
+	}
+	for _, c := range []struct {
+		name     string
+		ackRtt   time.Duration
+		convicts bool
+	}{
+		{name: "the ack round trip holds no queue", ackRtt: 110 * time.Millisecond},
+		{name: "the ack round trip holds the same queue", ackRtt: 2100 * time.Millisecond, convicts: true},
+		{name: "no ack was read on the route", convicts: true},
+	} {
+		settings := DefaultH1PathRerollSettings()
+		monitor, stats := newH1PathTestMonitor(t, &settings, 105*time.Millisecond)
+		decisions := runH1PathMonitorShape(monitor, 60, slowLink(c.ackRtt))
+		ticks := h1PathConvictionTicks(decisions)
+		if c.convicts != (0 < len(ticks)) {
+			t.Errorf("%s: conviction ticks = %v, want convictions %t", c.name, ticks, c.convicts)
+		}
+		if denied := stats.RxAckDeniedTicks.Load(); c.convicts == (0 < denied) {
+			t.Errorf("%s: %d ticks denied by the ack round trip", c.name, denied)
+		}
+	}
+
+	// the window: an ack is evidence for AckEvidenceWindow, so a route that
+	// carries one every 3 s never escapes it, and one that carries an ack every
+	// 15 s leaves whole windows with nothing to read
+	for _, c := range []struct {
+		name     string
+		ackEvery int
+		convicts bool
+	}{
+		{name: "an ack every 3 s", ackEvery: 6},
+		{name: "an ack every 15 s", ackEvery: 30, convicts: true},
+	} {
+		settings := DefaultH1PathRerollSettings()
+		monitor, _ := newH1PathTestMonitor(t, &settings, 105*time.Millisecond)
+		decisions := runH1PathMonitorShape(monitor, 60, func(k int) h1PathTickShape {
+			shape := slowLink(0)(k)
+			if k%c.ackEvery == 0 {
+				shape.ackRtt = 110 * time.Millisecond
+			}
+			return shape
+		})
+		if ticks := h1PathConvictionTicks(decisions); c.convicts != (0 < len(ticks)) {
+			t.Errorf("%s: conviction ticks = %v, want convictions %t", c.name, ticks, c.convicts)
+		}
+	}
+}
+
+// One tick of a connection driven through the real observer into the real
+// monitor: packs whose tags sit rel behind the read, an ack whose echo sits
+// ackRtt behind it, and the bytes the connection delivered.
+type h1PathObserverTickShape struct {
+	rel        time.Duration
+	ackRtt     time.Duration
+	rxByteRate float64
+}
+
+// Feeds the shape at each 500 ms tick from the test origin. Out-of-order data
+// advances every tick, so the loss evidence is never what decides.
+func runH1PathObserverMonitorShape(
+	t *testing.T,
+	settings *H1PathRerollSettings,
+	duration time.Duration,
+	shape func(elapsed time.Duration) h1PathObserverTickShape,
+) ([]h1PathDecision, *h1PathStats) {
+	t.Helper()
+	baseline := newH1QueueDelayBaseline(settings)
+	observer := newH1RouteObserver(baseline, 1)
+	monitor, stats := newH1PathTestMonitor(t, settings, 105*time.Millisecond)
+	sourceId := NewId()
+	sample := h1PathSample{
+		rxBytesKnown: true,
+		rxOooKnown:   true,
+		minRtt:       105 * time.Millisecond,
+		rcvMss:       1448,
+		sndMss:       1448,
+	}
+	decisions := []h1PathDecision{}
+	for k := 1; k <= int(duration/h1PathTestStep); k += 1 {
+		now := h1PathTestOrigin.Add(time.Duration(k) * h1PathTestStep)
+		tickShape := shape(now.Sub(h1PathTestOrigin))
+		for i := 0; i < 4; i += 1 {
+			observer.observePack(sourceId, h1ObserverTestTagMs(now.Add(-tickShape.rel)), now)
+		}
+		if 0 < tickShape.ackRtt {
+			observer.observeAck(h1ObserverTestTagMs(now.Add(-tickShape.ackRtt)), now)
+		}
+		tick := observer.takeTick(now)
+
+		byteCount := uint64(tickShape.rxByteRate * h1PathTestStep.Seconds())
+		sample.now = now
+		sample.readMessageCount += 1 + byteCount/(16*1024)
+		sample.writeMessageCount += 1
+		sample.readByteCount += byteCount
+		sample.rxBytes = sample.readByteCount
+		sample.rxOoo += 3
+		sample.queueDelay = 0
+		sample.queueDelaySamples = 0
+		if tick.known {
+			sample.queueDelay = tick.queueDelay
+			sample.queueDelaySamples = tick.samples
+		}
+		sample.ackRttMin = tick.ackRttMin
+		sample.ackRtt = tick.ackRtt
+		sample.ackRttSamples = tick.ackSamples
+		decisions = append(decisions, monitor.tick(sample))
+	}
+	return decisions, stats
+}
+
+// A provider phone that acquires network time can step its clock back by
+// seconds. Every pack it sends then reads that much late, for as long as the
+// baseline holds the pre-step floor, which with the floor's rise rate is
+// minutes. The client's own clock never moved, so nothing in checkClockStep
+// fires; the ack round trip is what keeps the healthy link it is sharing off
+// the rule, and it still lets the real collapse through.
+func TestH1PathSenderClockStepDoesNotConvictASlowLink(t *testing.T) {
+	const transit = 200 * time.Millisecond
+	settings := DefaultH1PathRerollSettings()
+
+	// 18 Mb/s of wi-fi, no queue of its own, and a 2 s backward step at 60 s
+	decisions, stats := runH1PathObserverMonitorShape(t, &settings, 5*time.Minute,
+		func(elapsed time.Duration) h1PathObserverTickShape {
+			rel := transit
+			if time.Minute <= elapsed {
+				rel += 2 * time.Second
+			}
+			return h1PathObserverTickShape{
+				rel:        rel,
+				ackRtt:     110 * time.Millisecond,
+				rxByteRate: 2_250_000,
+			}
+		})
+	if ticks := h1PathConvictionTicks(decisions); len(ticks) != 0 {
+		t.Errorf("a 2 s backward clock step on the sender convicted at ticks %v", ticks)
+	}
+	if denied := stats.RxAckDeniedTicks.Load(); denied < 400 {
+		t.Errorf("%d ticks denied by the ack round trip, want the step's ticks denied there", denied)
+	}
+
+	// without the check, which is where this rule stood before, the same step
+	// convicts a healthy link and in Act re-dials it
+	unchecked := settings
+	unchecked.AckEvidenceWindow = 0
+	decisions, _ = runH1PathObserverMonitorShape(t, &unchecked, 5*time.Minute,
+		func(elapsed time.Duration) h1PathObserverTickShape {
+			rel := transit
+			if time.Minute <= elapsed {
+				rel += 2 * time.Second
+			}
+			return h1PathObserverTickShape{
+				rel:        rel,
+				ackRtt:     110 * time.Millisecond,
+				rxByteRate: 2_250_000,
+			}
+		})
+	if ticks := h1PathConvictionTicks(decisions); len(ticks) == 0 {
+		t.Error("with the ack check off the clock step did not convict, so the arms above prove nothing")
+	}
+
+	// the measured collapse: 0.5 MB/s behind a 6 s queue that the ack round
+	// trip carries too
+	decisions, _ = runH1PathObserverMonitorShape(t, &settings, 5*time.Minute,
+		func(elapsed time.Duration) h1PathObserverTickShape {
+			shape := h1PathObserverTickShape{
+				rel:        transit,
+				ackRtt:     105 * time.Millisecond,
+				rxByteRate: 500_000,
+			}
+			if 5*time.Second <= elapsed {
+				shape.rel += 6 * time.Second
+				shape.ackRtt = 6100 * time.Millisecond
+			}
+			return shape
+		})
+	if ticks := h1PathConvictionTicks(decisions); len(ticks) == 0 {
+		t.Error("the measured collapse was not convicted")
 	}
 }

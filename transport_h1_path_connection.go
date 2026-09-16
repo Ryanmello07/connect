@@ -366,6 +366,8 @@ func (self *h1PathConnection) tick(now time.Time) h1PathDecision {
 			sample.queueDelaySamples = observerTick.samples
 		}
 		sample.ackRttMin = observerTick.ackRttMin
+		sample.ackRtt = observerTick.ackRtt
+		sample.ackRttSamples = observerTick.ackSamples
 		if self.rawConn != nil {
 			var kernelSample h1PathKernelSample
 			if h1PathReadKernel(self.rawConn, &kernelSample) {
@@ -488,14 +490,19 @@ func (self *h1PathConnection) logVerdict(now time.Time, decision *h1PathDecision
 	if decision.queueDelayKnown {
 		queueDelay = decision.queueDelay.String()
 	}
+	ackQueue := "unknown"
+	if decision.ackQueueKnown {
+		ackQueue = decision.ackQueue.String()
+	}
 	self.transport.log.Infof(
-		"[t]h1 path %s dir=%s confidence=%s ticks=%d/%d qd=%s rate=%s thin=%s rtt=%s loss=%d/%d kernel=%t port=%d mode=%s source=%s observe_only=%t action=%s reason=%s\n",
+		"[t]h1 path %s dir=%s confidence=%s ticks=%d/%d qd=%s ack_queue=%s rate=%s thin=%s rtt=%s loss=%d/%d kernel=%t port=%d mode=%s source=%s observe_only=%t action=%s reason=%s\n",
 		verdict,
 		decision.direction,
 		decision.confidence,
 		decision.collapsedTicks,
 		self.settings.WindowTicks,
 		queueDelay,
+		ackQueue,
 		h1PathBitRateString(decision.byteRate),
 		h1PathBitRateString(decision.thinByteRate),
 		decision.pathRtt,
@@ -513,7 +520,7 @@ func (self *h1PathConnection) logVerdict(now time.Time, decision *h1PathDecision
 
 func (self *h1PathConnection) logTick(sample *h1PathSample, decision *h1PathDecision) {
 	self.transport.log.Infof(
-		"[t]h1path tick connection=%d read=%d write=%d read_bytes=%d receive_full=%d speed_test=%t standing_down=%t qd=%s qd_samples=%d ack_rtt=%s rx_bytes=%t/%d rx_ooo=%t/%d tx=%t acked=%d retrans=%d not_sent=%d min_rtt=%s mss=%d/%d dormant=%t clean=%t convicted=%t dir=%s confidence=%s action=%s reason=%s collapsed=%d rate=%s thin=%s rtt=%s\n",
+		"[t]h1path tick connection=%d read=%d write=%d read_bytes=%d receive_full=%d speed_test=%t standing_down=%t qd=%s qd_samples=%d ack_rtt_min=%s ack_rtt=%s/%d rx_bytes=%t/%d rx_ooo=%t/%d tx=%t acked=%d retrans=%d not_sent=%d min_rtt=%s mss=%d/%d dormant=%t clean=%t convicted=%t dir=%s confidence=%s action=%s reason=%s collapsed=%d rate=%s thin=%s rtt=%s\n",
 		self.ordinal,
 		sample.readMessageCount,
 		sample.writeMessageCount,
@@ -524,6 +531,8 @@ func (self *h1PathConnection) logTick(sample *h1PathSample, decision *h1PathDeci
 		sample.queueDelay,
 		sample.queueDelaySamples,
 		sample.ackRttMin,
+		sample.ackRtt,
+		sample.ackRttSamples,
 		sample.rxBytesKnown,
 		sample.rxBytes,
 		sample.rxOooKnown,

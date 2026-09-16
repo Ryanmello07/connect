@@ -19,7 +19,9 @@ import (
 //
 // An ack's tag echoes our own send time, so readMs - tag is an ack round trip
 // on our clock alone. Its minimum over AckRttWindow is a path round trip that
-// needs no kernel counters.
+// needs no kernel counters, and a tick's own minimum is that tick's round trip:
+// the acks share the route with the packs, so the same queue is in both, and
+// the ack side of it is measured without the sender's clock.
 //
 // `h1RouteObserver` is published on one receive route through
 // TransferCarrierProperties and fed by Client.run, which samples one frame in
@@ -361,6 +363,10 @@ type h1ObserverTick struct {
 	stale int
 	// the minimum ack round trip over AckRttWindow; zero is unknown
 	ackRttMin time.Duration
+	// the minimum ack round trip of this tick's own acks, valid when
+	// ackSamples is positive: the same queue as the packs, on our own clock
+	ackRtt     time.Duration
+	ackSamples int
 	// at least one fresh sample, and no wall clock step during the tick
 	known bool
 }
@@ -522,6 +528,10 @@ func (self *h1RouteObserver) takeTick(now time.Time) h1ObserverTick {
 	tick := h1ObserverTick{
 		stale:     staleCount,
 		ackRttMin: self.baseline.ackRttMin(now),
+	}
+	if 0 < ackCount {
+		tick.ackRtt = time.Duration(ackMinMs) * time.Millisecond
+		tick.ackSamples = ackCount
 	}
 	for i := range slots {
 		slot := &slots[i]
