@@ -276,9 +276,9 @@ func TestPathsimS6InnerSegmentLossIsNotRetransmittedByTheProvider(t *testing.T) 
 // device's receive callback, which is the tun write: Transfer has delivered
 // the packet and acknowledged it to the provider by the time the packet is
 // dropped, so the drop is below Transfer's reliability boundary and nothing in
-// the transfer layer can see it. That is the rig's measurement - on physical
+// the transfer layer can see it. That is the rig's measurement — on physical
 // hosts at about 800 Mb/s one run in five loses a segment on the device's
-// receive socket - and every arm below asserts the transfer layer resent
+// receive socket — and every arm below asserts the transfer layer resent
 // nothing, which is what makes the inner repair the only repair there is.
 //
 // The arms are the fix off and on over the same path and the same drops, plus
@@ -287,18 +287,19 @@ func TestPathsimS6InnerSegmentLossIsNotRetransmittedByTheProvider(t *testing.T) 
 // acknowledgement for the tail, and acknowledges at once whenever its
 // out-of-order queue is not empty; nothing here negotiates selective
 // acknowledgement, on either side, so the duplicate acknowledgements are all
-// the provider has to go on. Its window is its free receive buffer, so the
-// queue behind a hole closes it, which is what stops the download rather than
-// any decision of the provider's.
+// the provider has to go on. Its window is its free receive buffer behind a
+// right edge that never moves left, which is what makes those
+// acknowledgements duplicates and what stops the download; the last paragraph
+// below is why that rule matters here.
 //
 // Produced (fast tier, a 50 ms round trip over one 1 Gb/s relay hop, a 64 KiB
 // device buffer, a 1 MiB origin in 1,005 segments of 1,060 bytes):
 //
 //	arm                delivered  exact   repair     done  retx  loss   maxooo      ooo
-//	off/one loss            7KiB     no        -        -     0     1    63415    63415
+//	off/one loss            7KiB     no        —        —     0     1    63415    63415
 //	on/one loss          1024KiB    yes   50.0ms  866.1ms     1     1    63415        0
 //	on/four losses       1024KiB    yes   50.0ms    1.06s     5     4    64475        0
-//	on/no loss           1024KiB    yes        -  825.5ms     0     0        0        0
+//	on/no loss           1024KiB    yes        —  825.5ms     0     0        0        0
 //
 // With the repair off the flow wedges exactly as the rig's did: the device
 // answers every later segment with a duplicate acknowledgement, the provider
@@ -307,7 +308,7 @@ func TestPathsimS6InnerSegmentLossIsNotRetransmittedByTheProvider(t *testing.T) 
 // buffer held out of order behind one missing segment for the rest of the run.
 // Nothing repairs it: the device is never handed a segment twice. The transfer
 // layer's one timeout resend in that arm, after two seconds of silence on a
-// route with a retained item, is not a repair - the receive sequence already
+// route with a retained item, is not a repair — the receive sequence already
 // holds that item, and the device's kernel is handed nothing by it.
 //
 // With the repair on the same drop costs one retransmission and exactly one
@@ -322,7 +323,7 @@ func TestPathsimS6InnerSegmentLossIsNotRetransmittedByTheProvider(t *testing.T) 
 // The device's window is the reason the wedge looks the way it does. Its
 // receiver never moves its right edge left (RFC 1122 §4.2.2.16), so while the
 // frontier is stuck every acknowledgement repeats the same number and the same
-// window - true duplicates, which is what fast retransmit needs - and the
+// window — true duplicates, which is what fast retransmit needs — and the
 // provider stops at that frozen edge rather than at any decision of its own.
 // A model that shrank the advertised window as the queue filled made every
 // duplicate a window update instead, and the hole then waited for the
@@ -436,6 +437,12 @@ func (self *pathInnerKernel) windowWithLock() int {
 		self.rcvRightEdge = edge
 	}
 	return int(self.rcvRightEdge - self.rcvNxt)
+}
+
+// The same window, read without moving the edge, for a reading taken between
+// acknowledgements. The lock must be held.
+func (self *pathInnerKernel) advertisedWindowWithLock() int {
+	return max(int(self.rcvRightEdge-self.rcvNxt), max(0, pathInnerClientWindow-self.oooByteCount))
 }
 
 // Builds one packet toward the provider. The lock must be held.
@@ -609,6 +616,18 @@ type pathInnerKernelSnapshot struct {
 	completeAt      time.Time
 }
 
+// Stops the delayed acknowledgement timer, so nothing is armed when the arm
+// tears down.
+func (self *pathInnerKernel) stop() {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.delayedAckTimer != nil {
+		self.delayedAckTimer.Stop()
+		self.delayedAckTimer = nil
+	}
+	self.inOrderPending = 0
+}
+
 func (self *pathInnerKernel) snapshot() pathInnerKernelSnapshot {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -619,10 +638,12 @@ func (self *pathInnerKernel) snapshot() pathInnerKernelSnapshot {
 		lossCount:       self.lossCount,
 		maxOooByteCount: self.maxOooByteCount,
 		oooByteCount:    self.oooByteCount,
-		window:          self.windowWithLock(),
-		firstLossAt:     self.firstLossAt,
-		firstHoleFixed:  self.firstHoleFixed,
-		completeAt:      self.completeAt,
+		// read, not advanced: the edge moves when an acknowledgement carries
+		// it
+		window:         self.advertisedWindowWithLock(),
+		firstLossAt:    self.firstLossAt,
+		firstHoleFixed: self.firstHoleFixed,
+		completeAt:     self.completeAt,
 	}
 }
 
@@ -893,6 +914,7 @@ func runPathInnerArm(t *testing.T, arm pathInnerArm) pathInnerResult {
 		result.transferTimeoutResends = recovery.TimeoutResendWriteCount
 
 		// the measurement ends here; what the teardown writes is not counted
+		kernel.stop()
 		carrier.frozen.Store(true)
 		originSocket.Close()
 		<-originDone
