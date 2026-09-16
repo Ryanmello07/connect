@@ -1061,6 +1061,12 @@ func TestH1PathMonitorNeverConvictsASaturatedUplink(t *testing.T) {
 			shape: uplink(2_500_000, 505_000, 101*time.Millisecond),
 		},
 		{
+			// the floor: a trickle upload's whole send queue is small, however
+			// long that queue takes to drain
+			name:  "80 kb/s upload, 30 kB unsent",
+			shape: uplink(10_000, 30_000, 101*time.Millisecond),
+		},
+		{
 			// 4 MiB takes 1.68 s to drain, past the 1.01 s threshold
 			name:     "20 Mb/s uplink, 4 MiB unsent",
 			shape:    uplink(2_500_000, 4*1024*1024, 101*time.Millisecond),
