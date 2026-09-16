@@ -460,6 +460,9 @@ func (self *h1PathConnection) tick(now time.Time) h1PathDecision {
 			sample.queueDelay = observerTick.queueDelay
 			sample.queueDelaySamples = observerTick.samples
 		}
+		// the packs the tick could read nothing from; the monitor counts them
+		sample.stalePacks = observerTick.stale
+		sample.unslottedPacks = observerTick.unslotted
 		sample.ackRttMin = observerTick.ackRttMin
 		sample.ackRtt = observerTick.ackRtt
 		sample.ackRttSamples = observerTick.ackSamples

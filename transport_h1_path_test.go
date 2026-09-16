@@ -2106,6 +2106,84 @@ func TestH1PathMonitorConvictsACollapseStandingAtTheFirstSample(t *testing.T) {
 	}
 }
 
+// The observer's two discard counts reach the process counters. Without them
+// the sticky slot rule's one blind spot -- a source that goes quiet for a whole
+// baseline window, loses its slot, and comes back to take its own standing
+// queue for a floor -- cannot be seen from an Observe rollout at all, and
+// neither can a re-roll whose replacement is still being handed the retired
+// connection's tags.
+func TestH1PathMonitorCountsThePacksTheObserverCouldNotRead(t *testing.T) {
+	settings := DefaultH1PathRerollSettings()
+	baseline := newH1QueueDelayBaseline(&settings)
+	observer := newH1RouteObserver(baseline, 1)
+	monitor, stats := newH1PathTestMonitor(t, &settings, 105*time.Millisecond)
+	sample := h1PathSample{
+		rxBytesKnown: true,
+		rxOooKnown:   true,
+		minRtt:       105 * time.Millisecond,
+		rcvMss:       1448,
+		sndMss:       1448,
+	}
+	feed := func(k int, tick h1ObserverTick) {
+		sample.now = h1PathTestOrigin.Add(time.Duration(k) * h1PathTestStep)
+		sample.readMessageCount += 16
+		sample.writeMessageCount += 1
+		sample.readByteCount += uint64(700_000 * h1PathTestStep.Seconds())
+		sample.rxBytes = sample.readByteCount
+		sample.queueDelay = tick.queueDelay
+		sample.queueDelaySamples = 0
+		if tick.known {
+			sample.queueDelaySamples = tick.samples
+		}
+		sample.stalePacks = tick.stale
+		sample.unslottedPacks = tick.unslotted
+		monitor.tick(sample)
+	}
+
+	// one source establishes a baseline, then a re-roll mark makes its older
+	// tags stale
+	sourceId := NewId()
+	start := h1PathTestOrigin
+	for i := 0; i < 4; i += 1 {
+		observer.observePack(sourceId, h1ObserverTestTagMs(start.Add(-200*time.Millisecond)), start)
+	}
+	feed(0, observer.takeTick(start))
+
+	rerollTime := start.Add(h1PathTestStep)
+	baseline.markReroll(rerollTime, 105*time.Millisecond)
+	afterReroll := rerollTime.Add(h1PathTestStep)
+	for i := 0; i < 3; i += 1 {
+		observer.observePack(sourceId, h1ObserverTestTagMs(rerollTime.Add(-time.Second)), afterReroll)
+	}
+	staleTick := observer.takeTick(afterReroll)
+	if staleTick.stale != 3 {
+		t.Fatalf("observer tick = %+v, want 3 stale packs", staleTick)
+	}
+	feed(2, staleTick)
+
+	// and more sources than the baseline holds slots for: the ones it refuses
+	// read nothing
+	unslottedTime := afterReroll.Add(h1PathTestStep)
+	for i := 0; i < 2*h1QueueDelaySourceCount; i += 1 {
+		other := NewId()
+		observer.observePack(other, h1ObserverTestTagMs(unslottedTime.Add(-200*time.Millisecond)), unslottedTime)
+		observer.observePack(other, h1ObserverTestTagMs(unslottedTime.Add(-200*time.Millisecond)), unslottedTime)
+	}
+	unslottedTick := observer.takeTick(unslottedTime)
+	if unslottedTick.unslotted == 0 {
+		t.Fatalf("observer tick = %+v, want packs of sources with no slot", unslottedTick)
+	}
+	feed(3, unslottedTick)
+
+	snapshot := stats.snapshot()
+	if snapshot.PacksStale != 3 {
+		t.Errorf("stats = %+v, want the 3 stale packs counted", snapshot)
+	}
+	if snapshot.PacksUnslotted != uint64(unslottedTick.unslotted) {
+		t.Errorf("stats = %+v, want %d unslotted packs counted", snapshot, unslottedTick.unslotted)
+	}
+}
+
 // The scope limit behind the test above, stated where it can fail. The pack
 // tags measure a queue against what the source has already shown, so a queue
 // that was standing when the source's floor was set is inside the floor and

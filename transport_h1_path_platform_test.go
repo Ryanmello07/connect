@@ -43,7 +43,13 @@ const (
 	// the same collapse on a route whose peer answers over another transport,
 	// so the queue stands on the sender's clock alone: unconfirmed
 	testingH1PathCollapsedNoAck testingH1PathClass = 3
+	// no queue at a rate under thin, which is what most sessions run at
+	testingH1PathHealthyThin testingH1PathClass = 4
 )
+
+// A rate with no queue under it that is still an order below thin: 5.6 Mb/s
+// against a thin rate of 28 Mb/s on the rig's 105 ms path.
+const testingH1PathHealthyThinByteRate = 700 * 1000
 
 type testingH1PathRig struct {
 	stats  *h1PathStats
@@ -137,8 +143,12 @@ func (self *testingH1PathRig) hooks() *h1PathTestHooks {
 					sample.ackRtt = testingH1PathRtt + 5*time.Second
 					sample.ackRttSamples = 4
 				}
-			case testingH1PathHealthy:
-				sample.rxBytes = uint64(seconds * testingH1PathHealthyByteRate)
+			case testingH1PathHealthy, testingH1PathHealthyThin:
+				byteRate := float64(testingH1PathHealthyByteRate)
+				if class == testingH1PathHealthyThin {
+					byteRate = testingH1PathHealthyThinByteRate
+				}
+				sample.rxBytes = uint64(seconds * byteRate)
 				sample.queueDelay = 0
 				sample.rxOoo = 0
 				sample.ackRttMin = testingH1PathRtt
@@ -1453,6 +1463,46 @@ func TestPlatformTransportH1PathImprovementClearsPending(t *testing.T) {
 		}
 		if !transport.IsConnected() {
 			t.Fatal("the improved replacement is not connected")
+		}
+	})
+}
+
+// A re-roll resolves as improved when the replacement stops collapsing, not
+// when it reaches the thin rate. Thin is 28 Mb/s on this path, so a rate bar
+// would leave the credit -- and the unconfirmed budget an improvement returns
+// -- unreachable for a session running at 5.6 Mb/s, which is the rate most
+// sessions run at and the whole bottom of the population the feature is for.
+func TestPlatformTransportH1PathImprovementAtARealUserRate(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		platform := newTestingPlatformServerIpVersion(t, ipVersion)
+		rig := newTestingH1PathRig(func(connectionOrdinal int, tickIndex int) testingH1PathClass {
+			if connectionOrdinal == 0 {
+				return testingH1PathCollapsed
+			}
+			return testingH1PathHealthyThin
+		})
+		settings := testingH1PathTransportSettings(H1PathRerollModeAct, rig)
+		testingPlatformTransport(t, ctx, platform.url, settings)
+
+		if !waitForCondition(15*time.Second, func() bool {
+			return rig.stats.Improved.Load() == 1
+		}) {
+			t.Fatalf("stats = %+v, want the re-roll improved at a rate under thin", rig.stats.snapshot())
+		}
+		testingH1PathRequireRerolled(t, rig, 0)
+		for _, decision := range rig.connectionDecisions(1) {
+			if decision.convicted {
+				t.Fatalf("the replacement convicted: %+v", decision)
+			}
+			if decision.clean && decision.thinByteRate <= decision.byteRate {
+				t.Fatalf("the replacement cleared the thin rate, so this test proves nothing: %+v", decision)
+			}
+		}
+		if state := testingH1PathLedgerSnapshot(rig.ledger); state.pendingCount != 0 || state.epochUnimproved != 0 {
+			t.Fatalf("ledger = %+v, want no pending re-roll", state)
 		}
 	})
 }

@@ -541,6 +541,11 @@ type h1PathSample struct {
 	// least MinTickPackSamples samples
 	queueDelay        time.Duration
 	queueDelaySamples int
+	// sampled packs the observer could not read a queue from: a tag older than
+	// the route's latest re-roll mark, and a source the baseline holds no slot
+	// for
+	stalePacks     int
+	unslottedPacks int
 	// the minimum ack echo round trip over AckRttWindow; zero is unknown
 	ackRttMin time.Duration
 	// the ack echo round trip of this tick, valid when ackRttSamples is
@@ -690,8 +695,11 @@ type h1PathDecision struct {
 //     by our own uplink, makes it no evidence either way;
 //   - tx collapsed: not excluded, a backlogged send queue, acked bytes
 //     advancing below thin;
-//   - clean: demand, a direction at or above thin, and no tick whose bytes
-//     were not counted (the speed test echo, a stand down);
+//   - clean, which is what resolves a re-roll as improved: demand and a
+//     direction at or above thin, or demand and no direction collapsed on a
+//     tick our own consumer did not pace. The second reading is what makes the
+//     credit reachable at the rates sessions actually run at; neither counts a
+//     tick whose bytes were not counted (the speed test echo, a stand down);
 //   - excluded from collapsing, for both directions: the receive channel was
 //     full, the speed test echo is active, or the transport is standing down
 //     H1;
@@ -715,9 +723,10 @@ type h1PathDecision struct {
 // TicksAckUnknown for the ones with no fresh ack round trip to judge,
 // TicksAckBacklogged for the ones whose ack our own send queue took away, and
 // TicksCollapsed for the ones a direction collapsed in. It also counts
-// RxAckDeniedTicks, the conviction counters, SuppressedLossDenied and
-// ConnectionsDormant when a tick makes it dormant. Not safe for concurrent
-// use.
+// PacksStale and PacksUnslotted, the sampled packs of an accepted tick that
+// read nothing, RxAckDeniedTicks, the conviction counters,
+// SuppressedLossDenied and ConnectionsDormant when a tick makes it dormant.
+// Not safe for concurrent use.
 type h1PathMonitor struct {
 	settings *H1PathRerollSettings
 	stats    *h1PathStats
@@ -916,6 +925,18 @@ func (self *h1PathMonitor) tick(sample h1PathSample) h1PathDecision {
 	if !queueDelayKnown {
 		self.stats.TicksQueueDelayUnknown.Add(1)
 	}
+	// The two ways a sampled pack reaches the observer and reads nothing. The
+	// sticky slot rule leaves one blind spot -- a source that goes quiet for a
+	// whole baseline window loses its slot, and the source that takes it reads
+	// its own standing queue as its floor -- and unslotted packs are the only
+	// sign of it from outside. Stale packs say the same about a re-roll whose
+	// replacement is still being handed the retired connection's tags.
+	if 0 < sample.stalePacks {
+		self.stats.PacksStale.Add(uint64(sample.stalePacks))
+	}
+	if 0 < sample.unslottedPacks {
+		self.stats.PacksUnslotted.Add(uint64(sample.unslottedPacks))
+	}
 	txKnown := prev.txKnown && sample.txKnown
 	txAckedByteCount := uint64(0)
 	if txKnown {
@@ -988,7 +1009,7 @@ func (self *h1PathMonitor) tick(sample h1PathSample) h1PathDecision {
 		rxDemand &&
 		rxQueued &&
 		rxByteRate < rxThinByteRate
-	rxClean := !unread && rxDemand && rxThinByteRate <= rxByteRate
+	rxCleanRate := !unread && rxDemand && rxThinByteRate <= rxByteRate
 
 	txThinByteRate := self.thinByteRate(pathRtt, sample.sndMss)
 	// a saturated uplink is always backlogged, slower than thin and
@@ -998,10 +1019,24 @@ func (self *h1PathMonitor) tick(sample h1PathSample) h1PathDecision {
 		sendBacklogged &&
 		0 < txAckedByteCount &&
 		txByteRate < txThinByteRate
-	txClean := !unread &&
-		txKnown &&
-		demandByteCount <= float64(txAckedByteCount) &&
-		txThinByteRate <= txByteRate
+	txDemand := txKnown && demandByteCount <= float64(txAckedByteCount)
+	txCleanRate := !unread && txDemand && txThinByteRate <= txByteRate
+	// What resolves a re-roll as improved, by either of two readings. A
+	// direction at or above thin is the strong one, and it survives our own
+	// back pressure, which only lowers the delivered rate: a tick that cleared
+	// thin cleared it in spite of us. The cheap one is a tick that moved real
+	// bytes and collapsed in neither direction, which is what the ledger is
+	// actually asking -- did the replacement stop doing the thing we convicted
+	// the last one for. Thin is 3.53 MB/s on a 101 ms path, so the strong
+	// reading alone puts the credit, and the unconfirmed budget an improvement
+	// returns, out of reach of every session running under 29 Mb/s: most of
+	// them, and all of the 5-140 Mb/s bad population below its own thin rate,
+	// which is the population the feature exists for. The cheap reading has to
+	// drop the ticks our own consumer paced, unlike the collapse rule, because
+	// a tick we slowed ourselves says nothing about the path either way.
+	clean := rxCleanRate ||
+		txCleanRate ||
+		(!excluded && (rxDemand || txDemand) && !rxCollapsed && !txCollapsed)
 	// An accepted tick that reached no verdict is not the same reading as a
 	// healthy one, and nothing said which it was: an Observe rollout could not
 	// tell a fleet with no collapse from one that was never able to classify a
@@ -1028,7 +1063,7 @@ func (self *h1PathMonitor) tick(sample h1PathSample) h1PathDecision {
 	self.txRetransRing = h1PathRingPush(self.txRetransRing, txKnown && prev.txRetrans < sample.txRetrans)
 
 	decision := h1PathDecision{
-		clean:           rxClean || txClean,
+		clean:           clean,
 		queueDelay:      sample.queueDelay,
 		queueDelayKnown: queueDelayKnown,
 		ackQueue:        ackQueue,
@@ -1459,6 +1494,13 @@ type h1PathStats struct {
 	// leaves unconfirmed, but kept apart so a busy uplink is not read as a peer
 	// that answers elsewhere
 	TicksAckBacklogged atomic.Uint64
+	// sampled packs of an accepted tick that read nothing: a tag older than the
+	// route's latest re-roll mark, and a source the baseline holds no slot for.
+	// The second is the only reading of the sticky slot rule's blind spot, a
+	// source that went quiet long enough to lose its slot and came back into a
+	// queue it now takes for its own floor
+	PacksStale     atomic.Uint64
+	PacksUnslotted atomic.Uint64
 	// ticks whose queue delay reached the threshold and whose fresh ack round
 	// trip did not: the sender's clock and ours disagree about the queue
 	RxAckDeniedTicks            atomic.Uint64
@@ -1537,6 +1579,8 @@ type H1PathRerollStatsSnapshot struct {
 	TicksAckUnknown             uint64
 	TicksAckBacklogged          uint64
 	TicksCollapsed              uint64
+	PacksStale                  uint64
+	PacksUnslotted              uint64
 	RxAckDeniedTicks            uint64
 	RxConvictions               uint64
 	TxConvictions               uint64
@@ -1575,6 +1619,8 @@ func (self *h1PathStats) snapshot() H1PathRerollStatsSnapshot {
 		TicksAckUnknown:             self.TicksAckUnknown.Load(),
 		TicksAckBacklogged:          self.TicksAckBacklogged.Load(),
 		TicksCollapsed:              self.TicksCollapsed.Load(),
+		PacksStale:                  self.PacksStale.Load(),
+		PacksUnslotted:              self.PacksUnslotted.Load(),
 		RxAckDeniedTicks:            self.RxAckDeniedTicks.Load(),
 		RxConvictions:               self.RxConvictions.Load(),
 		TxConvictions:               self.TxConvictions.Load(),
