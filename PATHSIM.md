@@ -2,7 +2,7 @@
 
 A deterministic, virtual-time simulation of the relay path for the transfer layer, and the scenarios that pin the
 findings of THROUGHPUT-RIG-REVIEW.md on it. Files: `pathsim_test.go` (the simulator), `pathsim_scenarios_test.go`
-(S1–S5, S7, S8), `pathsim_inner_tcp_test.go` (S6).
+(S1–S5, S7, S8), `pathsim_inner_tcp_test.go` (S6 and S9, the inner TCP cells).
 
 ## What it models
 
@@ -36,7 +36,12 @@ two compression intervals), a stall flag, and the sender's window estimate.
 - No kernel TCP on either end, no provider NAT, no origin: the load is packs of 16 KiB payload offered as fast as
   the sender admits them. Findings whose mechanism sits in the client's kernel TCP (its reaction to delay and
   reordering, its receive-window collapse) or in the provider's TCP reader do not appear here, and the scenario
-  comments say so where the rig disagrees.
+  comments say so where the rig disagrees. The inner TCP cells are the exception: S6 runs one provider
+  `TcpSequence` against an in-memory origin with no transfer layer at all, and S9 runs the provider's
+  `LocalUserNat` and its origin on one side of the carrier and a modelled device kernel on the other, so the inner
+  flow, its loss and its repair are the production code. That kernel is a model — in-order reassembly, an
+  out-of-order queue, Linux-like delayed acknowledgements, and a right window edge that never moves left — and not
+  a stack; the real tun stack is still only on the rig.
 - No websocket framing, no relay CPU, no memory pressure on the client. The relay is its queue and a rate.
 - No CPU time at all. In virtual time a frame costs nothing to build, so the simulator's own ceiling is the transfer
   layer's clocking — one window per acknowledgement compression interval — measured once per process by
@@ -99,6 +104,11 @@ instrument faults and must not appear).
    test's comment, and where the rig disagrees say so rather than bending the assertion.
 5. Gate long grids on `pathsimFull()` and use `pathOffer(fast, full)` for the offer length.
 
+The inner TCP cells (`pathsim_inner_tcp_test.go`) sit beside this rather than inside it: they measure bytes,
+counts and repair times rather than a rate, so they build their own arms (`runPathInnerArm`) and print their own
+table and digest, and the ceiling's censor rule — which is about rates — does not apply to them. They still run on
+one P inside a bubble, drain the carrier, and print a digest that three runs must agree on.
+
 ## Scenarios and findings
 
 | Scenario | Finding (THROUGHPUT-RIG-REVIEW) | Reproduces | Notes |
@@ -108,7 +118,8 @@ instrument faults and must not appear).
 | S3 `TestPathsimS3WindowRuleRegimes` | §1: the rule loses on the short path, gains at 100 ms for one flow, loses for eight | long/1 yes; short/1 as a ramp only; short/8 and long/8 no | short one flow 0.48x over a 2 s offer and 0.87x over 8 s but equal at steady state (the rig lost at steady state); 3.96x long one flow; equal at short eight; 4.12x at long eight where the rig's budgeted client read 0.62x |
 | S4 `TestPathsimS4RelayQueueOverflowVersusWindow` | §1: a larger window into the relay queue costs drops, not throughput | yes | the dropped and resent shares of the sender's writes rise 2 -> 4 -> 8 MiB on both flow counts, and the counts too at eight lanes, where the offered load is the same at every window; one flow at 4 MiB now keeps 0.94 of its rate, every drop costing exactly one gap resend under the receiver's budgeted wake (0.18 before it, the rig 0.43), and collapses at 8 MiB (0.14); the eight-lane 8 MiB arm carries a 9 s timeout-path tail, explained in the test |
 | S5 `TestPathsimS5SilentReneging` | REPORT §3.11c: the evicting receiver withdraws acknowledgements | withdrawal yes, 60 s stall no | committed-prefix withdraws none, the old policy withdraws 101 and is re-fetched by ack-tail probes; both collapse under the overrun and neither drain is asserted faster |
-| S6 `TestPathsimS6InnerSegmentLossIsNotRetransmittedByTheProvider` | §6: the provider's TCP does not retransmit, so a post-delivery loss is a permanent hole | the provider's half yes | needs a client stack under synctest and a post-delivery drop seam for the whole; neither exists yet |
+| S6 `TestPathsimS6InnerSegmentLossIsNotRetransmittedByTheProvider` | §6: without the inner repair the provider's TCP does not retransmit, so a post-delivery loss is a permanent hole | the provider's half yes | one sequence, no transfer layer, `EnableReturnRetransmit` off: the pre-fix shape, kept legible beside S9 |
+| S9 `TestPathsimS9InnerSegmentLossRepairedByTheProvider` | §6: the same loss over the whole path, with the provider's inner repair off and on | yes | the provider's nat and origin, a transfer client each side, a modelled device kernel that drops one delivered segment inside the tun write. Off: the download stops 7 KiB in with 62 KiB held out of order, nothing sent again. On: one retransmission, the hole filled in one round trip, the bytes exact. Four losses cost five retransmissions, not a storm. No arm's transfer layer resends or fills a gap, which is the finding |
 | S7 `TestPathsimS7HeavyLatencyGrid` | an instrument, not a finding | — | 50–300 ms one way x loss x rule; monotonic in delay without loss, rule above constant everywhere, loss costs everywhere |
 | S8 `TestPathsimS8MultiHop` | an instrument, not a finding | — | two and three hops with queues; no stall without loss, bounded recovery with loss |
 
