@@ -27,18 +27,27 @@ import (
 // synthetic source port), the lossy member's shape (a slow, deep, blocking
 // socket queue) and the switch (break before make: the old leg is torn down,
 // its queued bytes are lost, and a new leg for a new port starts after a dial
-// gap). Everything that decides is production code: `h1PathMonitor`,
-// `h1PathLedger`, `h1RouteObserver` (fed by the real `Client.run` sampling on
-// the receiver's route) and `newH1SourcePortPlan`.
+// gap). Everything that decides is production code, and the decision is
+// reached through the shipped path rather than a copy of it: each leg gets a
+// real `h1PathConnection`, and this file's ticker calls its `tick`, which
+// takes the observer's tick, builds the sample, reads `h1PathMonitor` and runs
+// `decide` -- the ledger, the source port rule, the stale-tag mark and the
+// action -- exactly as runH1's watcher does. A change to that ordering shows up
+// here. `h1RouteObserver` is fed by the real `Client.run` sampling on the
+// receiver's route, and a replacement port comes from `newH1SourcePortPlan`.
 //
-// What it does not model. There is no kernel TCP here, so the out-of-order
-// counter the monitor reads as loss evidence is scripted per arm rather than
-// measured, and the send-side counters are never known. There is no websocket
-// and no dial: a re-roll is a leg swap plus a fixed gap, and `RerollDials`,
-// `SourcePortBinds` and the platform transport's own reconnect path are not
-// exercised (they have their own tests in transport_h1_path_platform_test.go
-// and h1_source_port_unix_test.go). The drain handoff of the design's commit 10
-// is not implemented, so every arm here switches break before make.
+// What it does not model. There is no kernel TCP here, so the fields a socket
+// read would fill -- the out-of-order counter the monitor reads as loss
+// evidence, the delivered bytes, the round trip and the mss -- are scripted
+// through the connection's own sample hook, and the send-side counters are
+// never known. There is no websocket and no dial: a re-roll is a leg swap plus
+// a fixed gap, and `RerollDials`, `SourcePortBinds` and the platform
+// transport's own reconnect path are not exercised (they have their own tests
+// in transport_h1_path_platform_test.go and h1_source_port_unix_test.go). An
+// arm's mode and role are its scenario's: the process override and the
+// environment are not read, so a run reads the same wherever it happens. The
+// drain handoff of the design's commit 10 is not implemented, so every arm here
+// switches break before make.
 //
 // One detector setting is not the default. At 16 KiB payloads a connection
 // collapsed to 5 Mb/s carries about 39 frames a second, so the production 1-in-16
@@ -100,6 +109,19 @@ type pathRerollScenario struct {
 	// the rate a healthy connection reads, for the recovery window; zero
 	// leaves recovery unmeasured
 	HealthyRate float64
+	// When set, the receiver sends a small message upstream every interval and
+	// the sender acks it over the same legs, which is what a tunnel carrying a
+	// download does with its inner flows' acks. The receive rule then has an
+	// ack round trip of its own to read, measured on the client's own clock,
+	// and a conviction needs it to carry the same queue as the packs. Zero
+	// leaves the arm one-directional, where the queue delay stands alone.
+	ReturnInterval  time.Duration
+	ReturnByteCount int
+	// When set, the arm records what Transfer had written and resent at the
+	// first tick at or after it, which is where the collapse has stopped
+	// establishing itself: the send timeout has adapted to the standing queue
+	// and the window is full of packs the far socket is holding.
+	SteadyAfter time.Duration
 }
 
 // What one arm's re-roll produced.
@@ -125,6 +147,21 @@ type pathRerollResult struct {
 	// from the switch to the first second at 0.8 x HealthyRate; zero when the
 	// arm never switched or never recovered
 	recoveryAfterSwitch time.Duration
+	// ticks whose sample carried an ack round trip of its own, and the largest
+	// one read; zero for an arm with no return direction
+	ackTicks  int
+	maxAckRtt time.Duration
+	// the picture at the first switch: what Transfer had written and resent,
+	// and the ack round trip the collapse had reached
+	writesBeforeSwitch    uint64
+	resendsBeforeSwitch   uint64
+	maxAckRttBeforeSwitch time.Duration
+	// the same two at SteadyAfter, so what the established collapse cost
+	// Transfer is the difference
+	writesAtSteady  uint64
+	resendsAtSteady uint64
+	// messages the return direction sent upstream
+	returned int64
 }
 
 func (self *pathRerollResult) flag() string {
@@ -149,6 +186,7 @@ type pathReroll struct {
 	arm      pathArm
 	scenario *pathRerollScenario
 	carrier  *pathCarrier
+	sender   *Client
 	receiver *Client
 	meter    *pathMeter
 
@@ -156,22 +194,34 @@ type pathReroll struct {
 	stats    *h1PathStats
 	ledger   *h1PathLedger
 	baseline *h1QueueDelayBaseline
+	// the transport the production connection reads: its route manager is the
+	// ledger's key, its baseline is the one the observers share, and its mode
+	// is what standDown compares against. Nothing else of a platform transport
+	// is reachable from a monitor tick
+	transport *PlatformTransport
+	// the process counters a real connection reads, refreshed from the live
+	// leg's link controls before each tick
+	counters h1PathCounters
+	hooks    *h1PathTestHooks
 	// the kernel port model, and the far-random plan's draws
 	random *rand.Rand
 
-	// the live connection
+	// the live connection: the production h1PathConnection, ticked by this
+	// scenario in place of runH1's watcher
+	connection       *h1PathConnection
 	port             int
 	lossy            bool
+	plannedDial      bool
 	leg              *pathHopRuntime
-	observer         *h1RouteObserver
 	receiveTransport Transport
 	sendTransport    Transport
 	receiveRoute     Route
 	sendRoute        Route
-	monitor          *h1PathMonitor
 	rxOoo            uint64
-	cleanTicks       int
 	tickOrdinal      int
+
+	// messages the return direction has sent upstream
+	returned atomic.Int64
 
 	started  time.Time
 	switchAt time.Time
@@ -180,50 +230,91 @@ type pathReroll struct {
 	result   pathRerollResult
 }
 
-func newPathReroll(arm pathArm, carrier *pathCarrier, receiver *Client) *pathReroll {
+func newPathReroll(arm pathArm, carrier *pathCarrier, sender *Client, receiver *Client) *pathReroll {
 	scenario := arm.Reroll
 	stats := &h1PathStats{}
 	ledger := newH1PathLedger()
 	ledger.stats = stats
+	baseline := newH1QueueDelayBaseline(&scenario.Settings)
 	reroll := &pathReroll{
 		arm:      arm,
 		scenario: scenario,
 		carrier:  carrier,
+		sender:   sender,
 		receiver: receiver,
 		settings: scenario.Settings,
 		stats:    stats,
 		ledger:   ledger,
-		baseline: newH1QueueDelayBaseline(&scenario.Settings),
+		baseline: baseline,
+		transport: &PlatformTransport{
+			log:            loggerOrDefault(nil),
+			routeManager:   receiver.RouteManager(),
+			h1PathBaseline: baseline,
+			mode:           NewMonitorValue(TransportModeH1),
+		},
+		counters: h1PathCounters{
+			readMessageCount:  &atomic.Uint64{},
+			writeMessageCount: &atomic.Uint64{},
+			readByteCount:     &atomic.Uint64{},
+			receiveFullCount:  &atomic.Uint64{},
+			speedTestActive:   &atomic.Bool{},
+		},
 		// a stream of its own, so the loss draws of the hops are untouched
 		random:  rand.New(rand.NewPCG(arm.Seed, 99)),
 		port:    scenario.FirstPort,
 		stopped: make(chan struct{}),
 		done:    make(chan struct{}),
 	}
+	reroll.hooks = &h1PathTestHooks{
+		sample: func(_ int, sample *h1PathSample) {
+			reroll.scriptSample(sample)
+		},
+		stats:  stats,
+		ledger: ledger,
+	}
 	reroll.result.ports = []int{scenario.FirstPort}
 	reroll.lossy = pathConnectionLossy(
 		scenario.Hash, arm.Seed, scenario.FirstPort, scenario.Members, scenario.LossyMember)
 	if scenario.Settings.Mode != H1PathRerollModeOff {
-		reroll.startMonitor(time.Now())
+		reroll.startConnection(time.Now())
 	}
 	return reroll
 }
 
-// A new connection's monitor and observer. Nil when the path is too short to
-// monitor, exactly as `newH1PathMonitor` refuses one below MinPathRtt.
-func (self *pathReroll) startMonitor(now time.Time) {
-	self.monitor = nil
-	self.observer = nil
+// The production connection for a new leg, with the monitor and observer runH1
+// would give it. Nil when the path is too short to monitor, exactly as
+// `newH1PathMonitor` refuses one below MinPathRtt. The mode and the role are
+// the scenario's own: an arm does not read the process override or the
+// environment, so a run is the same wherever it happens.
+func (self *pathReroll) startConnection(now time.Time) {
+	self.connection = nil
 	monitor := newH1PathMonitor(&self.settings, now, self.pathRtt())
 	if monitor == nil {
 		self.stats.ConnectionsDormant.Add(1)
 		return
 	}
 	monitor.stats = self.stats
-	self.monitor = monitor
-	self.observer = newH1RouteObserver(self.baseline, self.settings.PackSampleEvery)
+	mode := h1PathNormalizeMode(self.settings.Mode)
+	self.connection = &h1PathConnection{
+		transport: self.transport,
+		settings:  &self.settings,
+		stats:     self.stats,
+		hooks:     self.hooks,
+		ordinal:   len(self.result.ports) - 1,
+		mode:      mode,
+		role:      self.settings.Role,
+		logTicks:  self.settings.LogTicks,
+		monitor:   monitor,
+		observer:  newH1RouteObserver(self.baseline, self.settings.PackSampleEvery),
+		counters:  self.counters,
+		localPort: self.port,
+		sourcePortUnmoved: h1PathSourcePortUnmoved(
+			&self.settings, self.ledger, mode, self.plannedDial, self.port),
+	}
+	if self.connection.sourcePortUnmoved {
+		self.stats.SourcePortUnmoved.Add(1)
+	}
 	self.rxOoo = 0
-	self.cleanTicks = 0
 	self.stats.ConnectionsMonitored.Add(1)
 }
 
@@ -239,7 +330,7 @@ func (self *pathReroll) observerOrNil() *h1RouteObserver {
 	if self == nil {
 		return nil
 	}
-	return self.observer
+	return self.connection.observerOrNil()
 }
 
 // Records the transports and routes of the connection the caller published, so
@@ -289,6 +380,7 @@ func (self *pathReroll) finish() *pathRerollResult {
 	self.result.suppressedLatched = int(self.stats.SuppressedLatched.Load())
 	self.result.suppressedUnconfirmedBudget = int(self.stats.SuppressedUnconfirmedBudget.Load())
 	self.result.improved = int(self.stats.Improved.Load())
+	self.result.returned = self.returned.Load()
 	return &self.result
 }
 
@@ -298,7 +390,7 @@ func (self *pathReroll) switches() int {
 
 func (self *pathReroll) run(ctx context.Context) {
 	defer close(self.done)
-	if self.monitor == nil {
+	if self.connection == nil {
 		// an Off arm, or a path short enough to be dormant: no ticks at all,
 		// which is the production cost of an unmonitored connection
 		return
@@ -324,40 +416,57 @@ func (self *pathReroll) run(ctx context.Context) {
 	}
 }
 
-// One monitor tick: the sample the platform transport would build from its
-// reader counters, its observer and the kernel, then the verdict, then the Act
-// steps in the order transport_h1_path_connection.go runs them.
+// One tick of the production connection: the counters a platform transport's
+// reader would have advanced, then `h1PathConnection.tick`, which takes the
+// observer's tick, builds the sample, reads the verdict and runs the Act steps
+// through this arm's ledger and stats. The scenario stands in only for the
+// kernel (scriptSample) and for runH1's watcher, which is this goroutine.
 func (self *pathReroll) tick(ctx context.Context, now time.Time) {
-	if self.monitor == nil {
+	if self.connection == nil {
 		return
 	}
 	self.tickOrdinal += 1
 	forward := self.leg.forwardControl
 	reverse := self.leg.reverseControl
-	sample := h1PathSample{
-		now: now,
-		// the leg is the connection: its counters start at zero, exactly as a
-		// fresh socket's do
-		readMessageCount:  uint64(forward.deliveredMessages.Load()),
-		writeMessageCount: uint64(reverse.deliveredMessages.Load()),
-		readByteCount:     uint64(forward.deliveredBytes.Load()),
-		rxBytesKnown:      true,
-		rxBytes:           uint64(forward.deliveredBytes.Load()),
-		minRtt:            self.pathRtt(),
-		rcvMss:            pathRerollMss,
-		sndMss:            pathRerollMss,
+	// the leg is the connection: its counters start at zero, exactly as a
+	// fresh socket's do
+	self.counters.readMessageCount.Store(uint64(forward.deliveredMessages.Load()))
+	self.counters.writeMessageCount.Store(uint64(reverse.deliveredMessages.Load()))
+	self.counters.readByteCount.Store(uint64(forward.deliveredBytes.Load()))
+
+	if steadyAfter := self.scenario.SteadyAfter; 0 < steadyAfter &&
+		self.result.writesAtSteady == 0 &&
+		steadyAfter <= now.Sub(self.started) {
+		self.result.writesAtSteady, self.result.resendsAtSteady = self.transferPicture()
 	}
-	observerTick := self.observer.takeTick(now)
-	if observerTick.known {
-		sample.queueDelay = observerTick.queueDelay
-		sample.queueDelaySamples = observerTick.samples
+	decision := self.connection.tick(now)
+	if decision.dormant {
+		// tick has already stopped the observer sampling
+		self.connection = nil
+		return
 	}
-	// the arms run one direction, so the receiver reads no ack of its own and
-	// the receive rule's ack corroboration has nothing to read: the queue delay
-	// stands alone here, as it does on a route whose peer answers elsewhere
-	sample.ackRttMin = observerTick.ackRttMin
-	sample.ackRtt = observerTick.ackRtt
-	sample.ackRttSamples = observerTick.ackSamples
+	if decision.convicted {
+		self.result.convictions += 1
+		if self.result.firstConvictionAfter == 0 {
+			self.result.firstConvictionAfter = now.Sub(self.started)
+		}
+	}
+	if decision.action == h1PathActionReroll {
+		self.switchLeg(ctx, now)
+	}
+}
+
+// The kernel half of a sample, which this simulator has no TCP to read: the
+// bytes the leg delivered, the path round trip, an ethernet mss, and the
+// out-of-order counter the arm scripts. Called from the connection's own tick,
+// after it has filled everything it can measure.
+func (self *pathReroll) scriptSample(sample *h1PathSample) {
+	forward := self.leg.forwardControl
+	sample.rxBytesKnown = true
+	sample.rxBytes = uint64(forward.deliveredBytes.Load())
+	sample.minRtt = self.pathRtt()
+	sample.rcvMss = pathRerollMss
+	sample.sndMss = pathRerollMss
 	if self.scenario.KernelOoo != nil {
 		known, advanced := self.scenario.KernelOoo(self.tickOrdinal, self.lossy)
 		if advanced {
@@ -366,59 +475,9 @@ func (self *pathReroll) tick(ctx context.Context, now time.Time) {
 		sample.rxOooKnown = known
 		sample.rxOoo = self.rxOoo
 	}
-
-	decision := self.monitor.tick(sample)
-	if decision.dormant {
-		self.observer.setActive(false)
-		self.monitor = nil
-		return
-	}
-	self.decide(ctx, now, &decision)
-}
-
-// The Act steps of transport_h1_path_connection.go's decide, on this arm's own
-// ledger and stats.
-func (self *pathReroll) decide(ctx context.Context, now time.Time, decision *h1PathDecision) {
-	act := self.settings.Mode == H1PathRerollModeAct
-	key := self.receiver.RouteManager()
-	switch {
-	case decision.convicted:
-		self.cleanTicks = 0
-		self.result.convictions += 1
-		if self.result.firstConvictionAfter == 0 {
-			self.result.firstConvictionAfter = now.Sub(self.started)
-		}
-		if !act {
-			self.stats.recordSuppression(h1PathReasonObserve)
-			return
-		}
-		if self.ledger.noteConviction(key, &self.settings, now) {
-			self.stats.Unimproved.Add(1)
-		}
-		allowed, reason := self.ledger.allow(
-			&self.settings,
-			now,
-			self.settings.Role,
-			decision.confidence,
-			now.Sub(self.monitor.start),
-		)
-		if !allowed {
-			self.stats.recordSuppression(reason)
-			return
-		}
-		self.ledger.noteReroll(
-			key, &self.settings, now, self.settings.Role, decision.confidence, self.port)
-		// packs built for this connection, and their resends, carry old tags
-		// that must not convict the next one
-		self.baseline.markReroll(now, decision.pathRtt)
-		self.stats.Rerolls.Add(1)
-		self.switchLeg(ctx, now)
-	case decision.clean && act:
-		self.cleanTicks += 1
-		if self.settings.CleanTicks <= self.cleanTicks &&
-			self.ledger.noteClean(key, &self.settings, now, self.cleanTicks) {
-			self.stats.Improved.Add(1)
-		}
+	if 0 < sample.ackRttSamples {
+		self.result.ackTicks += 1
+		self.result.maxAckRtt = max(self.result.maxAckRtt, sample.ackRtt)
 	}
 }
 
@@ -436,15 +495,18 @@ func (self *pathReroll) switchLeg(ctx context.Context, now time.Time) {
 	self.result.switchDrops += self.leg.forwardControl.trimNow(ctx, 0, true)
 	routeManager.RemoveTransport(self.receiveTransport)
 	routeManager.RemoveTransport(self.sendTransport)
-	if self.observer != nil {
-		self.observer.setActive(false)
-	}
+	// the retired connection stops sampling, as runH1's close does
+	self.connection.close()
 	self.leg.forwardCancel()
 	self.leg.reverseCancel()
 
 	self.result.switches += 1
 	if self.result.firstSwitchAfter == 0 {
 		self.result.firstSwitchAfter = now.Sub(self.started)
+		// what Transfer had seen of the collapse when the monitor called it:
+		// the rig's reading is no resends at all
+		self.result.writesBeforeSwitch, self.result.resendsBeforeSwitch = self.transferPicture()
+		self.result.maxAckRttBeforeSwitch = self.result.maxAckRtt
 	}
 	self.switchAt = now
 
@@ -479,7 +541,7 @@ func (self *pathReroll) switchLeg(ctx context.Context, now time.Time) {
 	self.receiveRoute = receiveRoute
 	self.sendRoute = sendRoute
 
-	self.startMonitor(time.Now())
+	self.startConnection(time.Now())
 	self.receiveTransport = NewReceiveGatewayTransportWithType(TransportTypeH1)
 	self.sendTransport = NewSendGatewayTransportWithType(TransportTypeH1)
 	routeManager.UpdateTransportWithProperties(
@@ -495,14 +557,27 @@ func (self *pathReroll) switchLeg(ctx context.Context, now time.Time) {
 	routeManager.UpdateTransport(self.sendTransport, []Route{sendRoute})
 }
 
-// The source port of the replacement connection.
+// What the sending client has written to this arm's receiver, and how much of
+// it was a resend.
+func (self *pathReroll) transferPicture() (writeCount uint64, resendCount uint64) {
+	sendStats := self.sender.DestinationSendStats(self.receiver.ClientId())
+	return sendStats.WriteCount, sendStats.ResendWriteCount
+}
+
+// The source port of the replacement connection, and whether its dial carried
+// a source port plan, which is what decides whether the replacement is judged
+// against the excluded window.
 func (self *pathReroll) nextPort() int {
+	self.plannedDial = self.scenario.PortPolicy == H1SourcePortFarRandom
 	if self.scenario.PortPolicy == H1SourcePortFarRandom {
 		plan := newH1SourcePortPlan(
 			&self.settings, self.ledger.excluded(), self.random.IntN, self.stats)
 		if port, ok := plan.pick(); ok {
 			return port
 		}
+		// the plan could not place the socket, which is what a dial whose bind
+		// falls back gets: the kernel's port, still next to the convicted one
+		self.stats.SourcePortFallbacks.Add(1)
 		return self.port
 	}
 	// the kernel's own choice: the next ports of its rotor, a few above the
@@ -685,8 +760,13 @@ const pathRerollBlockLossyPort = 40960
 //	S9/mode=off/leg=lossy                             5.0     4.9     856      14   14
 //	S9/mode=observe/leg=lossy                         5.0     4.9     856      14   14
 //	S9/mode=act/leg=lossy/hash=independent/port=far  227.0   302.5   27723     204    2
+//	S9/mode=act/leg=lossy/ack=measured              134.0   263.0   24777     191   13
 //	S9/mode=off/path=same-dc                        993.2   993.5   15338       0    0
 //	S9/mode=act/path=same-dc                        993.2   993.5   15338       0    0
+//
+// The ack=measured arm runs a longer offer (24 s) and convicts later than the
+// others, so its whole-offer rate carries thirteen seconds of collapse rather
+// than three and a half; its steady half is the healthy rate.
 //
 // The lossy member holds the connection at 5.0 Mb/s, one sixtieth of the
 // healthy 303, and Transfer sees 14 resends in 856 writes: the collapse is
@@ -700,6 +780,22 @@ const pathRerollBlockLossyPort = 40960
 // R_break, the recovery time the design's commit 10 has to beat with a drain
 // handoff, is 552 ms on this path. There is no drain arm to compare it against
 // here: the handoff is out of scope until that commit lands.
+//
+// The ack=measured arm is the rig's whole reading end to end. The client also
+// answers upstream -- five small messages a second, the cadence of a download's
+// inner acks -- and is acked for them over the same legs, so the ack round trip
+// the receive rule reads is measured rather than absent. It climbs to 6.70 s
+// against a 101 ms path, which is the rig's 6-10 s, and it is what corroborates
+// the pack queue delay: with the corroboration inverted this arm's conviction
+// slips from 13.0 s to 18.5 s and its rate falls to 0.42 of healthy, while
+// every other arm is unmoved, because no other arm reads an ack at all.
+// Transfer meanwhile sees nothing: the send timeout spends the first seconds
+// climbing from its 2 s cold floor to the standing queue, costing 14 resends,
+// and from the ninth second to the conviction it writes 144 more packs and
+// resends none. The arm waits for that steady state on purpose
+// (MinConnectionAge 13 s): on this queue the first upstream ack does not come
+// back for five seconds, so an arm that convicts at 3.5 s has read no ack yet
+// and falls back to the queue delay alone, which is what the other arms do.
 //
 // The full tier (CONNECT_PATHSIM_FULL=1) adds four arms, which read:
 //
@@ -744,6 +840,7 @@ func TestPathsimS9LossyConnectionReroll(t *testing.T) {
 	const healthyAct = "S9/mode=act/leg=healthy"
 	const shortOff = "S9/mode=off/path=same-dc"
 	const shortAct = "S9/mode=act/path=same-dc"
+	const measured = "S9/mode=act/leg=lossy/ack=measured"
 
 	// the healthy control first: its steady rate is the recovery target of the
 	// re-roll arm
@@ -776,6 +873,35 @@ func TestPathsimS9LossyConnectionReroll(t *testing.T) {
 			FirstPort:   pathRerollLossyPort,
 			PortPolicy:  H1SourcePortFarRandom,
 			HealthyRate: healthyRate,
+		}))
+
+	// the measured shape end to end: the client answers upstream and is acked
+	// over the same legs, so the collapse is read the way the rig read it --
+	// no resends at all, and an ack round trip that climbs into seconds
+	measuredSettings := pathRerollSettings(H1PathRerollModeAct)
+	// The other arms convict 3.5 s in, before one upstream ack has come back
+	// through a queue this deep, so their receive rule reads no ack at all and
+	// the queue delay stands alone. This arm waits for the collapse to reach
+	// the steady state the rig measured -- the window full, the send timeout
+	// adapted, the acks arriving five seconds after they were asked for --
+	// which is what gives the ack corroboration something to read.
+	measuredSettings.MinConnectionAge = 13 * time.Second
+	// long enough for thirteen seconds of collapse, the switch, and the twenty
+	// clean ticks that resolve the re-roll
+	measuredOffer := pathOffer(24*time.Second, 60*time.Second)
+	measuredResult := run(pathRerollArm(measured, pathShortRoundTrip, pathRerollLeg, measuredOffer,
+		&pathRerollScenario{
+			Settings:    measuredSettings,
+			FirstPort:   pathRerollLossyPort,
+			PortPolicy:  H1SourcePortFarRandom,
+			HealthyRate: healthyRate,
+			// about five upstream messages a second, the cadence of a
+			// download's inner acks, small enough to cost the leg nothing
+			ReturnInterval:  200 * time.Millisecond,
+			ReturnByteCount: 64,
+			// past the first seconds, in which the send timeout is still
+			// climbing from its cold floor toward the standing queue
+			SteadyAfter: 9 * time.Second,
 		}))
 
 	shortOffResult := run(pathRerollArm(shortOff, 500*time.Microsecond, pathRerollShortLeg, shortOffer,
@@ -841,12 +967,18 @@ func TestPathsimS9LossyConnectionReroll(t *testing.T) {
 			continue
 		}
 		t.Logf(
-			"S9: %s ports=%v convictions=%d(first %s) switches=%d(first %s) improved=%d recovery=%s switchdrops=%d",
+			"S9: %s ports=%v convictions=%d(first %s) switches=%d(first %s) improved=%d recovery=%s switchdrops=%d"+
+				" return=%d ackticks=%d maxack=%s steady=%dw/%dr at_switch=%dw/%dr/%s",
 			name, result.reroll.ports,
 			result.reroll.convictions, formatPathDuration(result.reroll.firstConvictionAfter),
 			result.reroll.switches, formatPathDuration(result.reroll.firstSwitchAfter),
 			result.reroll.improved, formatPathDuration(result.reroll.recoveryAfterSwitch),
 			result.reroll.switchDrops,
+			result.reroll.returned, result.reroll.ackTicks,
+			formatPathDuration(result.reroll.maxAckRtt),
+			result.reroll.writesAtSteady, result.reroll.resendsAtSteady,
+			result.reroll.writesBeforeSwitch, result.reroll.resendsBeforeSwitch,
+			formatPathDuration(result.reroll.maxAckRttBeforeSwitch),
 		)
 	}
 
@@ -908,6 +1040,63 @@ func TestPathsimS9LossyConnectionReroll(t *testing.T) {
 		t.Errorf(
 			"S9: %s read %.1f Mb/s steady, %.2f of the healthy %.1f Mb/s; the re-roll did not rescue it",
 			act, actResult.steadyGoodput()*8/1e6, rescued, healthyActResult.steadyGoodput()*8/1e6,
+		)
+	}
+
+	// The measured collapse, end to end. The client's own upstream is acked
+	// over the collapsed leg, so the ack round trip climbs into seconds and is
+	// what corroborates the pack queue delay; Transfer has still not resent a
+	// single pack when the monitor calls it.
+	if measuredResult.reroll.returned < 10 {
+		t.Errorf(
+			"S9: %s sent %d upstream messages; the arm has no return direction to measure",
+			measured, measuredResult.reroll.returned,
+		)
+	}
+	if measuredResult.reroll.ackTicks == 0 {
+		t.Errorf("S9: %s read no ack round trip of its own", measured)
+	}
+	if ackRtt := measuredResult.reroll.maxAckRttBeforeSwitch; ackRtt < time.Second {
+		t.Errorf(
+			"S9: %s convicted with an ack round trip of %s; the collapse is supposed to hold the acks too",
+			measured, formatPathDuration(ackRtt),
+		)
+	}
+	// The rig read no resends at all on a collapse that had been running for
+	// hours. Here the send timeout spends the first seconds climbing from its
+	// cold floor to the standing queue, which costs a handful; once it has,
+	// the established collapse is completely invisible to Transfer.
+	if steadyResends := measuredResult.reroll.resendsBeforeSwitch - measuredResult.reroll.resendsAtSteady; steadyResends != 0 {
+		t.Errorf(
+			"S9: %s resent %d packs while the collapse stood (%d of %d writes in all); the rig read none",
+			measured, steadyResends,
+			measuredResult.reroll.resendsBeforeSwitch, measuredResult.reroll.writesBeforeSwitch,
+		)
+	}
+	if measuredResult.reroll.writesBeforeSwitch <= measuredResult.reroll.writesAtSteady {
+		t.Errorf(
+			"S9: %s wrote nothing between the steady mark and the switch, so its resend count says nothing",
+			measured,
+		)
+	}
+	if measuredResult.reroll.switches != 1 || measuredResult.reroll.convictions != 1 ||
+		measuredResult.reroll.improved != 1 {
+		t.Errorf(
+			"S9: %s convicted %d times, switched %d times and improved %d, want one of each",
+			measured, measuredResult.reroll.convictions, measuredResult.reroll.switches,
+			measuredResult.reroll.improved,
+		)
+	}
+	if recovery := measuredResult.reroll.recoveryAfterSwitch; recovery == 0 || 2*time.Second < recovery {
+		t.Errorf(
+			"S9: %s recovered the healthy rate %s after the switch",
+			measured, formatPathDuration(recovery),
+		)
+	}
+	if rescued := pathRatio(measuredResult, healthyActResult); rescued < 0.6 {
+		t.Errorf(
+			"S9: %s read %.2f of the healthy rate after its re-roll",
+			measured, rescued,
 		)
 	}
 

@@ -1155,7 +1155,7 @@ func runPathArm(t *testing.T, arm pathArm) pathResult {
 		var reroll *pathReroll
 		receiverProperties := reliable
 		if arm.Reroll != nil {
-			reroll = newPathReroll(arm, carrier, receiver)
+			reroll = newPathReroll(arm, carrier, sender, receiver)
 			receiverProperties.receiveObserver = reroll.observerOrNil()
 		}
 		receiverReceiveTransport := NewReceiveGatewayTransportWithType(TransportTypeH1)
@@ -1251,6 +1251,33 @@ func runPathArm(t *testing.T, arm pathArm) pathResult {
 					}
 				}
 			}(lane, time.Duration(i)*pathLaneStagger)
+		}
+		// The return direction, when the arm has one: a small message upstream
+		// every interval, acked by the sender over the same legs. This is what
+		// a tunnel carrying a download does with its inner flows' acks, and it
+		// is what gives the client's receive rule an ack round trip of its own
+		// -- measured on its own clock -- to read against the pack queue delay.
+		if reroll != nil && 0 < arm.Reroll.ReturnInterval {
+			returnPayload := string(make([]byte, max(1, arm.Reroll.ReturnByteCount)))
+			offers.Add(1)
+			go func() {
+				defer offers.Done()
+				for !stop.Load() {
+					select {
+					case <-time.After(arm.Reroll.ReturnInterval):
+					case <-stopped:
+						return
+					}
+					frame := RequireToFrameWithDefaultProtocolVersion(
+						&protocol.SimpleMessage{Content: returnPayload},
+					)
+					if !receiver.SendWithTimeout(frame, senderId, nil, -1) {
+						MessagePoolReturn(frame.MessageBytes)
+						return
+					}
+					reroll.returned.Add(1)
+				}
+			}()
 		}
 		reroll.start(ctx, started)
 

@@ -355,15 +355,15 @@ func (self *PlatformTransport) newH1PathConnection(
 		// full, a platform that cannot bind, or a refusal leaves the port to
 		// connect(), which on linux moves only a few ports from the last one to
 		// the same destination -- back inside the window the plan exists to
-		// avoid. Only a dial that carried a plan is judged this way: the
-		// kernel's own port after an ordinary reconnect sits next to the
-		// previous one too, and that connection is a fresh 4-tuple nobody
-		// asked to move. Only an Act connection asks, so an Observe transport
-		// still never touches the ledger.
-		if plannedDial && mode == H1PathRerollModeAct && settings.SourcePortPolicy == H1SourcePortFarRandom {
-			connection.sourcePortUnmoved = self.h1PathLedger().excludesPort(
+		// avoid. Only an Act connection asks, so an Observe transport still
+		// never touches the ledger.
+		if mode == H1PathRerollModeAct {
+			connection.sourcePortUnmoved = h1PathSourcePortUnmoved(
+				settings,
+				self.h1PathLedger(),
+				mode,
+				plannedDial,
 				localPort,
-				max(0, settings.SourcePortExcludeRadius),
 			)
 			if connection.sourcePortUnmoved {
 				stats.SourcePortUnmoved.Add(1)

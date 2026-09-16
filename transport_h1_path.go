@@ -1164,6 +1164,28 @@ func (self *h1PathLedger) excludesPort(port int, radius int) bool {
 	return h1SourcePortExcluded(port, self.excludedPorts, radius)
 }
 
+// Whether a connection's local port means its planned dial did not move the
+// 4-tuple: the dial carried a source port plan, and the port it ended up with
+// is still inside the window the ledger excluded. Only a planned dial is judged
+// this way -- the kernel's port after an ordinary reconnect sits next to the
+// previous one too, and that connection is a fresh 4-tuple nobody asked to
+// move.
+func h1PathSourcePortUnmoved(
+	settings *H1PathRerollSettings,
+	ledger *h1PathLedger,
+	mode H1PathRerollMode,
+	plannedDial bool,
+	localPort int,
+) bool {
+	if !plannedDial ||
+		mode != H1PathRerollModeAct ||
+		settings.SourcePortPolicy != H1SourcePortFarRandom ||
+		localPort <= 0 {
+		return false
+	}
+	return ledger.excludesPort(localPort, max(0, settings.SourcePortExcludeRadius))
+}
+
 // A copy of the local ports convicted this epoch, oldest first.
 func (self *h1PathLedger) excluded() []int {
 	self.stateLock.Lock()
