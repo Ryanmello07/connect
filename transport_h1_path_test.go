@@ -2744,6 +2744,121 @@ func runH1PathRerollProbe(
 	return outcome, connection.stats, ledger
 }
 
+// What the ack guard costs, on the client it costs it to.
+//
+// The guard is a drain time, so the backlog it takes is the uplink's rate times
+// the queue delay threshold, and the 16 KiB floor under it only decides where
+// the drain time stops being allowed to answer on its own. Above that floor an
+// ordinary uploading client's own socket is enough: about a second of the
+// link's data, which is 32 KB on a 0.25 Mb/s uplink and 63 KB on a 0.5 Mb/s
+// one, both well under one send buffer. Such a client's ack evidence is
+// withdrawn on every tick for as long as it uploads, and on the population this
+// feature exists for -- a queue already standing when the source was first
+// read, so the pack tags read zero -- withdrawing the ack is withdrawing the
+// only measure that reads the queue. The receive collapse is then invisible
+// rather than unconfirmed, where the old shared bar at SendBacklogByteCount
+// convicted it.
+//
+// This is the residual of the rule and not a corner of it, so it is measured
+// here rather than assumed: the arms below are the same 7 s collapse read
+// through uplinks either side of each boundary, and TicksAckBacklogged is what
+// a rollout reads to size the population it applies to.
+func TestH1PathAckGuardCostsASlowUplinkItsEvidence(t *testing.T) {
+	const pathRtt = 101 * time.Millisecond
+	const queue = 7 * time.Second
+
+	// the measured collapse with the queue already standing at birth: 0.5 MB/s
+	// behind a 7 s queue that only the ack echo reads, with the kernel's
+	// out-of-order counter advancing, and a client uploading while it downloads
+	collapseUnder := func(uplinkByteRate float64, notSent uint64) func(k int) h1PathTickShape {
+		return func(k int) h1PathTickShape {
+			return h1PathTickShape{
+				rxByteRate:        500_000,
+				queueDelaySamples: 4,
+				rxOooAdvance:      true,
+				ackRtt:            pathRtt + queue,
+				minRtt:            pathRtt,
+				txKnown:           true,
+				txAckedByteRate:   uplinkByteRate,
+				txNotSent:         notSent,
+			}
+		}
+	}
+	cases := []struct {
+		label string
+		// the old rule, one shared bar for both questions
+		sharedBar bool
+		upBitRate float64
+		notSent   uint64
+		// whether the collapse is still convicted
+		convicts bool
+	}{
+		// under the floor the drain time is not allowed to answer alone, which
+		// is the residual the rule names: 8 KiB takes 1.3 s to leave a
+		// 0.05 Mb/s uplink and the ack is still read as the receive path's
+		{label: "under the floor", upBitRate: 0.05, notSent: 8 * 1024, convicts: true},
+		// and either side of the drain time, on the uplinks a real client has
+		{label: "0.25 Mb/s up", upBitRate: 0.25, notSent: 31_000, convicts: true},
+		{label: "0.25 Mb/s up", upBitRate: 0.25, notSent: 32_000, convicts: false},
+		{label: "0.5 Mb/s up", upBitRate: 0.5, notSent: 63_000, convicts: true},
+		{label: "0.5 Mb/s up", upBitRate: 0.5, notSent: 64_000, convicts: false},
+		// the same two backlogs against one shared bar at SendBacklogByteCount,
+		// which is where this collapse used to be convicted
+		{label: "shared bar", sharedBar: true, upBitRate: 0.25, notSent: 32_000, convicts: true},
+		{label: "shared bar", sharedBar: true, upBitRate: 0.5, notSent: 64_000, convicts: true},
+	}
+	for _, c := range cases {
+		settings := DefaultH1PathRerollSettings()
+		if c.sharedBar {
+			settings.AckBacklogFloorByteCount = settings.SendBacklogByteCount
+		}
+		monitor, stats := newH1PathTestMonitor(t, &settings, pathRtt)
+		decisions := runH1PathMonitorShape(monitor, 60, collapseUnder(c.upBitRate*1000*1000/8, c.notSent))
+		ticks := h1PathConvictionTicks(decisions)
+		snapshot := stats.snapshot()
+		bar := ""
+		if c.sharedBar {
+			bar = " against one shared bar"
+		}
+		t.Logf(
+			"%s, %d unsent%s: %d convictions, %d of %d ticks read as our own backlog",
+			c.label, c.notSent, bar,
+			len(ticks), snapshot.TicksAckBacklogged, snapshot.Ticks,
+		)
+		if c.convicts {
+			if len(ticks) == 0 || snapshot.TicksAckBacklogged != 0 {
+				t.Errorf(
+					"%s, %d unsent on %.2f Mb/s up: %d convictions and %d backlogged ticks, want the ack still read as the receive path's",
+					c.label, c.notSent, c.upBitRate, len(ticks), snapshot.TicksAckBacklogged,
+				)
+			}
+			continue
+		}
+		if len(ticks) != 0 {
+			t.Errorf(
+				"%s, %d unsent on %.2f Mb/s up: %d convictions, want the ack evidence withdrawn",
+				c.label, c.notSent, c.upBitRate, len(ticks),
+			)
+		}
+		// every tick of the run, not a few: the client is ack-blind for as long
+		// as it uploads, and this counter is the only sign of it
+		if snapshot.TicksAckBacklogged != snapshot.Ticks {
+			t.Errorf(
+				"%s, %d unsent on %.2f Mb/s up: %d of %d ticks counted, want every tick counted as our own backlog",
+				c.label, c.notSent, c.upBitRate, snapshot.TicksAckBacklogged, snapshot.Ticks,
+			)
+		}
+		// and its send direction is not convicted for it either, so the client
+		// loses its evidence and gains no verdict
+		if snapshot.TxConvictions != 0 {
+			t.Errorf(
+				"%s, %d unsent on %.2f Mb/s up: %d send convictions, want none from a queue in time",
+				c.label, c.notSent, c.upBitRate, snapshot.TxConvictions,
+			)
+		}
+	}
+}
+
 // The improvement credit on the population the feature exists for: a session
 // that starts bad and stays bad, and a client whose re-roll lands on a member
 // as slow as the one it left.

@@ -84,7 +84,10 @@ import (
 // that starts bad and stays bad. The ack echo is the only evidence that needs
 // no floor of the sender's, so where one rides the route the collapse is
 // convicted in 3 s and where none does the connection is invisible, in Observe
-// and in Act alike. Neither of the independent floors that suggest themselves
+// and in Act alike. A client uploading over a 0.25-0.5 Mb/s uplink joins that
+// invisible population for as long as it uploads, because the ack guard reads
+// its own send queue's drain time and withdraws the evidence (the rule, and
+// TicksAckBacklogged against Ticks). Neither of the independent floors that suggest themselves
 // closes it: neither the dial round trip nor the kernel's minimum round trip
 // bounds the offset between the two clocks that every pack tag carries, and
 // neither one times the far socket's send queue, which sits upstream of
@@ -458,7 +461,9 @@ type H1PathRerollSettings struct {
 	// our own uplink have put a threshold-sized queue into the ack round trip
 	// -- and AckBacklogFloorByteCount is only the floor that keeps a socket
 	// with a few bytes pending and nothing acked in the tick from answering
-	// yes for ever. A send conviction asks a second question, whether there is
+	// yes for ever. It cannot keep the ordinary queue of a client uploading over
+	// a 0.25-0.5 Mb/s uplink out of the guard, and what that costs is at the
+	// rule. A send conviction asks a second question, whether there is
 	// enough backlog to call the direction collapsed, and
 	// SendBacklogByteCount is that bar. Every platform reports the same
 	// quantity here (transport_h1_path_socket_darwin.go)
@@ -1030,6 +1035,24 @@ func (self *h1PathMonitor) tick(sample h1PathSample) h1PathDecision {
 	// as long as it stays quiet; below about 0.13 Mb/s up, where 16 KiB is
 	// itself a threshold-sized queue, the guard is the floor's and the residual
 	// stands.
+	//
+	// What the floor cannot do is keep an uploading client's ordinary queue out
+	// of the guard, and that is this rule's cost rather than a corner of it.
+	// The backlog it takes is the uplink's rate times the threshold: 32 KB on a
+	// 0.25 Mb/s uplink and 63 KB on a 0.5 Mb/s one, under one send buffer and
+	// about a second of that link's data, which a client that is uploading
+	// holds all the time. Its ack evidence is then withdrawn on every tick for
+	// as long as it uploads, and on the population this feature exists for --
+	// a queue already standing when the source was first read, so the pack tags
+	// read zero -- the ack is the only measure that reads the queue, so the
+	// collapse is invisible there rather than unconfirmed. Measured on that
+	// collapse, 0.5 MB/s behind a 7 s queue
+	// (TestH1PathAckGuardCostsASlowUplinkItsEvidence): 14 convictions in 60
+	// ticks become none, with every accepted tick counted, where the old shared
+	// bar at SendBacklogByteCount convicted all 14. TicksAckBacklogged against
+	// Ticks is what shows it, which is why it is kept apart from
+	// TicksAckUnknown: this population is an uplink to be read against, not a
+	// peer that answers elsewhere.
 	//
 	// The send rule asks a second question of the same bytes -- is there enough
 	// backlog to call the direction collapsed -- and SendBacklogByteCount is
