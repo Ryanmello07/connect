@@ -1450,8 +1450,9 @@ func TestTcpReturnRetransmitSackOnAnAdvancingAckRetransmitsNothing(t *testing.T)
 // away reports what it held when the acknowledgement left, and the segments
 // sent since are exactly the ones at and above that edge. Here the flight is
 // delivered in one instant and its acknowledgements arrive one by one a round
-// trip later, so the third duplicate reports four segments while nine have
-// been delivered: the segment at the edge must not go again with the hole.
+// trip later, so the third duplicate reports the three segments the source
+// held when it left while nine have been delivered: the segment at the edge
+// of what it reported must not go again with the hole.
 func TestTcpReturnRetransmitSackHolesStopAtTheHighestSelectiveByte(t *testing.T) {
 	const segmentCount = 9
 	const holeIndex = 1
