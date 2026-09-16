@@ -354,8 +354,8 @@ type pathInnerSegment struct {
 }
 
 // The client device's kernel TCP, reduced to what the provider can observe:
-// in-order reassembly, an out-of-order queue that shrinks the window it
-// advertises, Linux-like delayed acknowledgements with an immediate one
+// in-order reassembly, an out-of-order queue behind a window whose right edge
+// never moves left, Linux-like delayed acknowledgements with an immediate one
 // whenever that queue is not empty, and a drop policy standing in for the
 // receive-socket drop the rig measured. The drop is applied inside the
 // device's receive callback, which is the tun write: Transfer has delivered
@@ -379,7 +379,6 @@ type pathInnerKernel struct {
 	ooo             []pathInnerSegment
 	oooByteCount    int
 	maxOooByteCount int
-	establishedSeq  uint32
 	established     chan struct{}
 	inOrderPending  int
 	delayedAckTimer *time.Timer
@@ -427,8 +426,8 @@ func newPathInnerKernel(
 // right edge never moves left (RFC 1122 §4.2.2.16). That rule is why the
 // acknowledgements behind a hole are true duplicates rather than window
 // updates: the frontier is stuck and the edge is fixed, so every one of them
-// repeats the same window. It is also what stops the download - the provider
-// sends up to the edge and no further - and what the rig saw as the client's
+// repeats the same window. It is also what stops the download — the provider
+// sends up to the edge and no further — and what the rig saw as the client's
 // window collapsing, which is the free buffer behind the hole, not the field.
 // The lock must be held.
 func (self *pathInnerKernel) windowWithLock() int {
@@ -503,7 +502,6 @@ func (self *pathInnerKernel) receive(tcp *parsedTcp, now time.Time) {
 	if tcp.syn {
 		self.rcvNxt = tcp.seq + 1
 		self.rcvRightEdge = self.rcvNxt
-		self.establishedSeq = tcp.seq
 		self.ackNowWithLock()
 		select {
 		case self.established <- struct{}{}:
