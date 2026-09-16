@@ -796,6 +796,13 @@ func (self *tcpReturnRetransmitState) beginLossRecoveryWithLock(startNanos int64
 	self.recoveryPhase = tcpReturnRecoveryPhaseLoss
 	self.recoveryStartNanos = startNanos
 	self.burstSegmentCount = 1
+	// a recovery that begins with the interval's selective budget already
+	// spent still marks its first hole, which is the one the cumulative
+	// acknowledgement is stuck on (see markSackHolesWithLock)
+	self.sackBurstSegmentCount = min(
+		self.sackBurstSegmentCount,
+		returnRetransmitMaxBurstSegmentCount-1,
+	)
 }
 
 // Fast retransmit, on the duplicates of the head reaching the threshold with
@@ -893,6 +900,20 @@ func (self *tcpReturnRetransmitState) markBurstWithLock(windowEnd uint32, nowNan
 // hole waits between its own retransmissions; the holes a burst leaves are
 // marked by the next trigger, so a purged span still recovers in a burst per
 // interval rather than a segment per round trip.
+//
+// A loss recovery that begins inside a spent interval still marks its first
+// hole (beginLossRecoveryWithLock). Without that reserve a second loss
+// episode in the same interval was repaired not at all, not even at its head:
+// fastRetransmitWithLock leaves the head to this walk whenever anything is
+// selectively acknowledged, so the duplicates that began the recovery are
+// spent on nothing, no later trigger is owed, and the repair waits for the
+// timer. One hole per recovery is what the reserve costs, and a recovery
+// costs the source a cumulative acknowledgement to begin, which the blocks
+// this bound exists for cost it nothing. Handing the whole budget back there
+// instead does not hold: a source that reports the next two heads ends its
+// recovery as spurious and starts another for each segment it acknowledges,
+// which measured 384 selective retransmissions in one interval against 130
+// for the reserve.
 func (self *tcpReturnRetransmitState) markSackHolesWithLock(nowNanos int64) {
 	if self.sackedCount == 0 {
 		return

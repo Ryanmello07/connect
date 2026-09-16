@@ -1745,6 +1745,94 @@ func TestTcpReturnRetransmitCraftedSackBlocksMarkAtMostOneBurstARoundTrip(t *tes
 	})
 }
 
+// The interval's budget bounds what the blocks of one interval ask for, and a
+// loss recovery that begins inside a spent interval is not one of those asks:
+// it costs the source a cumulative acknowledgement, and it is the
+// acknowledgements saying a new segment is missing. Its first hole therefore
+// goes at once. Without that reserve the second recovery here was repaired
+// not at all, not even at its head, because the head is left to the selective
+// walk whenever anything is selectively acknowledged: the three duplicates
+// were spent, no later trigger was owed, and the repair waited for the timer.
+// What the reserve is not is the whole budget back, which would let a source
+// that reports the next two heads end each recovery as spurious and start
+// another for every segment it acknowledges.
+func TestTcpReturnRetransmitANewRecoveryMarksItsFirstHoleInASpentInterval(t *testing.T) {
+	// each flight is longer than the ceiling, so the first spends the whole
+	// interval budget and the second has holes of its own to spare
+	const flightSegmentCount = 200
+	runTcpReturnRetransmitTest(t, func(t *testing.T) {
+		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{sack: true})
+		// nothing is acknowledged, so the whole flight is retained
+		harness.source.holdAcks = true
+		payload := harness.payload(2 * flightSegmentCount)
+		flightByteCount := flightSegmentCount * harness.segmentByteCount
+		harness.write(payload[:flightByteCount])
+		synctest.Wait()
+		// one segment of the flight, as a block that claims it alone
+		block := func(segmentIndex int) []tcpSackBlock {
+			return []tcpSackBlock{{
+				start: harness.segmentSeq(segmentIndex),
+				end:   harness.segmentSeq(segmentIndex + 1),
+			}}
+		}
+
+		// a first recovery that spends the interval's whole budget
+		for range returnRetransmitDupAckThreshold {
+			harness.source.sendCraftedSackAck(harness.dataSeq, block(flightSegmentCount-1))
+		}
+		synctest.Wait()
+		_, _, firstPacketCount, _ := harness.retransmitState()
+		if firstPacketCount != returnRetransmitMaxBurstSegmentCount {
+			t.Fatalf("the first recovery drew %d, want the interval's whole budget of %d",
+				firstPacketCount, returnRetransmitMaxBurstSegmentCount)
+		}
+
+		// the source acknowledges everything, which ends that recovery and
+		// empties the ring, and the origin sends a second flight: all inside
+		// the same hole interval
+		harness.source.ackNow()
+		synctest.Wait()
+		if _, retainedCount, _, _ := harness.retransmitState(); retainedCount != 0 {
+			t.Fatalf("%d segments retained after the acknowledgement of the whole flight", retainedCount)
+		}
+		harness.source.holdAcks = true
+		harness.write(payload[flightByteCount:])
+		synctest.Wait()
+
+		// a new loss episode, still inside that interval: its first hole is
+		// the one the cumulative acknowledgement is stuck on
+		for range returnRetransmitDupAckThreshold {
+			harness.source.sendCraftedSackAck(harness.source.lastAckNumber, block(2*flightSegmentCount-1))
+		}
+		synctest.Wait()
+		_, _, packetCount, reasonCounts := harness.retransmitState()
+		if packetCount != firstPacketCount+1 || reasonCounts[tcpReturnRetransmitReasonSackHole] != packetCount {
+			t.Fatalf("retransmissions=%d reasons=%v, want the new recovery's first hole above the %d of the first",
+				packetCount, reasonCounts, firstPacketCount)
+		}
+		harness.requireSeenCount(flightSegmentCount, 2)
+
+		// and the rest of its holes at the next interval, as a burst
+		time.Sleep(returnRetransmitMinRto)
+		harness.source.sendCraftedSackAck(harness.source.lastAckNumber, block(2*flightSegmentCount-2))
+		synctest.Wait()
+		_, _, nextPacketCount, _ := harness.retransmitState()
+		if nextPacketCount <= packetCount+1 {
+			t.Fatalf("retransmissions=%d after the interval, want a burst above the %d the reserve drew", nextPacketCount, packetCount)
+		}
+
+		// the flow is unharmed: the source acknowledges both flights and the
+		// ring empties
+		harness.source.ackNow()
+		synctest.Wait()
+		harness.requireStream(payload)
+		retainedByteCount, retainedCount, _, _ := harness.retransmitState()
+		if retainedByteCount != 0 || retainedCount != 0 {
+			t.Fatalf("retained after the acknowledgement: %d bytes in %d segments", retainedByteCount, retainedCount)
+		}
+	})
+}
+
 // The interval's budget counts the holes it marks, not the segments it walks
 // past. A source reports holding a run and a segment far above it, so every
 // hole between them lies past a burst's worth of segments the walk skips
