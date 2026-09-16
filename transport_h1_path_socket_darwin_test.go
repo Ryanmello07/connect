@@ -110,3 +110,91 @@ func TestH1PathTcpConnectionInfoMapsFields(t *testing.T) {
 		t.Errorf("unfilled struct: %+v, want all unknown", kernel)
 	}
 }
+
+// The window states the unsent count is read across, and what each one means
+// for the two rules that read it (transport_h1_path_socket_darwin.go). The
+// numbers are the ones a linux socket reports directly as Notsent_bytes for
+// the same shapes, so this is where the two platforms are pinned against each
+// other.
+func TestH1PathTcpConnectionInfoUnsentBytesAcrossWindowStates(t *testing.T) {
+	unsentByteCount := func(sendBuffer uint32, cwnd uint32, wnd uint32) uint64 {
+		t.Helper()
+		info := unix.TCPConnectionInfo{
+			Maxseg:      1448,
+			Snd_cwnd:    cwnd,
+			Snd_wnd:     wnd,
+			Snd_sbbytes: sendBuffer,
+			Srtt:        101,
+		}
+		var kernel h1PathKernelSample
+		if !h1PathKernelSampleFromConnectionInfo(&info, &kernel) {
+			t.Fatalf("a filled struct read as unknown")
+		}
+		return kernel.txNotSent
+	}
+	states := []struct {
+		name       string
+		sendBuffer uint32
+		cwnd       uint32
+		wnd        uint32
+		want       uint64
+	}{
+		{
+			// window-limited, which is every saturated uplink: in-flight is
+			// the window and the subtraction is exact
+			name:       "400 KiB behind 128 KiB in flight",
+			sendBuffer: 528 * 1024, cwnd: 128 * 1024, wnd: 1024 * 1024,
+			want: 400 * 1024,
+		},
+		{
+			// a slow uplink's window is a handful of segments, so its own
+			// queue is visible here: 60 KB is two seconds at 0.25 Mb/s, which
+			// is what withdraws the ack evidence
+			name:       "60 KB behind a 14 KB congestion window",
+			sendBuffer: 60*1024 + 14*1024, cwnd: 14 * 1024, wnd: 256 * 1024,
+			want: 60 * 1024,
+		},
+		{
+			// not window-limited: the bound is loose and eats the whole
+			// buffer, where linux reports 400 KiB of an application-limited
+			// burst that leaves at line rate
+			name:       "400 KiB with the congestion window grown past it",
+			sendBuffer: 400 * 1024, cwnd: 512 * 1024, wnd: 1024 * 1024,
+			want: 0,
+		},
+		{
+			name:       "300 KiB behind a scaled 1 MiB peer window",
+			sendBuffer: 300 * 1024, cwnd: 2048 * 1024, wnd: 1024 * 1024,
+			want: 0,
+		},
+	}
+	for _, state := range states {
+		if unsent := unsentByteCount(state.sendBuffer, state.cwnd, state.wnd); unsent != state.want {
+			t.Errorf("%s: unsent = %d, want %d", state.name, unsent, state.want)
+		}
+	}
+
+	// and the slow uplink's reading fed to the rule it is for: a healthy
+	// receive path whose ack round trip carries two seconds of our own queue
+	// is not convicted for it
+	settings := DefaultH1PathRerollSettings()
+	monitor, stats := newH1PathTestMonitor(t, &settings, 105*time.Millisecond)
+	decisions := runH1PathMonitorShape(monitor, 60, func(k int) h1PathTickShape {
+		return h1PathTickShape{
+			rxByteRate:        700_000,
+			queueDelay:        20 * time.Millisecond,
+			queueDelaySamples: 4,
+			rxOooAdvance:      true,
+			ackRtt:            2 * time.Second,
+			txKnown:           true,
+			txAckedByteRate:   31_250,
+			txNotSent:         unsentByteCount(60*1024+14*1024, 14*1024, 256*1024),
+		}
+	})
+	if ticks := h1PathConvictionTicks(decisions); len(ticks) != 0 {
+		t.Errorf("a 0.25 Mb/s uplink's own queue convicted the receive path at ticks %v", ticks)
+	}
+	if snapshot := stats.snapshot(); snapshot.TicksAckBacklogged == 0 {
+		t.Errorf("stats = %+v, want the uplink's ticks counted as our own backlog", snapshot)
+	}
+}

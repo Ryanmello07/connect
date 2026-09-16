@@ -25,17 +25,42 @@ import (
 //   - Txretransmitpackets: retransmitted segments
 //   - Snd_sbbytes less the in-flight bound: the bytes the kernel has accepted
 //     and not yet put on the wire, which is what linux reports directly as
-//     Notsent_bytes. Darwin has no unsent field; Snd_sbbytes is the whole send
-//     buffer, unacked and unsent together, and in-flight data is at most the
-//     congestion window and at most the peer's advertised window, so taking
-//     the smaller of those off leaves a lower bound on the unsent bytes. It
-//     has to be the same quantity on both platforms, because one constant
-//     (SendBacklogByteCount) reads it: on the whole buffer the constant is
-//     reached by any client with a busy uplink, which convicts its send
-//     direction early and turns the receive side's ack evidence off
-//     altogether, and darwin and iOS are most of the fleet. Erring low is the
-//     safe direction for both rules: a backlog under-reported denies no
-//     evidence and convicts nothing
+//     Notsent_bytes. Darwin has no unsent field and no snd_una either;
+//     Snd_sbbytes is the whole send buffer, unacked and unsent together, and
+//     in-flight data is at most the congestion window and at most the peer's
+//     advertised window, so taking the smaller of those off leaves a lower
+//     bound on the unsent bytes. It has to be the same quantity on both
+//     platforms, because the same two bars read it (transport_h1_path.go): on
+//     the whole buffer they are reached by any client with a busy uplink,
+//     which convicts its send direction early and turns the receive side's ack
+//     evidence off altogether, and darwin and iOS are most of the fleet.
+//
+//     Where the two platforms agree and where they do not, measured through
+//     this function against a real linux socket's Notsent_bytes. A socket with
+//     more in its buffer than the window allows is window-limited: in-flight
+//     is the window, the subtraction is exact, and darwin reports what linux
+//     reports (400 KiB unsent behind 128 KiB in flight reads 400 KiB on both).
+//     That is every saturated and every slow uplink, which is the whole of
+//     what either bar is for. A socket with less in its buffer than the window
+//     allows reads zero here where linux can report a real Notsent_bytes -- an
+//     application-limited burst the kernel has not transmitted yet (400 KiB
+//     behind a cwnd grown to 512 KiB, 300 KiB behind a scaled 1 MiB peer
+//     window). Those bytes are not waiting on an ack, so they leave at line
+//     rate and cannot be the seconds the ack guard is looking for, while the
+//     guard's own drain term reads the acked rate of the tick and on an
+//     application-limited socket that is the application's rate: the zero is
+//     the better answer to the question being asked, not a worse one. What
+//     darwin cannot see at all is a kernel holding bytes back for a reason
+//     other than the window -- its own pacing, or a full interface queue --
+//     and that is the scope limit.
+//
+//     The direction of the error is not symmetric between the two rules that
+//     read it, which is worth naming because darwin and iOS are most of the
+//     fleet. Under-reporting a backlog convicts nothing and denies no ack
+//     evidence, which is the safe direction for the birth queue the ack rule
+//     exists to read, and the unsafe one for the uplink guard, whose whole job
+//     is to deny evidence: where darwin reads zero and linux does not, darwin
+//     keeps evidence linux withdraws
 //   - Srtt: the smoothed round trip in milliseconds; darwin keeps no minimum,
 //     so the caller keeps the lowest (h1PathKernelSample.copyTo)
 //   - Maxseg: both segment sizes
