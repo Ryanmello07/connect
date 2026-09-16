@@ -113,10 +113,9 @@ import (
 // not see: on a queue standing at birth the pack tags read zero before the
 // re-roll and zero after it, and twenty such ticks would clear the latch and
 // the budget together and let one bad member cost a disconnect every time the
-// acks went quiet. What the other
-// reading would buy is the ten points between 89 and 99, and what it would cost
-// is every sender clock step two disconnects and a 30 minute latch, on evidence
-// no clock here can check. A rollout that wants to re-price this reads
+// acks went quiet. What the other reading would buy is the ten points between
+// 89 and 99, and what it would cost is every sender clock step two disconnects
+// and a 30 minute latch, on evidence no clock here can check. A rollout that wants to re-price this reads
 // TicksAckUnknown against Ticks for the size of the population it applies to.
 //
 // The same cadence decides what the ledger is able to bound, and that is why
