@@ -100,6 +100,23 @@ type GroupHandle interface {
 	// is deliberately absent, which is guardrail G6 seen from this side -- an accessor taking a
 	// name would reach epoch_secret, confirmation_key and membership_key through the same door.
 	Export(label string, context []byte, length int) ([]byte, error)
+
+	// AMENDED for ledger item 228's read-receipt tag ruling. PairwiseExport is the exporter for
+	// key material TWO NAMED MEMBERS HOLD AND NO THIRD MEMBER CAN DERIVE, and it is on this
+	// interface for the same reason Export is and with the opposite scope: Export expands one of
+	// the epoch schedule's own secrets, so every member of the group answers the same value from
+	// it, while this one is a static-static diffie-hellman over two RFC 9420 leaf encryption
+	// keypairs and no member outside the pair can reach it.
+	//
+	// THE PEER IS A uint32 AND NOT AN mls.LeafIndex, which is this block's standing rule and not
+	// a convenience: a method naming an mls type would make Gate 5's swap a type change rather
+	// than a factory change. It is the same leaf index MemberAt answers at its first result.
+	//
+	// THE DIFFIE-HELLMAN HAPPENS BEHIND THIS SEAM AND NO LEAF SCALAR CROSSES IT. That is what
+	// this method buys over an accessor for the private key, and it is also forced: the label
+	// expansion is a method on mls's own CryptoProvider, which nothing on this side holds.
+	PairwiseExport(label string, peer uint32, length int) ([]byte, error)
+
 	SenderDataSecret() ([]byte, error)
 	EncryptionSecret() ([]byte, error)
 	EpochAuthenticator() []byte
@@ -598,6 +615,14 @@ func (self *connectMlsHandle) MemberAt(i int) (uint32, []byte, []byte, error) {
 // them through a label the caller names -- which is what keeps epoch_secret itself off the surface.
 func (self *connectMlsHandle) Export(label string, context []byte, length int) ([]byte, error) {
 	return self.group.Export(label, context, length)
+}
+
+// PairwiseExport is Export's pairwise sibling, ledger item 228. The whole of the conversion this
+// adapter makes is the leaf index: uint32 on the seam, mls.LeafIndex behind it, and the refusal for
+// a position that holds no member comes back from mls as ErrBlankLeaf rather than being invented
+// here out of a MemberAt walk that would be a second reading of the same tree.
+func (self *connectMlsHandle) PairwiseExport(label string, peer uint32, length int) ([]byte, error) {
+	return self.group.PairwiseExport(label, mls.LeafIndex(peer), length)
 }
 
 // SenderDataSecret is MASTER section 8.2's sender_data secret.

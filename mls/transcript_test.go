@@ -923,10 +923,22 @@ func trRecordLayerCodecMethods(t *testing.T) []string {
 }
 
 // trCallsToMethods answers every call in a parsed file whose selector names one of the given
-// methods, as file:name so a failure points at the line's file.
+// methods, as "file DECLARATION: name" so a failure points at the line's file AND at the
+// declaration that made the call.
+//
+// THE DECLARATION IS IN THE ANSWER BECAUSE THE ONE SANCTIONED SITE BELOW IS A DECLARATION. A file
+// was the whole of this reading until ledger item 228's pairwise exporter, and a sanction keyed on
+// a file would have licensed every future call in that file -- which is the shape GATES.md indexes
+// and which this project has shipped as a base-name exemption before. A call outside any function
+// reads as "(file scope)", which no sanction names.
 func trCallsToMethods(parsed parsedSource, path string, methods []string) []string {
 	found := []string{}
+	declaration := "(file scope)"
 	ast.Inspect(parsed.file, func(node ast.Node) bool {
+		if function, isFunction := node.(*ast.FuncDecl); isFunction {
+			declaration = trDeclarationName(function)
+			return true
+		}
 		call, isCall := node.(*ast.CallExpr)
 		if !isCall {
 			return true
@@ -936,11 +948,48 @@ func trCallsToMethods(parsed parsedSource, path string, methods []string) []stri
 			return true
 		}
 		if slices.Contains(methods, selector.Sel.Name) {
-			found = append(found, path+": "+selector.Sel.Name)
+			found = append(found, path+" "+declaration+": "+selector.Sel.Name)
 		}
 		return true
 	})
 	return found
+}
+
+// trDeclarationName is a function declaration's name with its receiver type in front of it, which
+// is how every other gate in this package spells a frame.
+func trDeclarationName(function *ast.FuncDecl) string {
+	if function.Recv == nil || len(function.Recv.List) != 1 {
+		return function.Name.Name
+	}
+	rendered := ""
+	ast.Inspect(function.Recv.List[0].Type, func(node ast.Node) bool {
+		switch read := node.(type) {
+		case *ast.StarExpr:
+			rendered += "*"
+		case *ast.Ident:
+			rendered += read.Name
+		}
+		return true
+	})
+	return rendered + "." + function.Name.Name
+}
+
+// trRecordLayerSanctioned is the DECLARATION -- one, today -- that is allowed to spell a length the
+// record layer's way inside package mls, with the reason beside it.
+//
+// THE RULE THIS GATE ENFORCES IS ABOUT MLS STRUCTURES, and that is what makes one exemption
+// possible without the rule losing its meaning. The cost the gate's own header describes is a FORK
+// AT THE FIRST CROSS-IMPLEMENTATION JOIN: an MLS structure spelled with a fixed 32 bit prefix is 32
+// well formed octets every member of a group running this code agrees on and no other
+// implementation does. encodePairwiseContext builds nothing any other implementation ever reads --
+// it is a KDF context consumed by HKDF-Expand inside this profile and it appears on no wire and in
+// no MLS structure -- so the failure this gate exists to catch cannot happen there, and ledger item
+// 228 rules the fixed width prefix for it by name.
+//
+// It is held in BOTH DIRECTIONS below: a sanctioned declaration that no longer makes the call fails
+// here rather than sitting on as a licence for the next one.
+var trRecordLayerSanctioned = map[string]string{
+	"group_pairwise.go encodePairwiseContext: WriteOpaqueLP": "ledger item 228's pairwise exporter context, which is a KDF preimage inside this profile and is not an MLS structure on any wire",
 }
 
 // TestNoMlsEncodingReachesTheRecordLayerLengthPrefix is guardrail-shaped rather than
@@ -988,11 +1037,32 @@ func TestNoMlsEncodingReachesTheRecordLayerLengthPrefix(t *testing.T) {
 	if scanned == 0 {
 		t.Fatalf("no non test source file was scanned, so this gate read nothing")
 	}
-	if len(offending) != 0 {
-		t.Errorf("%v spell a length the record layer's way inside package mls; MLS vectors are opaque<V> and the two encodings are never interchangeable",
-			offending)
+	// the sanction is applied HERE rather than inside the scanner, so what it removes is printed
+	// and the complement of the narrowing is visible on every run
+	sanctioned := []string{}
+	remaining := []string{}
+	for _, frame := range offending {
+		if reason, isSanctioned := trRecordLayerSanctioned[frame]; isSanctioned {
+			sanctioned = append(sanctioned, frame+" -- "+reason)
+			continue
+		}
+		remaining = append(remaining, frame)
 	}
-	t.Logf("%d non test files scanned for %v", scanned, methods)
+	if len(remaining) != 0 {
+		t.Errorf("%v spell a length the record layer's way inside package mls; MLS vectors are opaque<V> and the two encodings are never interchangeable",
+			remaining)
+	}
+	// and the other direction: a sanction whose declaration no longer makes the call is a licence
+	// for whatever is written there next, so it has to be deleted rather than left standing
+	for frame, reason := range trRecordLayerSanctioned {
+		if !slices.Contains(offending, frame) {
+			t.Errorf("%s is sanctioned as %q and no longer spells a length that way: drop the row rather than leaving it to license the next call in that declaration",
+				frame, reason)
+		}
+	}
+	slices.Sort(sanctioned)
+	t.Logf("%d non test files scanned for %v; %d sanctioned call(s): %v", scanned, methods,
+		len(sanctioned), sanctioned)
 }
 
 // One forbidden write and one forbidden read. Every matcher above runs on this, so a scan

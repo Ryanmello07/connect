@@ -1771,6 +1771,11 @@ var labelledFieldFrontier = []string{
 	// same reason the schedule's own row is open one line down -- a group cannot bound what a
 	// caller exports over without deciding for the caller what an exporter context may be.
 	"*Group.Export context (open, so a caller must bound what it sends)",
+	// ledger item 228's pairwise exporter forwards the caller's LABEL to ExpandWithLabel directly
+	// rather than through (*KeySchedule).Export, so the refusal that declaration makes on its
+	// behalf is made here instead. The CONTEXT is not a position on this frontier at all, because
+	// nothing a caller passes reaches it: PairwiseExport builds the context itself.
+	"*Group.PairwiseExport label (refused here)",
 	// the exported method that took a caller's label straight into a KDFLabel and panicked
 	// on it, while its own signature already carried ErrExportLength for a caller's number
 	"*KeySchedule.Export context (open, so a caller must bound what it sends)",
@@ -1854,6 +1859,20 @@ var labelledCompositionClass = []string{
 	"crypto_labels.go *suiteCryptoProvider.DeriveTreeSecret: mlsLabelBytes -> *suiteCryptoProvider.ExpandWithLabel context (fixed width where it is built)",
 	"framing_protect.go SignAuthenticatedContent: FramedContentTBSBytes -> *suiteCryptoProvider.SignWithLabel content (refused at the construction)",
 	"framing_protect.go VerifyAuthenticatedContent: FramedContentTBSBytes -> *suiteCryptoProvider.VerifyWithLabel content (refused at the construction)",
+	// ledger item 228's pairwise exporter, and it is the psk label's row one more time: the
+	// context is a COMPOSITION handed to ExpandWithLabel, whose signature cannot refuse, so the
+	// bound sits on the outermost declaration of the path that still has a caller to answer.
+	// marshalPairwiseContext is that declaration.
+	//
+	// AND IT IS A DECLARATION RATHER THAN A WRITER INLINE IN PairwiseExport BECAUSE OF THIS GATE.
+	// Written inline, this walk read THREE unbounded edges out of the one method: Writer.Bytes,
+	// and two more through the group's own fields -- self.schedule taints from
+	// NewKeyScheduleFromJoiner and self.tree from syntax.MarshalLimit, so an inline
+	// self.schedule.Secrets() read arrived here as a serialized structure reaching a labelled
+	// field with nothing bounding it. That is senderDataSecretLocked's account of the same
+	// over-reporting, and it has the same answer: a call into a declaration of this package is a
+	// frame of its own, walked in its turn.
+	"group.go *Group.PairwiseExport: marshalPairwiseContext -> *suiteCryptoProvider.ExpandWithLabel context (bounded where it is built)",
 	"key_package.go *KeyPackage.Validate: signedPreimage -> *suiteCryptoProvider.VerifyWithLabel content (refused at the construction)",
 	"key_package.go NewKeyPackageWithSigner: signedPreimage -> *suiteCryptoProvider.SignWithLabel content (refused at the construction)",
 	"key_schedule.go DeriveJoinerSecret: marshalBoundedComposition -> *suiteCryptoProvider.ExpandWithLabel context (bounded where it is built)",

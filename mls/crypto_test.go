@@ -3017,6 +3017,28 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 		{name: "mlsSignContent", call: func(take func([]byte) []byte) [][]byte {
 			return [][]byte{mlsSignContent("label", take(value))}
 		}},
+		// ledger item 228's pairwise exporter context and the bounded door onto it. Both are
+		// driven, and the pair is not one row twice: the encoder is where an argument could be
+		// aliased into the answer, and the door is where a copy could be made and then handed back
+		// over the caller's array anyway. Three byte arguments each, because all three of the group
+		// id, the two public points and the epoch authenticator are the caller's storage and the
+		// group goes on holding every one of them after the call.
+		{name: "encodePairwiseContext", call: func(take func([]byte) []byte) [][]byte {
+			encoded, err := encodePairwiseContext(take(value), 7, 1, 2,
+				take(pub), take(pub), take(plaintext))
+			if err != nil {
+				t.Fatalf("encodePairwiseContext over a context that fits: %v", err)
+			}
+			return [][]byte{encoded}
+		}},
+		{name: "marshalPairwiseContext", call: func(take func([]byte) []byte) [][]byte {
+			encoded, err := marshalPairwiseContext(take(value), 7, 1, 2,
+				take(pub), take(pub), take(plaintext))
+			if err != nil {
+				t.Fatalf("marshalPairwiseContext over a context that fits: %v", err)
+			}
+			return [][]byte{encoded}
+		}},
 		{name: "checkLabelledConstruction", call: func(take func([]byte) []byte) [][]byte {
 			if err := checkLabelledConstruction("probe", "label", take(value)); err != nil {
 				t.Fatalf("checkLabelledConstruction over a value that fits: %v", err)

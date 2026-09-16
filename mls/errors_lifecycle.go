@@ -80,4 +80,19 @@ var (
 	ErrNoPendingCommit     = errors.New("mls: no pending commit is staged")
 	ErrEpochStale          = errors.New("mls: message epoch is older than the current epoch")
 	ErrRemovedFromGroup    = errors.New("mls: this client was removed by the commit")
+
+	// the pairwise exporter, (*Group).PairwiseExport.
+	//
+	// They are POLICY refusals, which is why they are here rather than in crypto_errors.go or
+	// tree_errors.go: neither names a malformed key or a malformed tree. A caller that asked for
+	// a key with its OWN leaf, and a caller that named a position holding no member, each asked
+	// for a two party key where there is no second party -- this profile's rule about who a
+	// pairwise key may be derived WITH, exactly as the block at the top of this file is its rule
+	// about who may be in a group at all.
+	//
+	// TWO VALUES AND NOT ONE, for this file's own stated reason: a caller triaging "I named my
+	// own leaf" against "I named a blank position" is triaging a bug in its own leaf arithmetic
+	// against a member that has left, and errors.Is cannot tell those apart through one value.
+	ErrPairwiseSelf = errors.New("mls: a pairwise key with one's own leaf is not a pairwise key")
+	ErrBlankLeaf    = errors.New("mls: the leaf named holds no member at this epoch")
 )

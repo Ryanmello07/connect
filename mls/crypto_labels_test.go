@@ -883,6 +883,12 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		"group.go: syntax.WriteVector(w, self.SenderRatchets, writeOneSenderRatchet)",
 		"group_context_verified.go: syntax.Marshal(&self.GroupContext)",
 		"group_context_verified.go: syntax.Unmarshal(signed, decoded)",
+		// ledger item 228's pairwise exporter context. The DEFAULT limit, and here it is the only
+		// bound that can hold for the reason the GroupInfo preimage below has: these bytes become
+		// ONE labelled field of a KDFLabel, so a context built at a larger limit would be refused
+		// one frame later inside a provider method that cannot report a refusal at all. The refusal
+		// belongs at the encode, and marshalPairwiseContext is where it is made.
+		"group_pairwise.go: syntax.NewWriter()",
 		// the urmessage_group_policy body of MASTER section 6: its two vectors, the structure
 		// encode its Encode reaches, and the decode both Parse entry points reach. All six at the
 		// default limit and none at the ratchet tree one, and here that is the strictest reading

@@ -1560,6 +1560,37 @@ func groupAnswerSecondLeaf(t *testing.T, group *Group) LeafIndex {
 	return at
 }
 
+// groupAnswerPairwiseLeaf splices ONE peer leaf into the ratchet tree and answers its position, so
+// that the PairwiseExport row has a member to derive a key with.
+//
+// IT IS IDEMPOTENT AND groupAnswerSecondLeaf IS NOT, which is the whole reason it exists rather
+// than the row calling that one. PairwiseExport carries no projection, so
+// TestAGroupGoesOnPublishingWhatItWasFoundedOn asks its row TWICE over one group and requires the
+// two answers to be equal; a helper that spliced a freshly drawn leaf on every call would put a
+// different public point in front of the second derivation and the row would report a finding
+// against a method that is behaving exactly as specified.
+//
+// A SPLICED LEAF AND NOT A REAL PEER, which is the other half of the same requirement:
+// groupAnswerPeer commits, so it moves the epoch -- and the epoch is IN this derivation's context,
+// so two calls either side of it answer two different keys for the same reason. What this
+// derivation reads off the tree is the peer's public encryption point and nothing else, so a
+// spliced leaf is a complete peer as far as this method is concerned.
+func groupAnswerPairwiseLeaf(t *testing.T, group *Group) LeafIndex {
+	t.Helper()
+	for at := LeafIndex(0); LeafCount(at) < group.tree.LeafWidth(); at += 1 {
+		if at != group.ownLeaf && group.tree.Leaf(at) != nil {
+			return at
+		}
+	}
+	leaf, _ := testLeafNode(t, group.crypto,
+		testIdentity(t, group.crypto, "the peer this gate derives a pairwise key with"))
+	at, err := group.tree.AddLeaf(leaf)
+	if err != nil {
+		t.Fatalf("splice a peer leaf into the group this gate follows: %v", err)
+	}
+	return at
+}
+
 // groupAnswerPeer adds a real second member to the group this gate follows and answers that
 // member's own group, so that the three INBOUND rows have a message their group would accept.
 //
@@ -1637,6 +1668,17 @@ func groupAnswerRows(t *testing.T) []groupAnswerRow {
 		{name: "Export", call: func(group *Group) []any {
 			answer, err := group.Export("the exporter label this gate reads",
 				[]byte("the exporter context this gate reads"), 32)
+			return []any{&answer, &err}
+		}},
+		// PairwiseExport needs a SECOND LEAF to name, which the group this gate follows does not
+		// have, so the row splices one -- and it splices it through a helper that is IDEMPOTENT
+		// rather than through groupAnswerSecondLeaf. See groupAnswerPairwiseLeaf for why: this row
+		// carries no projection, so TestAGroupGoesOnPublishingWhatItWasFoundedOn asks it TWICE over
+		// one group and compares the two answers, and a row that drew a fresh peer key per call
+		// would answer two different keys from a group that is entirely correct.
+		{name: "PairwiseExport", call: func(group *Group) []any {
+			answer, err := group.PairwiseExport("the pairwise exporter label this gate reads",
+				groupAnswerPairwiseLeaf(t, group), 32)
 			return []any{&answer, &err}
 		}},
 		// both names of the closed enum, since the two arms read two different secrets and a row

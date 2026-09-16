@@ -53,6 +53,7 @@ var sectionSixGroupHandle = map[string]string{
 	"MemberAt":     "func(i int) (leafIndex uint32, identityPub []byte, leafKeys []byte, err error)",
 
 	"Export":              "func(label string, context []byte, length int) ([]byte, error)",
+	"PairwiseExport":      "func(label string, peer uint32, length int) ([]byte, error)",
 	"SenderDataSecret":    "func() ([]byte, error)",
 	"EncryptionSecret":    "func() ([]byte, error)",
 	"EpochAuthenticator":  "func() []byte",
@@ -185,12 +186,16 @@ func TestTheEngineInterfacesAreExactlySectionSixsBlock(t *testing.T) {
 	// the two counts section 6 was measured at, so a block that gained a method AND a
 	// transcription row in one edit is still a failure somebody has to look at.
 	//
-	// IT WAS 4 AND 23 UNTIL 2026-09-17 and is 4 and 25 from MASTER section 8.4.2 v2: ProtectBound
+	// IT WAS 4 AND 23 UNTIL 2026-09-17 and 4 and 25 from MASTER section 8.4.2 v2: ProtectBound
 	// and PeekSender are the two spec A section 8.2's amendment adds, and Unprotect's signature
 	// moved beside them. Three changes to the seam, made deliberately with the ruling in hand,
 	// which is exactly the event this pair of numbers exists to make somebody look at.
-	if len(sectionSixGroupEngine) != 4 || len(sectionSixGroupHandle) != 25 {
-		t.Errorf("section 6's block is transcribed as %d and %d methods; it was measured at 4 and 25, and a change to either is a change to the seam",
+	//
+	// AND IT IS 4 AND 26 FROM LEDGER ITEM 228's read-receipt tag ruling: PairwiseExport is the
+	// one method that ruling adds, and it is one method rather than an accessor for a leaf
+	// private key precisely so that no leaf scalar crosses this seam.
+	if len(sectionSixGroupEngine) != 4 || len(sectionSixGroupHandle) != 26 {
+		t.Errorf("section 6's block is transcribed as %d and %d methods; it was measured at 4 and 26, and a change to either is a change to the seam",
 			len(sectionSixGroupEngine), len(sectionSixGroupHandle))
 	}
 }

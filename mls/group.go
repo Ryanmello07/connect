@@ -827,6 +827,130 @@ func (self *Group) Export(label string, context []byte, length int) ([]byte, err
 	return self.schedule.Export(label, context, length)
 }
 
+// PairwiseExport is the exporter for key material TWO NAMED MEMBERS HOLD AND NO THIRD MEMBER CAN
+// DERIVE. Export above is the GROUP scoped one and this is its pairwise sibling; the two are not
+// interchangeable and the difference is the whole reason this method exists.
+//
+// WHAT SEPARATES IT FROM Export, said first because it is the only thing a caller has to decide
+// between them on. Export expands exporter_secret, which is one of the nine secrets of the epoch
+// schedule -- so EVERY member of the group derives the same answer from it, and a tag keyed by it
+// is forgeable by any of them. This method's key is an x25519 static-static Diffie-Hellman between
+// TWO LEAF HPKE KEYPAIRS: the RFC 9420 section 7.2 leaf encryption key, whose private half this
+// member holds on self.ownPriv and whose public half is in the ratchet tree every member holds. A
+// third member c holds the whole key schedule, every Export of it, the whole tree and every public
+// leaf point, and cannot derive this: the key lives OUTSIDE the key schedule, on two scalars c
+// does not have. TestAThirdMemberWithTheWholeScheduleAndTreeDerivesSomethingDifferent is that
+// sentence as a test, and it is the one property that could not be had from Export at any label.
+//
+// THE DH HAPPENS HERE AND NO LEAF SCALAR LEAVES THIS PACKAGE. That is not tidiness: self.ownPriv
+// is the key MergePendingCommit zeroizes, and a seam that handed the scalar out would have put a
+// copy of it in a package with no erase discipline. It is also forced -- ExpandWithLabel is a
+// METHOD on CryptoProvider and nothing outside this package holds one.
+//
+// THE CONTEXT, 160 octets at URmessage's 32 octet group id because every field is fixed width or
+// LP prefixed:
+//
+//	LP(group_id) || u64(epoch) || u32(lo) || u32(hi) || LP(pk_lo) || LP(pk_hi) || LP(epoch_authenticator)
+//
+// LP is the RECORD LAYER's fixed 32 bit big endian length prefix and NOT the MLS varint, and the
+// whole account of that -- why it is right here, why it is reached through mls/syntax rather than
+// through connect/message, and which gate sanctions it -- is on group_pairwise.go, which holds the
+// encoder. It is a DECLARATION rather than a writer inline in this body, for a reason that gate's
+// neighbour records: the labelled composition walk reads an inline self.schedule read here as a
+// serialized structure arriving at a labelled field with nothing bounding it, exactly as it does
+// for senderDataSecretLocked one screen down.
+//
+// WHY EACH TERM IS THERE, because a context term nothing can distinguish is a term that defends
+// nothing and each of these is answerable by a test that goes red without it:
+//
+//   - (lo, hi) is the pair SORTED, and BOTH public points accompany it. That is what makes the
+//     answer SYMMETRIC -- the two members derive byte-identical material without exchanging
+//     anything -- and it is what kills unknown-key-share: a point cannot be moved between the two
+//     positions without moving the index that names it.
+//   - epoch_authenticator binds the key to THAT EPOCH'S SCHEDULE. This is what puts a pairwise key
+//     under the SAME erase discipline the group scoped one is under: reconstructing it at a past
+//     epoch needs that epoch's schedule, which MergePendingCommit zeroizes and which
+//     DeleteGroupStateBefore(epoch - PastEpochWindow) prunes. Without it the answer would survive
+//     as long as the two scalars do, which is longer than any epoch secret does.
+//   - group_id and epoch make the same device pair in two groups, or in two epochs of one group,
+//     two different keys.
+//
+// WHAT IT REFUSES. A closed group, as Export does. ErrPairwiseSelf for one's own leaf, because a
+// DH with one's own point is not a two party key and answering one would hand a caller a value
+// that looks exactly like a real one. ErrBlankLeaf for a position holding no member -- a blank
+// node is not a member, and the own-leaf read is checked too so that the two public points are
+// both a member's. X25519DH's own ErrInvalidPoint for a low order peer point.
+//
+// IT IS NOT A VERIFIER AND IT DOES NOT KNOW WHICH EPOCH A CALLER MEANT. Like Export, it answers
+// the CURRENT epoch with a nil error, and MergePendingCommit REPLACES the schedule rather than
+// leaving it erased -- so a caller recomputing a tag over a record from an older epoch gets a
+// perfectly good key for the wrong epoch and no error at all. A caller that verifies has to read
+// the record's own epoch first and refuse to compute when it is not this one.
+func (self *Group) PairwiseExport(label string, peer LeafIndex, length int) ([]byte, error) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.closed {
+		return nil, errGroupClosed
+	}
+	if peer == self.ownLeaf {
+		return nil, ErrPairwiseSelf
+	}
+	ownNode := self.tree.Leaf(self.ownLeaf)
+	peerNode := self.tree.Leaf(peer)
+	if ownNode == nil || peerNode == nil {
+		return nil, ErrBlankLeaf
+	}
+	// (*KeySchedule).Export's two refusals, for its reasons and over the same two panics. The
+	// length is Expand's ceiling and the label is one opaque<V> of a KDFLabel, and BOTH of them
+	// reach a CryptoProvider method whose signature cannot report anything -- an over long label
+	// takes the process down inside mlsLabelBytes and an impossible length inside Expand. This
+	// declaration is exported, takes both from a caller, and already answers a caller's mistake
+	// with a typed error, so it answers these two as well rather than letting them panic.
+	//
+	// AND THEY ARE ASKED IN FRONT OF THE DIFFIE-HELLMAN, which is this tree's standing rule about
+	// a refusal and the work it precedes: a caller that cannot be served should not have had a
+	// curve operation spent on it first.
+	if length < 0 || length > 255*self.crypto.HashSize() {
+		return nil, fmt.Errorf("%w: %d", ErrExportLength, length)
+	}
+	if err := checkLabelledFieldLength("pairwise exporter", " label",
+		len(MlsLabelPrefix)+len(label)); err != nil {
+
+		return nil, err
+	}
+	priv, err := X25519PrivateKey(self.ownPriv.EncryptionPriv)
+	if err != nil {
+		return nil, err
+	}
+	pub, err := X25519PublicKey(peerNode.EncryptionKey)
+	if err != nil {
+		return nil, err
+	}
+	dh, err := X25519DH(priv, pub)
+	if err != nil {
+		return nil, err
+	}
+	// the raw shared secret is erased on the way out. ExpandWithLabel has already read it by
+	// then, and what the caller is handed is the expansion rather than the point.
+	defer zeroizeSecret(dh)
+
+	// the pair, sorted, with each public point carried in the position its index names. The two
+	// members run this method with (ownLeaf, peer) swapped, so the sort is the whole of why they
+	// agree -- and moving a point without moving its index is the case the ordering forbids.
+	lo, hi := uint32(self.ownLeaf), uint32(peer)
+	pkLo, pkHi := ownNode.EncryptionKey, peerNode.EncryptionKey
+	if hi < lo {
+		lo, hi = hi, lo
+		pkLo, pkHi = pkHi, pkLo
+	}
+	pairContext, err := marshalPairwiseContext(self.context.GroupId, self.context.Epoch,
+		lo, hi, pkLo, pkHi, self.schedule.Secrets().EpochAuthenticator)
+	if err != nil {
+		return nil, err
+	}
+	return self.crypto.ExpandWithLabel(dh, label, pairContext, length), nil
+}
+
 // EpochSecret exposes exactly the two secrets MASTER section 8.2 needs and refuses every other
 // name. The default arm is a refusal rather than a zero value, so a caller that invented a third
 // name is told so instead of being handed an empty slice it would go on to treat as a key.

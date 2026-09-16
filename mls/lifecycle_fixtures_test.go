@@ -357,6 +357,8 @@ var lifecycleOwnedErrors = map[string]error{
 	"ErrNoPendingCommit":             ErrNoPendingCommit,
 	"ErrEpochStale":                  ErrEpochStale,
 	"ErrRemovedFromGroup":            ErrRemovedFromGroup,
+	"ErrPairwiseSelf":                ErrPairwiseSelf,
+	"ErrBlankLeaf":                   ErrBlankLeaf,
 }
 
 // TestLifecycleOwnedErrorsIsEveryErrorItsFileDeclares holds the class to the file in both
@@ -398,8 +400,12 @@ func TestLifecycleErrorsAreDistinct(t *testing.T) {
 	// 26 since p7 task 14's second pass wired (*GroupInfo).Verify's rule 9. The count is
 	// asserted rather than derived on purpose -- see the note on lifecycleOwnedErrors -- so a
 	// later task adding a sentinel moves this number and says which task moved it.
-	if len(names) != 26 {
-		t.Fatalf("the lifecycle error set holds %d values, this plan declares 26", len(names))
+	//
+	// 28 since ledger item 228's pairwise exporter: ErrPairwiseSelf and ErrBlankLeaf are
+	// (*Group).PairwiseExport's two policy refusals, and moving this number is exactly the event
+	// it exists to make somebody look at.
+	if len(names) != 28 {
+		t.Fatalf("the lifecycle error set holds %d values, this plan declares 28", len(names))
 	}
 	for _, name := range names {
 		a := lifecycleOwnedErrors[name]

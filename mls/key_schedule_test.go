@@ -3055,6 +3055,24 @@ var groupMethodArgumentRows = map[string]func(t *testing.T, group *Group) [][]re
 			{reflect.ValueOf("URmessage/v1/other"), reflect.ValueOf(exportSweepContext), reflect.ValueOf(nh + 8)},
 		}
 	},
+	// ledger item 228's pairwise exporter, and it is Export's rows one scope over: one asks for
+	// KDF.Nh octets, so the answer is the same SIZE as the secret guardrail 6 is looking for and
+	// the comparison can mean something, and the other asks for a length that is not KDF.Nh so the
+	// pair differs in the length alone.
+	//
+	// THE PEER LEAF IS SPLICED, because this sweep's group has one member and a pairwise key needs
+	// two: driven at any leaf of a group of one the method answers ErrBlankLeaf, and a row that
+	// errors hands this sweep no octets at all -- the shape Export's comment above refuses. The
+	// splice is into the ratchet tree alone and it is the move the ProposeRemove row already
+	// makes; epochSecretSweepInboundMessage is written against exactly that and says so.
+	"PairwiseExport": func(t *testing.T, group *Group) [][]reflect.Value {
+		nh := group.crypto.HashSize()
+		peer := groupAnswerPairwiseLeaf(t, group)
+		return [][]reflect.Value{
+			{reflect.ValueOf("URmessage/v1/receipt-pair"), reflect.ValueOf(peer), reflect.ValueOf(nh)},
+			{reflect.ValueOf("URmessage/v1/other-pair"), reflect.ValueOf(peer), reflect.ValueOf(nh + 8)},
+		}
+	},
 	"EpochSecret": func(t *testing.T, group *Group) [][]reflect.Value {
 		return [][]reflect.Value{
 			{reflect.ValueOf(EpochSecretSenderData)},
