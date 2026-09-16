@@ -3883,9 +3883,11 @@ type TcpBufferSettings struct {
 	// EnableReturnRetransmit retains each inner TCP segment sent toward the
 	// source until the source's cumulative acknowledgement covers it, and
 	// sends it again on three duplicate acknowledgements, on partial
-	// acknowledgements during loss recovery, on the holes below a selective
-	// acknowledgement, and on a retransmission timer, cut to the current path
-	// mtu. Transfer delivers the segments losslessly to the source device, but
+	// acknowledgements during loss recovery, and on a retransmission timer,
+	// cut to the current path mtu. The holes below a selective
+	// acknowledgement are repaired only where EnableReturnRetransmitSack
+	// allows the negotiation as well, which is off, so on a default build
+	// the cumulative acknowledgement alone decides what is repaired. Transfer delivers the segments losslessly to the source device, but
 	// the device kernel can drop one on the flow's receive socket at high
 	// single-flow rates, and without this that drop is permanent: the source
 	// answers with duplicate acknowledgements for ever and the download stops.

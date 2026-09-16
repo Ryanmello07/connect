@@ -674,8 +674,8 @@ type pathInnerArm struct {
 // What one arm produced, in virtual time.
 type pathInnerResult struct {
 	arm string
-	// the provider's inner repair as the flow was actually built, read back
-	// from the settings the nat took rather than from the arm that asked
+	// the provider's inner repair as the flow was actually built, read out of
+	// the nat's own copy of its settings rather than from the arm that asked
 	repairEnabled      bool
 	deliveredByteCount int
 	exact              bool
@@ -794,13 +794,15 @@ func runPathInnerArm(t *testing.T, arm pathInnerArm) pathInnerResult {
 		natSocket, originSocket := net.Pipe()
 		natSettings := DefaultProviderLocalUserNatSettings()
 		natSettings.TcpBufferSettings.EnableReturnRetransmit = arm.returnRetransmit
-		result.repairEnabled = natSettings.TcpBufferSettings.EnableReturnRetransmit
 		natSettings.TcpBufferSettings.DialContextSettings = &DialContextSettings{
 			DialContext: func(dialCtx context.Context, network string, addr string) (net.Conn, error) {
 				return natSocket, nil
 			},
 		}
 		nat := NewLocalUserNat(ctx, "pathsim-exit", natSettings)
+		// the nat copies the settings it was given, so this is the flow's own
+		// value and not the arm's request read back to itself
+		result.repairEnabled = nat.settings.TcpBufferSettings.EnableReturnRetransmit
 		provider := NewRemoteUserNatProvider(providerClient, nat, DefaultRemoteUserNatProviderSettings())
 
 		sourceIp := net.IPv4(198, 51, 100, 10).To4()
@@ -1016,12 +1018,12 @@ func TestPathsimS9InnerSegmentLossRepairedByTheProvider(t *testing.T) {
 		}
 	}
 
-	// Each arm ran with the repair its name says, read back from the settings
-	// its flow was built with rather than from the arm that asked for them.
+	// Each arm ran with the repair its name says, read out of the nat's own
+	// copy of its settings rather than from the arm that asked for them.
 	// Three of the four fail outright when the flag is flipped; the lossless
 	// one cannot, because a repair with nothing to repair is silent in every
-	// number the device can see, so this and the digest are what hold its
-	// name to what it ran.
+	// number the device can see, so this read-back is what holds its name to
+	// what it ran.
 	if off.repairEnabled || !on.repairEnabled || !four.repairEnabled || !clean.repairEnabled {
 		t.Errorf("S9: the arms ran with the repair off=%t, on=%t, four losses=%t, no loss=%t; want it off in the first and on in the other three",
 			off.repairEnabled, on.repairEnabled, four.repairEnabled, clean.repairEnabled)

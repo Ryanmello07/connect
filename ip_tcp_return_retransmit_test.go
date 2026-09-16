@@ -2048,8 +2048,9 @@ func TestTcpReturnRetransmitANewRecoveryMarksItsFirstHoleInASpentInterval(t *tes
 		harness.source.sendCraftedSackAck(harness.source.lastAckNumber, block(2*flightSegmentCount-2))
 		synctest.Wait()
 		_, _, nextPacketCount, _ := harness.retransmitState()
-		if nextPacketCount <= packetCount+1 {
-			t.Fatalf("retransmissions=%d after the interval, want a burst above the %d the reserve drew", nextPacketCount, packetCount)
+		if wantNextPacketCount := packetCount + returnRetransmitMaxBurstSegmentCount; nextPacketCount != wantNextPacketCount {
+			t.Fatalf("retransmissions=%d after the interval, want the whole burst the new interval allows, %d, above the %d the reserve drew",
+				nextPacketCount, wantNextPacketCount, packetCount)
 		}
 
 		// the flow is unharmed: the source acknowledges both flights and the
