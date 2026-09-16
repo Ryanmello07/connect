@@ -1087,3 +1087,77 @@ func TestH1PathMonitorNeverConvictsASaturatedUplink(t *testing.T) {
 		}
 	}
 }
+
+// A loss denial re-arms the collapsed ring, so the direction is judged again
+// four ticks later. The loss evidence has to be re-armed with it: a loss
+// window that keeps its older ticks lets one out-of-order tick every few
+// seconds accumulate across denials until the bar is met, and the denial then
+// holds only for a path with almost no reordering at all. That denial is what
+// keeps a provider-leg queue, which inflates the queue delay while the client
+// socket is clean, from re-rolling the client's socket.
+func TestH1PathMonitorLossDenialRestartsTheReceiveLossWindow(t *testing.T) {
+	collapse := func(ooo func(k int) bool) func(k int) h1PathTickShape {
+		return func(k int) h1PathTickShape {
+			return h1PathTickShape{
+				rxByteRate:        500_000,
+				queueDelay:        6 * time.Second,
+				queueDelaySamples: 4,
+				rxOooAdvance:      ooo(k),
+			}
+		}
+	}
+	settings := DefaultH1PathRerollSettings()
+
+	// one out-of-order tick every five, a reordering rate a healthy client
+	// link reaches on its own
+	monitor, stats := newH1PathTestMonitor(t, &settings, 105*time.Millisecond)
+	decisions := runH1PathMonitorShape(monitor, 60, collapse(func(k int) bool { return k%5 == 0 }))
+	if ticks := h1PathConvictionTicks(decisions); len(ticks) != 0 {
+		t.Fatalf("conviction ticks = %v, want none: one tick in five is not loss evidence", ticks)
+	}
+	if denied := stats.SuppressedLossDenied.Load(); denied < 2 {
+		t.Fatalf("loss denied %d times over 30 s, want a denial for each re-armed window", denied)
+	}
+
+	// loss that is really there still confirms: from 10 s on every tick
+	// carries out-of-order data
+	monitor, _ = newH1PathTestMonitor(t, &settings, 105*time.Millisecond)
+	decisions = runH1PathMonitorShape(monitor, 60, collapse(func(k int) bool { return k%5 == 0 || 20 <= k }))
+	ticks := h1PathConvictionTicks(decisions)
+	if len(ticks) == 0 || ticks[0] < 20 {
+		t.Fatalf("conviction ticks = %v, want the first once loss arrives at tick 20", ticks)
+	}
+}
+
+// The send side denies a collapse without retransmits the same way, and its
+// retransmit window is re-armed with its collapsed ring for the same reason.
+func TestH1PathMonitorLossDenialRestartsTheSendLossWindow(t *testing.T) {
+	collapse := func(retrans func(k int) bool) func(k int) h1PathTickShape {
+		return func(k int) h1PathTickShape {
+			return h1PathTickShape{
+				rxByteRate:      20_000,
+				txKnown:         true,
+				txAckedByteRate: 500_000,
+				txNotSent:       1024 * 1024,
+				txRetrans:       retrans(k),
+			}
+		}
+	}
+	settings := DefaultH1PathRerollSettings()
+
+	monitor, stats := newH1PathTestMonitor(t, &settings, 105*time.Millisecond)
+	decisions := runH1PathMonitorShape(monitor, 60, collapse(func(k int) bool { return k%5 == 0 }))
+	if ticks := h1PathConvictionTicks(decisions); len(ticks) != 0 {
+		t.Fatalf("conviction ticks = %v, want none: one retransmitting tick in five is not loss evidence", ticks)
+	}
+	if denied := stats.SuppressedLossDenied.Load(); denied < 2 {
+		t.Fatalf("loss denied %d times over 30 s, want a denial for each re-armed window", denied)
+	}
+
+	monitor, _ = newH1PathTestMonitor(t, &settings, 105*time.Millisecond)
+	decisions = runH1PathMonitorShape(monitor, 60, collapse(func(k int) bool { return k%5 == 0 || 20 <= k }))
+	ticks := h1PathConvictionTicks(decisions)
+	if len(ticks) == 0 || ticks[0] < 20 {
+		t.Fatalf("conviction ticks = %v, want the first once retransmits arrive at tick 20", ticks)
+	}
+}

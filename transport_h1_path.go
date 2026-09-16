@@ -679,8 +679,13 @@ func (self *h1PathMonitor) tick(sample h1PathSample) h1PathDecision {
 			decision.confidence = h1PathConfidenceConfirmed
 		case 0 < lossKnownTicks:
 			// the kernel speaks for this socket and saw too little loss: a
-			// queue beyond it (the provider's leg) or an access link
+			// queue beyond it (the provider's leg) or an access link. Both
+			// rings restart together, so the next verdict reads the loss of
+			// the window it judges; a loss window that kept its older ticks
+			// would let one out-of-order tick every few seconds accumulate
+			// across denials until the bar is met.
 			self.rxCollapsedRing = 0
+			self.rxOooRing = 0
 			self.stats.recordSuppression(h1PathReasonLossDenied)
 			decision.reason = h1PathReasonLossDenied
 		default:
@@ -713,7 +718,9 @@ func (self *h1PathMonitor) tick(sample h1PathSample) h1PathDecision {
 			self.stats.recordConfidence(decision.confidence)
 			return decision
 		}
+		// both rings restart together, as on the receive side
 		self.txCollapsedRing = 0
+		self.txRetransRing = 0
 		self.stats.recordSuppression(h1PathReasonLossDenied)
 		decision.reason = h1PathReasonLossDenied
 	}
