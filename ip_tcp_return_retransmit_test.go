@@ -1477,6 +1477,82 @@ func TestTcpReturnRetransmitSackOnAnAdvancingAckRetransmitsNothing(t *testing.T)
 	})
 }
 
+// Inside loss recovery an acknowledgement that advances and reports a new
+// out-of-order run marks the holes that run reveals. This is the ordinary
+// shape of a partial acknowledgement from a source that reports its runs: it
+// covers the hole it was waiting for and says what it now holds above, and
+// the holes between are known from the blocks alone. The burst that partial
+// acknowledgements otherwise send is no help here, because every segment it
+// would reach was already sent again in this recovery and is in flight, so
+// without this the acknowledgement marks nothing and the next hole waits for
+// a duplicate that a source with blocks to send need never send.
+func TestTcpReturnRetransmitAnAdvancingAcknowledgementMarksTheHolesItsBlocksReveal(t *testing.T) {
+	const segmentCount = 40
+	// what the duplicates report holding, which puts the holes below it
+	const reportedIndex = 5
+	// what the advancing acknowledgement reports holding, well above it
+	const advancedIndex = 30
+	runTcpReturnRetransmitTest(t, func(t *testing.T) {
+		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{sack: true})
+		// nothing is acknowledged, so the whole flight is retained
+		harness.source.holdAcks = true
+		payload := harness.payload(segmentCount)
+		harness.write(payload)
+		synctest.Wait()
+		// one segment of the flight, as a block that claims it alone
+		block := func(segmentIndex int) []tcpSackBlock {
+			return []tcpSackBlock{{
+				start: harness.segmentSeq(segmentIndex),
+				end:   harness.segmentSeq(segmentIndex + 1),
+			}}
+		}
+
+		// three duplicates reporting one segment start the recovery, which
+		// marks the holes below what they report
+		for range returnRetransmitDupAckThreshold {
+			harness.source.sendCraftedSackAck(harness.dataSeq, block(reportedIndex))
+		}
+		synctest.Wait()
+		_, _, recoveryPacketCount, _ := harness.retransmitState()
+		if recoveryPacketCount != reportedIndex {
+			t.Fatalf("retransmissions=%d on the third duplicate, want the %d holes below what it reported",
+				recoveryPacketCount, reportedIndex)
+		}
+
+		// one acknowledgement that both advances over the repaired head and
+		// reports a run far above it
+		harness.source.sendCraftedSackAck(harness.segmentSeq(1), block(advancedIndex))
+		synctest.Wait()
+		_, _, packetCount, reasonCounts := harness.retransmitState()
+		// everything below the newly reported run that is not the segment it
+		// reports and was not already sent again in this recovery
+		wantPacketCount := int64(advancedIndex - 1)
+		if packetCount != wantPacketCount || reasonCounts[tcpReturnRetransmitReasonSackHole] != packetCount {
+			t.Fatalf("retransmissions=%d reasons=%v after the advancing acknowledgement, want %d on selective holes",
+				packetCount, reasonCounts, wantPacketCount)
+		}
+		for segmentIndex := 1; segmentIndex < advancedIndex; segmentIndex += 1 {
+			want := 2
+			if segmentIndex == reportedIndex {
+				// reported held, so never a hole
+				want = 1
+			}
+			harness.requireSeenCount(segmentIndex, want)
+		}
+		harness.requireSeenCount(advancedIndex, 1)
+
+		// the flow is unharmed: the source acknowledges the flight it had all
+		// along and the ring empties
+		harness.source.ackNow()
+		synctest.Wait()
+		harness.requireStream(payload)
+		retainedByteCount, retainedCount, _, _ := harness.retransmitState()
+		if retainedByteCount != 0 || retainedCount != 0 {
+			t.Fatalf("retained after the acknowledgement: %d bytes in %d segments", retainedByteCount, retainedCount)
+		}
+	})
+}
+
 // Hole selection stops at the highest selectively acknowledged byte: the
 // segment that starts exactly there is past everything the acknowledgement
 // reported and may be in flight, so it is not a hole. A source a round trip
