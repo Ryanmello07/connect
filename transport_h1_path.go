@@ -87,13 +87,14 @@ import (
 // and in Act alike. A client uploading over a 0.25-0.5 Mb/s uplink joins that
 // invisible population for as long as it uploads, because the ack guard reads
 // its own send queue's drain time and withdraws the evidence (the rule, and
-// TicksAckBacklogged against Ticks). Neither of the independent floors that suggest themselves
-// closes it: neither the dial round trip nor the kernel's minimum round trip
-// bounds the offset between the two clocks that every pack tag carries, and
-// neither one times the far socket's send queue, which sits upstream of
-// everything our kernel measures -- our own segments never wait behind it. A
-// round trip on our own clock is the only thing that does, which is what the
-// ack echo is, so this is the shape of the evidence and not a gap in the rule.
+// TicksAckBacklogged against Ticks). Neither of the independent floors that
+// suggest themselves closes it: neither the dial round trip nor the kernel's
+// minimum round trip bounds the offset between the two clocks that every pack
+// tag carries, and neither one times the far socket's send queue, which sits
+// upstream of everything our kernel measures -- our own segments never wait
+// behind it. A round trip on our own clock is the only thing that does, which
+// is what the ack echo is, so this is the shape of the evidence and not a gap
+// in the rule.
 //
 // That last shape is not a corner, and treating it as unconfirmed is a choice
 // about most clients, not about a few. A route carries an ack to read only
