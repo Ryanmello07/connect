@@ -77,10 +77,10 @@ import (
 // connection. The connection counts ConnectionsMonitored, ConnectionsDormant at
 // the dial gate, ConnectionsUnbuffered, KernelUnavailable (once per connection:
 // no kernel socket, or its first read failed), SourcePortUnmoved,
-// MonitorStopped,
-// SuppressedObserve and the ledger's refusals, Rerolls, Improved and
-// Unimproved; runH1 counts RerollDials, and a re-roll dial's source port plan
-// counts SourcePortBinds and SourcePortFallbacks, one per socket it plans.
+// MonitorStopped, SuppressedObserve and the ledger's refusals, Rerolls,
+// Improved and Unimproved; runH1 counts RerollDials, and a re-roll dial's
+// source port plan counts SourcePortBinds and SourcePortFallbacks, one per
+// socket it plans.
 
 // The per-connection counters runH1 keeps for the monitor. The reader and the
 // writer update them; the watcher reads them.
