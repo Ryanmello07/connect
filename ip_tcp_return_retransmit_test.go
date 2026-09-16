@@ -3492,27 +3492,37 @@ func TestTcpReturnRetransmitKeepsTheFinUntilItsOwnSequenceByteIsAcknowledged(t *
 // The drain waits for the retained ring at both of its ends. Its loop reads
 // the socket reader's queue from two places — the outer wait for the next
 // packet and the inner drain that fills a batch — and either can be the one
-// that finds the queue closed, depending on where the delivery of the last
-// batch left it. The tests above always end on the inner one, because the
-// reader closes the queue while the drain is still inside that batch. Here
-// the first segment's tunnel write holds the drain long enough for the
-// reader to queue the whole flight, add its FIN and close, so the batch is
-// finished from the queue and the close is found by the outer read. Without
-// the wait there the sequence cancels behind a delivered FIN with a hole
-// still retained, and the source's download ends one segment short.
+// that finds the queue closed. The tests above always end on the inner one,
+// because the reader closes the queue while the drain is still inside the
+// batch that carries the FIN. The outer one is reached when the batch is
+// finished from the queue instead: here the first segment's tunnel write holds
+// the drain while the reader queues the rest of the flight, adds its FIN and
+// closes, so the next batch fills to its size from the queue and the close is
+// found by the outer read. Without the wait there the sequence cancels behind
+// a delivered FIN with a hole still retained, and the source's download ends
+// one segment short.
 func TestTcpReturnRetransmitDrainWaitsForTheRingWhenTheReaderClosesFirst(t *testing.T) {
-	const segmentCount = 3
-	const holeIndex = 1
+	// the flight after the stalled first segment, one short of the batch, so
+	// the FIN fills it
+	const flightCount = 3
+	const holeIndex = 2
 	const stall = 10 * time.Millisecond
 	runTcpReturnRetransmitTest(t, func(t *testing.T) {
 		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{})
+		if harness.settings.WriteBatchSize != 1+flightCount {
+			t.Fatalf("batch size %d, want %d so the FIN fills the second batch", harness.settings.WriteBatchSize, 1+flightCount)
+		}
 		harness.source.stallDurations[harness.segmentSeq(0)] = stall
 		harness.source.dropCounts[harness.segmentSeq(holeIndex)] = 1
 		start := time.Now()
-		payload := harness.payload(segmentCount)
-		harness.write(payload)
-		// the reader queues its FIN and closes while the drain is still in
-		// the first segment's write
+		payload := harness.payload(1 + flightCount)
+		// the first segment alone, whose write holds the drain
+		harness.writeSegments(payload, 0, 1)
+
+		// everything else, and the reader's close, while the drain is held:
+		// the queue takes the flight and the FIN, and the batch that carries
+		// them is full without the closed queue being read
+		harness.write(payload[harness.segmentByteCount:])
 		harness.closeUpstream()
 		synctest.Wait()
 
@@ -3521,15 +3531,15 @@ func TestTcpReturnRetransmitDrainWaitsForTheRingWhenTheReaderClosesFirst(t *test
 		if harness.runIsDone() {
 			t.Fatal("the sequence ended with a hole still retained behind the delivered FIN")
 		}
-		finSeq := harness.segmentSeq(segmentCount)
+		finSeq := harness.segmentSeq(1 + flightCount)
 		if got := harness.source.seenCount(finSeq); got != 1 {
 			t.Fatalf("the FIN at %d was delivered %d times with the flight, want once", finSeq, got)
 		}
 		harness.requireSeenCount(holeIndex, 1)
 
-		// only two segments came behind the hole, the last of them the FIN,
-		// so the duplicates never reach the threshold and the timer repairs
-		// it (see the file header for the initial timer)
+		// only one segment and the FIN came behind the hole, so the
+		// duplicates never reach the threshold and the timer repairs it (see
+		// the file header for the initial timer)
 		harness.waitRunDone(2 * returnRetransmitInitialRto)
 		harness.requireSeenCount(holeIndex, 2)
 		if got, want := harness.requireDelivery(harness.segmentSeq(holeIndex), 1).at.Sub(start), stall+returnRetransmitInitialRto; got != want {
