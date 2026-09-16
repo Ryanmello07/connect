@@ -1504,10 +1504,11 @@ type h1PathStats struct {
 	// it crosses the three disjoint readings in the same way
 	TicksAckUnknown atomic.Uint64
 	// accepted ticks that had an ack round trip to read and lost it to our own
-	// send backlog, which is the same population for as long as the uplink is
-	// busy. Also counted in TicksAckUnknown's sense by the conviction it
-	// leaves unconfirmed, but kept apart so a busy uplink is not read as a peer
-	// that answers elsewhere
+	// send backlog. Disjoint from TicksAckUnknown, which counts the ticks with
+	// no ack to read at all; the two together are the ticks whose conviction
+	// could only be unconfirmed, and they are kept apart because a busy uplink
+	// and a peer that answers over another transport are different problems
+	// with different fixes
 	TicksAckBacklogged atomic.Uint64
 	// sampled packs of an accepted tick that read nothing: a tag older than the
 	// route's latest re-roll mark, and a source the baseline holds no slot for.
