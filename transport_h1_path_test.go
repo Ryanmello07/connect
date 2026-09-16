@@ -132,16 +132,30 @@ func h1PathConvictionTicks(decisions []h1PathDecision) []int {
 	return ticks
 }
 
-// the measured collapse: 0.5 MB/s delivered while the queue grows from the
-// start of the bulk at 0.5 s
+// The measured collapse: 0.5 MB/s delivered while the queue grows from the
+// start of the bulk at 0.5 s. The acks ride the same route as the packs and
+// carry the same queue, which is what the rig read -- an ack round trip
+// climbing to 6-10 s against a 101 ms path -- and what makes the conviction
+// confirmed rather than a queue on the sender's clock alone.
 func h1PathCollapseShape(k int) h1PathTickShape {
 	elapsed := time.Duration(k) * h1PathTestStep
+	queue := max(0, elapsed-500*time.Millisecond)
 	return h1PathTickShape{
 		rxByteRate:        500_000,
-		queueDelay:        max(0, elapsed-500*time.Millisecond),
+		queueDelay:        queue,
 		queueDelaySamples: 4,
 		rxOooAdvance:      true,
+		ackRtt:            105*time.Millisecond + queue,
 	}
+}
+
+// The collapse shape with the queue at its full depth from the first tick, in
+// the pack tags and in the acks alike.
+func h1PathHeldCollapseShape(k int) h1PathTickShape {
+	shape := h1PathCollapseShape(k)
+	shape.queueDelay = 6 * time.Second
+	shape.ackRtt = 6105 * time.Millisecond
+	return shape
 }
 
 // Ticks alone cannot tell a connection that saw no collapse from one that
@@ -182,8 +196,22 @@ func TestH1PathMonitorCountsHowEachTickWasRead(t *testing.T) {
 		t.Fatalf("stats = %+v, want every tick behind our own back pressure", snapshot)
 	}
 
-	// no pack sample: the queue delay is unknown, so the tick says nothing
-	// about a queue either way
+	// no pack sample and no ack to read: the tick says nothing about a queue
+	// either way
+	monitor, stats = newH1PathTestMonitor(t, &settings, 105*time.Millisecond)
+	runH1PathMonitorShape(monitor, tickCount, func(k int) h1PathTickShape {
+		shape := h1PathCollapseShape(k)
+		shape.queueDelaySamples = 0
+		shape.ackRtt = 0
+		return shape
+	})
+	snapshot = stats.snapshot()
+	if snapshot.TicksQueueDelayUnknown != tickCount-1 || snapshot.TicksCollapsed != 0 {
+		t.Fatalf("stats = %+v, want every tick without a queue delay counted", snapshot)
+	}
+
+	// no pack sample, but an ack round trip that holds the queue: the pack
+	// tags are still unread and the tick collapses on the ack alone
 	monitor, stats = newH1PathTestMonitor(t, &settings, 105*time.Millisecond)
 	runH1PathMonitorShape(monitor, tickCount, func(k int) h1PathTickShape {
 		shape := h1PathCollapseShape(k)
@@ -191,8 +219,8 @@ func TestH1PathMonitorCountsHowEachTickWasRead(t *testing.T) {
 		return shape
 	})
 	snapshot = stats.snapshot()
-	if snapshot.TicksQueueDelayUnknown != tickCount-1 || snapshot.TicksCollapsed != 0 {
-		t.Fatalf("stats = %+v, want every tick without a queue delay counted", snapshot)
+	if snapshot.TicksQueueDelayUnknown != tickCount-1 || snapshot.TicksCollapsed < 15 {
+		t.Fatalf("stats = %+v, want the ack collapsing ticks the pack tags could not read", snapshot)
 	}
 
 	// the measured collapse: every tick past the queue threshold is collapsed,
@@ -527,8 +555,7 @@ func TestH1PathMonitorDormantOnShortPath(t *testing.T) {
 
 	monitor, stats := newH1PathTestMonitor(t, &settings, 50*time.Millisecond)
 	decisions := runH1PathMonitorShape(monitor, 60, func(k int) h1PathTickShape {
-		shape := h1PathCollapseShape(k)
-		shape.queueDelay = 6 * time.Second
+		shape := h1PathHeldCollapseShape(k)
 		shape.minRtt = 300 * time.Microsecond
 		return shape
 	})
@@ -545,8 +572,7 @@ func TestH1PathMonitorDormantOnShortPath(t *testing.T) {
 	// after it is gone
 	monitor, _ = newH1PathTestMonitor(t, &settings, 50*time.Millisecond)
 	decisions = runH1PathMonitorShape(monitor, 60, func(k int) h1PathTickShape {
-		shape := h1PathCollapseShape(k)
-		shape.queueDelay = 6 * time.Second
+		shape := h1PathHeldCollapseShape(k)
 		if k == 3 {
 			shape.ackRttMin = 2 * time.Millisecond
 		}
@@ -562,11 +588,7 @@ func TestH1PathMonitorDormantOnShortPath(t *testing.T) {
 func TestH1PathMonitorAgeGateAndRingReset(t *testing.T) {
 	settings := DefaultH1PathRerollSettings()
 	monitor, _ := newH1PathTestMonitor(t, &settings, 105*time.Millisecond)
-	decisions := runH1PathMonitorShape(monitor, 12, func(k int) h1PathTickShape {
-		shape := h1PathCollapseShape(k)
-		shape.queueDelay = 6 * time.Second
-		return shape
-	})
+	decisions := runH1PathMonitorShape(monitor, 12, h1PathHeldCollapseShape)
 	// four collapsed ticks by 2.0 s wait for the 3 s age gate; the reset then
 	// needs four more collapsed ticks
 	if ticks := h1PathConvictionTicks(decisions); len(ticks) != 2 || ticks[0] != 6 || ticks[1] != 10 {
@@ -816,6 +838,25 @@ func TestH1PathLedgerUnconfirmedBudget(t *testing.T) {
 	ledger.networkChanged(now)
 	if ok, reason := ledger.allow(&settings, now, H1PathRerollRoleClient, h1PathConfidenceUnconfirmed, time.Minute); !ok {
 		t.Fatalf("a network change did not reset the unconfirmed budget: %s", reason)
+	}
+
+	// An improvement gives the budget back. A re-roll that fixed the
+	// connection is the evidence its conviction lacked, so the epoch is no
+	// worse off for having spent it, and a device whose peer answers over
+	// another transport keeps re-rolling for as long as re-rolling works.
+	ledger, _ = newH1PathTestLedger()
+	key := &RouteManager{}
+	now = h1PathTestOrigin
+	ledger.noteReroll(key, &settings, now, H1PathRerollRoleClient, h1PathConfidenceUnconfirmed, 0)
+	now = now.Add(time.Minute)
+	if ok, reason := ledger.allow(&settings, now, H1PathRerollRoleClient, h1PathConfidenceUnconfirmed, time.Minute); ok {
+		t.Fatalf("the unconfirmed budget was not spent: %t %s", ok, reason)
+	}
+	if !ledger.noteClean(key, &settings, now, settings.CleanTicks) {
+		t.Fatal("the clean ticks did not resolve the re-roll as improved")
+	}
+	if ok, reason := ledger.allow(&settings, now, H1PathRerollRoleClient, h1PathConfidenceUnconfirmed, time.Minute); !ok {
+		t.Fatalf("an improvement did not give the unconfirmed budget back: %s", reason)
 	}
 }
 
@@ -1774,8 +1815,7 @@ func TestH1PathMonitorCleanTicksSurviveReceiveBackpressure(t *testing.T) {
 	// tick under the thin rate is not clean either way
 	monitor, stats := newH1PathTestMonitor(t, &settings, 105*time.Millisecond)
 	decisions = runH1PathMonitorShape(monitor, 60, func(k int) h1PathTickShape {
-		shape := h1PathCollapseShape(k)
-		shape.queueDelay = 6 * time.Second
+		shape := h1PathHeldCollapseShape(k)
 		shape.receiveFull = true
 		return shape
 	})
@@ -2072,5 +2112,208 @@ func TestH1PathMonitorDoesNotReadOurOwnSendQueueAsTheReceiveQueue(t *testing.T) 
 	})
 	if ticks := h1PathConvictionTicks(decisions); len(ticks) == 0 {
 		t.Error("with the send queue under the floor the ack round trip did not convict")
+	}
+}
+
+// What one arm of the evidence policy produced: the monitor's verdicts and
+// what the process ledger did with them.
+type h1PathPolicyOutcome struct {
+	collapsedTicks  uint64
+	ackDeniedTicks  uint64
+	convictions     int
+	confirmed       int
+	unconfirmed     int
+	rerolls         int
+	suppressed      map[h1PathReason]int
+	firstConviction time.Duration
+	lastConviction  time.Duration
+}
+
+func (self h1PathPolicyOutcome) String() string {
+	return fmt.Sprintf(
+		"collapsed=%d ackdenied=%d convictions=%d(%dc/%du) rerolls=%d suppressed=%v first=%s last=%s",
+		self.collapsedTicks, self.ackDeniedTicks,
+		self.convictions, self.confirmed, self.unconfirmed, self.rerolls,
+		self.suppressed, self.firstConviction, self.lastConviction,
+	)
+}
+
+// Runs the shape through the real monitor and the real connection decision
+// against a real process ledger, so an arm reads the whole cost of a shape and
+// not only its verdicts. The connection is never replaced, which is the
+// pessimistic reading: the shape keeps producing whatever it produced.
+func runH1PathPolicyShape(
+	t *testing.T,
+	settings *H1PathRerollSettings,
+	dialRtt time.Duration,
+	tickCount int,
+	shape func(k int) h1PathTickShape,
+) h1PathPolicyOutcome {
+	t.Helper()
+	connection, _ := testingH1PathDecideConnection(H1PathRerollModeAct, false)
+	*connection.settings = *settings
+	monitor := newH1PathMonitor(connection.settings, h1PathTestOrigin, dialRtt)
+	if monitor == nil {
+		t.Fatalf("no monitor for dial rtt %s", dialRtt)
+	}
+	monitor.stats = connection.stats
+	connection.monitor = monitor
+
+	outcome := h1PathPolicyOutcome{suppressed: map[h1PathReason]int{}}
+	decisions := runH1PathMonitorShape(monitor, tickCount, shape)
+	for k := range decisions {
+		decision := decisions[k]
+		elapsed := time.Duration(k) * h1PathTestStep
+		connection.decide(h1PathTestOrigin.Add(elapsed), &decision)
+		if decision.convicted {
+			outcome.convictions += 1
+			if outcome.firstConviction == 0 {
+				outcome.firstConviction = elapsed
+			}
+			outcome.lastConviction = elapsed
+			switch decision.confidence {
+			case h1PathConfidenceConfirmed:
+				outcome.confirmed += 1
+			case h1PathConfidenceUnconfirmed:
+				outcome.unconfirmed += 1
+			}
+		}
+		switch decision.action {
+		case h1PathActionReroll:
+			outcome.rerolls += 1
+		case h1PathActionSuppressed:
+			outcome.suppressed[decision.reason] += 1
+		}
+	}
+	snapshot := connection.stats.snapshot()
+	outcome.collapsedTicks = snapshot.TicksCollapsed
+	outcome.ackDeniedTicks = snapshot.RxAckDeniedTicks
+	return outcome
+}
+
+// The evidence policy on the shapes the rollout has to be sized against, each
+// driven through the real monitor and the real ledger. The file header states
+// the same four readings in words; this is where they are measured.
+//
+// The queue delay and the ack round trip are two measures of one queue. The
+// queue delay is read on the sender's clock against a baseline built from what
+// that source has shown, so it is wrong in both directions: a backward clock
+// step on the sender adds a queue that is not there, and a queue already
+// standing when the source was first read is inside the baseline and never
+// appears. The ack round trip is this client's own send time against the dial
+// round trip, so a conviction it backs is one this device checked. A
+// conviction with no ack to read stands -- going blind on every route whose
+// peer answers over another transport would cost more than it saves -- but it
+// is unconfirmed, and the epoch's unconfirmed budget of one is what bounds it.
+func TestH1PathEvidencePolicyOnTheMeasuredShapes(t *testing.T) {
+	const pathRtt = 101 * time.Millisecond
+	settings := DefaultH1PathRerollSettings()
+
+	// the same datacenter: no monitor at all, and a connection whose kernel
+	// later reports a shorter path is dormant from its first tick
+	if monitor := newH1PathMonitor(&settings, h1PathTestOrigin, time.Millisecond); monitor != nil {
+		t.Error("a 1 ms dial round trip built a monitor")
+	}
+	sameDatacenter := runH1PathPolicyShape(t, &settings, 40*time.Millisecond, 1200,
+		func(k int) h1PathTickShape {
+			shape := h1PathHeldCollapseShape(k)
+			shape.minRtt = time.Millisecond
+			return shape
+		})
+	t.Logf("same datacenter: %s", sameDatacenter)
+	if sameDatacenter.convictions != 0 || sameDatacenter.collapsedTicks != 0 {
+		t.Errorf("same datacenter: %s, want a dormant connection", sameDatacenter)
+	}
+
+	// a healthy 101 ms path at 200 Mb/s, with ordinary reordering and a 4 ms
+	// standing queue that the acks carry
+	healthy := runH1PathPolicyShape(t, &settings, pathRtt, 1200, func(k int) h1PathTickShape {
+		return h1PathTickShape{
+			rxByteRate:        25_000_000,
+			queueDelay:        4 * time.Millisecond,
+			queueDelaySamples: 400,
+			rxOooAdvance:      k%30 < 26,
+			minRtt:            pathRtt,
+			ackRtt:            pathRtt + 4*time.Millisecond,
+		}
+	})
+	t.Logf("healthy 101 ms at 200 Mb/s: %s", healthy)
+	if healthy.convictions != 0 || healthy.collapsedTicks != 0 {
+		t.Errorf("healthy 101 ms at 200 Mb/s: %s, want nothing collapsed in ten minutes", healthy)
+	}
+
+	// a saturated 20 Mb/s access link whose large window holds 1.5 s of
+	// bufferbloat from 10 s on. The bloat is a real queue and the acks carry
+	// it, so nothing denies it: this is the residual false positive, and the
+	// ledger is the whole of what bounds it
+	bloat := runH1PathPolicyShape(t, &settings, pathRtt, 1200, func(k int) h1PathTickShape {
+		queue := time.Duration(0)
+		if 20 <= k {
+			queue = 1500 * time.Millisecond
+		}
+		return h1PathTickShape{
+			rxByteRate:        2_500_000,
+			queueDelay:        queue,
+			queueDelaySamples: 16,
+			rxOooAdvance:      true,
+			minRtt:            pathRtt,
+			ackRtt:            pathRtt + queue,
+		}
+	})
+	t.Logf("bufferbloated 20 Mb/s access link: %s", bloat)
+	if bloat.unconfirmed != 0 || bloat.confirmed == 0 {
+		t.Errorf("bufferbloated 20 Mb/s access link: %s, want confirmed convictions", bloat)
+	}
+	if bloat.rerolls != 2 || bloat.suppressed[h1PathReasonLatched] == 0 {
+		t.Errorf(
+			"bufferbloated 20 Mb/s access link: %s, want two re-rolls and then the epoch latched",
+			bloat,
+		)
+	}
+	if want := 11500 * time.Millisecond; bloat.firstConviction != want {
+		t.Errorf("bufferbloated 20 Mb/s access link convicted at %s, want %s", bloat.firstConviction, want)
+	}
+
+	// the measured collapse: 0.5 MB/s behind a queue that grows from the start
+	// of the bulk, with an ack round trip that carries the same queue
+	collapse := runH1PathPolicyShape(t, &settings, pathRtt, 1200, h1PathCollapseShape)
+	t.Logf("measured collapse: %s", collapse)
+	if collapse.unconfirmed != 0 || collapse.confirmed == 0 {
+		t.Errorf("measured collapse: %s, want confirmed convictions", collapse)
+	}
+	if want := 3500 * time.Millisecond; collapse.firstConviction != want {
+		t.Errorf("measured collapse convicted at %s, want %s", collapse.firstConviction, want)
+	}
+
+	// a route that carries no ack at all, and a sender that steps its clock
+	// back 2 s at 60 s: the pack tags cannot tell that from a queue, and
+	// nothing here can. The conviction stands and is unconfirmed, so the epoch
+	// pays one re-roll and refuses every later one
+	step := runH1PathPolicyShape(t, &settings, pathRtt, 1200, func(k int) h1PathTickShape {
+		queue := time.Duration(0)
+		if 120 <= k {
+			queue = 2 * time.Second
+		}
+		return h1PathTickShape{
+			rxByteRate:        2_250_000,
+			queueDelay:        queue,
+			queueDelaySamples: 4,
+			rxOooAdvance:      true,
+			minRtt:            pathRtt,
+		}
+	})
+	t.Logf("sender clock step on a route with no ack: %s", step)
+	if step.confirmed != 0 || step.unconfirmed == 0 {
+		t.Errorf("sender clock step on a route with no ack: %s, want unconfirmed convictions", step)
+	}
+	if step.rerolls != 1 || step.suppressed[h1PathReasonUnconfirmedBudget] == 0 ||
+		0 < step.suppressed[h1PathReasonLatched] {
+		t.Errorf(
+			"sender clock step on a route with no ack: %s, want one re-roll, the rest refused by the budget and no latch",
+			step,
+		)
+	}
+	if step.ackDeniedTicks != 0 {
+		t.Errorf("sender clock step on a route with no ack: %s, want no tick denied by an ack", step)
 	}
 }

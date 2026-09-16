@@ -18,6 +18,45 @@ import (
 // this: the carrier is reliable, so it shows no resends, only an ack round trip
 // that climbs to seconds while the window sits queued in the far socket.
 //
+// What each evidence is worth, and what it costs when it is wrong. The queue
+// delay is read from pack tags against the sender's clock and against a
+// baseline built from what that source has shown, so a sender clock step and a
+// queue that was already standing when the source was first read are both
+// invisible to it in opposite directions. The ack echo is this client's own
+// send time read against the dial round trip, so it needs neither clock nor
+// baseline, and it is the only queue evidence a conviction can be checked
+// against here. The four shapes the rollout is sized against, at the library
+// defaults and pinned by TestH1PathEvidencePolicyOnTheMeasuredShapes:
+//
+//   - the same datacenter: a dial round trip under MinPathRtt gets no monitor
+//     at all, and a connection whose kernel later reports a shorter path goes
+//     dormant at its first tick. No ticks, no cost, no false positive.
+//   - a healthy 101 ms path at 200 Mb/s: the rate alone excludes it, 25 MB/s
+//     against a thin rate of 3.5 MB/s, and its 4 ms queue is three orders
+//     below the threshold. No collapsed tick in ten minutes.
+//   - a saturated 20 Mb/s access link with bufferbloat: a real false positive
+//     and the residual cost of the feature. 2.5 MB/s is under thin, the bloat
+//     is a real queue that the acks carry too, so nothing denies it and the
+//     conviction is confirmed. It convicts 1.5 s after the queue stands and
+//     the ledger is what bounds it: two unimproved re-rolls latch the epoch
+//     for LatchDuration, so the cost is two or three break-before-make
+//     disconnects per network epoch on a link that was never going to improve.
+//     The lever if the field disagrees is BaselineRisePerMinute, which sets
+//     how long a queue of q stays visible ((q - thr) / rise, 4.9 min at 1.5 s),
+//     not the threshold, which is what keeps the measured collapse in.
+//   - the measured collapse, 0.5 MB/s behind a 6-10 s queue on a 101 ms path:
+//     convicted 2 s after the queue reaches the threshold, confirmed by the
+//     kernel's out-of-order counter and by an ack round trip that carries the
+//     same queue.
+//
+// And the shape with no ack to read at all -- a peer that answers over another
+// transport, and the sender clock step that is then indistinguishable from a
+// queue: the conviction stands on the pack tags, because the alternative is to
+// go blind on a route whose peer talks elsewhere, but it is unconfirmed. One
+// unconfirmed re-roll is allowed per network epoch and an improvement gives it
+// back, so a clock step costs one disconnect and then nothing, with no latch,
+// while a real collapse the re-roll fixes costs nothing at all.
+//
 // This file holds the pure parts, with no call sites of their own:
 //   - the settings and their defaults (library default Observe), the
 //     environment variables and the process mode override, and the precedence
@@ -358,7 +397,8 @@ type H1PathRerollSettings struct {
 	DeviceRerollSpacing time.Duration
 	// unimproved re-rolls in one network epoch that set the latch
 	MaxUnimprovedRerolls int
-	// re-rolls on an unconfirmed conviction allowed in one network epoch
+	// re-rolls on an unconfirmed conviction allowed in one network epoch; an
+	// improvement gives the budget back
 	MaxUnconfirmedRerolls int
 	// unimproved re-rolls in a rolling 24 hours that stop re-rolls (at most 32)
 	MaxUnimprovedRerollsPerDay int
@@ -576,8 +616,10 @@ type h1PathDecision struct {
 	// collapsed ticks in the window of the direction evaluated
 	collapsedTicks int
 	// ticks with loss evidence, and ticks where the evidence was known, in the loss window
-	lossTicks       int
-	lossKnownTicks  int
+	lossTicks      int
+	lossKnownTicks int
+	// ticks of the loss window whose own ack round trip held the queue
+	ackQueuedTicks  int
 	queueDelay      time.Duration
 	queueDelayKnown bool
 	// the latest ack round trip over the path round trip, and whether one was
@@ -609,10 +651,13 @@ type h1PathDecision struct {
 //     H1;
 //   - a direction convicts with ConvictTicks of the last WindowTicks collapsed,
 //     the connection at least MinConnectionAge old, and loss evidence over the
-//     last LossWindowTicks: rx is confirmed by out-of-order data in
-//     RxLossMinTicks ticks, denied when the kernel reports the field and fewer
-//     ticks show it, and unconfirmed when the field is unknown; tx needs
-//     retransmits in TxLossMinTicks ticks.
+//     last LossWindowTicks: rx is denied when the kernel reports out-of-order
+//     data and fewer than RxLossMinTicks ticks show it, confirmed when
+//     RxLossMinTicks ticks show it and an ack round trip held the queue in at
+//     least one tick of that window, and unconfirmed otherwise -- the kernel
+//     field unknown, or a queue that stood on the sender's clock alone; tx
+//     needs retransmits in TxLossMinTicks ticks and is measured entirely on
+//     this device's own clock, so it is confirmed.
 //
 // A conviction resets every ring. A denial resets only that direction's
 // collapsed ring, so it is evaluated again after ConvictTicks more collapsed
@@ -642,6 +687,7 @@ type h1PathMonitor struct {
 	txCollapsedRing uint16
 	rxOooRing       uint16
 	rxOooKnownRing  uint16
+	rxAckQueuedRing uint16
 	txRetransRing   uint16
 }
 
@@ -688,6 +734,7 @@ func (self *h1PathMonitor) resetRings() {
 	self.txCollapsedRing = 0
 	self.rxOooRing = 0
 	self.rxOooKnownRing = 0
+	self.rxAckQueuedRing = 0
 	self.txRetransRing = 0
 }
 
@@ -836,6 +883,7 @@ func (self *h1PathMonitor) tick(sample h1PathSample) h1PathDecision {
 	rxOooKnown := prev.rxOooKnown && sample.rxOooKnown
 	self.rxCollapsedRing = h1PathRingPush(self.rxCollapsedRing, rxCollapsed)
 	self.txCollapsedRing = h1PathRingPush(self.txCollapsedRing, txCollapsed)
+	self.rxAckQueuedRing = h1PathRingPush(self.rxAckQueuedRing, ackQueued)
 	self.rxOooKnownRing = h1PathRingPush(self.rxOooKnownRing, rxOooKnown)
 	self.rxOooRing = h1PathRingPush(self.rxOooRing, rxOooKnown && prev.rxOoo < sample.rxOoo)
 	self.txRetransRing = h1PathRingPush(self.txRetransRing, txKnown && prev.txRetrans < sample.txRetrans)
@@ -859,13 +907,20 @@ func (self *h1PathMonitor) tick(sample h1PathSample) h1PathDecision {
 	if rxCollapsedTicks := bits.OnesCount16(self.rxCollapsedRing & windowMask); settings.ConvictTicks <= rxCollapsedTicks {
 		lossTicks := bits.OnesCount16(self.rxOooRing & lossMask)
 		lossKnownTicks := bits.OnesCount16(self.rxOooKnownRing & lossMask)
+		ackQueuedTicks := bits.OnesCount16(self.rxAckQueuedRing & lossMask)
 		decision.direction = h1PathDirectionRx
 		decision.collapsedTicks = rxCollapsedTicks
 		decision.lossTicks = lossTicks
 		decision.lossKnownTicks = lossKnownTicks
+		decision.ackQueuedTicks = ackQueuedTicks
 		switch {
-		case settings.RxLossMinTicks <= lossTicks:
+		case settings.RxLossMinTicks <= lossTicks && 0 < ackQueuedTicks:
 			decision.confidence = h1PathConfidenceConfirmed
+		case settings.RxLossMinTicks <= lossTicks:
+			// loss the kernel saw, and a queue that stood on the sender's clock
+			// alone: nothing here was measured on a clock this device controls,
+			// so the re-roll draws on the unconfirmed budget
+			decision.confidence = h1PathConfidenceUnconfirmed
 		case 0 < lossKnownTicks:
 			// the kernel speaks for this socket and saw too little loss: a
 			// queue beyond it (the provider's leg) or an access link. Both
@@ -941,6 +996,12 @@ const h1PathExcludedPortLimit = 16
 // ticks are an improvement; an entry that ages out, is evicted, or is dropped
 // by a network change is unresolved. MaxUnimprovedRerolls unimproved re-rolls
 // in one network epoch set the latch for LatchDuration.
+//
+// An unconfirmed conviction is one nothing on this device could check: no
+// kernel loss counter, or a queue that stood on the sender's clock alone.
+// MaxUnconfirmedRerolls of those are allowed per network epoch, and an
+// improvement returns the budget, so a re-roll that keeps working is free and
+// one that changes nothing is spent once.
 //
 // The ledger counts Unresolved; callers count Unimproved and Improved from the
 // returns of noteConviction and noteClean, and the suppression reasons from
@@ -1131,7 +1192,9 @@ func (self *h1PathLedger) noteReroll(
 
 // Returns true when a pending re-roll on the route manager has reached
 // CleanTicks clean ticks. The re-roll is improved, and the epoch's unimproved
-// count is reset.
+// and unconfirmed counts are both reset: a re-roll that demonstrably fixed the
+// connection is the evidence its conviction lacked, so it costs the epoch
+// nothing and the next unconfirmed conviction is judged on its own.
 func (self *h1PathLedger) noteClean(
 	key *RouteManager,
 	settings *H1PathRerollSettings,
@@ -1151,6 +1214,7 @@ func (self *h1PathLedger) noteClean(
 	}
 	delete(self.pendingRouteManagerRerollTimes, pendingKey)
 	self.epochUnimproved = 0
+	self.epochUnconfirmed = 0
 	return true
 }
 
