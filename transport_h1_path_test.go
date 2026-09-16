@@ -2234,6 +2234,45 @@ func TestH1PathMonitorCannotReadABirthQueueOnARouteWithNoAck(t *testing.T) {
 	}
 }
 
+// A tick that could read no queue at all is not a tick with no queue in it, so
+// it cannot resolve a re-roll as improved. The window right after a re-roll is
+// exactly that tick: every arriving pack was built before the mark and reads
+// stale, and a route with no ack has nothing else, so twenty of them in a row
+// would credit the replacement with an improvement while it sat on the same bad
+// member -- and hand back the unconfirmed budget that is the only thing
+// stopping the next re-roll.
+func TestH1PathMonitorDoesNotCreditABlindTickAsClean(t *testing.T) {
+	settings := DefaultH1PathRerollSettings()
+	// 700 KB/s under a thin rate of 3.53 MB/s, so the rate reading cannot
+	// carry these ticks either way
+	blind := func(k int) h1PathTickShape {
+		return h1PathTickShape{rxByteRate: 700_000}
+	}
+	monitor, _ := newH1PathTestMonitor(t, &settings, 105*time.Millisecond)
+	for k, decision := range runH1PathMonitorShape(monitor, 30, blind) {
+		if decision.clean {
+			t.Fatalf("tick %d with no pack samples and no ack was credited clean: %+v", k, decision)
+		}
+	}
+
+	// the same rate with pack samples that read no queue is clean, so what the
+	// arm above shows is the blindness and not the rate
+	monitor, _ = newH1PathTestMonitor(t, &settings, 105*time.Millisecond)
+	cleanTicks := 0
+	for _, decision := range runH1PathMonitorShape(monitor, 30, func(k int) h1PathTickShape {
+		shape := blind(k)
+		shape.queueDelaySamples = 4
+		return shape
+	}) {
+		if decision.clean {
+			cleanTicks += 1
+		}
+	}
+	if cleanTicks < settings.CleanTicks {
+		t.Errorf("%d clean ticks with a readable queue, want at least %d", cleanTicks, settings.CleanTicks)
+	}
+}
+
 // A queue the ack round trip reads is bounded by BaselineRisePerMinute exactly
 // as a queue the pack tags read is: visible for (q - thr) / rise and then gone,
 // rather than convicting for as long as it stands. The hour this runs for is
