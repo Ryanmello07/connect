@@ -1062,6 +1062,14 @@ func (self *tcpReturnRetransmitTestHarness) burstRunSegmentCount() int {
 
 // Where the flow stands in repairing its return path, read under the sequence
 // mutex.
+// The duplicate acknowledgements this flow's own guesses can explain, read
+// under the sequence mutex (see fastRetransmitWithLock).
+func (self *tcpReturnRetransmitTestHarness) explainedDupAckCount() int {
+	self.sequence.mutex.Lock()
+	defer self.sequence.mutex.Unlock()
+	return self.sequence.returnRetransmit.explainedDupAckCount
+}
+
 func (self *tcpReturnRetransmitTestHarness) recoveryPhase() tcpReturnRecoveryPhase {
 	self.sequence.mutex.Lock()
 	defer self.sequence.mutex.Unlock()
@@ -3383,6 +3391,53 @@ func TestTcpReturnRetransmitPrunedSpanRecoversInBursts(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The guard credits this flow's own retransmissions with at most two bursts
+// of duplicate acknowledgements. Each take of due segments pushes the guard's
+// window out by a timer, so the window never lapsed during a recovery and the
+// count grew with every burst: the 702-segment recovery below left it at 701,
+// and a real loss after that would have needed 704 duplicates before fast
+// retransmit believed it, which is the timer's job and not the guard's. What
+// can still be drawing duplicates is the bursts in flight, which is one per
+// round trip over a window of at least two round trips, so the count stops at
+// two of them and the recovery it bounds is unchanged.
+func TestTcpReturnRetransmitTheGuardCreditsAtMostTwoBurstsOfItsOwn(t *testing.T) {
+	// the pruned span of the burst rows, whose bursts double to the ceiling
+	// and whose guesses are what the guard counts
+	const segmentCount = 704
+	runTcpReturnRetransmitTest(t, func(t *testing.T) {
+		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{ackDelay: tcpReturnTestBurstRoundTrip})
+		harness.source.dropCounts[harness.segmentSeq(1)] = 1
+		harness.source.renegeOnce = true
+		payload := harness.payload(segmentCount)
+		harness.write(payload)
+		synctest.Wait()
+
+		// twice a round trip apart over the whole recovery, so every burst is
+		// read
+		peakCount := 0
+		for range 24 {
+			time.Sleep(tcpReturnTestBurstRoundTrip / 2)
+			synctest.Wait()
+			peakCount = max(peakCount, harness.explainedDupAckCount())
+		}
+		if peakCount != returnRetransmitMaxExplainedDupAckCount {
+			t.Fatalf("the guard credited %d duplicates to its own guesses over the recovery, want the cap of %d reached and held",
+				peakCount, returnRetransmitMaxExplainedDupAckCount)
+		}
+
+		// and the recovery the guard rides on is unchanged: the pruned span
+		// comes back, each segment exactly once
+		fastRetransmitAt := harness.requireDelivery(harness.segmentSeq(1), 1).at
+		requireTcpReturnTestBurstRecovery(t, harness, payload, 2, segmentCount, fastRetransmitAt, 11)
+		_, _, packetCount, reasonCounts := harness.retransmitState()
+		if packetCount != segmentCount-1 ||
+			reasonCounts[tcpReturnRetransmitReasonDupAck] != 1 ||
+			reasonCounts[tcpReturnRetransmitReasonPartialAck] != segmentCount-2 {
+			t.Fatalf("retransmissions=%d reasons=%v, want the hole on duplicates and the pruned span once on partial acknowledgements", packetCount, reasonCounts)
+		}
+	})
 }
 
 // The same recovery after a real expiry: the source's kernel drops the whole

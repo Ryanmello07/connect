@@ -36,6 +36,17 @@ const (
 	// share this ceiling and not that period: they go once per hole interval,
 	// which at that round trip is the 200 ms floor (markSackHolesWithLock).
 	returnRetransmitMaxBurstSegmentCount = 128
+	// the most duplicate acknowledgements the storm guard credits to this
+	// flow's own guesses (see fastRetransmitWithLock). A burst goes once per
+	// partial acknowledgement, which is once per round trip, at no more than
+	// the ceiling above, and the guard's window is one timer, at least twice
+	// the smoothed round trip: so two bursts is everything that can still be
+	// drawing duplicates. Uncapped it grew with every burst of a recovery,
+	// because each take pushes the window out: a 702-segment recovery left it
+	// at 701, and a real loss after that one would have needed 704 duplicate
+	// acknowledgements to be believed, which is the timer's job and not the
+	// guard's.
+	returnRetransmitMaxExplainedDupAckCount = 2 * returnRetransmitMaxBurstSegmentCount
 	// the most blocks one SACK option carries beside a timestamp option
 	tcpMaxSackBlockCount = 4
 	// what one retained segment's ring record costs, checked against the
@@ -1306,7 +1317,10 @@ func (self *tcpReturnRetransmitState) takeDueWithLock(
 		if self.explainedDupAckNanos <= nowNanos {
 			self.explainedDupAckCount = 0
 		}
-		self.explainedDupAckCount += guessedPacketCount
+		self.explainedDupAckCount = min(
+			self.explainedDupAckCount+guessedPacketCount,
+			returnRetransmitMaxExplainedDupAckCount,
+		)
 		tail := self.segmentAtWithLock(self.count - 1)
 		self.explainedDupAckEnd = tail.seq + tail.byteCount
 		self.explainedDupAckNanos = nowNanos + self.baseRtoNanos()
