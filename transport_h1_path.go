@@ -57,6 +57,22 @@ import (
 // back, so a clock step costs one disconnect and then nothing, with no latch,
 // while a real collapse the re-roll fixes costs nothing at all.
 //
+// That last shape is not a corner, and treating it as unconfirmed is a choice
+// about most clients, not about a few. A route carries an ack to read only
+// while the peer answers over it, so the platform rig and six of the eight S9
+// arms read none: a pack queue and the kernel's out-of-order counter, and
+// nothing measured on a clock this device owns. The reading kept here is that
+// such a client re-rolls once per network epoch instead of twice, and the trade
+// is cheap for the shape the rollout is sized against. The ground truth is 11
+// in 100 four-tuples on a slow member, stable for hours, so one re-roll lands
+// healthy 89 times in 100, and a re-roll that lands healthy returns the budget
+// (noteClean), which leaves the cap binding on about one session in a hundred:
+// the one that re-rolls from one slow member onto another. What the other
+// reading would buy is the ten points between 89 and 99, and what it would cost
+// is every sender clock step two disconnects and a 30 minute latch, on evidence
+// no clock here can check. A rollout that wants to re-price this reads
+// TicksAckUnknown against Ticks for the size of the population it applies to.
+//
 // This file holds the pure parts, with no call sites of their own:
 //   - the settings and their defaults (library default Observe), the
 //     environment variables and the process mode override, and the precedence
@@ -665,7 +681,8 @@ type h1PathDecision struct {
 //
 // The monitor counts Ticks and, of those, how each was read: TicksUnread and
 // TicksReceiveFull for the ticks nothing could be judged from,
-// TicksQueueDelayUnknown for the ones with no queue delay to judge, and
+// TicksQueueDelayUnknown for the ones with no queue delay to judge,
+// TicksAckUnknown for the ones with no fresh ack round trip to judge, and
 // TicksCollapsed for the ones a direction collapsed in. It also counts
 // RxAckDeniedTicks, the conviction counters, SuppressedLossDenied and
 // ConnectionsDormant when a tick makes it dormant. Not safe for concurrent
@@ -818,10 +835,19 @@ func (self *h1PathMonitor) tick(sample h1PathSample) h1PathDecision {
 	// kernel reports a standing send queue has no ack evidence either way.
 	ownSendBacklog := sample.txKnown &&
 		uint64(settings.SendBacklogByteCount) <= sample.txNotSent
-	ackQueueKnown := 0 < settings.AckEvidenceWindow &&
+	ackFresh := 0 < settings.AckEvidenceWindow &&
 		!self.ackRttTime.IsZero() &&
-		sample.now.Sub(self.ackRttTime) <= settings.AckEvidenceWindow &&
-		!ownSendBacklog
+		sample.now.Sub(self.ackRttTime) <= settings.AckEvidenceWindow
+	ackQueueKnown := ackFresh && !ownSendBacklog
+	// A route whose peer answers elsewhere never carries one, and its
+	// convictions are therefore unconfirmed for the connection's life (the file
+	// header). Counting the ticks is what sizes that population, so a rollout
+	// can read how many clients the confidence rule applies to instead of
+	// assuming. Like TicksQueueDelayUnknown this crosses the three disjoint
+	// readings rather than joining them.
+	if !ackFresh {
+		self.stats.TicksAckUnknown.Add(1)
+	}
 	ackQueue := self.ackRtt - pathRtt
 	ackQueued := ackQueueKnown && queueDelayThreshold <= ackQueue
 	packQueued := queueDelayKnown && queueDelayThreshold <= sample.queueDelay
@@ -1314,6 +1340,11 @@ type h1PathStats struct {
 	// convict on the ack round trip alone, so a tick can both collapse and
 	// carry no readable pack tags, and a rollout needs to see both
 	TicksQueueDelayUnknown atomic.Uint64
+	// accepted ticks with no fresh ack round trip to read, which is every tick
+	// of a route whose peer answers over another transport. Against Ticks this
+	// is the size of the population whose convictions can only be unconfirmed;
+	// it crosses the three disjoint readings in the same way
+	TicksAckUnknown atomic.Uint64
 	// ticks whose queue delay reached the threshold and whose fresh ack round
 	// trip did not: the sender's clock and ours disagree about the queue
 	RxAckDeniedTicks            atomic.Uint64
@@ -1389,6 +1420,7 @@ type H1PathRerollStatsSnapshot struct {
 	TicksUnread                 uint64
 	TicksReceiveFull            uint64
 	TicksQueueDelayUnknown      uint64
+	TicksAckUnknown             uint64
 	TicksCollapsed              uint64
 	RxAckDeniedTicks            uint64
 	RxConvictions               uint64
@@ -1425,6 +1457,7 @@ func (self *h1PathStats) snapshot() H1PathRerollStatsSnapshot {
 		TicksUnread:                 self.TicksUnread.Load(),
 		TicksReceiveFull:            self.TicksReceiveFull.Load(),
 		TicksQueueDelayUnknown:      self.TicksQueueDelayUnknown.Load(),
+		TicksAckUnknown:             self.TicksAckUnknown.Load(),
 		TicksCollapsed:              self.TicksCollapsed.Load(),
 		RxAckDeniedTicks:            self.RxAckDeniedTicks.Load(),
 		RxConvictions:               self.RxConvictions.Load(),

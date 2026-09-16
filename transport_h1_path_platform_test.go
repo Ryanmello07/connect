@@ -35,10 +35,14 @@ type testingH1PathClass int
 const (
 	// the connection's own counters and flags, on the scripted far round trip
 	testingH1PathReal testingH1PathClass = 0
-	// thin delivery behind a 5 s queue, with out-of-order data every tick
+	// thin delivery behind a 5 s queue that holds the acks too, with
+	// out-of-order data every tick: the measured collapse, confirmed
 	testingH1PathCollapsed testingH1PathClass = 1
 	// full rate, no queue
 	testingH1PathHealthy testingH1PathClass = 2
+	// the same collapse on a route whose peer answers over another transport,
+	// so the queue stands on the sender's clock alone: unconfirmed
+	testingH1PathCollapsedNoAck testingH1PathClass = 3
 )
 
 type testingH1PathRig struct {
@@ -101,7 +105,8 @@ func (self *testingH1PathRig) hooks() *h1PathTestHooks {
 			}
 			// a loopback kernel or ack round trip would make every connection
 			// dormant, and a loopback ack carries none of the queue the class
-			// scripts, so it would deny every collapsed tick
+			// scripts, so it would deny every collapsed tick; each class below
+			// writes the ack round trip its own shape has
 			sample.ackRttMin = 0
 			sample.ackRtt = 0
 			sample.ackRttSamples = 0
@@ -121,14 +126,24 @@ func (self *testingH1PathRig) hooks() *h1PathTestHooks {
 			sample.rxOooKnown = true
 			sample.queueDelaySamples = 4
 			switch class {
-			case testingH1PathCollapsed:
+			case testingH1PathCollapsed, testingH1PathCollapsedNoAck:
 				sample.rxBytes = uint64(seconds * testingH1PathCollapsedByteRate)
 				sample.queueDelay = 5 * time.Second
 				sample.rxOoo = uint64(tickIndex)
+				if class == testingH1PathCollapsed {
+					// the acks ride the collapsed route and carry the same
+					// queue, measured against the dial round trip
+					sample.ackRttMin = testingH1PathRtt
+					sample.ackRtt = testingH1PathRtt + 5*time.Second
+					sample.ackRttSamples = 4
+				}
 			case testingH1PathHealthy:
 				sample.rxBytes = uint64(seconds * testingH1PathHealthyByteRate)
 				sample.queueDelay = 0
 				sample.rxOoo = 0
+				sample.ackRttMin = testingH1PathRtt
+				sample.ackRtt = testingH1PathRtt
+				sample.ackRttSamples = 4
 			}
 		},
 		decision: func(connectionOrdinal int, decision h1PathDecision) {
@@ -245,6 +260,49 @@ func TestPlatformTransportH1PathObserveCountsConvictionWithoutRedial(t *testing.
 					decision.confidence != h1PathConfidenceConfirmed) {
 				t.Fatalf("conviction = %+v, want a confirmed rx conviction observed", decision)
 			}
+		}
+	})
+}
+
+// A route whose peer answers over another transport carries no ack, so the
+// queue stands on the sender's clock alone and nothing here can check it: the
+// conviction is unconfirmed, and the epoch's unconfirmed budget of one allows
+// exactly one re-roll however long the collapse lasts. This is what the
+// confidence rule decides for every client whose peer talks elsewhere (see the
+// no-ack paragraph of transport_h1_path.go), and the cost it is accepted at.
+func TestPlatformTransportH1PathNoAckRouteRerollsOncePerEpoch(t *testing.T) {
+	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		platform := newTestingPlatformServerIpVersion(t, ipVersion)
+		rig := newTestingH1PathRig(func(connectionOrdinal int, tickIndex int) testingH1PathClass {
+			return testingH1PathCollapsedNoAck
+		})
+		settings := testingH1PathTransportSettings(H1PathRerollModeAct, rig)
+		settings.H1PathReroll.DeviceRerollSpacing = 50 * time.Millisecond
+		testingPlatformTransport(t, ctx, platform.url, settings)
+
+		testingH1PathWaitForConvictions(t, rig, 1, 2)
+		if dials := rig.dials(); len(dials) != 2 {
+			t.Fatalf("connections %v, want 2: one re-roll, then the unconfirmed budget", dials)
+		}
+		testingH1PathRequireRerolled(t, rig, 0)
+		testingH1PathRequireSuppressed(t, rig, 1, h1PathReasonUnconfirmedBudget)
+		for _, decision := range rig.connectionDecisions(0) {
+			if decision.convicted && decision.confidence != h1PathConfidenceUnconfirmed {
+				t.Fatalf("conviction = %+v, want it unconfirmed with no ack on the route", decision)
+			}
+		}
+		stats := rig.stats.snapshot()
+		if stats.Rerolls != 1 || stats.ConfirmedConvictions != 0 ||
+			stats.UnconfirmedConvictions < 2 || stats.SuppressedUnconfirmedBudget < 1 {
+			t.Fatalf("stats = %+v, want one unconfirmed re-roll and the budget refusing", stats)
+		}
+		// every tick of both connections read no ack, which is what sizes the
+		// population the rule applies to
+		if stats.TicksAckUnknown != stats.Ticks {
+			t.Fatalf("stats = %+v, want every tick counted with no ack to read", stats)
 		}
 	})
 }
