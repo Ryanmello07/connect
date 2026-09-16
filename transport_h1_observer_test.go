@@ -254,14 +254,59 @@ func TestH1RouteObserverQueueDelayAttributionAcrossRoutes(t *testing.T) {
 		}
 		synctest.Wait()
 		now = time.Now()
-		replyTickA := observerA.takeTick(now)
-		replyTickB := observerB.takeTick(now)
-		t.Logf("replies: route A tick %+v; route B tick %+v", replyTickA, replyTickB)
-		// the minimum is shared by the transport's routes, and at least one ack
-		// took the 200 ms route; the ack's own hold is well under the 2 s route
-		if replyTickA.ackRttMin != replyTickB.ackRttMin ||
-			replyTickA.ackRttMin < 200*time.Millisecond || 2000*time.Millisecond <= replyTickA.ackRttMin {
-			t.Errorf("ack round trips = %s and %s, want one minimum in [200 ms, 2 s)", replyTickA.ackRttMin, replyTickB.ackRttMin)
+		// An ack write carries the Pack's inbound carrier as a transport
+		// affinity, and a route generation's affinity set is a fixed order, so
+		// the ack route is drawn once by the snapshot's shuffle and every ack
+		// of this phase takes it. Which route wins says nothing about the
+		// observer, but it does decide the order: takeTick folds its own acks
+		// into the shared window before reading the minimum back, so the route
+		// that carried them goes first and the other route then reports a
+		// window it contributed nothing to, which is the sharing under test.
+		ackSampleCount := func(observer *h1RouteObserver) int {
+			observer.stateLock.Lock()
+			defer observer.stateLock.Unlock()
+			return observer.ackCount
+		}
+		type replyRoute struct {
+			name     string
+			delay    time.Duration
+			observer *h1RouteObserver
+			tick     h1ObserverTick
+		}
+		replyRoutes := []*replyRoute{
+			{name: "A", delay: 200 * time.Millisecond, observer: observerA},
+			{name: "B", delay: 2000 * time.Millisecond, observer: observerB},
+		}
+		if ackSampleCount(observerA) < ackSampleCount(observerB) {
+			replyRoutes[0], replyRoutes[1] = replyRoutes[1], replyRoutes[0]
+		}
+		ackSamples := 0
+		ownAckRttMin := time.Duration(0)
+		for _, route := range replyRoutes {
+			route.tick = route.observer.takeTick(now)
+			t.Logf("replies: route %s (%s) tick %+v", route.name, route.delay, route.tick)
+			if route.tick.ackSamples == 0 {
+				continue
+			}
+			ackSamples += route.tick.ackSamples
+			if ownAckRttMin == 0 || route.tick.ackRtt < ownAckRttMin {
+				ownAckRttMin = route.tick.ackRtt
+			}
+			// the replies take the undelayed return route, so the round trip
+			// is this route's delay plus the two clients' own work
+			if route.tick.ackRtt < route.delay || route.delay+50*time.Millisecond < route.tick.ackRtt {
+				t.Errorf("route %s ack round trip = %s, want %s and its own work", route.name, route.tick.ackRtt, route.delay)
+			}
+		}
+		// every reply is acked at least once; a repeat ack is allowed
+		if ackSamples < messageCount {
+			t.Errorf("ack samples = %d across both routes, want at least %d", ackSamples, messageCount)
+		}
+		// the window is shared by the transport's routes: the tick taken last
+		// reports the minimum over every route, whether or not it read an ack
+		// of its own
+		if replyRoutes[1].tick.ackRttMin != ownAckRttMin {
+			t.Errorf("route %s read %s of a shared minimum of %s", replyRoutes[1].name, replyRoutes[1].tick.ackRttMin, ownAckRttMin)
 		}
 
 		closeCtx, closeCancel := context.WithTimeout(context.Background(), 60*time.Second)
