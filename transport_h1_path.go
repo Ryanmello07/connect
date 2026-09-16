@@ -6,6 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"weak"
 )
 
 // H1 path re-roll: detection and budgeting for an H1 websocket whose TCP
@@ -913,17 +914,25 @@ type h1PathLedger struct {
 	latchStart         time.Time
 	latchUntil         time.Time
 	// the settings that set the latch decide when a network change may clear it
-	latchNetworkResetAge           time.Duration
-	dayUnimprovedTimes             [h1PathDayRingSize]time.Time
-	dayUnimprovedNext              int
-	pendingRouteManagerRerollTimes map[*RouteManager]time.Time
+	latchNetworkResetAge time.Duration
+	dayUnimprovedTimes   [h1PathDayRingSize]time.Time
+	dayUnimprovedNext    int
+	// Keyed weakly: the ledger outlives every transport in the process, and an
+	// entry waits out the improvement window whether or not anything still
+	// reads it, so a strong key would pin a route manager -- its match states,
+	// its pending writer snapshots and its alias scopes -- until the next
+	// caller happened to sweep. A weak key keeps the identity (a pointer that
+	// has been collected never equals a live one, whatever the allocator does
+	// with the address) and drops the object. A collected route manager's
+	// re-roll is unresolved, which is what it is: nothing is left to judge it.
+	pendingRouteManagerRerollTimes map[weak.Pointer[RouteManager]]time.Time
 	excludedPorts                  []int
 }
 
 func newH1PathLedger() *h1PathLedger {
 	return &h1PathLedger{
 		stats:                          &h1PathProcessStats,
-		pendingRouteManagerRerollTimes: map[*RouteManager]time.Time{},
+		pendingRouteManagerRerollTimes: map[weak.Pointer[RouteManager]]time.Time{},
 	}
 }
 
@@ -945,7 +954,7 @@ func h1PathDefaultLedger() *h1PathLedger {
 
 func (self *h1PathLedger) expirePendingWithLock(settings *H1PathRerollSettings, now time.Time) {
 	for key, rerollTime := range self.pendingRouteManagerRerollTimes {
-		if settings.ImprovementWindow < now.Sub(rerollTime) {
+		if settings.ImprovementWindow < now.Sub(rerollTime) || key.Value() == nil {
 			delete(self.pendingRouteManagerRerollTimes, key)
 			self.stats.Unresolved.Add(1)
 		}
@@ -964,10 +973,11 @@ func (self *h1PathLedger) noteConviction(
 	defer self.stateLock.Unlock()
 
 	self.expirePendingWithLock(settings, now)
-	if _, ok := self.pendingRouteManagerRerollTimes[key]; !ok {
+	pendingKey := weak.Make(key)
+	if _, ok := self.pendingRouteManagerRerollTimes[pendingKey]; !ok {
 		return false
 	}
-	delete(self.pendingRouteManagerRerollTimes, key)
+	delete(self.pendingRouteManagerRerollTimes, pendingKey)
 	self.epochUnimproved += 1
 	self.dayUnimprovedTimes[self.dayUnimprovedNext] = now
 	self.dayUnimprovedNext = (self.dayUnimprovedNext + 1) % h1PathDayRingSize
@@ -1049,19 +1059,22 @@ func (self *h1PathLedger) noteReroll(
 	if confidence != h1PathConfidenceConfirmed {
 		self.epochUnconfirmed += 1
 	}
-	if _, ok := self.pendingRouteManagerRerollTimes[key]; !ok && h1PathPendingLimit <= len(self.pendingRouteManagerRerollTimes) {
-		var oldestKey *RouteManager
+	pendingKey := weak.Make(key)
+	if _, ok := self.pendingRouteManagerRerollTimes[pendingKey]; !ok && h1PathPendingLimit <= len(self.pendingRouteManagerRerollTimes) {
+		var oldestKey weak.Pointer[RouteManager]
 		var oldestTime time.Time
-		for pendingKey, rerollTime := range self.pendingRouteManagerRerollTimes {
-			if oldestKey == nil || rerollTime.Before(oldestTime) {
-				oldestKey = pendingKey
+		oldestSet := false
+		for candidateKey, rerollTime := range self.pendingRouteManagerRerollTimes {
+			if !oldestSet || rerollTime.Before(oldestTime) {
+				oldestKey = candidateKey
 				oldestTime = rerollTime
+				oldestSet = true
 			}
 		}
 		delete(self.pendingRouteManagerRerollTimes, oldestKey)
 		self.stats.Unresolved.Add(1)
 	}
-	self.pendingRouteManagerRerollTimes[key] = now
+	self.pendingRouteManagerRerollTimes[pendingKey] = now
 	if 0 < localPort {
 		self.excludedPorts = append(self.excludedPorts, localPort)
 		if h1PathExcludedPortLimit < len(self.excludedPorts) {
@@ -1087,13 +1100,14 @@ func (self *h1PathLedger) noteClean(
 	defer self.stateLock.Unlock()
 
 	self.expirePendingWithLock(settings, now)
-	if _, ok := self.pendingRouteManagerRerollTimes[key]; !ok {
+	pendingKey := weak.Make(key)
+	if _, ok := self.pendingRouteManagerRerollTimes[pendingKey]; !ok {
 		return false
 	}
 	if cleanTicks < settings.CleanTicks {
 		return false
 	}
-	delete(self.pendingRouteManagerRerollTimes, key)
+	delete(self.pendingRouteManagerRerollTimes, pendingKey)
 	self.epochUnimproved = 0
 	return true
 }

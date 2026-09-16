@@ -2,6 +2,7 @@ package connect
 
 import (
 	"fmt"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -575,6 +576,57 @@ func newH1PathTestLedger() (*h1PathLedger, *h1PathStats) {
 	stats := &h1PathStats{}
 	ledger.stats = stats
 	return ledger, stats
+}
+
+// A pending re-roll waits out its improvement window whether or not anything
+// still reads the route manager it names, so the ledger holds the key weakly: a
+// route manager nothing else references is collected, and its re-roll resolves
+// as unresolved at the next call rather than pinning the route manager -- its
+// match states, its writer snapshots and its alias scopes -- for the process's
+// life. A route manager that is still live keeps its entry through any number
+// of collections.
+func TestH1PathLedgerDoesNotPinARouteManager(t *testing.T) {
+	settings := DefaultH1PathRerollSettings()
+	ledger, stats := newH1PathTestLedger()
+	now := h1PathTestOrigin
+
+	live := &RouteManager{}
+	ledger.noteReroll(live, &settings, now, H1PathRerollRoleClient, h1PathConfidenceConfirmed, 40004)
+	func() {
+		// the ledger is the only thing that will know this one
+		dead := &RouteManager{}
+		ledger.noteReroll(dead, &settings, now, H1PathRerollRoleClient, h1PathConfidenceConfirmed, 40012)
+		if state := testingH1PathLedgerSnapshot(ledger); state.pendingCount != 2 {
+			t.Fatalf("ledger = %+v, want both re-rolls pending", state)
+		}
+		runtime.KeepAlive(dead)
+	}()
+
+	// the sweep runs from any call, and only a collection can drop the entry
+	// inside the improvement window
+	pendingCount := 2
+	for range 10 {
+		runtime.GC()
+		ledger.allow(&settings, now.Add(time.Second), H1PathRerollRoleClient, h1PathConfidenceConfirmed, time.Minute)
+		pendingCount = testingH1PathLedgerSnapshot(ledger).pendingCount
+		if pendingCount <= 1 {
+			break
+		}
+	}
+	if pendingCount != 1 {
+		t.Fatalf("pending re-rolls = %d, want the collected route manager's dropped", pendingCount)
+	}
+	if unresolved := stats.Unresolved.Load(); unresolved != 1 {
+		t.Fatalf("unresolved = %d, want the collected route manager's re-roll", unresolved)
+	}
+	// the live one is untouched, and still resolves the way it always did
+	if !ledger.noteConviction(live, &settings, now.Add(2*time.Second)) {
+		t.Fatal("the live route manager's re-roll was dropped by a collection")
+	}
+	if state := testingH1PathLedgerSnapshot(ledger); state.pendingCount != 0 || state.epochUnimproved != 1 {
+		t.Fatalf("ledger = %+v, want the live re-roll resolved as unimproved", state)
+	}
+	runtime.KeepAlive(live)
 }
 
 func TestH1PathLedgerDeviceSpacing(t *testing.T) {
