@@ -1035,7 +1035,9 @@ func (self *h1PathMonitor) tick(sample h1PathSample) h1PathDecision {
 	// pending and nothing acked in the tick, whose drain time is unbounded for
 	// as long as it stays quiet; below about 0.13 Mb/s up, where 16 KiB is
 	// itself a threshold-sized queue, the guard is the floor's and the residual
-	// stands.
+	// stands -- 8 KiB leaving a 0.05 Mb/s uplink takes 1.3 s, and a socket with
+	// no receive queue at all is convicted for it
+	// (TestH1PathAckGuardCostsASlowUplinkItsEvidence).
 	//
 	// What the floor cannot do is keep an uploading client's ordinary queue out
 	// of the guard, and that is this rule's cost rather than a corner of it.

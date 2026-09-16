@@ -2794,7 +2794,11 @@ func runH1PathRerollProbe(
 // This is the residual of the rule and not a corner of it, so it is measured
 // here rather than assumed: the arms below are the same 7 s collapse read
 // through uplinks either side of each boundary, and TicksAckBacklogged is what
-// a rollout reads to size the population it applies to.
+// a rollout reads to size the population it applies to. The rule's other
+// residual, the one the floor leaves open underneath, is an arm here too: below
+// about 0.13 Mb/s up the drain time is not allowed to answer alone, so a socket
+// with no receive queue at all is convicted for the seconds its own uplink put
+// into the round trip.
 func TestH1PathAckGuardCostsASlowUplinkItsEvidence(t *testing.T) {
 	const pathRtt = 101 * time.Millisecond
 	const queue = 7 * time.Second
@@ -2802,13 +2806,16 @@ func TestH1PathAckGuardCostsASlowUplinkItsEvidence(t *testing.T) {
 	// the measured collapse with the queue already standing at birth: 0.5 MB/s
 	// behind a 7 s queue that only the ack echo reads, with the kernel's
 	// out-of-order counter advancing, and a client uploading while it downloads
-	collapseUnder := func(uplinkByteRate float64, notSent uint64) func(k int) h1PathTickShape {
+	collapseUnder := func(uplinkByteRate float64, notSent uint64, ackRtt time.Duration) func(k int) h1PathTickShape {
+		if ackRtt == 0 {
+			ackRtt = pathRtt + queue
+		}
 		return func(k int) h1PathTickShape {
 			return h1PathTickShape{
 				rxByteRate:        500_000,
 				queueDelaySamples: 4,
 				rxOooAdvance:      true,
-				ackRtt:            pathRtt + queue,
+				ackRtt:            ackRtt,
 				minRtt:            pathRtt,
 				txKnown:           true,
 				txAckedByteRate:   uplinkByteRate,
@@ -2822,13 +2829,20 @@ func TestH1PathAckGuardCostsASlowUplinkItsEvidence(t *testing.T) {
 		sharedBar bool
 		upBitRate float64
 		notSent   uint64
+		// the round trip the ack echo carries; zero is the collapse's own
+		// pathRtt + queue
+		ackRtt time.Duration
 		// whether the collapse is still convicted
 		convicts bool
 	}{
-		// under the floor the drain time is not allowed to answer alone, which
-		// is the residual the rule names: 8 KiB takes 1.3 s to leave a
-		// 0.05 Mb/s uplink and the ack is still read as the receive path's
+		// under the floor the drain time is not allowed to answer alone: 8 KiB
+		// takes 1.3 s to leave a 0.05 Mb/s uplink, and the guard is the floor's,
+		// so the receive path keeps its evidence and is convicted
 		{label: "under the floor", upBitRate: 0.05, notSent: 8 * 1024, convicts: true},
+		// which is the residual the rule names, read the other way: the same
+		// socket with no receive queue at all, whose ack round trip carries
+		// only the 1.3 s its own uplink put there, is convicted for it
+		{label: "the residual", upBitRate: 0.05, notSent: 8 * 1024, ackRtt: pathRtt + 1300*time.Millisecond, convicts: true},
 		// and either side of the drain time, on the uplinks a real client has
 		{label: "0.25 Mb/s up", upBitRate: 0.25, notSent: 31_000, convicts: true},
 		{label: "0.25 Mb/s up", upBitRate: 0.25, notSent: 32_000, convicts: false},
@@ -2845,7 +2859,7 @@ func TestH1PathAckGuardCostsASlowUplinkItsEvidence(t *testing.T) {
 			settings.AckBacklogFloorByteCount = settings.SendBacklogByteCount
 		}
 		monitor, stats := newH1PathTestMonitor(t, &settings, pathRtt)
-		decisions := runH1PathMonitorShape(monitor, 60, collapseUnder(c.upBitRate*1000*1000/8, c.notSent))
+		decisions := runH1PathMonitorShape(monitor, 60, collapseUnder(c.upBitRate*1000*1000/8, c.notSent, c.ackRtt))
 		ticks := h1PathConvictionTicks(decisions)
 		snapshot := stats.snapshot()
 		bar := ""
