@@ -1003,8 +1003,8 @@ func TestH1PathLedgerUnresolvedIsChargedWhenItsWindowClosed(t *testing.T) {
 	start := h1PathTestOrigin
 
 	ledger.noteReroll(key, &settings, start, H1PathRerollRoleClient, h1PathConfidenceConfirmed, h1PathConvicted{direction: h1PathDirectionRx, ackCarried: true}, 0)
-	// nothing touches the ledger for most of a day, and this call is what finds
-	// the entry, ten minutes after its window closed and hours after that
+	// nothing touches the ledger for half a day, so this call is what finds the
+	// entry, twelve hours after the window it was owed a verdict in closed
 	found := start.Add(12 * time.Hour)
 	if ok, reason := ledger.allow(&settings, found, H1PathRerollRoleClient, h1PathConfidenceConfirmed, time.Minute); ok || reason != h1PathReasonDailyBudget {
 		t.Fatalf("allow = %t %s, want the aged-out re-roll charged", ok, reason)
