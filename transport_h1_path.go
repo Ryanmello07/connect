@@ -1469,7 +1469,11 @@ func (self *h1PathLedger) expirePendingWithLock(settings *H1PathRerollSettings, 
 		delete(self.pendingRouteManagerRerolls, key)
 		self.stats.Unresolved.Add(1)
 		if !collected {
-			self.chargeDayWithLock(now)
+			// charged when the window closed and not when the ledger was next
+			// touched: nothing sweeps these entries on a timer, and on a device
+			// whose only connection stops convicting the next touch can be
+			// hours away, which would hold the budget for a day from then
+			self.chargeDayWithLock(pending.rerollTime.Add(settings.ImprovementWindow))
 		}
 	}
 }

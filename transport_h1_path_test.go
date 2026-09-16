@@ -989,6 +989,38 @@ func TestH1PathLedgerNetworkChangeLatchAge(t *testing.T) {
 	}
 }
 
+// A re-roll nothing could judge is charged when its window closed, not when the
+// ledger was next touched. Nothing sweeps the pending entries on a timer -- a
+// conviction, a re-roll or a clean run is what expires them -- so on a device
+// whose one connection stops convicting, the entry can sit there for hours.
+// Charged at the moment it was found, one re-roll in the morning would hold the
+// daily budget until the same hour the following evening.
+func TestH1PathLedgerUnresolvedIsChargedWhenItsWindowClosed(t *testing.T) {
+	settings := DefaultH1PathRerollSettings()
+	settings.MaxUnimprovedRerollsPerDay = 1
+	ledger, stats := newH1PathTestLedger()
+	key := &RouteManager{}
+	start := h1PathTestOrigin
+
+	ledger.noteReroll(key, &settings, start, H1PathRerollRoleClient, h1PathConfidenceConfirmed, h1PathConvicted{direction: h1PathDirectionRx, ackCarried: true}, 0)
+	// nothing touches the ledger for most of a day, and this call is what finds
+	// the entry, ten minutes after its window closed and hours after that
+	found := start.Add(12 * time.Hour)
+	if ok, reason := ledger.allow(&settings, found, H1PathRerollRoleClient, h1PathConfidenceConfirmed, time.Minute); ok || reason != h1PathReasonDailyBudget {
+		t.Fatalf("allow = %t %s, want the aged-out re-roll charged", ok, reason)
+	}
+	if unresolved := stats.Unresolved.Load(); unresolved != 1 {
+		t.Fatalf("unresolved = %d, want the one re-roll", unresolved)
+	}
+	closed := start.Add(settings.ImprovementWindow)
+	if ok, reason := ledger.allow(&settings, closed.Add(24*time.Hour-time.Second), H1PathRerollRoleClient, h1PathConfidenceConfirmed, time.Minute); ok || reason != h1PathReasonDailyBudget {
+		t.Fatalf("a second before the charge ages out allow = %t %s, want dailyBudget", ok, reason)
+	}
+	if ok, reason := ledger.allow(&settings, closed.Add(24*time.Hour), H1PathRerollRoleClient, h1PathConfidenceConfirmed, time.Minute); !ok {
+		t.Fatalf("24 h after the window closed allow still refused: %s", reason)
+	}
+}
+
 func TestH1PathLedgerDailyBudget(t *testing.T) {
 	settings := DefaultH1PathRerollSettings()
 	ledger, _ := newH1PathTestLedger()
