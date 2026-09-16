@@ -615,9 +615,12 @@ type h1PathDecision struct {
 // collapsed ring, so it is evaluated again after ConvictTicks more collapsed
 // ticks against a loss window that kept its history.
 //
-// The monitor counts Ticks, RxAckDeniedTicks, the conviction counters,
-// SuppressedLossDenied and ConnectionsDormant when a tick makes it dormant.
-// Not safe for concurrent use.
+// The monitor counts Ticks and, of those, how each was read: TicksUnread and
+// TicksReceiveFull for the ticks nothing could be judged from, TicksQueueDelay
+// Unknown for the ones with no queue delay to judge, TicksCollapsed for the
+// ones a direction collapsed in. It also counts RxAckDeniedTicks, the
+// conviction counters, SuppressedLossDenied and ConnectionsDormant when a tick
+// makes it dormant. Not safe for concurrent use.
 type h1PathMonitor struct {
 	settings *H1PathRerollSettings
 	stats    *h1PathStats
@@ -729,7 +732,20 @@ func (self *h1PathMonitor) tick(sample h1PathSample) h1PathDecision {
 	// speed test and a stand down are different: their bytes are not counted at
 	// all, so neither verdict can read the tick.
 	unread := sample.speedTestActive || sample.standingDown
-	excluded := prev.receiveFullCount != sample.receiveFullCount || unread
+	receiveFull := prev.receiveFullCount != sample.receiveFullCount
+	excluded := receiveFull || unread
+	// An accepted tick that reached no verdict is not the same reading as a
+	// healthy one, and nothing said which it was: an Observe rollout could not
+	// tell a fleet with no collapse from one that was never able to classify a
+	// tick. The sharpest case is a speed test whose SpeedStop is never
+	// delivered, which leaves speedTestActive set and the connection blind for
+	// the rest of its life with no signal at all.
+	if unread {
+		self.stats.TicksUnread.Add(1)
+	}
+	if receiveFull {
+		self.stats.TicksReceiveFull.Add(1)
+	}
 
 	rxByteCount := h1PathCounterDelta(prev.readByteCount, sample.readByteCount)
 	if prev.rxBytesKnown && sample.rxBytesKnown {
@@ -744,6 +760,9 @@ func (self *h1PathMonitor) tick(sample h1PathSample) h1PathDecision {
 	)
 	queueDelayKnown := 0 < sample.queueDelaySamples &&
 		settings.MinTickPackSamples <= sample.queueDelaySamples
+	if !queueDelayKnown {
+		self.stats.TicksQueueDelayUnknown.Add(1)
+	}
 	// The queue delay is read against the sender's clock, so a backward step of
 	// that clock reads exactly like a standing queue and nothing in the pack
 	// tags can tell the two apart. The ack echo carries our own send time, and
@@ -790,6 +809,9 @@ func (self *h1PathMonitor) tick(sample h1PathSample) h1PathDecision {
 		txKnown &&
 		demandByteCount <= float64(txAckedByteCount) &&
 		txThinByteRate <= txByteRate
+	if rxCollapsed || txCollapsed {
+		self.stats.TicksCollapsed.Add(1)
+	}
 
 	rxOooKnown := prev.rxOooKnown && sample.rxOooKnown
 	self.rxCollapsedRing = h1PathRingPush(self.rxCollapsedRing, rxCollapsed)
@@ -1163,6 +1185,16 @@ type h1PathStats struct {
 	// itself running
 	MonitorStopped atomic.Uint64
 	Ticks          atomic.Uint64
+	// ticks the speed test echo or a stand down kept out of both verdicts, and
+	// ticks our own back pressure kept out of a conviction. With Ticks they
+	// separate a connection that saw no collapse from one that never looked
+	TicksUnread      atomic.Uint64
+	TicksReceiveFull atomic.Uint64
+	// accepted ticks with too few pack samples to read a queue delay
+	TicksQueueDelayUnknown atomic.Uint64
+	// accepted ticks a direction collapsed in, whether or not the window ever
+	// reached a conviction
+	TicksCollapsed atomic.Uint64
 	// ticks whose queue delay reached the threshold and whose fresh ack round
 	// trip did not: the sender's clock and ours disagree about the queue
 	RxAckDeniedTicks            atomic.Uint64
@@ -1235,6 +1267,10 @@ type H1PathRerollStatsSnapshot struct {
 	KernelUnavailable           uint64
 	MonitorStopped              uint64
 	Ticks                       uint64
+	TicksUnread                 uint64
+	TicksReceiveFull            uint64
+	TicksQueueDelayUnknown      uint64
+	TicksCollapsed              uint64
 	RxAckDeniedTicks            uint64
 	RxConvictions               uint64
 	TxConvictions               uint64
@@ -1267,6 +1303,10 @@ func (self *h1PathStats) snapshot() H1PathRerollStatsSnapshot {
 		KernelUnavailable:           self.KernelUnavailable.Load(),
 		MonitorStopped:              self.MonitorStopped.Load(),
 		Ticks:                       self.Ticks.Load(),
+		TicksUnread:                 self.TicksUnread.Load(),
+		TicksReceiveFull:            self.TicksReceiveFull.Load(),
+		TicksQueueDelayUnknown:      self.TicksQueueDelayUnknown.Load(),
+		TicksCollapsed:              self.TicksCollapsed.Load(),
 		RxAckDeniedTicks:            self.RxAckDeniedTicks.Load(),
 		RxConvictions:               self.RxConvictions.Load(),
 		TxConvictions:               self.TxConvictions.Load(),

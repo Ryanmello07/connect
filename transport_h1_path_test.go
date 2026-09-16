@@ -144,6 +144,87 @@ func h1PathCollapseShape(k int) h1PathTickShape {
 	}
 }
 
+// Ticks alone cannot tell a connection that saw no collapse from one that
+// could never read a tick, which is what an Observe rollout has to know before
+// it believes a quiet fleet. Every accepted tick is now counted by how it was
+// read: unread (the speed test echo or a stand down), our own back pressure,
+// no queue delay to judge, or a collapse in a direction.
+func TestH1PathMonitorCountsHowEachTickWasRead(t *testing.T) {
+	settings := DefaultH1PathRerollSettings()
+	const tickCount = 21
+
+	// a speed test that never stops: every tick is accepted and none is read
+	monitor, stats := newH1PathTestMonitor(t, &settings, 105*time.Millisecond)
+	decisions := runH1PathMonitorShape(monitor, tickCount, func(k int) h1PathTickShape {
+		shape := h1PathCollapseShape(k)
+		shape.speedTestActive = true
+		return shape
+	})
+	if ticks := h1PathConvictionTicks(decisions); 0 < len(ticks) {
+		t.Fatalf("a speed test convicted at %v", ticks)
+	}
+	snapshot := stats.snapshot()
+	if snapshot.Ticks != tickCount-1 || snapshot.TicksUnread != tickCount-1 ||
+		snapshot.TicksCollapsed != 0 || snapshot.TicksReceiveFull != 0 {
+		t.Fatalf("stats = %+v, want every tick of a stuck speed test unread", snapshot)
+	}
+
+	// our own back pressure: read, but no conviction can come of it
+	monitor, stats = newH1PathTestMonitor(t, &settings, 105*time.Millisecond)
+	runH1PathMonitorShape(monitor, tickCount, func(k int) h1PathTickShape {
+		shape := h1PathCollapseShape(k)
+		shape.receiveFull = true
+		return shape
+	})
+	snapshot = stats.snapshot()
+	if snapshot.TicksReceiveFull != tickCount-1 || snapshot.TicksUnread != 0 ||
+		snapshot.TicksCollapsed != 0 {
+		t.Fatalf("stats = %+v, want every tick behind our own back pressure", snapshot)
+	}
+
+	// no pack sample: the queue delay is unknown, so the tick says nothing
+	// about a queue either way
+	monitor, stats = newH1PathTestMonitor(t, &settings, 105*time.Millisecond)
+	runH1PathMonitorShape(monitor, tickCount, func(k int) h1PathTickShape {
+		shape := h1PathCollapseShape(k)
+		shape.queueDelaySamples = 0
+		return shape
+	})
+	snapshot = stats.snapshot()
+	if snapshot.TicksQueueDelayUnknown != tickCount-1 || snapshot.TicksCollapsed != 0 {
+		t.Fatalf("stats = %+v, want every tick without a queue delay counted", snapshot)
+	}
+
+	// the measured collapse: every tick past the queue threshold is collapsed,
+	// and the convictions are a small part of them
+	monitor, stats = newH1PathTestMonitor(t, &settings, 105*time.Millisecond)
+	decisions = runH1PathMonitorShape(monitor, tickCount, h1PathCollapseShape)
+	convictions := len(h1PathConvictionTicks(decisions))
+	snapshot = stats.snapshot()
+	if snapshot.Ticks != tickCount-1 || snapshot.TicksUnread != 0 ||
+		snapshot.TicksReceiveFull != 0 || snapshot.TicksQueueDelayUnknown != 0 {
+		t.Fatalf("stats = %+v, want every tick of the collapse read", snapshot)
+	}
+	if snapshot.TicksCollapsed < 15 || uint64(convictions) == snapshot.TicksCollapsed {
+		t.Fatalf(
+			"stats = %+v with %d convictions, want the collapsed ticks counted apart from them",
+			snapshot, convictions,
+		)
+	}
+
+	// a healthy connection: read on every tick, and nothing collapsed
+	monitor, stats = newH1PathTestMonitor(t, &settings, 105*time.Millisecond)
+	runH1PathMonitorShape(monitor, tickCount, func(k int) h1PathTickShape {
+		return h1PathTickShape{rxByteRate: 25_000_000, queueDelay: 4 * time.Millisecond, queueDelaySamples: 4}
+	})
+	snapshot = stats.snapshot()
+	if snapshot.Ticks != tickCount-1 || snapshot.TicksCollapsed != 0 ||
+		snapshot.TicksUnread != 0 || snapshot.TicksReceiveFull != 0 ||
+		snapshot.TicksQueueDelayUnknown != 0 {
+		t.Fatalf("stats = %+v, want a healthy connection read on every tick", snapshot)
+	}
+}
+
 func TestH1PathRerollSettingsDefaultToObserve(t *testing.T) {
 	if mode := (H1PathRerollSettings{}).Mode; mode != H1PathRerollModeOff {
 		t.Fatalf("zero settings mode = %s, want off", mode)
