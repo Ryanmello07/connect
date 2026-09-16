@@ -23,7 +23,19 @@ import (
 //   - Rxbytes and Rxoutoforderbytes: received and out-of-order bytes
 //   - Txbytes: bytes sent, a proxy for acked bytes
 //   - Txretransmitpackets: retransmitted segments
-//   - Snd_sbbytes: the send buffer, which includes in-flight data
+//   - Snd_sbbytes less the in-flight bound: the bytes the kernel has accepted
+//     and not yet put on the wire, which is what linux reports directly as
+//     Notsent_bytes. Darwin has no unsent field; Snd_sbbytes is the whole send
+//     buffer, unacked and unsent together, and in-flight data is at most the
+//     congestion window and at most the peer's advertised window, so taking
+//     the smaller of those off leaves a lower bound on the unsent bytes. It
+//     has to be the same quantity on both platforms, because one constant
+//     (SendBacklogByteCount) reads it: on the whole buffer the constant is
+//     reached by any client with a busy uplink, which convicts its send
+//     direction early and turns the receive side's ack evidence off
+//     altogether, and darwin and iOS are most of the fleet. Erring low is the
+//     safe direction for both rules: a backlog under-reported denies no
+//     evidence and convicts nothing
 //   - Srtt: the smoothed round trip in milliseconds; darwin keeps no minimum,
 //     so the caller keeps the lowest (h1PathKernelSample.copyTo)
 //   - Maxseg: both segment sizes
@@ -57,7 +69,11 @@ func h1PathKernelSampleFromConnectionInfo(info *unix.TCPConnectionInfo, out *h1P
 	out.txKnown = true
 	out.txAckedBytes = info.Txbytes
 	out.txRetrans = info.Txretransmitpackets
-	out.txNotSent = uint64(info.Snd_sbbytes)
+	// the window fields are zero on a socket that has not sent, where the whole
+	// buffer is unsent anyway
+	inFlight := uint64(min(info.Snd_cwnd, info.Snd_wnd))
+	sendBuffer := uint64(info.Snd_sbbytes)
+	out.txNotSent = sendBuffer - min(sendBuffer, inFlight)
 	out.minRtt = time.Duration(info.Srtt) * time.Millisecond
 	out.rcvMss = int(info.Maxseg)
 	out.sndMss = int(info.Maxseg)

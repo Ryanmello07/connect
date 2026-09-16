@@ -2112,9 +2112,14 @@ func TestH1PathMonitorConvictsACollapseStandingAtTheFirstSample(t *testing.T) {
 // reads an ack round trip of seconds on a receive path that has no queue at
 // all, and without the send backlog guard that alone would collapse every
 // receive tick.
+// The guard is the send side's own bar: a backlog over the byte floor that
+// also takes at least the queue delay threshold to drain. Both halves are
+// needed -- bytes alone withdraw the evidence from any client with a full
+// batch on a fast uplink, and a drain time alone withdraws it from an idle
+// socket -- and the two arms below are each half failing on its own.
 func TestH1PathMonitorDoesNotReadOurOwnSendQueueAsTheReceiveQueue(t *testing.T) {
-	// 700 KB/s down, no receive queue, and an uplink holding 400 KiB that puts
-	// 7 s into every ack round trip
+	// 700 KB/s down, no receive queue, and an uplink holding 400 KiB it takes
+	// 2 s to drain, which is what can put 7 s into every ack round trip
 	uploader := func(k int) h1PathTickShape {
 		return h1PathTickShape{
 			rxByteRate:        700_000,
@@ -2123,22 +2128,27 @@ func TestH1PathMonitorDoesNotReadOurOwnSendQueueAsTheReceiveQueue(t *testing.T) 
 			rxOooAdvance:      true,
 			ackRtt:            7 * time.Second,
 			txKnown:           true,
-			txAckedByteRate:   25_000_000,
+			txAckedByteRate:   200_000,
 			txNotSent:         400 * 1024,
 		}
 	}
 	settings := DefaultH1PathRerollSettings()
 	monitor, stats := newH1PathTestMonitor(t, &settings, 105*time.Millisecond)
 	decisions := runH1PathMonitorShape(monitor, 60, uploader)
-	if ticks := h1PathConvictionTicks(decisions); len(ticks) != 0 {
-		t.Errorf("a saturated uplink convicted the receive path at ticks %v", ticks)
+	for k, decision := range decisions {
+		if decision.convicted && decision.direction == h1PathDirectionRx {
+			t.Fatalf("tick %d convicted the receive path behind our own send queue: %+v", k, decision)
+		}
+		if decision.ackQueueKnown {
+			t.Fatalf("tick %d read our own send queue as ack evidence: %+v", k, decision)
+		}
 	}
-	if snapshot := stats.snapshot(); snapshot.TicksCollapsed != 0 {
-		t.Errorf("stats = %+v, want no collapsed tick behind our own send queue", snapshot)
+	if snapshot := stats.snapshot(); snapshot.RxConvictions != 0 || snapshot.TicksAckBacklogged == 0 {
+		t.Errorf("stats = %+v, want no receive conviction and the ack withdrawn", snapshot)
 	}
 
-	// the same shape with the send queue under the floor: the ack round trip
-	// is then the receive path's and it convicts, so the arm above is the
+	// the same shape with the send queue under the byte floor: the ack round
+	// trip is then the receive path's and it convicts, so the arm above is the
 	// guard and not the rest of the rule
 	monitor, _ = newH1PathTestMonitor(t, &settings, 105*time.Millisecond)
 	decisions = runH1PathMonitorShape(monitor, 60, func(k int) h1PathTickShape {
@@ -2148,6 +2158,22 @@ func TestH1PathMonitorDoesNotReadOurOwnSendQueueAsTheReceiveQueue(t *testing.T) 
 	})
 	if ticks := h1PathConvictionTicks(decisions); len(ticks) == 0 {
 		t.Error("with the send queue under the floor the ack round trip did not convict")
+	}
+
+	// and with the same 400 KiB on an uplink that clears it in 16 ms: our own
+	// send queue cannot be what put 7 s into the round trip, so the evidence
+	// stands and the receive path is convicted
+	monitor, stats = newH1PathTestMonitor(t, &settings, 105*time.Millisecond)
+	decisions = runH1PathMonitorShape(monitor, 60, func(k int) h1PathTickShape {
+		shape := uploader(k)
+		shape.txAckedByteRate = 25_000_000
+		return shape
+	})
+	if ticks := h1PathConvictionTicks(decisions); len(ticks) == 0 {
+		t.Error("a backlog that drains in 16 ms withdrew the ack evidence")
+	}
+	if snapshot := stats.snapshot(); snapshot.TicksAckBacklogged != 0 {
+		t.Errorf("stats = %+v, want no tick read as our own backlog", snapshot)
 	}
 }
 

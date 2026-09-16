@@ -387,8 +387,12 @@ type H1PathRerollSettings struct {
 	LossWindowTicks int
 	RxLossMinTicks  int
 	TxLossMinTicks  int
-	// the floor on kernel unsent bytes for a backlogged send-side tick; the
-	// backlog must also take at least the queue delay threshold to drain
+	// the floor on the bytes our kernel has accepted and not yet put on the
+	// wire, for a tick whose own send queue counts as backlogged; the backlog
+	// must also take at least the queue delay threshold to drain. One bar for
+	// both rules: it convicts the send direction and it withdraws the ack
+	// evidence from the receive direction. Every platform reports the same
+	// quantity here (transport_h1_path_socket_darwin.go)
 	SendBacklogByteCount ByteCount
 	// the queue delay baseline is the minimum over BaselineBucketCount buckets
 	// (at most 16), and may rise above the smallest delay a source ever showed
@@ -652,14 +656,17 @@ type h1PathDecision struct {
 // delivery collapsed:
 //   - thr = max(QueueDelayFloor, QueueDelayRttMultiple x pathRtt), and
 //     thin = ThinSegmentsPerRtt x mss / max(pathRtt, RttFloor);
+//   - our own send queue is backlogged when the kernel's unsent bytes are at
+//     least SendBacklogByteCount and take at least thr to drain at the rate
+//     the wire is acking. One bar, read the same way by both directions;
 //   - rx collapsed: not excluded, demand, rate below thin, and a queue of at
 //     least thr -- a fresh ack round trip that holds one over the path round
 //     trip, or, with no fresh ack to read, a queue delay that holds one. A
 //     fresh ack round trip below thr denies the tick whatever the queue delay
-//     says, and the send backlog that would inflate that round trip makes it
-//     no evidence either way;
-//   - tx collapsed: not excluded, kernel tx known, unsent at least
-//     SendBacklogByteCount, acked bytes advancing below thin;
+//     says, and a backlogged send queue, which would inflate that round trip
+//     by our own uplink, makes it no evidence either way;
+//   - tx collapsed: not excluded, a backlogged send queue, acked bytes
+//     advancing below thin;
 //   - clean: demand, a direction at or above thin, and no tick whose bytes
 //     were not counted (the speed test echo, a stand down);
 //   - excluded from collapsing, for both directions: the receive channel was
@@ -682,7 +689,8 @@ type h1PathDecision struct {
 // The monitor counts Ticks and, of those, how each was read: TicksUnread and
 // TicksReceiveFull for the ticks nothing could be judged from,
 // TicksQueueDelayUnknown for the ones with no queue delay to judge,
-// TicksAckUnknown for the ones with no fresh ack round trip to judge, and
+// TicksAckUnknown for the ones with no fresh ack round trip to judge,
+// TicksAckBacklogged for the ones whose ack our own send queue took away, and
 // TicksCollapsed for the ones a direction collapsed in. It also counts
 // RxAckDeniedTicks, the conviction counters, SuppressedLossDenied and
 // ConnectionsDormant when a tick makes it dormant. Not safe for concurrent
@@ -823,6 +831,26 @@ func (self *h1PathMonitor) tick(sample h1PathSample) h1PathDecision {
 	if !queueDelayKnown {
 		self.stats.TicksQueueDelayUnknown.Add(1)
 	}
+	txKnown := prev.txKnown && sample.txKnown
+	txAckedByteCount := uint64(0)
+	if txKnown {
+		txAckedByteCount = h1PathCounterDelta(prev.txAckedBytes, sample.txAckedBytes)
+	}
+	txByteRate := float64(txAckedByteCount) / seconds
+	// Our own send queue, by the one bar both rules use: bytes the kernel has
+	// not put on the wire, over the floor, and taking at least the queue delay
+	// threshold to drain at the rate the wire is acking. Two readings would be
+	// two rules -- a byte count alone calls a fast uplink with a full batch
+	// backlogged, and a drain time alone calls an idle socket backlogged
+	// forever -- and the receive side needs the same bar as the send side
+	// because it is answering the same question: could our own uplink have put
+	// a threshold-sized queue into what we sent. Unknown on either end of the
+	// delta reads as not backlogged, which leaves the ack evidence on, as it is
+	// on every platform with no kernel counters at all.
+	sendBacklogged := txKnown &&
+		uint64(settings.SendBacklogByteCount) <= sample.txNotSent &&
+		txByteRate*queueDelayThreshold.Seconds() <= float64(sample.txNotSent)
+
 	// The queue delay is read against the sender's clock, so a backward step of
 	// that clock reads exactly like a standing queue and nothing in the pack
 	// tags can tell the two apart. The ack echo carries our own send time, and
@@ -830,15 +858,20 @@ func (self *h1PathMonitor) tick(sample h1PathSample) h1PathDecision {
 	// holds the acks with it: the measured collapse runs an ack round trip of
 	// 6-10 s against a 101 ms path.
 	//
-	// Our own send backlog is in that round trip too, and the time our uplink
-	// takes to drain says nothing about the receive path, so a tick whose
-	// kernel reports a standing send queue has no ack evidence either way.
-	ownSendBacklog := sample.txKnown &&
-		uint64(settings.SendBacklogByteCount) <= sample.txNotSent
+	// Our own send path is in that round trip too -- the tag is stamped at pack
+	// build, so the Transfer send queue, the batch writer and the kernel send
+	// buffer are all inside it -- and the time our uplink takes to drain says
+	// nothing about the receive path. A tick whose own send queue is backlogged
+	// by the bar above therefore has no ack evidence either way.
 	ackFresh := 0 < settings.AckEvidenceWindow &&
 		!self.ackRttTime.IsZero() &&
 		sample.now.Sub(self.ackRttTime) <= settings.AckEvidenceWindow
-	ackQueueKnown := ackFresh && !ownSendBacklog
+	ackQueueKnown := ackFresh && !sendBacklogged
+	// the uplink's share of the no-ack population: these ticks had an ack to
+	// read and our own send queue took it away
+	if ackFresh && sendBacklogged {
+		self.stats.TicksAckBacklogged.Add(1)
+	}
 	// A route whose peer answers elsewhere never carries one, and its
 	// convictions are therefore unconfirmed for the connection's life (the file
 	// header). Counting the ticks is what sizes that population, so a rollout
@@ -872,22 +905,12 @@ func (self *h1PathMonitor) tick(sample h1PathSample) h1PathDecision {
 		rxByteRate < rxThinByteRate
 	rxClean := !unread && rxDemand && rxThinByteRate <= rxByteRate
 
-	txKnown := prev.txKnown && sample.txKnown
-	txAckedByteCount := uint64(0)
-	if txKnown {
-		txAckedByteCount = h1PathCounterDelta(prev.txAckedBytes, sample.txAckedBytes)
-	}
-	txByteRate := float64(txAckedByteCount) / seconds
 	txThinByteRate := self.thinByteRate(pathRtt, sample.sndMss)
-	// the backlog bar is a duration, the same one the receive side applies to
-	// its queue delay: a saturated uplink is always backlogged, slower than
-	// thin and retransmitting, and only the time its own send queue takes to
-	// drain separates it from a collapse. The byte floor keeps a slow but
-	// healthy upload, whose whole queue is small, off the rule.
+	// a saturated uplink is always backlogged, slower than thin and
+	// retransmitting, and only the time its own send queue takes to drain
+	// separates it from a collapse
 	txCollapsed := !excluded &&
-		txKnown &&
-		uint64(settings.SendBacklogByteCount) <= sample.txNotSent &&
-		txByteRate*queueDelayThreshold.Seconds() <= float64(sample.txNotSent) &&
+		sendBacklogged &&
 		0 < txAckedByteCount &&
 		txByteRate < txThinByteRate
 	txClean := !unread &&
@@ -1345,6 +1368,12 @@ type h1PathStats struct {
 	// is the size of the population whose convictions can only be unconfirmed;
 	// it crosses the three disjoint readings in the same way
 	TicksAckUnknown atomic.Uint64
+	// accepted ticks that had an ack round trip to read and lost it to our own
+	// send backlog, which is the same population for as long as the uplink is
+	// busy. Also counted in TicksAckUnknown's sense by the conviction it
+	// leaves unconfirmed, but kept apart so a busy uplink is not read as a peer
+	// that answers elsewhere
+	TicksAckBacklogged atomic.Uint64
 	// ticks whose queue delay reached the threshold and whose fresh ack round
 	// trip did not: the sender's clock and ours disagree about the queue
 	RxAckDeniedTicks            atomic.Uint64
@@ -1421,6 +1450,7 @@ type H1PathRerollStatsSnapshot struct {
 	TicksReceiveFull            uint64
 	TicksQueueDelayUnknown      uint64
 	TicksAckUnknown             uint64
+	TicksAckBacklogged          uint64
 	TicksCollapsed              uint64
 	RxAckDeniedTicks            uint64
 	RxConvictions               uint64
@@ -1458,6 +1488,7 @@ func (self *h1PathStats) snapshot() H1PathRerollStatsSnapshot {
 		TicksReceiveFull:            self.TicksReceiveFull.Load(),
 		TicksQueueDelayUnknown:      self.TicksQueueDelayUnknown.Load(),
 		TicksAckUnknown:             self.TicksAckUnknown.Load(),
+		TicksAckBacklogged:          self.TicksAckBacklogged.Load(),
 		TicksCollapsed:              self.TicksCollapsed.Load(),
 		RxAckDeniedTicks:            self.RxAckDeniedTicks.Load(),
 		RxConvictions:               self.RxConvictions.Load(),
