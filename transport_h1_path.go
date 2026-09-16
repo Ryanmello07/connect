@@ -1370,9 +1370,10 @@ type h1PathPendingReroll struct {
 // conviction inside the window sets it: that is the reading that says the
 // replacement is as bad as what it replaced. The daily budget reads
 // disconnects, so everything that spent one and was not resolved as improved is
-// charged to it -- unimproved, aged out, or evicted (expirePendingWithLock) --
-// and it is what bounds a device whose route cannot produce a verdict inside
-// the window at all.
+// charged to it -- unimproved (noteConviction), aged out
+// (expirePendingWithLock) or evicted at the pending limit (noteReroll) -- and
+// it is what bounds a device whose route cannot produce a verdict inside the
+// window at all.
 //
 // An unconfirmed conviction is one nothing on this device could check: no
 // kernel loss counter, or a queue that stood on the sender's clock alone.
