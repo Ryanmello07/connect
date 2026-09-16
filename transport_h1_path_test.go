@@ -44,69 +44,113 @@ type h1PathTickShape struct {
 	mss    int
 }
 
+// One run of a shape: the cumulative sample the monitor reads deltas from, and
+// the rolling minimum ack round trip that goes with it. That minimum is the
+// one production's observer keeps over AckRttWindow and hands to every
+// connection of the path (h1QueueDelayBaseline.ackRttMin), so it is kept here
+// and not in the monitor: it outlives a re-dial the way the pack baseline
+// does, while the monitor's own ack floor does not. A shape that sets its own
+// minimum is left alone.
+type h1PathShapeRun struct {
+	sample      h1PathSample
+	ackRttTimes []time.Time
+	ackRtts     []time.Duration
+}
+
+// Fills the run's sample for one tick and returns it.
+func (self *h1PathShapeRun) tickSample(
+	settings *H1PathRerollSettings,
+	k int,
+	tickShape h1PathTickShape,
+) *h1PathSample {
+	sample := &self.sample
+	sample.now = h1PathTestOrigin.Add(time.Duration(k) * h1PathTestStep)
+	if 0 < k && !tickShape.idle {
+		rxByteCount := uint64(tickShape.rxByteRate * h1PathTestStep.Seconds())
+		sample.readMessageCount += 1 + rxByteCount/(16*1024)
+		sample.writeMessageCount += 1
+		sample.readByteCount += rxByteCount
+		sample.rxBytes += rxByteCount
+		if tickShape.rxOooAdvance {
+			sample.rxOoo += 3
+		}
+		if tickShape.txKnown {
+			sample.txAckedBytes += uint64(tickShape.txAckedByteRate * h1PathTestStep.Seconds())
+			if tickShape.txRetrans {
+				sample.txRetrans += 2
+			}
+		}
+		if tickShape.receiveFull {
+			sample.receiveFullCount += 1
+		}
+	}
+	sample.rxBytesKnown = !tickShape.kernelUnknown
+	sample.rxOooKnown = !tickShape.kernelUnknown && !tickShape.rxOooUnknown
+	sample.txKnown = tickShape.txKnown
+	sample.txNotSent = tickShape.txNotSent
+	sample.queueDelay = tickShape.queueDelay
+	sample.queueDelaySamples = tickShape.queueDelaySamples
+	sample.speedTestActive = tickShape.speedTestActive
+	sample.standingDown = tickShape.standingDown
+	sample.ackRtt = tickShape.ackRtt
+	sample.ackRttSamples = 0
+	if 0 < tickShape.ackRtt {
+		sample.ackRttSamples = 1
+		self.ackRttTimes = append(self.ackRttTimes, sample.now)
+		self.ackRtts = append(self.ackRtts, tickShape.ackRtt)
+	}
+	sample.ackRttMin = tickShape.ackRttMin
+	if tickShape.ackRttMin == 0 {
+		window := max(settings.AckRttWindow, 0)
+		kept := 0
+		ackRttMin := time.Duration(0)
+		for i, ackRttTime := range self.ackRttTimes {
+			if window < sample.now.Sub(ackRttTime) {
+				continue
+			}
+			self.ackRttTimes[kept] = ackRttTime
+			self.ackRtts[kept] = self.ackRtts[i]
+			kept += 1
+			if ackRttMin == 0 {
+				ackRttMin = self.ackRtts[i]
+			}
+			ackRttMin = min(ackRttMin, self.ackRtts[i])
+		}
+		self.ackRttTimes = self.ackRttTimes[:kept]
+		self.ackRtts = self.ackRtts[:kept]
+		sample.ackRttMin = ackRttMin
+	}
+	switch {
+	case tickShape.minRtt < 0 || tickShape.kernelUnknown:
+		sample.minRtt = 0
+	case tickShape.minRtt == 0:
+		sample.minRtt = 105 * time.Millisecond
+	default:
+		sample.minRtt = tickShape.minRtt
+	}
+	sample.rcvMss = 1448
+	sample.sndMss = 1448
+	if tickShape.mss != 0 {
+		sample.rcvMss = tickShape.mss
+		sample.sndMss = tickShape.mss
+	}
+	if tickShape.kernelUnknown {
+		sample.rcvMss = 0
+		sample.sndMss = 0
+	}
+	return sample
+}
+
 // Feeds the monitor the shape at each tick index and returns every decision.
 func runH1PathMonitorShape(
 	monitor *h1PathMonitor,
 	tickCount int,
 	shape func(k int) h1PathTickShape,
 ) []h1PathDecision {
-	sample := h1PathSample{}
+	run := &h1PathShapeRun{}
 	decisions := make([]h1PathDecision, 0, tickCount)
 	for k := 0; k < tickCount; k++ {
-		tickShape := shape(k)
-		sample.now = h1PathTestOrigin.Add(time.Duration(k) * h1PathTestStep)
-		if 0 < k && !tickShape.idle {
-			rxByteCount := uint64(tickShape.rxByteRate * h1PathTestStep.Seconds())
-			sample.readMessageCount += 1 + rxByteCount/(16*1024)
-			sample.writeMessageCount += 1
-			sample.readByteCount += rxByteCount
-			sample.rxBytes += rxByteCount
-			if tickShape.rxOooAdvance {
-				sample.rxOoo += 3
-			}
-			if tickShape.txKnown {
-				sample.txAckedBytes += uint64(tickShape.txAckedByteRate * h1PathTestStep.Seconds())
-				if tickShape.txRetrans {
-					sample.txRetrans += 2
-				}
-			}
-			if tickShape.receiveFull {
-				sample.receiveFullCount += 1
-			}
-		}
-		sample.rxBytesKnown = !tickShape.kernelUnknown
-		sample.rxOooKnown = !tickShape.kernelUnknown && !tickShape.rxOooUnknown
-		sample.txKnown = tickShape.txKnown
-		sample.txNotSent = tickShape.txNotSent
-		sample.queueDelay = tickShape.queueDelay
-		sample.queueDelaySamples = tickShape.queueDelaySamples
-		sample.speedTestActive = tickShape.speedTestActive
-		sample.standingDown = tickShape.standingDown
-		sample.ackRttMin = tickShape.ackRttMin
-		sample.ackRtt = tickShape.ackRtt
-		sample.ackRttSamples = 0
-		if 0 < tickShape.ackRtt {
-			sample.ackRttSamples = 1
-		}
-		switch {
-		case tickShape.minRtt < 0 || tickShape.kernelUnknown:
-			sample.minRtt = 0
-		case tickShape.minRtt == 0:
-			sample.minRtt = 105 * time.Millisecond
-		default:
-			sample.minRtt = tickShape.minRtt
-		}
-		sample.rcvMss = 1448
-		sample.sndMss = 1448
-		if tickShape.mss != 0 {
-			sample.rcvMss = tickShape.mss
-			sample.sndMss = tickShape.mss
-		}
-		if tickShape.kernelUnknown {
-			sample.rcvMss = 0
-			sample.sndMss = 0
-		}
-		decisions = append(decisions, monitor.tick(sample))
+		decisions = append(decisions, monitor.tick(*run.tickSample(monitor.settings, k, shape(k))))
 	}
 	return decisions
 }
@@ -2472,8 +2516,16 @@ func (self h1PathPolicyOutcome) String() string {
 
 // Runs the shape through the real monitor and the real connection decision
 // against a real process ledger, so an arm reads the whole cost of a shape and
-// not only its verdicts. The connection is never replaced, which is the
-// pessimistic reading: the shape keeps producing whatever it produced.
+// not only its verdicts. The shape keeps producing whatever it produced, which
+// is the pessimistic reading: a re-roll here never lands anywhere better.
+//
+// A re-roll rebuilds the monitor and resets the connection's own state, which
+// is what production does -- every dial builds both (newH1PathConnection) --
+// and it is what decides how long a shape stays visible, because the ack
+// round trip's floor and rise live on the monitor and start again with it
+// while the pack baseline and the rolling ack minimum do not. A harness that
+// kept one monitor for a whole run measured a bufferbloated link as costing
+// three re-rolls where it costs six.
 func runH1PathPolicyShape(
 	t *testing.T,
 	settings *H1PathRerollSettings,
@@ -2484,19 +2536,26 @@ func runH1PathPolicyShape(
 	t.Helper()
 	connection, _ := testingH1PathDecideConnection(H1PathRerollModeAct, false)
 	*connection.settings = *settings
-	monitor := newH1PathMonitor(connection.settings, h1PathTestOrigin, dialRtt)
-	if monitor == nil {
-		t.Fatalf("no monitor for dial rtt %s", dialRtt)
+	settings = connection.settings
+	dial := func(now time.Time) {
+		monitor := newH1PathMonitor(settings, now, dialRtt)
+		if monitor == nil {
+			t.Fatalf("no monitor for dial rtt %s", dialRtt)
+		}
+		monitor.stats = connection.stats
+		connection.monitor = monitor
+		connection.cleanTicks = h1PathCleanTicks{}
+		connection.convicted = false
 	}
-	monitor.stats = connection.stats
-	connection.monitor = monitor
+	dial(h1PathTestOrigin)
 
 	outcome := h1PathPolicyOutcome{suppressed: map[h1PathReason]int{}}
-	decisions := runH1PathMonitorShape(monitor, tickCount, shape)
-	for k := range decisions {
-		decision := decisions[k]
+	run := &h1PathShapeRun{}
+	for k := 0; k < tickCount; k += 1 {
 		elapsed := time.Duration(k) * h1PathTestStep
-		connection.decide(h1PathTestOrigin.Add(elapsed), &decision)
+		now := h1PathTestOrigin.Add(elapsed)
+		decision := connection.monitor.tick(*run.tickSample(settings, k, shape(k)))
+		connection.decide(now, &decision)
 		if decision.convicted {
 			outcome.convictions += 1
 			if outcome.firstConviction == 0 {
@@ -2513,6 +2572,7 @@ func runH1PathPolicyShape(
 		switch decision.action {
 		case h1PathActionReroll:
 			outcome.rerolls += 1
+			dial(now)
 		case h1PathActionSuppressed:
 			outcome.suppressed[decision.reason] += 1
 		}
@@ -2831,12 +2891,15 @@ func TestH1PathEvidencePolicyOnTheMeasuredShapes(t *testing.T) {
 	if want := 11500 * time.Millisecond; bloat.firstConviction != want {
 		t.Errorf("bufferbloated 20 Mb/s access link convicted at %s, want %s", bloat.firstConviction, want)
 	}
-	// (1.5 s - 1.01 s of threshold) / 100 ms a minute, from the 10 s the bloat
-	// starts at
-	if want := 5 * time.Minute; bloat.lastConviction < want-time.Minute ||
+	// (1.5 s - 1.01 s of threshold) / 100 ms a minute predicts five minutes,
+	// and the rolling ack minimum puts a floor of one AckRttWindow under every
+	// ack-carried queue whatever its depth: the reference cannot rise past the
+	// smallest round trip still in that window, so nothing shallower than
+	// (thr + AckRttWindow x rise) is bounded by the rise at all
+	if want := settings.AckRttWindow; bloat.lastConviction < want ||
 		bloat.lastConviction > want+time.Minute {
 		t.Errorf(
-			"bufferbloated 20 Mb/s access link convicted last at %s, want the rise to end it near %s",
+			"bufferbloated 20 Mb/s access link convicted last at %s, want the rolling minimum to end it near %s",
 			bloat.lastConviction, want,
 		)
 	}
@@ -2844,32 +2907,59 @@ func TestH1PathEvidencePolicyOnTheMeasuredShapes(t *testing.T) {
 		t.Errorf("bufferbloated 20 Mb/s access link: %s, want the epoch bounded before the day", bloat)
 	}
 
-	// four times the bloat is four times as long visible, not the same forever:
-	// the rise is the lever the header names, and it has to move the reading
-	deepBloat := runH1PathPolicyShape(t, &settings, pathRtt, bloatTicks, bloatShape(6*time.Second))
-	t.Logf("bufferbloated 20 Mb/s access link, 6 s over two hours: %s", deepBloat)
-	if deepBloat.rerolls != 3 {
+	// Four times the bloat is not four times the cost, because each re-roll
+	// rebuilds the monitor and the ack reference starts again from the dial
+	// round trip while the queue does not: the rise bounds one connection and
+	// the re-roll hands it a new one. What bounds the device here is the daily
+	// budget, and a 6 s queue spends all six of it. Four hours is long enough
+	// for the sixth, which is the whole of what this shape can cost in a day.
+	const deepBloatTicks = int(4 * time.Hour / h1PathTestStep)
+	deepBloat := runH1PathPolicyShape(t, &settings, pathRtt, deepBloatTicks, bloatShape(6*time.Second))
+	t.Logf("bufferbloated 20 Mb/s access link, 6 s over four hours: %s", deepBloat)
+	if deepBloat.rerolls != settings.MaxUnimprovedRerollsPerDay {
 		t.Errorf(
-			"bufferbloated 20 Mb/s access link at 6 s: %s, want the third re-roll the second latch allows and no more",
-			deepBloat,
+			"bufferbloated 20 Mb/s access link at 6 s: %s, want the %d re-rolls of the daily budget",
+			deepBloat, settings.MaxUnimprovedRerollsPerDay,
 		)
+	}
+	if deepBloat.suppressed[h1PathReasonDailyBudget] == 0 {
+		t.Errorf("bufferbloated 20 Mb/s access link at 6 s: %s, want the daily budget to end it", deepBloat)
 	}
 	if deepBloat.lastConviction <= bloat.lastConviction {
 		t.Errorf(
-			"a 6 s queue stayed visible for %s and a 1.5 s queue for %s; the rise bounds neither",
+			"a 6 s queue stayed visible for %s and a 1.5 s queue for %s; nothing bounds either",
 			deepBloat.lastConviction, bloat.lastConviction,
 		)
 	}
-	// and (6 s - 1.01 s) / 100 ms a minute for four times the queue
-	if want := 50 * time.Minute; deepBloat.lastConviction < want-time.Minute ||
-		deepBloat.lastConviction > want+time.Minute {
+	// the last conviction is the last one a connection in the budget's own
+	// epoch can reach, which is about the sixth latch out
+	if lower, upper := 2*time.Hour, 3*time.Hour+30*time.Minute; deepBloat.lastConviction < lower ||
+		upper < deepBloat.lastConviction {
 		t.Errorf(
-			"bufferbloated 20 Mb/s access link at 6 s convicted last at %s, want the rise to end it near %s",
-			deepBloat.lastConviction, want,
+			"bufferbloated 20 Mb/s access link at 6 s convicted last at %s, want it between %s and %s",
+			deepBloat.lastConviction, lower, upper,
 		)
 	}
-	if 0 < deepBloat.suppressed[h1PathReasonDailyBudget] {
-		t.Errorf("bufferbloated 20 Mb/s access link at 6 s: %s, want the epoch bounded before the day", deepBloat)
+
+	// A queue that clears and comes back is not bounded by the rise at all:
+	// the reference drops back to the floor while the queue is gone, so every
+	// return is the first one again. Two minutes of bloat in every ten costs
+	// the same daily budget as a queue that never lifts, and this is the shape
+	// an evening access link actually has.
+	recurringBloat := runH1PathPolicyShape(t, &settings, pathRtt, deepBloatTicks, func(k int) h1PathTickShape {
+		shape := bloatShape(6 * time.Second)(k)
+		if 2*time.Minute <= time.Duration(k)*h1PathTestStep%(10*time.Minute) {
+			shape.queueDelay = 0
+			shape.ackRtt = pathRtt
+		}
+		return shape
+	})
+	t.Logf("20 Mb/s access link bloated two minutes in every ten, over four hours: %s", recurringBloat)
+	if recurringBloat.rerolls != settings.MaxUnimprovedRerollsPerDay {
+		t.Errorf(
+			"recurring bloat: %s, want the same %d re-rolls a standing queue costs",
+			recurringBloat, settings.MaxUnimprovedRerollsPerDay,
+		)
 	}
 
 	// the measured collapse: 0.5 MB/s behind a queue that grows from the start

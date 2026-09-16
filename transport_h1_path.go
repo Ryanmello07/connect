@@ -38,18 +38,31 @@ import (
 //     and the residual cost of the feature. 2.5 MB/s is under thin, the bloat
 //     is a real queue that the acks carry too, so nothing denies it and the
 //     conviction is confirmed. It convicts 1.5 s after the queue stands, and
-//     two things bound it together. The ledger bounds the re-rolls: two
-//     unimproved ones latch the epoch for LatchDuration. BaselineRisePerMinute
-//     bounds the visibility, and it has to bound both measures or it bounds
-//     nothing -- a reference that cannot rise is a queue that never lifts and a
-//     conviction that never stops, which is how one bloated link spent a whole
-//     daily budget while the pack side was decaying on schedule. A queue of q
-//     is visible for (q - thr) / rise on each measure, so over two hours on one
-//     epoch a 1.5 s bloat costs two break-before-make disconnects and stops
-//     convicting at 5m03, and a 6 s bloat costs three and stops at 50m03, with
-//     the daily budget untouched in both. The lever if the field disagrees is
-//     that rise, not the threshold, which is what keeps the measured collapse
-//     in.
+//     what bounds the device is the ledger: two unimproved re-rolls latch the
+//     epoch for LatchDuration and MaxUnimprovedRerollsPerDay stop them
+//     altogether. BaselineRisePerMinute bounds how long one connection goes on
+//     seeing the queue -- a reference that cannot rise is a queue that never
+//     lifts and a conviction that never stops, which is how one bloated link
+//     spent a whole daily budget while the pack side was decaying on schedule
+//     -- and it has to bound both measures or it bounds nothing. What it
+//     cannot bound is the device, because the ack reference's floor and rise
+//     live on the monitor and every dial builds a new one: the queue survives
+//     the re-roll and the reference does not, while the pack baseline and the
+//     rolling ack minimum, which belong to the path, do survive it. Measured on
+//     one epoch through the re-dialling harness, which is what production does
+//     (TestH1PathEvidencePolicyOnTheMeasuredShapes): a 1.5 s bloat costs two
+//     break-before-make disconnects and stops convicting at 10m09 with the
+//     daily budget untouched, and a 6 s bloat spends the whole daily budget of
+//     six inside four hours -- 5102 convictions, the last at 2h50m, and 596
+//     refusals after it. A queue that clears and comes back is not bounded by
+//     the rise at all, since the reference drops back to its floor while the
+//     queue is gone: two minutes of 6 s bloat in every ten costs the same six.
+//     Visibility is (q - thr) / rise on each measure and never less than one
+//     AckRttWindow on the ack side, where the rolling minimum holds the
+//     reference at the smallest round trip still inside that window, so 1.5 s
+//     and 6 s of bloat are the same reading for the first ten minutes. The
+//     levers if the field disagrees are that rise and the daily budget, not the
+//     threshold, which is what keeps the measured collapse in.
 //   - the measured collapse, 0.5 MB/s behind a 6-10 s queue on a 101 ms path:
 //     convicted 2 s after the queue reaches the threshold, confirmed by the
 //     kernel's out-of-order counter and by an ack round trip that carries the
@@ -820,7 +833,12 @@ func newH1PathMonitor(
 // as long as it stayed bloated, at 1.5 s exactly as at 6 s, which spent the
 // device's whole daily budget instead of an epoch's two or three re-rolls. With
 // it, a queue of q is visible for (q - thr) / rise, the same lever and the same
-// arithmetic the pack side has always had, now on both measures.
+// arithmetic the pack side has always had, now on both measures -- with a floor
+// of one AckRttWindow under it, because the rolling minimum caps the reference
+// at the smallest round trip still in that window and the pre-queue readings
+// take the whole window to age out. Any ack-carried queue is therefore visible
+// for at least ten minutes whatever its depth, which is what the cap costs and
+// why a 1.5 s bloat and a 6 s one read the same for that long.
 //
 // The rise restarts when the acks come back within the threshold of the floor,
 // not within the threshold of the risen reference. The second test is the
