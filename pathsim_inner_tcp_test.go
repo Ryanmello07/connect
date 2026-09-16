@@ -396,6 +396,9 @@ type pathInnerKernel struct {
 	firstHoleFixed time.Time
 	segmentCount   int
 	retransmitted  int
+	// acknowledgements it could not hand to its sender, which would be loss
+	// on the return path, and there is none here
+	ackDropCount   int
 	completeAt     time.Time
 	completeTarget int
 }
@@ -487,11 +490,13 @@ func (self *pathInnerKernel) ackNowWithLock() {
 	}
 	packet := self.buildWithLock(false, self.rcvNxt)
 	if packet == nil {
+		self.ackDropCount += 1
 		return
 	}
 	select {
 	case self.acks <- packet:
 	default:
+		self.ackDropCount += 1
 	}
 }
 
@@ -609,6 +614,7 @@ type pathInnerKernelSnapshot struct {
 	maxOooByteCount int
 	oooByteCount    int
 	window          int
+	ackDropCount    int
 	firstLossAt     time.Time
 	firstHoleFixed  time.Time
 	completeAt      time.Time
@@ -639,6 +645,7 @@ func (self *pathInnerKernel) snapshot() pathInnerKernelSnapshot {
 		// read, not advanced: the edge moves when an acknowledgement carries
 		// it
 		window:         self.advertisedWindowWithLock(),
+		ackDropCount:   self.ackDropCount,
 		firstLossAt:    self.firstLossAt,
 		firstHoleFixed: self.firstHoleFixed,
 		completeAt:     self.completeAt,
@@ -892,6 +899,10 @@ func runPathInnerArm(t *testing.T, arm pathInnerArm) pathInnerResult {
 		result.maxOooByteCount = snapshot.maxOooByteCount
 		result.oooByteCount = snapshot.oooByteCount
 		result.window = snapshot.window
+		if 0 < snapshot.ackDropCount {
+			t.Errorf("S9: %s: the device could not send %d acknowledgements; the return path in this cell loses nothing",
+				arm.name, snapshot.ackDropCount)
+		}
 		kernel.stateLock.Lock()
 		result.exact = bytes.Equal(kernel.stream, origin)
 		kernel.stateLock.Unlock()
