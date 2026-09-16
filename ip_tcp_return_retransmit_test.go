@@ -148,6 +148,9 @@ type tcpReturnTestSource struct {
 	// while held, nothing is acknowledged; released by ackNow
 	holdAcks bool
 	rcvNxt   uint32
+	// the source's own send sequence, which its upload advances and every
+	// segment it sends carries
+	sndNxt uint32
 	// when the in-order frontier last advanced
 	frontierAt time.Time
 	stream     []byte
@@ -346,6 +349,12 @@ func (self *tcpReturnTestSource) accept(segment tcpReturnTestSegment) {
 	}
 }
 
+// The window every segment the source sends advertises, in the units the
+// field carries at the negotiated scale. The lock must be held.
+func (self *tcpReturnTestSource) windowSizeWithLock() uint16 {
+	return uint16(tcpReturnTestWindowByteCount>>tcpReturnTestWindowScale) - 64 + self.windowGrowth
+}
+
 // Builds one pure acknowledgement at `ackNumber`, with SACK blocks for the
 // out-of-order runs when negotiated, a timestamp when negotiated, and the
 // current window. The lock must be held.
@@ -403,10 +412,10 @@ func (self *tcpReturnTestSource) buildAckWithLock(ackNumber uint32) ([]byte, par
 	self.lastAckNumber = ackNumber
 	self.ackCount += 1
 	parsed := parsedTcp{
-		seq:        self.harness.dataSeq,
+		seq:        self.sndNxt,
 		ack:        true,
 		ackNumber:  ackNumber,
-		windowSize: uint16(tcpReturnTestWindowByteCount>>tcpReturnTestWindowScale) - 64 + self.windowGrowth,
+		windowSize: self.windowSizeWithLock(),
 		options:    options,
 	}
 	parseTcpOptions(&parsed)
@@ -468,6 +477,32 @@ func (self *tcpReturnTestSource) sendDuplicateAck() {
 		ackPacket, ackTcp = self.buildAckWithLock(self.lastAckNumber)
 	}()
 	self.harness.sendFromSource(&ackTcp, ackPacket)
+}
+
+// Sends one data segment of the source's own upload, as a client sends while
+// the download runs. It repeats the last cumulative acknowledgement and the
+// current window, having nothing new to report, and carries the payload the
+// sequence forwards to the origin.
+func (self *tcpReturnTestSource) sendData(payload []byte) {
+	var packet []byte
+	var tcp parsedTcp
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		var tcpHeader []byte
+		packet, tcpHeader = self.harness.sourcePacket(TcpHeaderSizeWithoutExtensions + len(payload))
+		tcpHeader[12] = byte(TcpHeaderSizeWithoutExtensions/4) << 4
+		copy(tcpHeader[TcpHeaderSizeWithoutExtensions:], payload)
+		tcp = parsedTcp{
+			seq:        self.sndNxt,
+			ack:        true,
+			ackNumber:  self.lastAckNumber,
+			windowSize: self.windowSizeWithLock(),
+			payload:    tcpHeader[TcpHeaderSizeWithoutExtensions:],
+		}
+		self.sndNxt += uint32(len(payload))
+	}()
+	self.harness.sendFromSource(&tcp, packet)
 }
 
 // Takes the stall set for the next delivery at `seq`, zero when none is.
@@ -645,6 +680,7 @@ func newTcpReturnRetransmitTestHarness(t *testing.T, options tcpReturnTestOption
 		ackDelay:       options.ackDelay,
 		stepAcks:       options.stepAcks,
 		rcvNxt:         harness.dataSeq,
+		sndNxt:         harness.dataSeq,
 		lastAckNumber:  harness.dataSeq,
 		dropCounts:     map[uint32]int{},
 		stallDurations: map[uint32]time.Duration{},
@@ -1362,6 +1398,66 @@ func TestTcpReturnRetransmitWindowUpdatesAreNotDuplicateAcks(t *testing.T) {
 	})
 }
 
+// A data segment from the source repeats the cumulative acknowledgement when
+// it has nothing new to report, and is news of the upload rather than
+// evidence of a hole: a duplicate carries no payload (RFC 5681 §2). Three of
+// them with a download in flight retransmit nothing, and three true
+// duplicates after them still recover the head. Counting upload segments
+// started a spurious recovery on every bidirectional flow, a request body
+// under a streaming response as much as a websocket, and the partial
+// acknowledgements of that recovery then sent bursts of data the source
+// already held.
+func TestTcpReturnRetransmitSourceDataIsNotADuplicateAck(t *testing.T) {
+	const downloadSegmentCount = 4
+	const uploadSegmentCount = 3
+	const uploadSegmentByteCount = 64
+	runTcpReturnRetransmitTest(t, func(t *testing.T) {
+		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{})
+		// the download stays unacknowledged under the upload
+		harness.source.holdAcks = true
+
+		payload := harness.payload(downloadSegmentCount)
+		harness.write(payload)
+		synctest.Wait()
+
+		upload := tcpReturnTestPayload(uploadSegmentCount, uploadSegmentByteCount)
+		for segmentIndex := 0; segmentIndex < uploadSegmentCount; segmentIndex += 1 {
+			harness.source.sendData(upload[segmentIndex*uploadSegmentByteCount : (segmentIndex+1)*uploadSegmentByteCount])
+			synctest.Wait()
+		}
+		// the origin takes the upload, which is what those segments were
+		received := make([]byte, len(upload))
+		for readByteCount := 0; readByteCount < len(received); {
+			n, err := harness.upstream.Read(received[readByteCount:])
+			if err != nil {
+				t.Fatalf("upstream read: %v", err)
+			}
+			readByteCount += n
+		}
+		synctest.Wait()
+		if !bytes.Equal(received, upload) {
+			t.Fatal("the origin did not receive the source's upload")
+		}
+		if _, _, packetCount, reasonCounts := harness.retransmitState(); packetCount != 0 {
+			t.Fatalf("retransmissions=%d reasons=%v after %d upload segments, want none", packetCount, reasonCounts, uploadSegmentCount)
+		}
+		for segmentIndex := 0; segmentIndex < downloadSegmentCount; segmentIndex += 1 {
+			harness.requireSeenCount(segmentIndex, 1)
+		}
+
+		for range returnRetransmitDupAckThreshold {
+			harness.source.sendDuplicateAck()
+		}
+		synctest.Wait()
+		_, _, packetCount, reasonCounts := harness.retransmitState()
+		if packetCount != 1 || reasonCounts[tcpReturnRetransmitReasonDupAck] != 1 {
+			t.Fatalf("retransmissions=%d reasons=%v after three duplicates, want the head once", packetCount, reasonCounts)
+		}
+		harness.requireSeenCount(0, 2)
+		harness.requireSeenCount(1, 1)
+	})
+}
+
 // Sent means delivered: a segment still queued behind a stalled tunnel write
 // has not reached the source, so it counts for nothing. With the first
 // segments acknowledged inside their own delivery and the rest each holding
@@ -1371,45 +1467,54 @@ func TestTcpReturnRetransmitWindowUpdatesAreNotDuplicateAcks(t *testing.T) {
 // timer while its original waits, overtaking it. The wrapped row puts the
 // segments acknowledged first numerically above the queued ones, which is
 // where a plain comparison in the delivery marking counts the queued
-// segments as sent.
+// segments as sent. The IPv6 rows run the same stall because the marking
+// reads each delivered packet's sequence from its own header, whose offset is
+// the version's: read at the IPv4 offset an IPv6 packet yields its
+// destination address, which by its value either marks every queued segment
+// as sent, as the documentation range here does, or marks nothing ever.
 func TestTcpReturnRetransmitNeverSendsAgainASegmentStillQueuedForDelivery(t *testing.T) {
 	const segmentCount = 8
 	const stalledIndex = 4
 	// longer than the timer before a round-trip sample
 	const stall = 2 * returnRetransmitInitialRto
-	for _, initialSynSeq := range tcpReturnTestInitialSynSeqs(tcpReturnTestOptions{}, stalledIndex-1) {
-		runTcpReturnRetransmitTest(t, func(t *testing.T) {
-			t.Logf("initial sequence %d", initialSynSeq)
-			harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{initialSynSeq: initialSynSeq})
-			for segmentIndex := stalledIndex; segmentIndex < segmentCount; segmentIndex += 1 {
-				harness.source.stallDurations[harness.segmentSeq(segmentIndex)] = stall
-			}
-			start := time.Now()
-			payload := harness.payload(segmentCount)
-			harness.write(payload)
-			synctest.Wait()
-			// every stall, and a timer's ceiling past them
-			time.Sleep(time.Duration(segmentCount-stalledIndex)*stall + returnRetransmitMaxRto)
-			synctest.Wait()
+	for _, ipVersion := range []int{4, 6} {
+		for _, initialSynSeq := range tcpReturnTestInitialSynSeqs(tcpReturnTestOptions{ipVersion: ipVersion}, stalledIndex-1) {
+			runTcpReturnRetransmitTest(t, func(t *testing.T) {
+				t.Logf("IPv%d initial sequence %d", ipVersion, initialSynSeq)
+				harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{
+					ipVersion:     ipVersion,
+					initialSynSeq: initialSynSeq,
+				})
+				for segmentIndex := stalledIndex; segmentIndex < segmentCount; segmentIndex += 1 {
+					harness.source.stallDurations[harness.segmentSeq(segmentIndex)] = stall
+				}
+				start := time.Now()
+				payload := harness.payload(segmentCount)
+				harness.write(payload)
+				synctest.Wait()
+				// every stall, and a timer's ceiling past them
+				time.Sleep(time.Duration(segmentCount-stalledIndex)*stall + returnRetransmitMaxRto)
+				synctest.Wait()
 
-			harness.requireStream(payload)
-			for segmentIndex := 0; segmentIndex < segmentCount; segmentIndex += 1 {
-				harness.requireSeenCount(segmentIndex, 1)
-			}
-			if got, want := harness.requireDelivery(harness.segmentSeq(segmentCount-1), 0).at.Sub(start), time.Duration(segmentCount-stalledIndex)*stall; got != want {
-				t.Fatalf("last segment delivered at +%s, want +%s after every stall", got, want)
-			}
-			retainedByteCount, retainedCount, packetCount, reasonCounts := harness.retransmitState()
-			if retainedByteCount != 0 || retainedCount != 0 {
-				t.Fatalf("retained after full acknowledgement: %d bytes in %d segments", retainedByteCount, retainedCount)
-			}
-			if packetCount != 0 {
-				t.Fatalf("retransmissions=%d reasons=%v with nothing lost, want none", packetCount, reasonCounts)
-			}
-			if stats := harness.counters.snapshot(); stats.TimeoutCount != 0 {
-				t.Fatalf("stats=%+v, want no timer expiry while nothing delivered was outstanding", stats)
-			}
-		})
+				harness.requireStream(payload)
+				for segmentIndex := 0; segmentIndex < segmentCount; segmentIndex += 1 {
+					harness.requireSeenCount(segmentIndex, 1)
+				}
+				if got, want := harness.requireDelivery(harness.segmentSeq(segmentCount-1), 0).at.Sub(start), time.Duration(segmentCount-stalledIndex)*stall; got != want {
+					t.Fatalf("IPv%d: last segment delivered at +%s, want +%s after every stall", ipVersion, got, want)
+				}
+				retainedByteCount, retainedCount, packetCount, reasonCounts := harness.retransmitState()
+				if retainedByteCount != 0 || retainedCount != 0 {
+					t.Fatalf("IPv%d: retained after full acknowledgement: %d bytes in %d segments", ipVersion, retainedByteCount, retainedCount)
+				}
+				if packetCount != 0 {
+					t.Fatalf("IPv%d: retransmissions=%d reasons=%v with nothing lost, want none", ipVersion, packetCount, reasonCounts)
+				}
+				if stats := harness.counters.snapshot(); stats.TimeoutCount != 0 {
+					t.Fatalf("IPv%d: stats=%+v, want no timer expiry while nothing delivered was outstanding", ipVersion, stats)
+				}
+			})
+		}
 	}
 }
 
@@ -2557,6 +2662,89 @@ func TestTcpReturnRetransmitRetainsAndRetransmitsFin(t *testing.T) {
 	}
 }
 
+// The FIN's own sequence byte is retained with it. With data still
+// unacknowledged, the source's acknowledgement of exactly that data ends at
+// the FIN's sequence, one byte short of the FIN's end, and releases the data
+// alone. A FIN whose record ended at its sequence would go with that
+// acknowledgement: a FIN the source's kernel dropped would never be sent
+// again, the ring would empty under the parked drain, and the flow would end
+// with neither FIN nor reset, so a download that ends by closing never reaches
+// its end of stream. The wrapped rows wrap halfway through the second segment,
+// and right after the data, where the FIN's sequence byte is the last in the
+// space and its end is zero.
+func TestTcpReturnRetransmitKeepsTheFinUntilItsOwnSequenceByteIsAcknowledged(t *testing.T) {
+	for _, initialSynSeq := range []uint32{
+		0,
+		tcpReturnTestInitialSynSeqWrappingAfter(tcpReturnTestSegmentByteCount + tcpReturnTestSegmentByteCount/2),
+		tcpReturnTestInitialSynSeqWrappingAfter(2*tcpReturnTestSegmentByteCount + 1),
+	} {
+		runTcpReturnRetransmitTest(t, func(t *testing.T) {
+			t.Logf("initial sequence %d", initialSynSeq)
+			harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{initialSynSeq: initialSynSeq})
+			// the data is still outstanding when the FIN goes
+			harness.source.holdAcks = true
+			payload := harness.payload(2)
+			harness.write(payload)
+			synctest.Wait()
+
+			finSeq := harness.segmentSeq(2)
+			harness.source.dropCounts[finSeq] = 1
+			harness.closeUpstream()
+			synctest.Wait()
+			retainedByteCount, retainedCount, _, _ := harness.retransmitState()
+			if retainedByteCount != int64(len(payload))+1 || retainedCount != 3 {
+				// not fatal: what follows shows what the missing byte costs
+				t.Errorf("retained %d bytes in %d segments, want the two segments and the FIN's sequence byte", retainedByteCount, retainedCount)
+			}
+
+			// the data alone, which is the whole frontier of a source whose
+			// kernel dropped the FIN
+			ackAt := time.Now()
+			harness.source.stateLock.Lock()
+			harness.source.holdAcks = false
+			harness.source.stateLock.Unlock()
+			harness.source.sendAck(finSeq)
+			synctest.Wait()
+			retainedByteCount, retainedCount, _, _ = harness.retransmitState()
+			if retainedByteCount != 1 || retainedCount != 1 {
+				t.Errorf("retained %d bytes in %d segments after the data was acknowledged, want the FIN's sequence byte alone", retainedByteCount, retainedCount)
+			}
+			if harness.runIsDone() {
+				t.Fatal("the sequence ended on the data acknowledgement, with the FIN never sent again")
+			}
+			if got := harness.source.seenCount(finSeq); got != 1 {
+				t.Fatalf("FIN delivered %d times before the timer, want 1", got)
+			}
+
+			// that acknowledgement sampled the round trip, which is nothing in
+			// virtual time, so the timer stands at its floor
+			harness.waitRunDone(2 * returnRetransmitMinRto)
+
+			times := harness.source.deliveryTimes(finSeq)
+			if len(times) != 2 {
+				t.Fatalf("FIN delivered %d times, want 2", len(times))
+			}
+			if got := times[1].Sub(ackAt); got != returnRetransmitMinRto {
+				t.Fatalf("FIN retransmitted at +%s after the data was acknowledged, want +%s", got, returnRetransmitMinRto)
+			}
+			harness.source.stateLock.Lock()
+			finReceived, rstReceived := harness.source.finReceived, harness.source.rstReceived
+			harness.source.stateLock.Unlock()
+			if !finReceived || rstReceived {
+				t.Fatalf("fin=%t rst=%t, want the FIN accepted and no reset", finReceived, rstReceived)
+			}
+			harness.requireStream(payload)
+			retainedByteCount, retainedCount, packetCount, reasonCounts := harness.retransmitState()
+			if retainedByteCount != 0 || retainedCount != 0 {
+				t.Fatalf("retained after the FIN was acknowledged: %d bytes in %d segments", retainedByteCount, retainedCount)
+			}
+			if packetCount != 1 || reasonCounts[tcpReturnRetransmitReasonTimeout] != 1 {
+				t.Fatalf("retransmissions=%d reasons=%v, want the FIN once on the timer", packetCount, reasonCounts)
+			}
+		})
+	}
+}
+
 // Establishes a flow whose upstream has sent its FIN, unacknowledged and
 // held in retention, with the delivery drain parked waiting for that
 // acknowledgement, on an upstream whose Close takes time.
@@ -2614,6 +2802,69 @@ func TestTcpReturnRetransmitParkedDrainEndsOnIdleTimeout(t *testing.T) {
 			t.Fatalf("retained after the end: %d bytes in %d segments", retainedByteCount, retainedCount)
 		}
 		harness.close()
+	})
+}
+
+// An upstream that fails rather than closing resets the flow toward the
+// source, and a reset is never repaired: the retained ring goes with it,
+// while the source is still acknowledging nothing. Without that release the
+// drain parks on a ring no acknowledgement will ever empty, the worker goes
+// on retransmitting data behind a reset the source has already seen, and the
+// flow holds its pool shares and its slot until the no-progress bound two
+// minutes later. The upstream fails here by a read timeout, which is the
+// socket reader's ordinary non-EOF exit, shared with its socket errors.
+func TestTcpReturnRetransmitUpstreamFailureReleasesTheRetainedRing(t *testing.T) {
+	const segmentCount = 2
+	// well inside the timer before a round-trip sample, so nothing is due
+	const readTimeout = 100 * time.Millisecond
+	runTcpReturnRetransmitTest(t, func(t *testing.T) {
+		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{
+			configure: func(settings *TcpBufferSettings) {
+				settings.ReadTimeout = readTimeout
+			},
+		})
+		// the ring is full of segments the source has not acknowledged when
+		// the upstream fails
+		harness.source.holdAcks = true
+		start := time.Now()
+		payload := harness.payload(segmentCount)
+		harness.write(payload)
+		synctest.Wait()
+		if _, retainedCount, _, _ := harness.retransmitState(); retainedCount != segmentCount {
+			t.Fatalf("%d segments retained before the upstream failed, want %d", retainedCount, segmentCount)
+		}
+
+		// the upstream's read times out here and the reset follows it
+		time.Sleep(readTimeout)
+		synctest.Wait()
+
+		harness.source.stateLock.Lock()
+		rstReceived, rstAt := harness.source.rstReceived, harness.source.rstAt
+		harness.source.stateLock.Unlock()
+		if !rstReceived {
+			t.Fatal("the source was never reset when the upstream failed")
+		}
+		if got := rstAt.Sub(start); got != readTimeout {
+			t.Fatalf("reset at +%s, want +%s when the upstream read timed out", got, readTimeout)
+		}
+		retainedByteCount, retainedCount, packetCount, reasonCounts := harness.retransmitState()
+		if retainedByteCount != 0 || retainedCount != 0 {
+			// not fatal: the flow's end below is what the retained ring costs
+			t.Errorf("retained behind the reset: %d bytes in %d segments", retainedByteCount, retainedCount)
+		}
+		if packetCount != 0 {
+			t.Fatalf("retransmissions=%d reasons=%v behind the reset, want none", packetCount, reasonCounts)
+		}
+		// nothing is left waiting for an acknowledgement that cannot come:
+		// well before the timer's first expiry, and far inside the
+		// no-progress bound that is the only other way out
+		harness.waitRunDone(returnRetransmitInitialRto / 2)
+		for segmentIndex := 0; segmentIndex < segmentCount; segmentIndex += 1 {
+			harness.requireSeenCount(segmentIndex, 1)
+		}
+		if stats := harness.counters.snapshot(); stats.TimeoutCount != 0 || stats.AbandonCount != 0 {
+			t.Fatalf("stats=%+v, want the reset to end the flow, not the timer or the bound", stats)
+		}
 	})
 }
 
