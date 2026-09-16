@@ -2336,12 +2336,13 @@ func TestH1PathMonitorAckQueueDecaysAtTheBaselineRise(t *testing.T) {
 // all, and without the send backlog guard that alone would collapse every
 // receive tick.
 //
-// The guard is the send side's own bar: a backlog over the byte floor that
-// also takes at least the queue delay threshold to drain. Both halves are
-// needed -- bytes alone withdraw the evidence from any client with a full
-// batch on a fast uplink, and a drain time alone withdraws it from an idle
-// socket -- and the three arms below are each half failing on its own and the
-// bar holding.
+// The guard is the time that backlog takes to drain at the rate the wire is
+// acking, floored by a byte count small enough to be no more than a moment of
+// any uplink this rule applies to. The drain time is what has to decide,
+// because the queue it is asking about is a duration and not a byte count: the
+// arms below are a 400 KiB backlog that is a real queue on a 1.6 Mb/s uplink
+// and no queue at all on a 200 Mb/s one, and 60 KB that is two seconds of a
+// 0.25 Mb/s uplink and nowhere near the byte bar a send conviction needs.
 func TestH1PathMonitorDoesNotReadOurOwnSendQueueAsTheReceiveQueue(t *testing.T) {
 	// 700 KB/s down, no receive queue, and an uplink holding 400 KiB it takes
 	// 2 s to drain, which is what can put 7 s into every ack round trip
@@ -2372,7 +2373,7 @@ func TestH1PathMonitorDoesNotReadOurOwnSendQueueAsTheReceiveQueue(t *testing.T) 
 		t.Errorf("stats = %+v, want no receive conviction and the ack withdrawn", snapshot)
 	}
 
-	// the same shape with the send queue under the byte floor: the ack round
+	// the same shape with a send queue that clears in 150 ms: the ack round
 	// trip is then the receive path's and it convicts, so the arm above is the
 	// guard and not the rest of the rule
 	monitor, _ = newH1PathTestMonitor(t, &settings, 105*time.Millisecond)
@@ -2382,7 +2383,51 @@ func TestH1PathMonitorDoesNotReadOurOwnSendQueueAsTheReceiveQueue(t *testing.T) 
 		return shape
 	})
 	if ticks := h1PathConvictionTicks(decisions); len(ticks) == 0 {
-		t.Error("with the send queue under the floor the ack round trip did not convict")
+		t.Error("a send queue that clears in 150 ms withdrew the ack evidence")
+	}
+
+	// A slow uplink puts the same seconds into the round trip with a backlog
+	// nowhere near the byte bar a send conviction needs: 60 KB at 0.25 Mb/s is
+	// two seconds. This is the case the byte bar hid while it was ANDed with
+	// the drain time, and the receive path here has no queue at all.
+	slow := func(k int) h1PathTickShape {
+		shape := uploader(k)
+		shape.ackRtt = 2 * time.Second
+		shape.txAckedByteRate = 31_250
+		shape.txNotSent = 60_000
+		return shape
+	}
+	monitor, stats = newH1PathTestMonitor(t, &settings, 105*time.Millisecond)
+	decisions = runH1PathMonitorShape(monitor, 60, slow)
+	for k, decision := range decisions {
+		if decision.convicted || decision.ackQueueKnown {
+			t.Fatalf("tick %d read a 0.25 Mb/s uplink's own two seconds as the receive path's: %+v", k, decision)
+		}
+	}
+	if snapshot := stats.snapshot(); snapshot.TicksAckBacklogged == 0 {
+		t.Errorf("stats = %+v, want the slow uplink's ticks counted as our own backlog", snapshot)
+	}
+	// and its send direction is not convicted for it either: 60 KB is a queue
+	// in time and not a backlog, so only the ack evidence is withdrawn
+	if snapshot := stats.snapshot(); snapshot.TxConvictions != 0 {
+		t.Errorf("stats = %+v, want no send conviction from a 60 KB backlog", snapshot)
+	}
+
+	// The floor is the one thing the drain time alone gets wrong: a socket
+	// with a few bytes pending and nothing acked in the tick drains in no time
+	// at all, for ever. Its ack round trip is still the receive path's.
+	monitor, stats = newH1PathTestMonitor(t, &settings, 105*time.Millisecond)
+	decisions = runH1PathMonitorShape(monitor, 60, func(k int) h1PathTickShape {
+		shape := uploader(k)
+		shape.txAckedByteRate = 0
+		shape.txNotSent = 8 * 1024
+		return shape
+	})
+	if ticks := h1PathConvictionTicks(decisions); len(ticks) == 0 {
+		t.Error("a quiet socket with 8 KiB pending withdrew the ack evidence")
+	}
+	if snapshot := stats.snapshot(); snapshot.TicksAckBacklogged != 0 {
+		t.Errorf("stats = %+v, want nothing read as our own backlog under the floor", snapshot)
 	}
 
 	// and with the same 400 KiB on an uplink that clears it in 16 ms: our own
