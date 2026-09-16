@@ -43,8 +43,12 @@ import (
 // uniform draws before a pick scans the range
 const h1SourcePortPickDraws = 64
 
-// picks tried per socket while the picked port is in use
-const h1SourcePortBindAttempts = 4
+// Picks tried per socket while the picked port is in use. Each pick is an
+// independent uniform draw over the allowed ports, so this many consecutive
+// EADDRINUSE means the range is essentially full; below that the surrender is
+// the expensive outcome, because the kernel's own port is a few above the one
+// just convicted and so inside the window the plan exists to avoid.
+const h1SourcePortBindAttempts = 16
 
 // The kernel's default ephemeral range: ip_local_port_range on linux and
 // android, the dynamic range on darwin, ios and everything else. Both bounds
@@ -120,16 +124,24 @@ func (self *h1SourcePortPlan) randomIndex(n int) int {
 }
 
 func (self *h1SourcePortPlan) allowed(port int) bool {
-	for _, excludedPort := range self.excludedPorts {
+	return !h1SourcePortExcluded(port, self.excludedPorts, self.excludeRadius)
+}
+
+// Whether the port is within radius of any of the ports, which is the window a
+// planned dial must land outside of. A connection inside it shares the
+// convicted 4-tuple's neighbourhood and, on a path that hashes blocks of
+// adjacent ports, its member.
+func h1SourcePortExcluded(port int, excludedPorts []int, radius int) bool {
+	for _, excludedPort := range excludedPorts {
 		distance := port - excludedPort
 		if distance < 0 {
 			distance = -distance
 		}
-		if distance <= self.excludeRadius {
-			return false
+		if distance <= radius {
+			return true
 		}
 	}
-	return true
+	return false
 }
 
 type h1SourcePortPlanContextKey struct{}

@@ -51,7 +51,11 @@ import (
 // In Observe a conviction is counted and logged, at most once per
 // ConvictionLogInterval per connection. In Act, a conviction goes through the
 // process ledger, keyed by the transport's route manager:
-//   - noteConviction first, which counts an earlier re-roll on the same route
+//   - a connection whose own local port is inside the window the ledger
+//     excluded is suppressed first: its planned dial did not move the 4-tuple,
+//     so it is neither evidence about the re-roll that produced it nor a reason
+//     to spend another;
+//   - noteConviction, which counts an earlier re-roll on the same route
 //     manager as unimproved when this conviction lands in its improvement
 //     window;
 //   - an observe-only connection stops there and is observed;
@@ -131,6 +135,10 @@ type h1PathConnection struct {
 	sampled        bool
 	lastReadCount  uint64
 	lastWriteCount uint64
+
+	// the local port is inside the window the ledger excluded, so the planned
+	// dial that should have moved this connection's 4-tuple did not
+	sourcePortUnmoved bool
 
 	lastLogTime time.Time
 	// clean ticks since the connection started or last convicted
@@ -282,6 +290,7 @@ func (self *PlatformTransport) newH1PathConnection(
 	extenderIp netip.Addr,
 	dialDuration time.Duration,
 	connectionOrdinal int,
+	plannedDial bool,
 	counters h1PathCounters,
 ) *h1PathConnection {
 	proxied := self.clientStrategy != nil &&
@@ -342,16 +351,35 @@ func (self *PlatformTransport) newH1PathConnection(
 	if rawConn, localPort, ok := h1PathKernelSocket(ws, self.platformUrl); ok {
 		connection.rawConn = rawConn
 		connection.localPort = localPort
+		// The bind of a planned dial never fails the dial: a range that is
+		// full, a platform that cannot bind, or a refusal leaves the port to
+		// connect(), which on linux moves only a few ports from the last one to
+		// the same destination -- back inside the window the plan exists to
+		// avoid. Only a dial that carried a plan is judged this way: the
+		// kernel's own port after an ordinary reconnect sits next to the
+		// previous one too, and that connection is a fresh 4-tuple nobody
+		// asked to move. Only an Act connection asks, so an Observe transport
+		// still never touches the ledger.
+		if plannedDial && mode == H1PathRerollModeAct && settings.SourcePortPolicy == H1SourcePortFarRandom {
+			connection.sourcePortUnmoved = self.h1PathLedger().excludesPort(
+				localPort,
+				max(0, settings.SourcePortExcludeRadius),
+			)
+			if connection.sourcePortUnmoved {
+				stats.SourcePortUnmoved.Add(1)
+			}
+		}
 	} else {
 		stats.KernelUnavailable.Add(1)
 	}
 	stats.ConnectionsMonitored.Add(1)
 	if self.log.V(1).Enabled() {
 		self.log.Infof(
-			"[t]h1 path monitor dial_rtt=%s kernel=%t port=%d mode=%s source=%s role=%s observe_only=%t\n",
+			"[t]h1 path monitor dial_rtt=%s kernel=%t port=%d unmoved=%t mode=%s source=%s role=%s observe_only=%t\n",
 			dialRtt,
 			connection.rawConn != nil,
 			connection.localPort,
+			connection.sourcePortUnmoved,
 			mode,
 			modeSource,
 			role,
@@ -492,6 +520,19 @@ func (self *h1PathConnection) decide(now time.Time, decision *h1PathDecision) {
 			self.observe(decision)
 			break
 		}
+		if self.sourcePortUnmoved {
+			// The dial that replaced a convicted connection kept a port inside
+			// the excluded window, so this connection is in the same
+			// neighbourhood -- on a path that hashes blocks of adjacent ports,
+			// the same member. It is not the replacement the ledger is waiting
+			// for: its collapse is no evidence about that re-roll, and spending
+			// another re-roll here would draw from the same broken plan. The
+			// pending entry ages out unresolved instead of latching the epoch.
+			decision.action = h1PathActionSuppressed
+			decision.reason = h1PathReasonSourcePort
+			self.stats.recordSuppression(h1PathReasonSourcePort)
+			break
+		}
 		ledger := self.ledger()
 		if ledger.noteConviction(key, self.settings, now) {
 			self.stats.Unimproved.Add(1)
@@ -521,7 +562,9 @@ func (self *h1PathConnection) decide(now time.Time, decision *h1PathDecision) {
 		decision.action = h1PathActionReroll
 	case decision.reason != h1PathReasonNone:
 		decision.action = h1PathActionSuppressed
-	case decision.clean && act:
+	case decision.clean && act && !self.sourcePortUnmoved:
+		// an unmoved connection resolves nothing either way: a clean tick on
+		// the convicted neighbourhood is not the re-roll's doing
 		self.cleanTicks += 1
 		if self.settings.CleanTicks <= self.cleanTicks &&
 			self.ledger().noteClean(key, self.settings, now, self.cleanTicks) {

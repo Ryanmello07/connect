@@ -2136,6 +2136,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			ws, err = connect()
 		}
 		releaseReconnect()
+		// the connection below reads whether its own dial carried the source
+		// port plan; the flag itself is cleared for the next iteration
+		plannedDial := rerollDial
 		rerollDial = false
 		if err != nil {
 			// a canceled dial is local teardown -- this transport or its owner
@@ -2208,6 +2211,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				dialExtenderIp,
 				dialDuration,
 				connectionOrdinal,
+				plannedDial,
 				h1PathCounters{
 					readMessageCount:  &readCounter,
 					writeMessageCount: &writeCounter,

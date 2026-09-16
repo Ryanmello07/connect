@@ -1109,6 +1109,58 @@ func TestPlatformTransportH1PathObserveModeNeverRedials(t *testing.T) {
 	})
 }
 
+// A planned re-roll dial whose bind falls back keeps the kernel's port, which
+// on linux is a few ports from the one just convicted -- inside the window the
+// plan exists to avoid, so the 4-tuple never moved. The replacement's own
+// collapse is then no evidence about the re-roll: it is suppressed by its
+// source port, the earlier re-roll is not counted unimproved, and the epoch is
+// not latched by a draw that never happened.
+//
+// The fallback is forced the way a full ephemeral range would: an exclude
+// radius that covers the range leaves the plan no port to pick, so the dial
+// gets the kernel's.
+func TestPlatformTransportH1PathUnmovedSourcePortSpendsNothing(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	platform := newTestingPlatformServer(t)
+	rig := newTestingH1PathRig(testingH1PathCollapsedAlways)
+	settings := testingH1PathTransportSettings(H1PathRerollModeAct, rig)
+	// wide enough that every ephemeral port is inside the window of the
+	// convicted one
+	settings.H1PathReroll.SourcePortExcludeRadius = 65535
+	testingPlatformTransport(t, ctx, platform.url, settings)
+
+	// the first connection re-rolls, and the replacement cannot leave the
+	// window
+	if !waitForCondition(15*time.Second, func() bool {
+		return 2 <= len(rig.dials()) && 1 <= rig.stats.snapshot().SourcePortUnmoved
+	}) {
+		t.Fatalf("connections %v, stats = %+v; want a replacement inside the excluded window", rig.dials(), rig.stats.snapshot())
+	}
+	testingH1PathRequireRerolled(t, rig, 0)
+	testingH1PathWaitForConvictions(t, rig, 1, 2)
+	testingH1PathRequireSuppressed(t, rig, 1, h1PathReasonSourcePort)
+
+	// no second re-roll, whatever the replacement reads
+	if dials := rig.dials(); len(dials) != 2 {
+		t.Fatalf("connections %v, want [0 1]: the unmoved replacement re-rolled again", dials)
+	}
+	stats := rig.stats.snapshot()
+	if stats.Rerolls != 1 || stats.SourcePortFallbacks == 0 || stats.SourcePortBinds != 0 {
+		t.Fatalf("stats = %+v, want one re-roll whose plan fell back", stats)
+	}
+	if stats.SuppressedSourcePort < 2 || stats.Unimproved != 0 || stats.Improved != 0 {
+		t.Fatalf("stats = %+v, want the unmoved convictions to resolve nothing", stats)
+	}
+	// the re-roll stays pending until it ages out unresolved, so the epoch is
+	// not latched
+	if state := testingH1PathLedgerSnapshot(rig.ledger); state.pendingCount != 1 ||
+		state.epochUnimproved != 0 || !state.latchUntil.IsZero() {
+		t.Fatalf("ledger = %+v, want the re-roll still pending and the epoch clean", state)
+	}
+}
+
 // A provider asking for Act without AllowProviderAct is observed: its re-dial
 // would count against its reliability.
 func TestPlatformTransportH1PathProviderRoleClampsToObserve(t *testing.T) {

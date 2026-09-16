@@ -543,7 +543,8 @@ func (self h1PathAction) String() string {
 	}
 }
 
-// Why a conviction did not re-roll, in the order the checks run.
+// Why a conviction did not re-roll, in the order the checks run. sourcePort is
+// the connection's own: its dial kept a port inside the excluded window.
 type h1PathReason string
 
 const (
@@ -556,6 +557,7 @@ const (
 	h1PathReasonSpacing           h1PathReason = "spacing"
 	h1PathReasonUnconfirmedBudget h1PathReason = "unconfirmedBudget"
 	h1PathReasonProviderGate      h1PathReason = "providerGate"
+	h1PathReasonSourcePort        h1PathReason = "sourcePort"
 )
 
 // The monitor's verdict for one sample. The monitor sets action none; the
@@ -1118,6 +1120,14 @@ func (self *h1PathLedger) networkChanged(now time.Time) {
 	}
 }
 
+// Whether the port is inside the window of a port convicted this network epoch,
+// which is what a far-random plan is required to avoid.
+func (self *h1PathLedger) excludesPort(port int, radius int) bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return h1SourcePortExcluded(port, self.excludedPorts, radius)
+}
+
 // A copy of the local ports convicted this epoch, oldest first.
 func (self *h1PathLedger) excluded() []int {
 	self.stateLock.Lock()
@@ -1156,11 +1166,15 @@ type h1PathStats struct {
 	SuppressedUnconfirmedBudget atomic.Uint64
 	SuppressedDailyBudget       atomic.Uint64
 	SuppressedProviderGate      atomic.Uint64
+	SuppressedSourcePort        atomic.Uint64
 	Improved                    atomic.Uint64
 	Unimproved                  atomic.Uint64
 	Unresolved                  atomic.Uint64
 	SourcePortBinds             atomic.Uint64
 	SourcePortFallbacks         atomic.Uint64
+	// connections whose local port is inside the window the ledger excluded,
+	// so a planned re-roll dial did not move the 4-tuple
+	SourcePortUnmoved atomic.Uint64
 }
 
 var h1PathProcessStats h1PathStats
@@ -1183,6 +1197,8 @@ func (self *h1PathStats) recordSuppression(reason h1PathReason) {
 		self.SuppressedDailyBudget.Add(1)
 	case h1PathReasonProviderGate:
 		self.SuppressedProviderGate.Add(1)
+	case h1PathReasonSourcePort:
+		self.SuppressedSourcePort.Add(1)
 	}
 }
 
@@ -1220,11 +1236,13 @@ type H1PathRerollStatsSnapshot struct {
 	SuppressedUnconfirmedBudget uint64
 	SuppressedDailyBudget       uint64
 	SuppressedProviderGate      uint64
+	SuppressedSourcePort        uint64
 	Improved                    uint64
 	Unimproved                  uint64
 	Unresolved                  uint64
 	SourcePortBinds             uint64
 	SourcePortFallbacks         uint64
+	SourcePortUnmoved           uint64
 }
 
 func (self *h1PathStats) snapshot() H1PathRerollStatsSnapshot {
@@ -1250,11 +1268,13 @@ func (self *h1PathStats) snapshot() H1PathRerollStatsSnapshot {
 		SuppressedUnconfirmedBudget: self.SuppressedUnconfirmedBudget.Load(),
 		SuppressedDailyBudget:       self.SuppressedDailyBudget.Load(),
 		SuppressedProviderGate:      self.SuppressedProviderGate.Load(),
+		SuppressedSourcePort:        self.SuppressedSourcePort.Load(),
 		Improved:                    self.Improved.Load(),
 		Unimproved:                  self.Unimproved.Load(),
 		Unresolved:                  self.Unresolved.Load(),
 		SourcePortBinds:             self.SourcePortBinds.Load(),
 		SourcePortFallbacks:         self.SourcePortFallbacks.Load(),
+		SourcePortUnmoved:           self.SourcePortUnmoved.Load(),
 	}
 }
 
