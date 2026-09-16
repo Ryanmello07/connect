@@ -609,7 +609,12 @@ func (self *tcpReturnTestSlowCloseConn) Close() error {
 // How one harness is built.
 type tcpReturnTestOptions struct {
 	// zero is 4
-	ipVersion  int
+	ipVersion int
+	// the flow negotiates selective acknowledgement: the SYN offers
+	// sack-permitted and the settings let the SYN-ACK offer it back, which is
+	// what the sequence requires before it reads a block (RFC 2018 §2).
+	// Without it no block from this source is read at all, however the source
+	// sends it
 	sack       bool
 	timestamps bool
 	// zero is the default well inside the sequence space; see
@@ -649,7 +654,9 @@ type tcpReturnRetransmitTestHarness struct {
 	// payload bytes per full segment on this flow
 	segmentByteCount int
 	synAckReceived   chan struct{}
-	runDone          chan struct{}
+	// whether the SYN-ACK offered sack-permitted, read after the handshake
+	synAckSackPermitted bool
+	runDone             chan struct{}
 	// closed when the delayed acknowledgement pump ends; nil without one
 	ackPumpDone  chan struct{}
 	poolTaken    uint64
@@ -688,6 +695,9 @@ func newTcpReturnRetransmitTestHarness(t *testing.T, options tcpReturnTestOption
 	segmentByteCount := tcpReturnTestSegmentByteCountFor(options)
 	// one socket read is eight segments
 	settings.ReadBufferByteCount = 8 * segmentByteCount
+	// off by default, as production has it, so only a row that asks for the
+	// negotiation reaches the selective paths
+	settings.EnableReturnRetransmitSack = options.sack
 	if options.configure != nil {
 		options.configure(settings)
 	}
@@ -776,6 +786,9 @@ func newTcpReturnRetransmitTestHarness(t *testing.T, options tcpReturnTestOption
 				return
 			}
 			if tcp.syn {
+				// what the SYN-ACK offered back, which decides whether this
+				// flow reads a selective block at all
+				harness.synAckSackPermitted = tcp.enableSackPermitted
 				select {
 				case harness.synAckReceived <- struct{}{}:
 				default:
@@ -830,6 +843,11 @@ func newTcpReturnRetransmitTestHarness(t *testing.T, options tcpReturnTestOption
 		// its echo past the SYN's and no row could tell a current echo
 		binary.BigEndian.PutUint32(synOptions[8:12], tcpReturnTestSourceTimestampValue())
 	}
+	if options.sack {
+		// sack-permitted, which the SYN-ACK answers only where the settings
+		// let it, and two NOPs so the options stay a whole header word
+		synOptions = append(synOptions, 4, 2, 1, 1)
+	}
 	synPacket, synTcpHeader := harness.sourcePacket(TcpHeaderSizeWithoutExtensions + len(synOptions))
 	copy(synTcpHeader[TcpHeaderSizeWithoutExtensions:], synOptions)
 	synTcp := parsedTcp{
@@ -845,6 +863,13 @@ func newTcpReturnRetransmitTestHarness(t *testing.T, options tcpReturnTestOption
 	case <-time.After(2 * time.Second):
 		harness.close()
 		t.Fatal("TCP return retransmit harness did not establish")
+	}
+	// the negotiation the row asked for, on the wire: a source reads the
+	// SYN-ACK's sack-permitted to decide whether to report its out-of-order
+	// runs at all
+	if harness.synAckSackPermitted != options.sack {
+		harness.close()
+		t.Fatalf("syn-ack offered sack-permitted=%t, want %t", harness.synAckSackPermitted, options.sack)
 	}
 	// the handshake's acknowledgement, which established flows apply directly
 	harness.source.ackNow()
@@ -1508,12 +1533,78 @@ func TestTcpReturnRetransmitSackHolesStopAtTheHighestSelectiveByte(t *testing.T)
 	})
 }
 
-// Selective blocks are applied whoever sends them, and one acknowledgement's
-// blocks mark at most a burst's worth of holes. Nothing in the handshake here
-// advertises sack-permitted, so a compliant source sends no blocks at all and
-// a source that sends them is reporting what it likes; the blocks are still
-// applied, which is what lets the code recover a real selective
-// acknowledgement the day the handshake negotiates one. What must not follow
+// Selective blocks are read only where the handshake negotiated
+// sack-permitted, and nothing here negotiates it: the option parser reads the
+// blocks, and every rule that would act on them is behind that gate, so a
+// source that reports what it likes to a flow that never offered the option
+// changes nothing at all. The same crafted acknowledgements that draw a
+// burst of holes on the negotiated flow below draw the head alone here, which
+// is what three duplicate acknowledgements mean without blocks, and the flow
+// reaches the same place segment for segment as one whose acknowledgements
+// carried no blocks.
+func TestTcpReturnRetransmitSackBlocksWithoutTheNegotiationChangeNothing(t *testing.T) {
+	// as many segments as the crafted rows below, so an unbounded mark would
+	// be plain
+	const segmentCount = 300
+	var packetCounts [2]int64
+	var reasonCounts [2][tcpReturnRetransmitReasonCount]int64
+	for arm, blocks := range []bool{true, false} {
+		runTcpReturnRetransmitTest(t, func(t *testing.T) {
+			harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{})
+			// nothing is acknowledged, so the whole flight is retained
+			harness.source.holdAcks = true
+			payload := harness.payload(segmentCount)
+			harness.write(payload)
+			synctest.Wait()
+			if _, retainedCount, _, _ := harness.retransmitState(); retainedCount != segmentCount {
+				t.Fatalf("%d segments retained, want the whole flight of %d", retainedCount, segmentCount)
+			}
+
+			// three duplicates of the handshake's acknowledgement, each
+			// claiming the newest segment alone where the arm sends blocks
+			var crafted []tcpSackBlock
+			if blocks {
+				crafted = []tcpSackBlock{{
+					start: harness.segmentSeq(segmentCount - 1),
+					end:   harness.segmentSeq(segmentCount),
+				}}
+			}
+			for range returnRetransmitDupAckThreshold {
+				harness.source.sendCraftedSackAck(harness.dataSeq, crafted)
+			}
+			synctest.Wait()
+			packetCounts[arm], reasonCounts[arm] = func() (int64, [tcpReturnRetransmitReasonCount]int64) {
+				_, _, packetCount, reasons := harness.retransmitState()
+				return packetCount, reasons
+			}()
+			if packetCounts[arm] != 1 || reasonCounts[arm][tcpReturnRetransmitReasonDupAck] != 1 {
+				t.Fatalf("blocks=%t: retransmissions=%d reasons=%v, want the head alone on its duplicate acknowledgements",
+					blocks, packetCounts[arm], reasonCounts[arm])
+			}
+
+			// the flow is unharmed either way: the source acknowledges the
+			// flight it had all along and the ring empties
+			harness.source.ackNow()
+			synctest.Wait()
+			harness.requireStream(payload)
+			retainedByteCount, retainedCount, _, _ := harness.retransmitState()
+			if retainedByteCount != 0 || retainedCount != 0 {
+				t.Fatalf("blocks=%t: retained after the acknowledgement: %d bytes in %d segments", blocks, retainedByteCount, retainedCount)
+			}
+		})
+	}
+	if packetCounts[0] != packetCounts[1] || reasonCounts[0] != reasonCounts[1] {
+		t.Fatalf("crafted blocks drew %d retransmissions %v, acknowledgements without blocks %d %v: the blocks changed the flow",
+			packetCounts[0], reasonCounts[0], packetCounts[1], reasonCounts[1])
+	}
+}
+
+// A source that negotiated sack-permitted still reports what it likes, and
+// one acknowledgement's blocks mark at most a burst's worth of holes. The
+// flow here negotiates the option and then sends blocks no out-of-order run
+// of its own supports, which is the shape the bound has to hold for: the
+// handshake decides whether blocks are read at all, and nothing after it can
+// tell a crafted block from a true one. What must not follow
 // is that one 40-byte acknowledgement, whose single block covers only the
 // newest retained segment, marks every delivered segment below it as a hole:
 // the worker then builds a window of packets in one hold of the sequence
@@ -1525,7 +1616,7 @@ func TestTcpReturnRetransmitCraftedSackBlocksMarkAtMostOneBurst(t *testing.T) {
 	// more than twice the ceiling, so a run that is not bounded is plain
 	const segmentCount = 300
 	runTcpReturnRetransmitTest(t, func(t *testing.T) {
-		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{})
+		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{sack: true})
 		// nothing is acknowledged, so the whole flight is retained
 		harness.source.holdAcks = true
 		payload := harness.payload(segmentCount)
@@ -1589,7 +1680,7 @@ func TestTcpReturnRetransmitCraftedSackBlocksMarkAtMostOneBurstARoundTrip(t *tes
 	// applied set, and each of which drew its own burst
 	const laterAckCount = 4
 	runTcpReturnRetransmitTest(t, func(t *testing.T) {
-		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{})
+		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{sack: true})
 		// nothing is acknowledged, so the whole flight is retained
 		harness.source.holdAcks = true
 		payload := harness.payload(segmentCount)
@@ -1666,7 +1757,7 @@ func TestTcpReturnRetransmitSackHolesPastWhatTheSourceHoldsAreStillMarked(t *tes
 	const heldCount = returnRetransmitMaxBurstSegmentCount
 	const segmentCount = 2*heldCount + 44
 	runTcpReturnRetransmitTest(t, func(t *testing.T) {
-		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{})
+		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{sack: true})
 		// nothing is acknowledged, so the whole flight is retained
 		harness.source.holdAcks = true
 		payload := harness.payload(segmentCount)
@@ -2925,7 +3016,7 @@ func TestTcpReturnRetransmitAHeadNeverSentAgainEndsTheRecovery(t *testing.T) {
 	// it that puts the holes between them below its highest selective byte
 	const highestHeldIndex = 4
 	runTcpReturnRetransmitTest(t, func(t *testing.T) {
-		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{})
+		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{sack: true})
 		// nothing is acknowledged, so the whole flight is retained
 		harness.source.holdAcks = true
 		payload := harness.payload(segmentCount)

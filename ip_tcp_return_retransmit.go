@@ -199,6 +199,23 @@ func (self *returnRetransmitCounters) snapshot() ReturnRetransmitStats {
 // retransmits its SYN-ACK, cut by the segment size packetization would use at
 // that moment.
 //
+// Selective acknowledgement is negotiated or ignored. Every rule below that
+// reads a block runs only on a sequence whose handshake negotiated
+// sack-permitted: the source's SYN offered it and the SYN-ACK offered it
+// back, which it does only where EnableReturnRetransmitSack turns it on, and
+// that is off. So on every flow today the cumulative acknowledgement and the
+// timer alone decide what is repaired, and a source that sends blocks unasked
+// is reporting what it likes to a path that does not read them. The option
+// parsing and the hole rules stay behind that gate for the day the handshake
+// does negotiate it, and they are written to hold for whoever sends the
+// blocks then, since a source that negotiated them is no more trusted than
+// one that did not: what a run of crafted blocks costs is bounded per hole
+// interval in markSackHolesWithLock. The gate is the reason to hold it shut
+// for now: the selective path is where a few dozen bytes of acknowledgement
+// ask for a burst of full-size segments, per flow, with nothing bounding the
+// sum across flows, and the repair this exists for is one the cumulative
+// acknowledgement already makes.
+//
 // Pieces. After the source reports a smaller path mtu (fragmentation needed,
 // packet too big), a segment packetized before the report is larger than the
 // path carries, and sent again whole it would be dropped again on every
@@ -294,8 +311,8 @@ func (self *returnRetransmitCounters) snapshot() ReturnRetransmitStats {
 // the duplicates this flow's own retransmissions draw from the source, which
 // it answers one for one; a run of duplicates within reach of a recent
 // retransmission starts nothing unless it is longer than the retransmissions
-// that explain it (see fastRetransmitWithLock). With
-// SACK blocks it retransmits every unmarked segment below the highest
+// that explain it (see fastRetransmitWithLock). Where the handshake
+// negotiated SACK, blocks retransmit every unmarked segment below the highest
 // selectively acknowledged byte instead, and further duplicate
 // acknowledgements that extend the marked range retransmit the holes they
 // newly reveal. A partial acknowledgement inside loss recovery, one that
@@ -398,7 +415,12 @@ func (self *returnRetransmitCounters) snapshot() ReturnRetransmitStats {
 // worker that builds and sends retransmissions runs on its own goroutine and
 // takes that mutex only to select and build.
 type tcpReturnRetransmitState struct {
-	enabled               bool
+	enabled bool
+	// whether the handshake negotiated selective acknowledgement, which the
+	// sequence sets from ConnectionState.enableSack. False, every selective
+	// block is ignored and the cumulative acknowledgement alone decides what
+	// is repaired.
+	sackPermitted         bool
 	retainByteCount       int64
 	retainMemoryByteCount int64
 	timeout               time.Duration
@@ -849,14 +871,14 @@ func (self *tcpReturnRetransmitState) markBurstWithLock(windowEnd uint32, nowNan
 
 // Retransmits every unmarked delivered segment below the highest selectively
 // acknowledged byte, each at most once per round trip, and at most a burst's
-// worth newly marked per hole interval. The blocks are applied whoever sends
-// them: nothing in the handshake advertises sack-permitted, so a compliant
-// source sends none and a source that sends them anyway is reporting what it
-// likes. One such acknowledgement, whose single block covers only the newest
-// retained segment, would otherwise mark every delivered segment below it,
-// and takeDueWithLock builds all of them in one hold of the sequence mutex,
-// which the shared send shard's acknowledgement path waits on, and the worker
-// holds every packet until the first is delivered.
+// worth newly marked per hole interval. Nothing reaches this without the
+// handshake negotiating sack-permitted (applySackWithLock), and a source that
+// negotiated it still reports what it likes: one acknowledgement whose single
+// block covers only the newest retained segment would otherwise mark every
+// delivered segment below it, and takeDueWithLock builds all of them in one
+// hold of the sequence mutex, which the shared send shard's acknowledgement
+// path waits on, and the worker holds every packet until the first is
+// delivered.
 //
 // The bound is carried over the hole interval rather than over one
 // acknowledgement, because one acknowledgement is not what an interval costs:
@@ -920,6 +942,11 @@ func (self *tcpReturnRetransmitState) indexAtOrAfterWithLock(seq uint32) int {
 // or adds one walks only its own segments. Reports whether anything new was
 // marked.
 func (self *tcpReturnRetransmitState) applySackWithLock(tcp *parsedTcp) (changed bool) {
+	if !self.sackPermitted {
+		// the handshake negotiated none, so these blocks report what their
+		// sender likes and nothing here is decided by them
+		return false
+	}
 	for blockIndex := 0; blockIndex < tcp.sackBlockCount; blockIndex += 1 {
 		block := tcp.sackBlocks[blockIndex]
 		if int32(block.end-block.start) <= 0 {

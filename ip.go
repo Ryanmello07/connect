@@ -2036,6 +2036,9 @@ type parsedTcp struct {
 	enableTimestamp   bool
 	timestampValue    uint32
 	timestampEcho     uint32
+	// the sack-permitted option (RFC 2018 §2), which a SYN carries to offer
+	// selective acknowledgement
+	enableSackPermitted bool
 	// selective acknowledgement blocks (RFC 2018), in the option's order, at
 	// most tcpMaxSackBlockCount; a fixed array keeps the parse allocation free
 	sackBlockCount int
@@ -2181,6 +2184,7 @@ func parseTcpOptions(tcp *parsedTcp) {
 	tcp.enableTimestamp = false
 	tcp.timestampValue = 0
 	tcp.timestampEcho = 0
+	tcp.enableSackPermitted = false
 	tcp.sackBlockCount = 0
 	for optionIndex := 0; optionIndex < len(tcp.options); {
 		switch tcp.options[optionIndex] {
@@ -2209,6 +2213,11 @@ func parseTcpOptions(tcp *parsedTcp) {
 				if optionByteCount == 3 {
 					tcp.enableWindowScale = true
 					tcp.windowScale = min(uint32(tcp.options[optionIndex+2]), 14)
+				}
+			case 4:
+				// sack-permitted, which only a SYN carries (RFC 2018 §2)
+				if optionByteCount == 2 {
+					tcp.enableSackPermitted = true
 				}
 			case 5:
 				// SACK: 2 + 8n bytes. Blocks past the fixed capacity are
@@ -3883,6 +3892,18 @@ type TcpBufferSettings struct {
 	// See tcpReturnRetransmitState for the design. On by default; off restores
 	// the earlier behaviour byte for byte, with nothing retained.
 	EnableReturnRetransmit bool
+	// EnableReturnRetransmitSack offers sack-permitted in the SYN-ACK to a
+	// source whose SYN offered it, and repairs the holes the source's
+	// selective blocks report. Off, the SYN-ACK offers none, so a compliant
+	// source sends no blocks (RFC 2018 §2), and blocks from a source that
+	// sends them anyway are ignored: the cumulative acknowledgement alone
+	// decides what is repaired. Off by default. The selective path costs a
+	// provider more than it saves until it is measured: one crafted 40-byte
+	// acknowledgement asks for a burst of full-size segments, and the flow
+	// count on a targetless provider is unbounded, so the rate it allows is
+	// per flow and the sum across flows is not bounded at all (see
+	// tcpReturnRetransmitState).
+	EnableReturnRetransmitSack bool
 	// The hard cap on retained sequence bytes per flow beside the source's
 	// advertised window; a burst beyond it waits for acknowledgements as it
 	// waits for the window. Retained bytes are the bytes in flight, so a cap
@@ -5139,6 +5160,14 @@ func (self *TcpSequence) initializeSynWithLock(tcp *parsedTcp) {
 	self.receiveWindowScale = tcp.windowScale
 	self.enableTimestamp = tcp.enableTimestamp
 	self.timestampRecent = tcp.timestampValue
+	// Selective acknowledgement is negotiated by both ends offering
+	// sack-permitted (RFC 2018 §2): the source's SYN offers it here, and the
+	// SYN-ACK offers it back only where the settings turn it on. Nothing
+	// selective is honoured without that, so with the setting off no source,
+	// compliant or not, can reach the selective paths of
+	// tcpReturnRetransmitState.
+	self.enableSack = self.tcpBufferSettings.EnableReturnRetransmitSack && tcp.enableSackPermitted
+	self.returnRetransmit.sackPermitted = self.enableSack
 	if tcp.enableMss {
 		self.peerMss = tcp.mss
 	}
@@ -6621,9 +6650,14 @@ type ConnectionState struct {
 	windowSize          uint32
 	windowScale         uint32
 	enableTimestamp     bool
-	timestampRecent     uint32
-	timestampOffset     uint32
-	peerMss             uint32
+	// whether the handshake negotiated selective acknowledgement: both the
+	// source's SYN and this side's SYN-ACK offered sack-permitted (RFC 2018
+	// §2). The SYN-ACK offers it only where the settings turn it on, so this
+	// is false on every flow by default
+	enableSack      bool
+	timestampRecent uint32
+	timestampOffset uint32
+	peerMss         uint32
 	// Tests provide an exact timestamp without sleeping. Nil uses elapsed
 	// monotonic process time and is a production no-op.
 	timestampValueForTest func() uint32
@@ -6760,9 +6794,13 @@ func (self *ConnectionState) synAckWithSequence(mtu int, sequence uint32) ([]byt
 		ipHeaderByteCount = Ipv6HeaderSize
 	}
 
-	// MSS (kind 2, length 4), optional window scale (kind 3, length 3), and
-	// timestamp (kind 8, length 10), zero padded to a header word.
+	// MSS (kind 2, length 4), optional sack-permitted (kind 4, length 2),
+	// window scale (kind 3, length 3), and timestamp (kind 8, length 10),
+	// zero padded to a header word.
 	optionsByteCount := 4
+	if self.enableSack {
+		optionsByteCount += 2
+	}
 	if self.enableWindowScale {
 		optionsByteCount += 3
 	}
@@ -6803,6 +6841,13 @@ func (self *ConnectionState) synAckWithSequence(mtu int, sequence uint32) ([]byt
 	options[1] = 4
 	binary.BigEndian.PutUint16(options[2:4], uint16(mtu-ipHeaderByteCount-TcpHeaderSizeWithoutExtensions))
 	optionIndex := 4
+	if self.enableSack {
+		// offered back to a source that offered it, which is what lets the
+		// source report its out-of-order runs (RFC 2018 §2)
+		options[optionIndex] = 4
+		options[optionIndex+1] = 2
+		optionIndex += 2
+	}
 	if self.enableTimestamp {
 		options[optionIndex] = 8
 		options[optionIndex+1] = 10
