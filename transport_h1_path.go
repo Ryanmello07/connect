@@ -1110,12 +1110,18 @@ func (self *h1PathMonitor) tick(sample h1PathSample) h1PathDecision {
 	// being set is not a queue that lifted either: the floor of a source first
 	// read under a standing queue is inside that queue, and its delay then
 	// reads zero for the connection's life -- which is the ground truth's own
-	// shape, a session that starts bad and stays bad. Crediting either would
-	// resolve a re-roll as improved while the replacement sat on the same bad
-	// member, and hand back the unimproved latch and the unconfirmed budget,
-	// which are the only things bounding the next one. Both also drop the ticks
-	// our own consumer paced, because a tick we slowed ourselves says nothing
-	// about the path.
+	// shape, a session that starts bad and stays bad. What that guard reads is
+	// the age of the reference and not which source convicted, so one gap is
+	// left: a source whose floor was set inside the queue while the convicted
+	// connection was running is older than the replacement and reads zero for
+	// it too. It takes a socket whose talkers changed under a standing queue,
+	// and closing it means carrying the convicting source through the ledger,
+	// which is a heavier reading than the counters it protects. Crediting
+	// either reading would resolve a re-roll as improved while the replacement
+	// sat on the same bad member, and hand back the unimproved latch and the
+	// unconfirmed budget, which are the only things bounding the next one. Both
+	// also drop the ticks our own consumer paced, because a tick we slowed
+	// ourselves says nothing about the path.
 	//
 	// The send reading needs no such guard: a send conviction is read from our
 	// own kernel's send queue, and a tick that moved acked bytes without that
@@ -1678,11 +1684,16 @@ type h1PathStats struct {
 	SuppressedDailyBudget       atomic.Uint64
 	SuppressedProviderGate      atomic.Uint64
 	SuppressedSourcePort        atomic.Uint64
-	Improved                    atomic.Uint64
-	Unimproved                  atomic.Uint64
-	Unresolved                  atomic.Uint64
-	SourcePortBinds             atomic.Uint64
-	SourcePortFallbacks         atomic.Uint64
+	// A re-roll is Improved only when the measure that convicted reads its own
+	// queue gone (h1PathConvicted), so a replacement nothing could read on that
+	// measure is Unresolved and not Improved: a rollout reading Improved against
+	// Rerolls is reading how often a re-roll was seen to work, and Unresolved is
+	// how often nothing could tell either way
+	Improved            atomic.Uint64
+	Unimproved          atomic.Uint64
+	Unresolved          atomic.Uint64
+	SourcePortBinds     atomic.Uint64
+	SourcePortFallbacks atomic.Uint64
 	// connections whose local port is inside the window the ledger excluded,
 	// so a planned re-roll dial did not move the 4-tuple
 	SourcePortUnmoved atomic.Uint64
