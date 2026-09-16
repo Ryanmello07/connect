@@ -825,12 +825,23 @@ func (self *tcpReturnRetransmitState) markBurstWithLock(windowEnd uint32, nowNan
 }
 
 // Retransmits every unmarked delivered segment below the highest selectively
-// acknowledged byte, each at most once per round trip.
+// acknowledged byte, each at most once per round trip, and at most a burst's
+// worth due at once. The blocks are applied whoever sends them: nothing in
+// the handshake advertises sack-permitted, so a compliant source sends none
+// and a source that sends them anyway is reporting what it likes. One such
+// acknowledgement, whose single block covers only the newest retained
+// segment, would otherwise mark every delivered segment below it, and
+// takeDueWithLock builds all of them in one hold of the sequence mutex, which
+// the shared send shard's acknowledgement path waits on, and the worker holds
+// every packet until the first is delivered. The ceiling is the one the
+// partial-acknowledgement bursts keep, for the same reason; the holes it
+// leaves are marked by the next trigger.
 func (self *tcpReturnRetransmitState) markSackHolesWithLock(nowNanos int64) {
 	if self.sackedCount == 0 {
 		return
 	}
-	for index := 0; index < self.deliveredCount; index += 1 {
+	for index := 0; index < self.deliveredCount &&
+		self.dueCount < returnRetransmitMaxBurstSegmentCount; index += 1 {
 		segment := self.segmentAtWithLock(index)
 		if 0 <= int32(segment.seq-self.highestSackedEnd) {
 			break

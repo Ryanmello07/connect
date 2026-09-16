@@ -505,6 +505,20 @@ func (self *tcpReturnTestSource) sendDuplicateAck() {
 	self.harness.sendFromSource(&ackTcp, ackPacket)
 }
 
+// Sends one acknowledgement whose selective blocks are the test's own rather
+// than the runs the source holds, as a source that never negotiated selective
+// acknowledgement and reports what it likes.
+func (self *tcpReturnTestSource) sendCraftedSackAck(ackNumber uint32, blocks []tcpSackBlock) {
+	var ackPacket []byte
+	var ackTcp parsedTcp
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		ackPacket, ackTcp = self.buildAckWithLock(ackNumber, blocks)
+	}()
+	self.harness.sendFromSource(&ackTcp, ackPacket)
+}
+
 // Sends one data segment of the source's own upload, as a client sends while
 // the download runs. It repeats the last cumulative acknowledgement and the
 // current window, having nothing new to report, and carries the payload the
@@ -1481,6 +1495,65 @@ func TestTcpReturnRetransmitSackHolesStopAtTheHighestSelectiveByte(t *testing.T)
 		}
 		if stats := harness.counters.snapshot(); stats.TimeoutCount != 0 {
 			t.Fatalf("stats=%+v, want no timer expiry", stats)
+		}
+	})
+}
+
+// Selective blocks are applied whoever sends them, and one acknowledgement's
+// blocks mark at most a burst's worth of holes. Nothing in the handshake here
+// advertises sack-permitted, so a compliant source sends no blocks at all and
+// a source that sends them is reporting what it likes; the blocks are still
+// applied, which is what lets the code recover a real selective
+// acknowledgement the day the handshake negotiates one. What must not follow
+// is that one 40-byte acknowledgement, whose single block covers only the
+// newest retained segment, marks every delivered segment below it as a hole:
+// the worker then builds a window of packets in one hold of the sequence
+// mutex, which the shared send shard's acknowledgement path waits on, and
+// holds every one of them until the first is delivered. The ceiling is the
+// one the partial-acknowledgement bursts keep, and what is left over waits
+// for the next trigger.
+func TestTcpReturnRetransmitCraftedSackBlocksMarkAtMostOneBurst(t *testing.T) {
+	// more than twice the ceiling, so a run that is not bounded is plain
+	const segmentCount = 300
+	runTcpReturnRetransmitTest(t, func(t *testing.T) {
+		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{})
+		// nothing is acknowledged, so the whole flight is retained
+		harness.source.holdAcks = true
+		payload := harness.payload(segmentCount)
+		harness.write(payload)
+		synctest.Wait()
+		if _, retainedCount, _, _ := harness.retransmitState(); retainedCount != segmentCount {
+			t.Fatalf("%d segments retained, want the whole flight of %d", retainedCount, segmentCount)
+		}
+
+		// three duplicates of the handshake's acknowledgement, each claiming
+		// the newest segment alone
+		newest := tcpSackBlock{
+			start: harness.segmentSeq(segmentCount - 1),
+			end:   harness.segmentSeq(segmentCount),
+		}
+		for range returnRetransmitDupAckThreshold {
+			harness.source.sendCraftedSackAck(harness.dataSeq, []tcpSackBlock{newest})
+		}
+		synctest.Wait()
+
+		_, _, packetCount, reasonCounts := harness.retransmitState()
+		t.Logf("one crafted acknowledgement drew %d packets, reasons=%v", packetCount, reasonCounts)
+		if returnRetransmitMaxBurstSegmentCount < packetCount {
+			t.Fatalf("retransmissions=%d reasons=%v on one acknowledgement, above the ceiling of %d", packetCount, reasonCounts, returnRetransmitMaxBurstSegmentCount)
+		}
+		if packetCount == 0 || reasonCounts[tcpReturnRetransmitReasonSackHole] != packetCount {
+			t.Fatalf("retransmissions=%d reasons=%v, want the holes the blocks reported, up to the ceiling", packetCount, reasonCounts)
+		}
+
+		// the flow is unharmed: the source acknowledges the flight it had all
+		// along and the ring empties
+		harness.source.ackNow()
+		synctest.Wait()
+		harness.requireStream(payload)
+		retainedByteCount, retainedCount, _, _ := harness.retransmitState()
+		if retainedByteCount != 0 || retainedCount != 0 {
+			t.Fatalf("retained after the acknowledgement: %d bytes in %d segments", retainedByteCount, retainedCount)
 		}
 	})
 }
