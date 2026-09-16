@@ -63,6 +63,22 @@ import (
 // back, so a clock step costs one disconnect and then nothing, with no latch,
 // while a real collapse the re-roll fixes costs nothing at all.
 //
+// A route with no ack is also outside the reach of one of the two fixes, and
+// the boundary is worth naming because it is the ground truth's own shape. The
+// queue delay is measured against what the source has already shown, so a queue
+// already standing when that source's floor was set is inside the floor and
+// reads as zero for the connection's life -- and the ground truth is a session
+// that starts bad and stays bad. The ack echo is the only evidence that needs
+// no floor of the sender's, so where one rides the route the collapse is
+// convicted in 3 s and where none does the connection is invisible, in Observe
+// and in Act alike. Neither of the independent floors that suggest themselves
+// closes it: neither the dial round trip nor the kernel's minimum round trip
+// bounds the offset between the two clocks that every pack tag carries, and
+// neither one times the far socket's send queue, which sits upstream of
+// everything our kernel measures -- our own segments never wait behind it. A
+// round trip on our own clock is the only thing that does, which is what the
+// ack echo is, so this is the shape of the evidence and not a gap in the rule.
+//
 // That last shape is not a corner, and treating it as unconfirmed is a choice
 // about most clients, not about a few. A route carries an ack to read only
 // while the peer answers over it, so the platform rig and six of the eight S9

@@ -2106,17 +2106,56 @@ func TestH1PathMonitorConvictsACollapseStandingAtTheFirstSample(t *testing.T) {
 	}
 }
 
-// The ack round trip carries our own uplink's standing queue as well as the
-// receive path's, and the time our send buffer takes to drain says nothing
-// about what is arriving. A device uploading hard while it downloads therefore
-// reads an ack round trip of seconds on a receive path that has no queue at
-// all, and without the send backlog guard that alone would collapse every
-// receive tick.
-// The guard is the send side's own bar: a backlog over the byte floor that
-// also takes at least the queue delay threshold to drain. Both halves are
-// needed -- bytes alone withdraw the evidence from any client with a full
-// batch on a fast uplink, and a drain time alone withdraws it from an idle
-// socket -- and the two arms below are each half failing on its own.
+// The scope limit behind the test above, stated where it can fail. The pack
+// tags measure a queue against what the source has already shown, so a queue
+// that was standing when the source's floor was set is inside the floor and
+// reads as zero for the connection's life. The ack echo is the only evidence
+// that needs no floor of the sender's, so a route carrying no ack does not read
+// a queue standing at birth at all, in Observe or in Act.
+//
+// Neither candidate for an independent floor closes it. Neither the dial round
+// trip nor the kernel's minimum round trip bounds the offset between the two
+// clocks that every rel carries, and neither one times the far socket's send
+// queue, which sits upstream of everything our kernel measures: our own
+// segments never wait behind it. A round trip on our own clock is the only
+// thing that does, which is what the ack echo is. The limit is therefore the
+// shape of the evidence and not a gap in the rule, and what it costs is read
+// from TicksAckUnknown against Ticks.
+func TestH1PathMonitorCannotReadABirthQueueOnARouteWithNoAck(t *testing.T) {
+	const transit = 200 * time.Millisecond
+	const queue = 6 * time.Second
+	settings := DefaultH1PathRerollSettings()
+	noAckShape := func(queueAfter time.Duration) func(elapsed time.Duration) h1PathObserverTickShape {
+		return func(elapsed time.Duration) h1PathObserverTickShape {
+			shape := h1PathObserverTickShape{rel: transit, rxByteRate: 700_000}
+			if queueAfter <= elapsed {
+				shape.rel += queue
+			}
+			return shape
+		}
+	}
+
+	decisions, stats := runH1PathObserverMonitorShape(t, &settings, 3*time.Minute, noAckShape(0))
+	if ticks := h1PathConvictionTicks(decisions); len(ticks) != 0 {
+		t.Errorf("a queue standing at the first sample convicted at ticks %v with no ack to read", ticks)
+	}
+	snapshot := stats.snapshot()
+	if snapshot.TicksCollapsed != 0 {
+		t.Errorf("stats = %+v, want the connection invisible for its whole life", snapshot)
+	}
+	if snapshot.Ticks == 0 || snapshot.TicksAckUnknown != snapshot.Ticks {
+		t.Errorf("stats = %+v, want every tick counted with no ack to read", snapshot)
+	}
+
+	// and the boundary: the same route reads a queue that arrives after the
+	// floor is set, so what is lost is the queue standing at birth and not the
+	// pack rule
+	decisions, _ = runH1PathObserverMonitorShape(t, &settings, 3*time.Minute, noAckShape(10*time.Second))
+	if ticks := h1PathConvictionTicks(decisions); len(ticks) == 0 {
+		t.Error("a queue arriving at 10 s was never convicted from the pack tags alone")
+	}
+}
+
 // A queue the ack round trip reads is bounded by BaselineRisePerMinute exactly
 // as a queue the pack tags read is: visible for (q - thr) / rise and then gone,
 // rather than convicting for as long as it stands. The hour this runs for is
@@ -2164,6 +2203,19 @@ func TestH1PathMonitorAckQueueDecaysAtTheBaselineRise(t *testing.T) {
 		len(ticks), first, last, stats.snapshot().TicksCollapsed)
 }
 
+// The ack round trip carries our own uplink's standing queue as well as the
+// receive path's, and the time our send buffer takes to drain says nothing
+// about what is arriving. A device uploading hard while it downloads therefore
+// reads an ack round trip of seconds on a receive path that has no queue at
+// all, and without the send backlog guard that alone would collapse every
+// receive tick.
+//
+// The guard is the send side's own bar: a backlog over the byte floor that
+// also takes at least the queue delay threshold to drain. Both halves are
+// needed -- bytes alone withdraw the evidence from any client with a full
+// batch on a fast uplink, and a drain time alone withdraws it from an idle
+// socket -- and the three arms below are each half failing on its own and the
+// bar holding.
 func TestH1PathMonitorDoesNotReadOurOwnSendQueueAsTheReceiveQueue(t *testing.T) {
 	// 700 KB/s down, no receive queue, and an uplink holding 400 KiB it takes
 	// 2 s to drain, which is what can put 7 s into every ack round trip
