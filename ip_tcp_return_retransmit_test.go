@@ -3440,6 +3440,84 @@ func TestTcpReturnRetransmitTheGuardCreditsAtMostTwoBurstsOfItsOwn(t *testing.T)
 	})
 }
 
+// What the credit buys and what it costs, read as behaviour rather than as
+// the constant: after a recovery whose guesses are more than two bursts, the
+// run of duplicate acknowledgements the guard absorbs at a standing
+// cumulative acknowledgement is exactly two bursts, and the threshold's own
+// three on top of them; the next duplicate is believed and the repair goes.
+// A credit of one burst would start the repair at half this run, and a credit
+// of four bursts, or the uncapped count this recovery would otherwise leave
+// at 399, would not start it inside twice the run.
+//
+// Two bursts is what a recovery can still have unanswered: a burst goes at
+// most once per partial acknowledgement and no further than the ceiling, the
+// path delivers in order, so the guesses whose duplicates have not yet
+// arrived when a run begins are the bursts in flight. The source here reports
+// more duplicates than the segments it was sent, which is what makes the run
+// reach the credit at all.
+func TestTcpReturnRetransmitTheGuardAbsorbsTwoBurstsOfDuplicatesAndNoMore(t *testing.T) {
+	const recoverySegmentCount = 400
+	const laterSegmentCount = 100
+	// the run the guard is expected to absorb, and twice it, so a credit
+	// larger than the cap reads as its own number rather than as never
+	const wantRun = returnRetransmitDupAckThreshold + 2*returnRetransmitMaxBurstSegmentCount
+	runTcpReturnRetransmitTest(t, func(t *testing.T) {
+		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{})
+		harness.source.holdAcks = true
+		payload := harness.payload(recoverySegmentCount + laterSegmentCount)
+		recoveryByteCount := recoverySegmentCount * harness.segmentByteCount
+		harness.write(payload[:recoveryByteCount])
+		synctest.Wait()
+
+		// a recovery whose bursts guess far past the hole: the source
+		// acknowledges one segment at a time, so every burst grows
+		for range returnRetransmitDupAckThreshold {
+			harness.source.sendAck(harness.dataSeq)
+		}
+		synctest.Wait()
+		for segmentIndex := 1; segmentIndex < recoverySegmentCount-100; segmentIndex += 1 {
+			harness.source.sendAck(harness.segmentSeq(segmentIndex))
+			synctest.Wait()
+		}
+
+		// data behind the recovery point, so the ring still holds a head
+		// when the recovery ends and the run below has something to repair
+		harness.write(payload[recoveryByteCount:])
+		synctest.Wait()
+		harness.source.sendAck(harness.segmentSeq(recoverySegmentCount))
+		synctest.Wait()
+		if phase := harness.recoveryPhase(); phase != tcpReturnRecoveryPhaseNone {
+			t.Fatalf("recovery phase %d after the acknowledgement that ends it, want none", phase)
+		}
+		_, _, recoveryPacketCount, _ := harness.retransmitState()
+		if recoveryPacketCount <= 2*returnRetransmitMaxBurstSegmentCount {
+			t.Fatalf("the recovery sent %d segments again, want more than the two bursts the run below is read against", recoveryPacketCount)
+		}
+		t.Logf("the recovery sent %d segments again and left the guard crediting %d duplicates",
+			recoveryPacketCount, harness.explainedDupAckCount())
+
+		// the run at the standing acknowledgement, one duplicate at a time
+		run := 0
+		for index := 1; index <= 2*wantRun; index += 1 {
+			harness.source.sendDuplicateAck()
+			synctest.Wait()
+			if _, _, packetCount, _ := harness.retransmitState(); recoveryPacketCount < packetCount {
+				run = index
+				break
+			}
+		}
+		if run != wantRun {
+			t.Fatalf("the guard absorbed %d duplicates before the repair went (0 = more than %d), want the threshold above two bursts, %d",
+				run, 2*wantRun, wantRun)
+		}
+		_, _, packetCount, reasonCounts := harness.retransmitState()
+		if packetCount != recoveryPacketCount+1 ||
+			reasonCounts[tcpReturnRetransmitReasonDupAck] != 2 {
+			t.Fatalf("retransmissions=%d reasons=%v, want the run to have sent the head once", packetCount, reasonCounts)
+		}
+	})
+}
+
 // The same recovery after a real expiry: the source's kernel drops the whole
 // flight after its first segment, so no duplicate acknowledgement ever comes.
 // The expiry probes with the head, the source acknowledges exactly that head,
