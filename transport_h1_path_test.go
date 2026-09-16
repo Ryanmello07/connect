@@ -730,11 +730,11 @@ func TestH1PathLedgerDoesNotPinARouteManager(t *testing.T) {
 	now := h1PathTestOrigin
 
 	live := &RouteManager{}
-	ledger.noteReroll(live, &settings, now, H1PathRerollRoleClient, h1PathConfidenceConfirmed, 40004)
+	ledger.noteReroll(live, &settings, now, H1PathRerollRoleClient, h1PathConfidenceConfirmed, h1PathConvicted{direction: h1PathDirectionRx, ackCarried: true}, 40004)
 	func() {
 		// the ledger is the only thing that will know this one
 		dead := &RouteManager{}
-		ledger.noteReroll(dead, &settings, now, H1PathRerollRoleClient, h1PathConfidenceConfirmed, 40012)
+		ledger.noteReroll(dead, &settings, now, H1PathRerollRoleClient, h1PathConfidenceConfirmed, h1PathConvicted{direction: h1PathDirectionRx, ackCarried: true}, 40012)
 		if state := testingH1PathLedgerSnapshot(ledger); state.pendingCount != 2 {
 			t.Fatalf("ledger = %+v, want both re-rolls pending", state)
 		}
@@ -777,7 +777,7 @@ func TestH1PathLedgerDeviceSpacing(t *testing.T) {
 	if ok, reason := ledger.allow(&settings, now, H1PathRerollRoleClient, h1PathConfidenceConfirmed, time.Minute); !ok {
 		t.Fatalf("first re-roll refused: %s", reason)
 	}
-	ledger.noteReroll(key, &settings, now, H1PathRerollRoleClient, h1PathConfidenceConfirmed, 40004)
+	ledger.noteReroll(key, &settings, now, H1PathRerollRoleClient, h1PathConfidenceConfirmed, h1PathConvicted{direction: h1PathDirectionRx, ackCarried: true}, 40004)
 	// spacing is per device: any connection's re-roll 1 s later is refused
 	if ok, reason := ledger.allow(&settings, now.Add(time.Second), H1PathRerollRoleClient, h1PathConfidenceConfirmed, time.Minute); ok || reason != h1PathReasonSpacing {
 		t.Fatalf("re-roll 1 s later = %t %s, want spacing", ok, reason)
@@ -793,7 +793,7 @@ func TestH1PathLedgerUnimprovedLatch(t *testing.T) {
 	key := &RouteManager{}
 	now := h1PathTestOrigin
 
-	ledger.noteReroll(key, &settings, now, H1PathRerollRoleClient, h1PathConfidenceConfirmed, 40004)
+	ledger.noteReroll(key, &settings, now, H1PathRerollRoleClient, h1PathConfidenceConfirmed, h1PathConvicted{direction: h1PathDirectionRx, ackCarried: true}, 40004)
 	now = now.Add(30 * time.Second)
 	if !ledger.noteConviction(key, &settings, now) {
 		t.Fatal("a conviction 30 s after a re-roll was not unimproved")
@@ -801,7 +801,7 @@ func TestH1PathLedgerUnimprovedLatch(t *testing.T) {
 	if ok, reason := ledger.allow(&settings, now, H1PathRerollRoleClient, h1PathConfidenceConfirmed, time.Minute); !ok {
 		t.Fatalf("one unimproved re-roll refused the next: %s", reason)
 	}
-	ledger.noteReroll(key, &settings, now, H1PathRerollRoleClient, h1PathConfidenceConfirmed, 40012)
+	ledger.noteReroll(key, &settings, now, H1PathRerollRoleClient, h1PathConfidenceConfirmed, h1PathConvicted{direction: h1PathDirectionRx, ackCarried: true}, 40012)
 	now = now.Add(30 * time.Second)
 	if !ledger.noteConviction(key, &settings, now) {
 		t.Fatal("the second conviction inside the window was not unimproved")
@@ -824,17 +824,23 @@ func TestH1PathLedgerCleanTicksResolveImprovement(t *testing.T) {
 	now := h1PathTestOrigin
 
 	// one unimproved re-roll, then a second re-roll that turns out clean
-	ledger.noteReroll(key, &settings, now, H1PathRerollRoleClient, h1PathConfidenceConfirmed, 40004)
+	ledger.noteReroll(key, &settings, now, H1PathRerollRoleClient, h1PathConfidenceConfirmed, h1PathConvicted{direction: h1PathDirectionRx, ackCarried: true}, 40004)
 	now = now.Add(10 * time.Second)
 	if !ledger.noteConviction(key, &settings, now) {
 		t.Fatal("conviction was not unimproved")
 	}
-	ledger.noteReroll(key, &settings, now, H1PathRerollRoleClient, h1PathConfidenceConfirmed, 40012)
+	ledger.noteReroll(key, &settings, now, H1PathRerollRoleClient, h1PathConfidenceConfirmed, h1PathConvicted{direction: h1PathDirectionRx, ackCarried: true}, 40012)
 	now = now.Add(10 * time.Second)
-	if ledger.noteClean(key, &settings, now, 19) {
+	if ledger.noteClean(key, &settings, now, h1PathCleanTicks{rxAck: 19}) {
 		t.Fatal("19 clean ticks counted as improved")
 	}
-	if ledger.noteClean(key, &settings, now, 20) != true {
+	// the re-roll answers a receive queue the ack echo read, so a send
+	// direction that never stopped working and a pack baseline that never saw
+	// that queue are not what it has to beat
+	if ledger.noteClean(key, &settings, now, h1PathCleanTicks{tx: 400, rxPack: 400}) {
+		t.Fatal("clean ticks of the directions that did not convict counted as improved")
+	}
+	if ledger.noteClean(key, &settings, now, h1PathCleanTicks{rxAck: 20}) != true {
 		t.Fatal("20 clean ticks did not count as improved")
 	}
 	if ledger.epochUnimproved != 0 {
@@ -846,7 +852,7 @@ func TestH1PathLedgerCleanTicksResolveImprovement(t *testing.T) {
 
 	// a conviction after the improvement window is not unimproved, and the
 	// aged-out entry is unresolved
-	ledger.noteReroll(key, &settings, now, H1PathRerollRoleClient, h1PathConfidenceConfirmed, 0)
+	ledger.noteReroll(key, &settings, now, H1PathRerollRoleClient, h1PathConfidenceConfirmed, h1PathConvicted{direction: h1PathDirectionRx, ackCarried: true}, 0)
 	if ledger.noteConviction(key, &settings, now.Add(121*time.Second)) {
 		t.Fatal("a conviction 121 s after the re-roll was unimproved")
 	}
@@ -863,7 +869,7 @@ func TestH1PathLedgerUnconfirmedBudget(t *testing.T) {
 	if ok, reason := ledger.allow(&settings, now, H1PathRerollRoleClient, h1PathConfidenceUnconfirmed, time.Minute); !ok {
 		t.Fatalf("first unconfirmed re-roll refused: %s", reason)
 	}
-	ledger.noteReroll(&RouteManager{}, &settings, now, H1PathRerollRoleClient, h1PathConfidenceUnconfirmed, 0)
+	ledger.noteReroll(&RouteManager{}, &settings, now, H1PathRerollRoleClient, h1PathConfidenceUnconfirmed, h1PathConvicted{direction: h1PathDirectionRx}, 0)
 	now = now.Add(time.Minute)
 	if ok, reason := ledger.allow(&settings, now, H1PathRerollRoleClient, h1PathConfidenceUnconfirmed, time.Minute); ok || reason != h1PathReasonUnconfirmedBudget {
 		t.Fatalf("second unconfirmed re-roll = %t %s, want unconfirmedBudget", ok, reason)
@@ -883,12 +889,15 @@ func TestH1PathLedgerUnconfirmedBudget(t *testing.T) {
 	ledger, _ = newH1PathTestLedger()
 	key := &RouteManager{}
 	now = h1PathTestOrigin
-	ledger.noteReroll(key, &settings, now, H1PathRerollRoleClient, h1PathConfidenceUnconfirmed, 0)
+	ledger.noteReroll(key, &settings, now, H1PathRerollRoleClient, h1PathConfidenceUnconfirmed, h1PathConvicted{direction: h1PathDirectionRx}, 0)
 	now = now.Add(time.Minute)
 	if ok, reason := ledger.allow(&settings, now, H1PathRerollRoleClient, h1PathConfidenceUnconfirmed, time.Minute); ok {
 		t.Fatalf("the unconfirmed budget was not spent: %t %s", ok, reason)
 	}
-	if !ledger.noteClean(key, &settings, now, settings.CleanTicks) {
+	if ledger.noteClean(key, &settings, now, h1PathCleanTicks{rxAck: settings.CleanTicks}) {
+		t.Fatal("an ack the conviction never read resolved a re-roll the pack tags convicted")
+	}
+	if !ledger.noteClean(key, &settings, now, h1PathCleanTicks{rxPack: settings.CleanTicks}) {
 		t.Fatal("the clean ticks did not resolve the re-roll as improved")
 	}
 	if ok, reason := ledger.allow(&settings, now, H1PathRerollRoleClient, h1PathConfidenceUnconfirmed, time.Minute); !ok {
@@ -903,7 +912,7 @@ func TestH1PathLedgerNetworkChangeLatchAge(t *testing.T) {
 	now := h1PathTestOrigin
 
 	for i := 0; i < 2; i++ {
-		ledger.noteReroll(key, &settings, now, H1PathRerollRoleClient, h1PathConfidenceConfirmed, 0)
+		ledger.noteReroll(key, &settings, now, H1PathRerollRoleClient, h1PathConfidenceConfirmed, h1PathConvicted{direction: h1PathDirectionRx, ackCarried: true}, 0)
 		now = now.Add(10 * time.Second)
 		ledger.noteConviction(key, &settings, now)
 	}
@@ -912,7 +921,7 @@ func TestH1PathLedgerNetworkChangeLatchAge(t *testing.T) {
 		t.Fatalf("allow = %t %s, want latched", ok, reason)
 	}
 	// a pending entry is dropped as unresolved by a network change
-	ledger.noteReroll(&RouteManager{}, &settings, now, H1PathRerollRoleClient, h1PathConfidenceConfirmed, 0)
+	ledger.noteReroll(&RouteManager{}, &settings, now, H1PathRerollRoleClient, h1PathConfidenceConfirmed, h1PathConvicted{direction: h1PathDirectionRx, ackCarried: true}, 0)
 
 	ledger.networkChanged(latchStart.Add(4 * time.Minute))
 	if ok, reason := ledger.allow(&settings, latchStart.Add(4*time.Minute), H1PathRerollRoleClient, h1PathConfidenceConfirmed, time.Minute); ok || reason != h1PathReasonLatched {
@@ -950,7 +959,7 @@ func TestH1PathLedgerDailyBudget(t *testing.T) {
 			if ok, reason := ledger.allow(&settings, now, H1PathRerollRoleClient, h1PathConfidenceConfirmed, time.Minute); !ok {
 				t.Fatalf("epoch %d re-roll %d refused: %s", epoch, i, reason)
 			}
-			ledger.noteReroll(key, &settings, now, H1PathRerollRoleClient, h1PathConfidenceConfirmed, 0)
+			ledger.noteReroll(key, &settings, now, H1PathRerollRoleClient, h1PathConfidenceConfirmed, h1PathConvicted{direction: h1PathDirectionRx, ackCarried: true}, 0)
 			now = now.Add(10 * time.Second)
 			if !ledger.noteConviction(key, &settings, now) {
 				t.Fatalf("epoch %d conviction %d was not unimproved", epoch, i)
@@ -992,7 +1001,7 @@ func TestH1PathLedgerProviderGate(t *testing.T) {
 	if ok, reason := ledger.allow(&settings, now, H1PathRerollRoleProvider, h1PathConfidenceConfirmed, 121*time.Second); !ok {
 		t.Fatalf("provider at age 121 s refused: %s", reason)
 	}
-	ledger.noteReroll(&RouteManager{}, &settings, now, H1PathRerollRoleProvider, h1PathConfidenceConfirmed, 0)
+	ledger.noteReroll(&RouteManager{}, &settings, now, H1PathRerollRoleProvider, h1PathConfidenceConfirmed, h1PathConvicted{direction: h1PathDirectionRx, ackCarried: true}, 0)
 	if ok, reason := ledger.allow(&settings, now.Add(9*time.Minute), H1PathRerollRoleProvider, h1PathConfidenceConfirmed, 5*time.Minute); ok || reason != h1PathReasonProviderGate {
 		t.Fatalf("provider 9 min after its re-roll = %t %s, want providerGate", ok, reason)
 	}
@@ -1011,7 +1020,7 @@ func TestH1PathLedgerExcludedPorts(t *testing.T) {
 	now := h1PathTestOrigin
 
 	for i := 0; i < 20; i++ {
-		ledger.noteReroll(&RouteManager{}, &settings, now, H1PathRerollRoleClient, h1PathConfidenceConfirmed, 40000+i)
+		ledger.noteReroll(&RouteManager{}, &settings, now, H1PathRerollRoleClient, h1PathConfidenceConfirmed, h1PathConvicted{direction: h1PathDirectionRx, ackCarried: true}, 40000+i)
 	}
 	excluded := ledger.excluded()
 	if len(excluded) != 16 || excluded[0] != 40004 || excluded[15] != 40019 {
@@ -1035,7 +1044,7 @@ func TestH1PathDefaultLedgerFollowsNetworkChange(t *testing.T) {
 	settings := DefaultH1PathRerollSettings()
 	// an hour in the past, so the process ledger's device spacing and pending
 	// entry cannot refuse or judge another test's re-roll
-	ledger.noteReroll(&RouteManager{}, &settings, time.Now().Add(-time.Hour), H1PathRerollRoleClient, h1PathConfidenceConfirmed, 40004)
+	ledger.noteReroll(&RouteManager{}, &settings, time.Now().Add(-time.Hour), H1PathRerollRoleClient, h1PathConfidenceConfirmed, h1PathConvicted{direction: h1PathDirectionRx, ackCarried: true}, 40004)
 	NetworkChanged()
 	if excluded := ledger.excluded(); len(excluded) != 0 {
 		t.Fatalf("NetworkChanged left the default ledger's excluded ports %v", excluded)
@@ -2467,6 +2476,226 @@ func runH1PathPolicyShape(
 	outcome.collapsedTicks = snapshot.TicksCollapsed
 	outcome.ackDeniedTicks = snapshot.RxAckDeniedTicks
 	return outcome
+}
+
+// One tick of a probe that re-dials: what the receive route carries, on the
+// sender's clock and on ours.
+type h1PathRerollProbeShape struct {
+	// the pack tags' transit -- the path, plus whatever queue stands in front
+	// of the far socket -- read against the sender's clock
+	rel time.Duration
+	// this tick's ack echo round trip; zero leaves the tick with no ack to
+	// read, which is every tick of a route whose peer answers elsewhere and
+	// most ticks of a download-heavy client, whose acks are echoes of its own
+	// sparse sends
+	ackRtt     time.Duration
+	rxByteRate float64
+	// the source the packs come from; the zero Id keeps the previous one
+	sourceId Id
+}
+
+// What a probe run cost the device.
+type h1PathRerollProbeOutcome struct {
+	convictions int
+	rerolls     int
+	rerollTimes []time.Duration
+	improved    uint64
+	suppressed  map[h1PathReason]int
+}
+
+func (self h1PathRerollProbeOutcome) String() string {
+	return fmt.Sprintf(
+		"convictions=%d rerolls=%d at=%v improved=%d suppressed=%v",
+		self.convictions, self.rerolls, self.rerollTimes, self.improved, self.suppressed,
+	)
+}
+
+// Drives the real observer, the real shared baseline, the real monitor, the
+// connection's own decide and a real ledger, and re-dials the way production
+// does: an allowed re-roll builds a new monitor and a new observer on the
+// transport's shared baseline, so the ack floor and the connection's age start
+// again with the connection while the pack baseline does not
+// (PlatformTransport.newH1PathConnection). That is what runH1PathPolicyShape
+// cannot read -- it keeps one monitor for a whole run, which answers what one
+// connection costs -- and it is the only way to see what a replacement is
+// credited for.
+func runH1PathRerollProbe(
+	t *testing.T,
+	settings *H1PathRerollSettings,
+	dialRtt time.Duration,
+	duration time.Duration,
+	shape func(elapsed time.Duration, connectionOrdinal int) h1PathRerollProbeShape,
+) (h1PathRerollProbeOutcome, *h1PathStats, *h1PathLedger) {
+	t.Helper()
+	connection, ledger := testingH1PathDecideConnection(H1PathRerollModeAct, false)
+	*connection.settings = *settings
+	settings = connection.settings
+	baseline := newH1QueueDelayBaseline(settings)
+	connection.transport.h1PathBaseline = baseline
+
+	start := h1PathTestOrigin
+	newConnection := func(now time.Time) (*h1RouteObserver, h1PathSample) {
+		monitor := newH1PathMonitor(settings, now, dialRtt)
+		if monitor == nil {
+			t.Fatalf("no monitor for dial rtt %s", dialRtt)
+		}
+		monitor.stats = connection.stats
+		connection.monitor = monitor
+		// every frame is sampled, so a tick reads what the shape says
+		return newH1RouteObserver(baseline, 1), h1PathSample{
+			rxBytesKnown: true,
+			rxOooKnown:   true,
+			minRtt:       dialRtt,
+			rcvMss:       1448,
+			sndMss:       1448,
+		}
+	}
+	observer, sample := newConnection(start)
+
+	outcome := h1PathRerollProbeOutcome{suppressed: map[h1PathReason]int{}}
+	sourceId := NewId()
+	connectionOrdinal := 0
+	for k := 1; k <= int(duration/h1PathTestStep); k += 1 {
+		now := start.Add(time.Duration(k) * h1PathTestStep)
+		elapsed := now.Sub(start)
+		tickShape := shape(elapsed, connectionOrdinal)
+		if tickShape.sourceId != (Id{}) {
+			sourceId = tickShape.sourceId
+		}
+		for i := 0; i < 4; i += 1 {
+			observer.observePack(sourceId, h1ObserverTestTagMs(now.Add(-tickShape.rel)), now)
+		}
+		if 0 < tickShape.ackRtt {
+			observer.observeAck(h1ObserverTestTagMs(now.Add(-tickShape.ackRtt)), now)
+		}
+		observerTick := observer.takeTick(now)
+
+		byteCount := uint64(tickShape.rxByteRate * h1PathTestStep.Seconds())
+		sample.now = now
+		sample.readMessageCount += 1 + byteCount/(16*1024)
+		sample.writeMessageCount += 1
+		sample.readByteCount += byteCount
+		sample.rxBytes += byteCount
+		// out-of-order data every tick, so the loss evidence is never what
+		// decides
+		sample.rxOoo += 3
+		sample.queueDelay = 0
+		sample.queueDelaySamples = 0
+		sample.queueDelaySlotTime = time.Time{}
+		if observerTick.known {
+			sample.queueDelay = observerTick.queueDelay
+			sample.queueDelaySamples = observerTick.samples
+			sample.queueDelaySlotTime = observerTick.queueDelaySlotTime
+		}
+		sample.ackRttMin = observerTick.ackRttMin
+		sample.ackRtt = observerTick.ackRtt
+		sample.ackRttSamples = observerTick.ackSamples
+
+		decision := connection.monitor.tick(sample)
+		connection.decide(now, &decision)
+		if decision.convicted {
+			outcome.convictions += 1
+		}
+		switch decision.action {
+		case h1PathActionReroll:
+			outcome.rerolls += 1
+			outcome.rerollTimes = append(outcome.rerollTimes, elapsed)
+			connectionOrdinal += 1
+			observer, sample = newConnection(now)
+		case h1PathActionSuppressed:
+			outcome.suppressed[decision.reason] += 1
+		}
+	}
+	outcome.improved = connection.stats.snapshot().Improved
+	return outcome, connection.stats, ledger
+}
+
+// The improvement credit on the population the feature exists for: a session
+// that starts bad and stays bad, and a client whose re-roll lands on a member
+// as slow as the one it left.
+//
+// Such a session's pack baseline is built under the standing queue -- the
+// source was first read inside it -- so the queue delay reads zero for the
+// connection's life, on the replacement exactly as on the connection that was
+// convicted. The ack echo is the only measure that reads the queue, and a
+// download-heavy client's acks are echoes of its own sparse sends, so most
+// ticks have none. Crediting the ticks in between credits a replacement for
+// being invisible, and because an improvement resets the epoch's unimproved
+// count and its unconfirmed budget together, it turns off both of the things
+// bounding a client that keeps re-rolling: the device pays a break-before-make
+// disconnect every time the acks go quiet long enough. What has to happen here
+// is the design's own number -- two re-rolls, then the latch.
+func TestH1PathRerollOntoAnotherSlowMemberStillLatches(t *testing.T) {
+	const transit = 101 * time.Millisecond
+	const queue = 6 * time.Second
+	settings := DefaultH1PathRerollSettings()
+
+	// 700 KB/s behind a 6 s queue standing from the first frame, and an ack
+	// echo that comes back every twenty seconds and carries the same queue.
+	// The queue is read for the five seconds an ack is evidence for
+	// (AckEvidenceWindow) and nothing reads it for the fifteen after that,
+	// which is the ordinary shape of a download: the acks a client reads on
+	// this route are echoes of its own sends.
+	outcome, stats, ledger := runH1PathRerollProbe(t, &settings, transit, 20*time.Minute,
+		func(elapsed time.Duration, connectionOrdinal int) h1PathRerollProbeShape {
+			shape := h1PathRerollProbeShape{rel: transit + queue, rxByteRate: 700_000}
+			if elapsed%(20*time.Second) == 0 {
+				shape.ackRtt = transit + queue
+			}
+			return shape
+		})
+	t.Logf("every member as slow as the last: %s", outcome)
+	if outcome.rerolls != settings.MaxUnimprovedRerolls {
+		t.Errorf(
+			"%s, want the %d re-rolls the unimproved latch allows",
+			outcome, settings.MaxUnimprovedRerolls,
+		)
+	}
+	if outcome.improved != 0 {
+		t.Errorf("%s, want no replacement credited while every one of them stayed collapsed", outcome)
+	}
+	if outcome.suppressed[h1PathReasonLatched] == 0 {
+		t.Errorf("%s, want the epoch latched", outcome)
+	}
+	if snapshot := stats.snapshot(); snapshot.TicksAckUnknown == 0 || snapshot.TicksAckUnknown == snapshot.Ticks {
+		t.Errorf(
+			"stats = %+v, want the blind ticks this reads to be some of the ticks and not all of them",
+			snapshot,
+		)
+	}
+	if state := testingH1PathLedgerSnapshot(ledger); state.epochUnimproved < settings.MaxUnimprovedRerolls {
+		t.Errorf("ledger = %+v, want both re-rolls charged", state)
+	}
+
+	// The same reading from the other measure. A route with no ack at all
+	// convicts on the pack tags, and after the re-roll its traffic comes from a
+	// source the shared baseline has never held a slot for: that source's floor
+	// is set inside the queue still standing, so its queue delay reads zero
+	// from the first tick. A floor this connection watched being set is not
+	// evidence that a queue lifted, and crediting it here would hand back the
+	// unconfirmed budget that is the only thing stopping the next re-roll.
+	replacementSource := NewId()
+	outcome, _, ledger = runH1PathRerollProbe(t, &settings, transit, 3*time.Minute,
+		func(elapsed time.Duration, connectionOrdinal int) h1PathRerollProbeShape {
+			shape := h1PathRerollProbeShape{rel: transit, rxByteRate: 700_000}
+			if 30*time.Second <= elapsed {
+				shape.rel += queue
+			}
+			if 0 < connectionOrdinal {
+				shape.sourceId = replacementSource
+			}
+			return shape
+		})
+	t.Logf("a replacement read from a source the baseline has never seen: %s", outcome)
+	if outcome.rerolls != 1 || outcome.convictions == 0 {
+		t.Errorf("%s, want the one re-roll the unconfirmed budget allows", outcome)
+	}
+	if outcome.improved != 0 {
+		t.Errorf("%s, want no credit from a floor set inside the queue being judged", outcome)
+	}
+	if state := testingH1PathLedgerSnapshot(ledger); state.epochUnconfirmed != 1 {
+		t.Errorf("ledger = %+v, want the unconfirmed budget still spent", state)
+	}
 }
 
 // The evidence policy on the shapes the rollout has to be sized against, each

@@ -66,7 +66,9 @@ import (
 //   - noteReroll, then the stale-tag mark on the shared baseline, and the
 //     decision's action is reroll. runH1's watcher closes the connection and
 //     the loop re-dials without the reconnect backoff.
-// Clean ticks after a re-roll resolve it as improved (noteClean).
+// Clean ticks of the direction and the measure that convicted resolve the
+// re-roll as improved (noteClean); a clean reading from anywhere else resolves
+// nothing, so the connection counts one clean run per reading.
 //
 // A transport whose receive channel is unbuffered (TransportBufferSize 0) is
 // not monitored either: our own consumer paces every delivery there, so no tick
@@ -144,8 +146,9 @@ type h1PathConnection struct {
 	sourcePortUnmoved bool
 
 	lastLogTime time.Time
-	// clean ticks since the connection started or last convicted
-	cleanTicks int
+	// clean ticks since the connection started or last convicted, one count
+	// per reading that can credit a pending re-roll
+	cleanTicks h1PathCleanTicks
 	// this connection has convicted at least once, so ConnectionsConvicted
 	// counts it once however long it goes on convicting
 	convicted bool
@@ -462,6 +465,7 @@ func (self *h1PathConnection) tick(now time.Time) h1PathDecision {
 		if observerTick.known {
 			sample.queueDelay = observerTick.queueDelay
 			sample.queueDelaySamples = observerTick.samples
+			sample.queueDelaySlotTime = observerTick.queueDelaySlotTime
 		}
 		// the packs the tick could read nothing from; the monitor counts them
 		sample.stalePacks = observerTick.stale
@@ -524,7 +528,7 @@ func (self *h1PathConnection) decide(now time.Time, decision *h1PathDecision) {
 	key := self.transport.routeManager
 	switch {
 	case decision.convicted:
-		self.cleanTicks = 0
+		self.cleanTicks = h1PathCleanTicks{}
 		if !self.convicted {
 			self.convicted = true
 			self.stats.ConnectionsConvicted.Add(1)
@@ -570,7 +574,20 @@ func (self *h1PathConnection) decide(now time.Time, decision *h1PathDecision) {
 			self.stats.recordSuppression(reason)
 			break
 		}
-		ledger.noteReroll(key, self.settings, now, self.role, decision.confidence, self.localPort)
+		ledger.noteReroll(
+			key,
+			self.settings,
+			now,
+			self.role,
+			decision.confidence,
+			// what the replacement has to beat: this direction, on the measure
+			// that read this queue
+			h1PathConvicted{
+				direction:  decision.direction,
+				ackCarried: 0 < decision.ackQueuedTicks,
+			},
+			self.localPort,
+		)
 		// packs built for this connection, and their resends, carry old tags
 		// that must not convict the next one
 		self.transport.h1PathBaseline.markReroll(now, decision.pathRtt)
@@ -581,8 +598,16 @@ func (self *h1PathConnection) decide(now time.Time, decision *h1PathDecision) {
 	case decision.clean && act && !self.sourcePortUnmoved:
 		// an unmoved connection resolves nothing either way: a clean tick on
 		// the convicted neighbourhood is not the re-roll's doing
-		self.cleanTicks += 1
-		if self.settings.CleanTicks <= self.cleanTicks &&
+		if decision.cleanRxAck {
+			self.cleanTicks.rxAck += 1
+		}
+		if decision.cleanRxPack {
+			self.cleanTicks.rxPack += 1
+		}
+		if decision.cleanTx {
+			self.cleanTicks.tx += 1
+		}
+		if self.cleanTicks.reached(self.settings.CleanTicks) &&
 			self.ledger().noteClean(key, self.settings, now, self.cleanTicks) {
 			self.stats.Improved.Add(1)
 		}

@@ -89,7 +89,14 @@ import (
 // in 100 four-tuples on a slow member, stable for hours, so one re-roll lands
 // healthy 89 times in 100, and a re-roll that lands healthy returns the budget
 // (noteClean), which leaves the cap binding on about one session in a hundred:
-// the one that re-rolls from one slow member onto another. What the other
+// the one that re-rolls from one slow member onto another. That last session is
+// also the one the cap has to hold, so the budget comes back only when the
+// measure that convicted reads its own queue gone (h1PathConvicted). A
+// replacement read on any other measure is credited for what that measure could
+// not see: on a queue standing at birth the pack tags read zero before the
+// re-roll and zero after it, and twenty such ticks would clear the latch and
+// the budget together and let one bad member cost a disconnect every time the
+// acks went quiet. What the other
 // reading would buy is the ten points between 89 and 99, and what it would cost
 // is every sender clock step two disconnects and a 30 minute latch, on evidence
 // no clock here can check. A rollout that wants to re-price this reads
@@ -541,6 +548,10 @@ type h1PathSample struct {
 	// least MinTickPackSamples samples
 	queueDelay        time.Duration
 	queueDelaySamples int
+	// when the source the delay was read from took its baseline slot, which is
+	// when the floor behind that delay started being built. Zero where nothing
+	// supplied it, which the observer only does with no delay to read
+	queueDelaySlotTime time.Time
 	// sampled packs the observer could not read a queue from: a tag older than
 	// the route's latest re-roll mark, and a source the baseline holds no slot
 	// for
@@ -660,6 +671,14 @@ type h1PathDecision struct {
 	action     h1PathAction
 	reason     h1PathReason
 
+	// The readings that can credit a re-roll as improved, one per measure a
+	// conviction can be read from, because the ledger judges a replacement
+	// against the conviction it answers and not against whatever the
+	// replacement happens to be able to read. clean is any of the three.
+	cleanRxAck  bool
+	cleanRxPack bool
+	cleanTx     bool
+
 	// collapsed ticks in the window of the direction evaluated
 	collapsedTicks int
 	// ticks with loss evidence, and ticks where the evidence was known, in the loss window
@@ -695,12 +714,14 @@ type h1PathDecision struct {
 //     by our own uplink, makes it no evidence either way;
 //   - tx collapsed: not excluded, a backlogged send queue, acked bytes
 //     advancing below thin;
-//   - clean, which is what resolves a re-roll as improved: demand and a
-//     direction at or above thin, or, on a tick our own consumer did not pace,
-//     demand and a direction that could read its queue and did not collapse.
-//     The second reading is what makes the credit reachable at the rates
-//     sessions actually run at; neither counts a tick whose bytes were not
-//     counted (the speed test echo, a stand down);
+//   - clean, which is what resolves a re-roll as improved, read once per
+//     measure a conviction can stand on: demand and a direction at or above
+//     thin, or, on a tick our own consumer did not pace, demand and a queue
+//     that measure read and found under thr -- a fresh ack round trip, or a
+//     queue delay against a baseline floor older than the connection. The
+//     cheap readings are what make the credit reachable at the rates sessions
+//     actually run at; none of them counts a tick whose bytes were not counted
+//     (the speed test echo, a stand down);
 //   - excluded from collapsing, for both directions: the receive channel was
 //     full, the speed test echo is active, or the transport is standing down
 //     H1;
@@ -1022,31 +1043,47 @@ func (self *h1PathMonitor) tick(sample h1PathSample) h1PathDecision {
 		txByteRate < txThinByteRate
 	txDemand := txKnown && demandByteCount <= float64(txAckedByteCount)
 	txCleanRate := !unread && txDemand && txThinByteRate <= txByteRate
-	// What resolves a re-roll as improved, by either of two readings. A
-	// direction at or above thin is the strong one, and it survives our own
-	// back pressure, which only lowers the delivered rate: a tick that cleared
-	// thin cleared it in spite of us. The cheap one is a tick that moved real
-	// bytes and did not collapse in a direction whose queue it could read,
-	// which is what the ledger is actually asking -- did the replacement stop
-	// doing the thing we convicted the last one for. Thin is 3.53 MB/s on a
-	// 101 ms path, so the strong reading alone puts the credit, and the
-	// unconfirmed budget an improvement returns, out of reach of every session
-	// running under 29 Mb/s: most of them, and all of the 5-140 Mb/s bad
-	// population below its own thin rate, which is the population the feature
-	// exists for.
+	// What resolves a re-roll as improved, kept apart by the measure that read
+	// it, because the ledger judges a replacement against the conviction it
+	// answers: the same direction, read from the same measure, found healthy
+	// (h1PathLedger). A credit from anywhere else credits the replacement for
+	// what it could not see.
 	//
-	// The cheap reading takes two guards the collapse rule does not need. It
-	// drops the ticks our own consumer paced, because a tick we slowed
-	// ourselves says nothing about the path either way. And it requires a queue
-	// to have been readable at all: a tick with neither pack samples nor a
-	// fresh ack is not a queue that was absent, and crediting it would resolve
-	// a re-roll as improved from the blind window after the re-roll mark, while
-	// the replacement was sitting on the same bad member.
-	rxReadable := queueDelayKnown || ackQueueKnown
-	clean := rxCleanRate ||
-		txCleanRate ||
-		(!excluded && ((rxDemand && rxReadable && !rxCollapsed) ||
-			(txDemand && !txCollapsed)))
+	// A direction at or above thin is the strong reading, and it survives our
+	// own back pressure, which only lowers the delivered rate: a tick that
+	// cleared thin cleared it in spite of us. It credits both measures of the
+	// receive direction, since a collapse is a rate under thin whatever read
+	// its queue. Thin is 3.53 MB/s on a 101 ms path, so on its own it puts the
+	// credit, and the unconfirmed budget an improvement returns, out of reach
+	// of every session running under 29 Mb/s: most of them, and all of the
+	// 5-140 Mb/s bad population below its own thin rate, which is the
+	// population the feature exists for.
+	//
+	// The cheap readings are what put the credit in reach of those, and each
+	// one is a queue this tick read and found absent rather than a queue it
+	// could not read. A tick with no fresh ack is not an ack round trip with no
+	// queue in it. A queue delay read against a floor this connection watched
+	// being set is not a queue that lifted either: the floor of a source first
+	// read under a standing queue is inside that queue, and its delay then
+	// reads zero for the connection's life -- which is the ground truth's own
+	// shape, a session that starts bad and stays bad. Crediting either would
+	// resolve a re-roll as improved while the replacement sat on the same bad
+	// member, and hand back the unimproved latch and the unconfirmed budget,
+	// which are the only things bounding the next one. Both also drop the ticks
+	// our own consumer paced, because a tick we slowed ourselves says nothing
+	// about the path.
+	//
+	// The send reading needs no such guard: a send conviction is read from our
+	// own kernel's send queue, and a tick that moved acked bytes without that
+	// queue standing is that queue drained.
+	packFloorHeld := !sample.queueDelaySlotTime.After(self.start)
+	rxAckClean := !excluded && rxDemand && ackQueueKnown && !ackQueued && !rxCollapsed
+	rxPackClean := !excluded && rxDemand && queueDelayKnown && packFloorHeld &&
+		!packQueued && !rxCollapsed
+	cleanRxAck := rxCleanRate || rxAckClean
+	cleanRxPack := rxCleanRate || rxPackClean
+	cleanTx := txCleanRate || (!excluded && txDemand && !txCollapsed)
+	clean := cleanRxAck || cleanRxPack || cleanTx
 	// An accepted tick that reached no verdict is not the same reading as a
 	// healthy one, and nothing said which it was: an Observe rollout could not
 	// tell a fleet with no collapse from one that was never able to classify a
@@ -1074,6 +1111,9 @@ func (self *h1PathMonitor) tick(sample h1PathSample) h1PathDecision {
 
 	decision := h1PathDecision{
 		clean:           clean,
+		cleanRxAck:      cleanRxAck,
+		cleanRxPack:     cleanRxPack,
+		cleanTx:         cleanTx,
 		queueDelay:      sample.queueDelay,
 		queueDelayKnown: queueDelayKnown,
 		ackQueue:        ackQueue,
@@ -1172,14 +1212,59 @@ const h1PathPendingLimit = 64
 // at most this many convicted local ports are excluded per network epoch
 const h1PathExcludedPortLimit = 16
 
+// What a re-roll has to beat. The monitor that convicted does not survive the
+// dial that answers it -- every dial builds a new one (newH1PathConnection) --
+// so the conviction it read is kept here for as long as the re-roll is pending,
+// and the improvement is judged against it.
+type h1PathConvicted struct {
+	direction h1PathDirection
+	// the queue was read from the ack echo, so only an ack echo saying the
+	// queue is gone answers it: the pack tags never saw this queue, and their
+	// silence about it after the re-roll is the same silence as before
+	ackCarried bool
+}
+
+// The clean ticks a connection has counted since it last convicted, one count
+// per reading that can credit a re-roll (h1PathMonitor.tick).
+type h1PathCleanTicks struct {
+	rxAck  int
+	rxPack int
+	tx     int
+}
+
+// whether any reading has reached the bar, which is the cheap test before the
+// ledger's lock
+func (self h1PathCleanTicks) reached(cleanTicks int) bool {
+	return cleanTicks <= max(self.rxAck, self.rxPack, self.tx)
+}
+
+// the count that can resolve a re-roll answering this conviction
+func (self h1PathConvicted) cleanTicks(cleanTicks h1PathCleanTicks) int {
+	switch {
+	case self.direction == h1PathDirectionTx:
+		return cleanTicks.tx
+	case self.ackCarried:
+		return cleanTicks.rxAck
+	default:
+		return cleanTicks.rxPack
+	}
+}
+
+// One re-roll waiting for a verdict.
+type h1PathPendingReroll struct {
+	rerollTime time.Time
+	convicted  h1PathConvicted
+}
+
 // The process-wide budget for re-rolls. Every method takes the current time so
 // the ledger can be driven by a test clock.
 //
 // A re-roll leaves its route manager pending for ImprovementWindow. A
-// conviction on that route manager inside the window is unimproved; clean
-// ticks are an improvement; an entry that ages out, is evicted, or is dropped
-// by a network change is unresolved. MaxUnimprovedRerolls unimproved re-rolls
-// in one network epoch set the latch for LatchDuration.
+// conviction on that route manager inside the window is unimproved; clean ticks
+// of the measure that convicted are an improvement; an entry that ages out, is
+// evicted, or is dropped by a network change is unresolved.
+// MaxUnimprovedRerolls unimproved re-rolls in one network epoch set the latch
+// for LatchDuration.
 //
 // An unconfirmed conviction is one nothing on this device could check: no
 // kernel loss counter, or a queue that stood on the sender's clock alone.
@@ -1212,14 +1297,14 @@ type h1PathLedger struct {
 	// has been collected never equals a live one, whatever the allocator does
 	// with the address) and drops the object. A collected route manager's
 	// re-roll is unresolved, which is what it is: nothing is left to judge it.
-	pendingRouteManagerRerollTimes map[weak.Pointer[RouteManager]]time.Time
-	excludedPorts                  []int
+	pendingRouteManagerRerolls map[weak.Pointer[RouteManager]]h1PathPendingReroll
+	excludedPorts              []int
 }
 
 func newH1PathLedger() *h1PathLedger {
 	return &h1PathLedger{
-		stats:                          &h1PathProcessStats,
-		pendingRouteManagerRerollTimes: map[weak.Pointer[RouteManager]]time.Time{},
+		stats:                      &h1PathProcessStats,
+		pendingRouteManagerRerolls: map[weak.Pointer[RouteManager]]h1PathPendingReroll{},
 	}
 }
 
@@ -1240,9 +1325,9 @@ func h1PathDefaultLedger() *h1PathLedger {
 }
 
 func (self *h1PathLedger) expirePendingWithLock(settings *H1PathRerollSettings, now time.Time) {
-	for key, rerollTime := range self.pendingRouteManagerRerollTimes {
-		if settings.ImprovementWindow < now.Sub(rerollTime) || key.Value() == nil {
-			delete(self.pendingRouteManagerRerollTimes, key)
+	for key, pending := range self.pendingRouteManagerRerolls {
+		if settings.ImprovementWindow < now.Sub(pending.rerollTime) || key.Value() == nil {
+			delete(self.pendingRouteManagerRerolls, key)
 			self.stats.Unresolved.Add(1)
 		}
 	}
@@ -1261,10 +1346,10 @@ func (self *h1PathLedger) noteConviction(
 
 	self.expirePendingWithLock(settings, now)
 	pendingKey := weak.Make(key)
-	if _, ok := self.pendingRouteManagerRerollTimes[pendingKey]; !ok {
+	if _, ok := self.pendingRouteManagerRerolls[pendingKey]; !ok {
 		return false
 	}
-	delete(self.pendingRouteManagerRerollTimes, pendingKey)
+	delete(self.pendingRouteManagerRerolls, pendingKey)
 	self.epochUnimproved += 1
 	self.dayUnimprovedTimes[self.dayUnimprovedNext] = now
 	self.dayUnimprovedNext = (self.dayUnimprovedNext + 1) % h1PathDayRingSize
@@ -1333,6 +1418,7 @@ func (self *h1PathLedger) noteReroll(
 	now time.Time,
 	role H1PathRerollRole,
 	confidence h1PathConfidence,
+	convicted h1PathConvicted,
 	localPort int,
 ) {
 	self.stateLock.Lock()
@@ -1347,21 +1433,24 @@ func (self *h1PathLedger) noteReroll(
 		self.epochUnconfirmed += 1
 	}
 	pendingKey := weak.Make(key)
-	if _, ok := self.pendingRouteManagerRerollTimes[pendingKey]; !ok && h1PathPendingLimit <= len(self.pendingRouteManagerRerollTimes) {
+	if _, ok := self.pendingRouteManagerRerolls[pendingKey]; !ok && h1PathPendingLimit <= len(self.pendingRouteManagerRerolls) {
 		var oldestKey weak.Pointer[RouteManager]
 		var oldestTime time.Time
 		oldestSet := false
-		for candidateKey, rerollTime := range self.pendingRouteManagerRerollTimes {
-			if !oldestSet || rerollTime.Before(oldestTime) {
+		for candidateKey, pending := range self.pendingRouteManagerRerolls {
+			if !oldestSet || pending.rerollTime.Before(oldestTime) {
 				oldestKey = candidateKey
-				oldestTime = rerollTime
+				oldestTime = pending.rerollTime
 				oldestSet = true
 			}
 		}
-		delete(self.pendingRouteManagerRerollTimes, oldestKey)
+		delete(self.pendingRouteManagerRerolls, oldestKey)
 		self.stats.Unresolved.Add(1)
 	}
-	self.pendingRouteManagerRerollTimes[pendingKey] = now
+	self.pendingRouteManagerRerolls[pendingKey] = h1PathPendingReroll{
+		rerollTime: now,
+		convicted:  convicted,
+	}
 	if 0 < localPort {
 		self.excludedPorts = append(self.excludedPorts, localPort)
 		if h1PathExcludedPortLimit < len(self.excludedPorts) {
@@ -1375,28 +1464,38 @@ func (self *h1PathLedger) noteReroll(
 }
 
 // Returns true when a pending re-roll on the route manager has reached
-// CleanTicks clean ticks. The re-roll is improved, and the epoch's unimproved
-// and unconfirmed counts are both reset: a re-roll that demonstrably fixed the
-// connection is the evidence its conviction lacked, so it costs the epoch
-// nothing and the next unconfirmed conviction is judged on its own.
+// CleanTicks clean ticks of the measure that convicted. The re-roll is
+// improved, and the epoch's unimproved and unconfirmed counts are both reset: a
+// re-roll that demonstrably fixed the connection is the evidence its conviction
+// lacked, so it costs the epoch nothing and the next unconfirmed conviction is
+// judged on its own.
+//
+// Only the convicted measure counts, because these two counters are the only
+// bound on a client that keeps re-rolling, and every other reading a
+// replacement can offer is a reading of something we did not convict: a send
+// direction that was never the complaint, or a receive queue on the measure
+// that was blind to this one. A replacement that cannot be read on the
+// convicted measure resolves nothing and its re-roll ages out unresolved,
+// which is what it is.
 func (self *h1PathLedger) noteClean(
 	key *RouteManager,
 	settings *H1PathRerollSettings,
 	now time.Time,
-	cleanTicks int,
+	cleanTicks h1PathCleanTicks,
 ) bool {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
 	self.expirePendingWithLock(settings, now)
 	pendingKey := weak.Make(key)
-	if _, ok := self.pendingRouteManagerRerollTimes[pendingKey]; !ok {
+	pending, ok := self.pendingRouteManagerRerolls[pendingKey]
+	if !ok {
 		return false
 	}
-	if cleanTicks < settings.CleanTicks {
+	if pending.convicted.cleanTicks(cleanTicks) < settings.CleanTicks {
 		return false
 	}
-	delete(self.pendingRouteManagerRerollTimes, pendingKey)
+	delete(self.pendingRouteManagerRerolls, pendingKey)
 	self.epochUnimproved = 0
 	self.epochUnconfirmed = 0
 	return true
@@ -1418,8 +1517,8 @@ func (self *h1PathLedger) networkChanged(now time.Time) {
 	self.epochUnconfirmed = 0
 	self.excludedPorts = nil
 	// a connection on the new network says nothing about a re-roll on the old one
-	for key := range self.pendingRouteManagerRerollTimes {
-		delete(self.pendingRouteManagerRerollTimes, key)
+	for key := range self.pendingRouteManagerRerolls {
+		delete(self.pendingRouteManagerRerolls, key)
 		self.stats.Unresolved.Add(1)
 	}
 }

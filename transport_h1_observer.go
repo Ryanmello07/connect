@@ -140,6 +140,11 @@ type h1QueueDelaySource struct {
 	// buckets may rise above it only at the rise rate. math.MaxInt64 is unset
 	floorMs   int64
 	floorTime time.Time
+	// when the slot was taken, which is when this source's floor started being
+	// built from nothing. A floor first built under a standing queue is inside
+	// that queue, so a reader comparing it against its own age can tell a
+	// reference older than itself from one it watched being set
+	slotTime time.Time
 	// tags at or below this are from before the latest re-roll
 	freshAfterTagMs uint64
 }
@@ -240,14 +245,19 @@ func (self *h1QueueDelayBaseline) admitWithLock(sourceId Id, now time.Time) *h1Q
 		sourceId: sourceId,
 		used:     true,
 		floorMs:  math.MaxInt64,
+		slotTime: now,
 	}
 	return source
 }
 
 // Folds one tick's minimum rel for the source into its buckets and returns the
-// baseline, which includes that minimum. math.MaxInt64 when every slot is held
-// by another live source.
-func (self *h1QueueDelayBaseline) observe(sourceId Id, minRelMs int64, now time.Time) int64 {
+// baseline, which includes that minimum, and the time the source took its slot.
+// math.MaxInt64 when every slot is held by another live source.
+func (self *h1QueueDelayBaseline) observe(
+	sourceId Id,
+	minRelMs int64,
+	now time.Time,
+) (int64, time.Time) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
@@ -256,7 +266,7 @@ func (self *h1QueueDelayBaseline) observe(sourceId Id, minRelMs int64, now time.
 	if source == nil {
 		source = self.admitWithLock(sourceId, now)
 		if source == nil {
-			return math.MaxInt64
+			return math.MaxInt64, time.Time{}
 		}
 	}
 	source.buckets.advanceWithLock(self.bucketCount, epoch)
@@ -268,7 +278,7 @@ func (self *h1QueueDelayBaseline) observe(sourceId Id, minRelMs int64, now time.
 		source.floorMs = minRelMs
 		source.floorTime = now
 	}
-	return self.baselineWithLock(source, now)
+	return self.baselineWithLock(source, now), source.slotTime
 }
 
 // For every source with a baseline, marks tags up to 2 x pathRtt past the
@@ -364,6 +374,8 @@ func (self *h1QueueDelayBaseline) checkClockStep(now time.Time) (bool, uint64) {
 			self.sources[i].buckets.resetWithLock(self.bucketCount, self.sources[i].buckets.epoch)
 			self.sources[i].floorMs = math.MaxInt64
 			self.sources[i].floorTime = time.Time{}
+			// the floor is built again from here, as it is for a new slot
+			self.sources[i].slotTime = now
 		}
 	}
 	if self.ackBuckets.set {
@@ -394,6 +406,9 @@ type h1ObserverTick struct {
 	queueDelay time.Duration
 	// that source's pack samples in the tick
 	samples int
+	// when that source took its baseline slot, which is when the floor the
+	// delay is read against started being built
+	queueDelaySlotTime time.Time
 	// packs ignored because their tag predates the latest re-roll
 	stale int
 	// packs of a source the baseline does not hold, read while every slot was
@@ -641,7 +656,7 @@ func (self *h1RouteObserver) takeTick(now time.Time) h1ObserverTick {
 		if !slot.used || slot.count == 0 {
 			continue
 		}
-		baseMs := self.baseline.observe(slot.sourceId, slot.minRelMs, now)
+		baseMs, slotTime := self.baseline.observe(slot.sourceId, slot.minRelMs, now)
 		func() {
 			self.stateLock.Lock()
 			defer self.stateLock.Unlock()
@@ -658,6 +673,7 @@ func (self *h1RouteObserver) takeTick(now time.Time) h1ObserverTick {
 		tick.known = true
 		tick.samples = slot.count
 		tick.queueDelay = time.Duration(max(0, slot.minRelMs-baseMs)) * time.Millisecond
+		tick.queueDelaySlotTime = slotTime
 	}
 	return tick
 }

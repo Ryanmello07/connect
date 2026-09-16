@@ -702,22 +702,24 @@ func TestApiMultiClientGeneratorWindowSharesOneH1PathBaseline(t *testing.T) {
 }
 
 type testingH1PathLedgerState struct {
-	pendingCount    int
-	lastReroll      time.Time
-	epochUnimproved int
-	latchUntil      time.Time
-	excludedPorts   []int
+	pendingCount     int
+	lastReroll       time.Time
+	epochUnimproved  int
+	epochUnconfirmed int
+	latchUntil       time.Time
+	excludedPorts    []int
 }
 
 func testingH1PathLedgerSnapshot(ledger *h1PathLedger) testingH1PathLedgerState {
 	ledger.stateLock.Lock()
 	defer ledger.stateLock.Unlock()
 	return testingH1PathLedgerState{
-		pendingCount:    len(ledger.pendingRouteManagerRerollTimes),
-		lastReroll:      ledger.lastReroll,
-		epochUnimproved: ledger.epochUnimproved,
-		latchUntil:      ledger.latchUntil,
-		excludedPorts:   append([]int{}, ledger.excludedPorts...),
+		pendingCount:     len(ledger.pendingRouteManagerRerolls),
+		lastReroll:       ledger.lastReroll,
+		epochUnimproved:  ledger.epochUnimproved,
+		epochUnconfirmed: ledger.epochUnconfirmed,
+		latchUntil:       ledger.latchUntil,
+		excludedPorts:    append([]int{}, ledger.excludedPorts...),
 	}
 }
 
@@ -1541,7 +1543,11 @@ func testingH1PathConviction() h1PathDecision {
 		convicted:  true,
 		direction:  h1PathDirectionRx,
 		confidence: h1PathConfidenceConfirmed,
-		pathRtt:    testingH1PathRtt,
+		// a confirmed receive conviction is one an ack round trip of this
+		// client's own carried, so the ack echo is the measure that has to
+		// clear it (h1PathConvicted)
+		ackQueuedTicks: 1,
+		pathRtt:        testingH1PathRtt,
 	}
 }
 
@@ -1550,7 +1556,7 @@ func testingH1PathConviction() h1PathDecision {
 func TestH1PathConnectionObserveOnlyNeverRerolls(t *testing.T) {
 	connection, ledger := testingH1PathDecideConnection(H1PathRerollModeAct, true)
 	now := time.Now()
-	ledger.noteReroll(connection.transport.routeManager, connection.settings, now.Add(-time.Minute), H1PathRerollRoleClient, h1PathConfidenceConfirmed, 0)
+	ledger.noteReroll(connection.transport.routeManager, connection.settings, now.Add(-time.Minute), H1PathRerollRoleClient, h1PathConfidenceConfirmed, h1PathConvicted{direction: h1PathDirectionRx, ackCarried: true}, 0)
 
 	decision := testingH1PathConviction()
 	connection.decide(now, &decision)
@@ -1593,11 +1599,29 @@ func TestH1PathConnectionActRerollsThroughTheLedger(t *testing.T) {
 	}
 
 	for i := 1; i <= settings.CleanTicks; i += 1 {
-		clean := h1PathDecision{clean: true, pathRtt: testingH1PathRtt}
+		clean := h1PathDecision{clean: true, cleanRxAck: true, pathRtt: testingH1PathRtt}
 		connection.decide(start.Add(time.Duration(i)*settings.TickInterval), &clean)
 	}
 	if stats := connection.stats.snapshot(); stats.Improved != 1 || stats.Rerolls != 1 {
 		t.Fatalf("stats = %+v, want the re-roll improved after %d clean ticks", stats, settings.CleanTicks)
+	}
+
+	// and the same twenty ticks read on any other measure resolve nothing: the
+	// re-roll answered a receive queue the ack echo read, and a send direction
+	// that never stopped working says nothing about it
+	other, otherLedger := testingH1PathDecideConnection(H1PathRerollModeAct, false)
+	other.settings.DeviceRerollSpacing = time.Minute
+	otherConviction := testingH1PathConviction()
+	other.decide(start, &otherConviction)
+	for i := 1; i <= 4*other.settings.CleanTicks; i += 1 {
+		clean := h1PathDecision{clean: true, cleanTx: true, cleanRxPack: true, pathRtt: testingH1PathRtt}
+		other.decide(start.Add(time.Duration(i)*other.settings.TickInterval), &clean)
+	}
+	if stats := other.stats.snapshot(); stats.Improved != 0 {
+		t.Fatalf("stats = %+v, want no improvement from the measures that did not convict", stats)
+	}
+	if state := testingH1PathLedgerSnapshot(otherLedger); state.pendingCount != 1 {
+		t.Fatalf("ledger = %+v, want the re-roll still waiting for a verdict", state)
 	}
 
 	soon := start.Add(time.Duration(settings.CleanTicks+1) * settings.TickInterval)
