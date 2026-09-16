@@ -365,6 +365,20 @@ func (self *returnRetransmitCounters) snapshot() ReturnRetransmitStats {
 // first loss of a flow - 1.05 s on a 50 ms path, a timer of 3.15 s - and the
 // timer stayed seconds wide for the rest of the flow, over every later tail
 // loss.
+//
+// A flow whose source offered timestamps could sample a recovery after all,
+// and deliberately does not. The echo says which copy the acknowledgement
+// answers, which is the one exemption from Karn's rule RFC 6298 §3 names, and
+// the receiver takes its TS.Recent from whichever copy filled the hole
+// (RFC 7323 §4.3), so the time from that echo would be the path rather than
+// the repair. What it would buy is a flow under continuous loss, which keeps
+// the timer its last acknowledgement of unretransmitted data left, bounded
+// either way by the floor and the 8 s ceiling and re-sampled by the first
+// clean acknowledgement after the loss; what it costs is that the echo is the
+// source's to choose, so the value has to be checked against this flow's own
+// clock before it may set srtt, and a source could otherwise write the timer
+// it prefers. That check is a rule with its own tests and it belongs with the
+// spurious-recovery detection this leaves open, not beside the rule above.
 // Every hole is sent at most once per max(srtt, 200 ms), whatever triggers
 // it, so a run of duplicate acknowledgements costs one segment; the timer
 // bypasses that limit, being a limit itself. Nothing is ever retransmitted
