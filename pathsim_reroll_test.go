@@ -836,10 +836,9 @@ const pathRerollBlockLossyPort = 40960
 // session in a hundred that the ground truth's 11-in-100 leaves, the client
 // that would re-roll for ever. It convicts at 13.0 s, re-rolls 49154 -> 60160
 // -> 51018 on darwin and 49154 -> 42171 -> 37366 on linux, is credited no
-// improvement for either, and the epoch latches with
-// it still on a collapsed member at 4.9 Mb/s, refusing the fourteen convictions
-// that follow. Without this arm nothing in the simulation tier reaches the
-// latch at all.
+// improvement for either, and the epoch latches with it still on a collapsed
+// member at 4.9 Mb/s, refusing the fourteen convictions that follow. Without
+// this arm nothing in the simulation tier reaches the latch at all.
 func TestPathsimS9LossyConnectionReroll(t *testing.T) {
 	// Long enough that the re-roll arm reaches its twenty clean ticks (ten
 	// seconds past a switch at about 3.5 s) with room to spare, and short
