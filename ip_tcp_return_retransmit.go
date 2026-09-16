@@ -405,6 +405,11 @@ type tcpReturnRetransmitState struct {
 	appliedSackBlockCount   int
 	finRetained             bool
 	dueCount                int
+	// the selective holes newly marked in the current hole interval, and
+	// when that interval ends; the ceiling is carried over the interval
+	// rather than over one acknowledgement (see markSackHolesWithLock)
+	sackBurstSegmentCount int
+	sackBurstEndNanos     int64
 
 	dupAckCount int
 	// the duplicate acknowledgements this flow's own retransmissions can
@@ -826,27 +831,49 @@ func (self *tcpReturnRetransmitState) markBurstWithLock(windowEnd uint32, nowNan
 
 // Retransmits every unmarked delivered segment below the highest selectively
 // acknowledged byte, each at most once per round trip, and at most a burst's
-// worth due at once. The blocks are applied whoever sends them: nothing in
-// the handshake advertises sack-permitted, so a compliant source sends none
-// and a source that sends them anyway is reporting what it likes. One such
-// acknowledgement, whose single block covers only the newest retained
-// segment, would otherwise mark every delivered segment below it, and
-// takeDueWithLock builds all of them in one hold of the sequence mutex, which
-// the shared send shard's acknowledgement path waits on, and the worker holds
-// every packet until the first is delivered. The ceiling is the one the
-// partial-acknowledgement bursts keep, for the same reason; the holes it
-// leaves are marked by the next trigger.
+// worth newly marked per hole interval. The blocks are applied whoever sends
+// them: nothing in the handshake advertises sack-permitted, so a compliant
+// source sends none and a source that sends them anyway is reporting what it
+// likes. One such acknowledgement, whose single block covers only the newest
+// retained segment, would otherwise mark every delivered segment below it,
+// and takeDueWithLock builds all of them in one hold of the sequence mutex,
+// which the shared send shard's acknowledgement path waits on, and the worker
+// holds every packet until the first is delivered.
+//
+// The bound is carried over the hole interval rather than over one
+// acknowledgement, because one acknowledgement is not what an interval costs:
+// this runs again for every acknowledgement whose blocks are new, any number
+// of which can arrive inside one interval, and the segments the last run sent
+// are skipped by the one-per-hole-interval rule rather than counted against
+// the ceiling, so the walk goes on past them to the next unsent ones. A
+// source that moves its single block down the flight drew the whole retained
+// set per interval that way, one burst per acknowledgement. Over the interval
+// the rate is the one the partial-acknowledgement bursts keep, which have one
+// partial acknowledgement per round trip to grow on, and the same period one
+// hole waits between its own retransmissions; the holes a burst leaves are
+// marked by the next trigger, so a purged span still recovers in a burst per
+// interval rather than a segment per round trip.
 func (self *tcpReturnRetransmitState) markSackHolesWithLock(nowNanos int64) {
 	if self.sackedCount == 0 {
 		return
 	}
+	if self.sackBurstSegmentCount == 0 || self.sackBurstEndNanos <= nowNanos {
+		// the interval runs from its first mark, rather than from a zero
+		// deadline the monotonic clock can be either side of
+		self.sackBurstSegmentCount = 0
+		self.sackBurstEndNanos = nowNanos + self.holeIntervalNanos()
+	}
 	for index := 0; index < self.deliveredCount &&
-		self.dueCount < returnRetransmitMaxBurstSegmentCount; index += 1 {
+		self.sackBurstSegmentCount < returnRetransmitMaxBurstSegmentCount; index += 1 {
 		segment := self.segmentAtWithLock(index)
 		if 0 <= int32(segment.seq-self.highestSackedEnd) {
 			break
 		}
+		dueCount := self.dueCount
 		self.markDueWithLock(segment, tcpReturnRetransmitReasonSackHole, nowNanos)
+		if dueCount < self.dueCount {
+			self.sackBurstSegmentCount += 1
+		}
 	}
 }
 
