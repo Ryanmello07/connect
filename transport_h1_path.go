@@ -74,8 +74,8 @@ const H1PathRerollLogTicksEnv = "CONNECT_H1_PATH_REROLL_LOG_TICKS"
 //
 // The role is what selects the provider gates, and a process that serves
 // clients has to say so: nothing in this package can tell a provider's
-// websocket to the platform from a client's. Without it, CONNECT_H1_PATH_REROLL
-// =act in a provider process re-rolls under the client gates -- no minimum
+// websocket to the platform from a client's. Without it, a provider process
+// asking for the act mode re-rolls under the client gates -- no minimum
 // connection age and no provider spacing -- because the settings of a
 // host-built transport carry the zero role, which is client.
 const H1PathRerollRoleEnv = "CONNECT_H1_PATH_REROLL_ROLE"
@@ -226,8 +226,8 @@ var h1PathRoleOverrideValue atomic.Int32
 
 // SetH1PathRerollRoleOverride sets the H1 path re-roll role of every connection
 // dialed after it, over the environment and over each transport's settings. A
-// provider process declares itself with this (or with CONNECT_H1_PATH_REROLL
-// _ROLE) so that its connections are clamped to Observe unless
+// provider process declares itself with this, or with the role environment
+// variable above, so that its connections are clamped to Observe unless
 // AllowProviderAct, and go through the provider age and spacing gates when they
 // are allowed to act. An unknown role is stored as Provider.
 func SetH1PathRerollRoleOverride(role H1PathRerollRole) {
@@ -616,9 +616,9 @@ type h1PathDecision struct {
 // ticks against a loss window that kept its history.
 //
 // The monitor counts Ticks and, of those, how each was read: TicksUnread and
-// TicksReceiveFull for the ticks nothing could be judged from, TicksQueueDelay
-// Unknown for the ones with no queue delay to judge, TicksCollapsed for the
-// ones a direction collapsed in. It also counts RxAckDeniedTicks, the
+// TicksReceiveFull for the ticks nothing could be judged from,
+// TicksQueueDelayUnknown for the ones with no queue delay to judge, and
+// TicksCollapsed for the ones a direction collapsed in. It also counts RxAckDeniedTicks, the
 // conviction counters, SuppressedLossDenied and ConnectionsDormant when a tick
 // makes it dormant. Not safe for concurrent use.
 type h1PathMonitor struct {
