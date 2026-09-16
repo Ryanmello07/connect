@@ -2382,7 +2382,11 @@ func TestTcpReturnRetransmitTakesNoRoundTripSampleAcrossARepairedHole(t *testing
 		synctest.Wait()
 		harness.requireStream(payload)
 		rto, baseRto := harness.retransmitTimer()
-		if want := 4 * roundTrip; baseRto != want || rto != baseRto {
+		// the floor, and not a rule read from the round trip: two 50 ms
+		// samples give srtt 50 ms and rttvar 18.75 ms, so both 2 x srtt and
+		// srtt + 4 rttvar are below it. The floor's own value, not the
+		// constant, which a test that read it could not pin
+		if want := 200 * time.Millisecond; baseRto != want || rto != baseRto {
 			t.Fatalf("timer %s base %s after two %s samples, want %s, the floor on a path this fast", rto, baseRto, roundTrip, want)
 		}
 		if stats := harness.counters.snapshot(); stats.TimeoutCount != 1 {
