@@ -978,14 +978,14 @@ func TestH1PathLedgerNetworkChangeLatchAge(t *testing.T) {
 	if ok, reason := ledger.allow(&settings, latchStart.Add(6*time.Minute), H1PathRerollRoleClient, h1PathConfidenceConfirmed, time.Minute); !ok {
 		t.Fatalf("a network change 6 min into the latch kept it: %s", reason)
 	}
-	dayUnimproved := 0
-	for _, unimprovedTime := range ledger.dayUnimprovedTimes {
-		if !unimprovedTime.IsZero() {
-			dayUnimproved += 1
+	dayCharged := 0
+	for _, chargedTime := range ledger.dayChargedTimes {
+		if !chargedTime.IsZero() {
+			dayCharged += 1
 		}
 	}
-	if dayUnimproved != 2 {
-		t.Fatalf("the daily count after two network changes = %d, want 2", dayUnimproved)
+	if dayCharged != 2 {
+		t.Fatalf("the daily count after two network changes = %d, want 2", dayCharged)
 	}
 }
 
@@ -2862,6 +2862,116 @@ func TestH1PathRerollOntoAnotherSlowMemberStillLatches(t *testing.T) {
 	}
 	if outcome.improved != 0 {
 		t.Errorf("%s, want no credit from the direction that did not convict", outcome)
+	}
+}
+
+// What bounds a device whose route cannot produce a verdict inside the
+// improvement window.
+//
+// A re-roll is judged by the connection that replaced it, so the verdict
+// arrives at the cadence of whatever evidence the route carries. On the
+// population the feature exists for -- a session behind a queue that was
+// already standing when its source was first read, so the pack tags read zero
+// and only the ack echo reads the queue -- that cadence is the ack echo's, and
+// a client whose acks are echoes of its own sparse sends can go minutes
+// between them. An echo slower than ImprovementWindow convicts the replacement
+// after the window has closed, which is not a verdict on the re-roll before it:
+// that one ages out unresolved.
+//
+// Charged to nothing, an age-out is a free disconnect, and the device pays one
+// per ack cadence for ever with neither budget binding, since nothing is ever
+// unimproved and nothing is ever improved either. Measured at the branch parent
+// over one simulated hour each: 30 s and 100 s are inside the window and cost
+// 3 re-rolls with the epoch latched, and 150 s and 240 s are outside it and
+// cost 23 and 14, unbounded. Charging the age-out to the daily budget leaves
+// the first two alone and stops the last two at the budget's six.
+func TestH1PathRerollIsChargedWhateverTheRouteCanJudge(t *testing.T) {
+	const transit = 101 * time.Millisecond
+	const queue = 6 * time.Second
+	const duration = 60 * time.Minute
+
+	cases := []struct {
+		ackEvery time.Duration
+		// whether an echo lands inside ImprovementWindow, which is what
+		// decides whether the replacement's own conviction can answer the
+		// re-roll that produced it
+		judged bool
+	}{
+		{ackEvery: 30 * time.Second, judged: true},
+		{ackEvery: 100 * time.Second, judged: true},
+		{ackEvery: 150 * time.Second, judged: false},
+		{ackEvery: 240 * time.Second, judged: false},
+	}
+	for _, c := range cases {
+		settings := DefaultH1PathRerollSettings()
+		// 700 KB/s behind a 6 s queue standing from the first frame, with an
+		// ack echo carrying the same queue every ackEvery and no other reading
+		// of it. Every replacement lands on a member as slow as the one it
+		// left, which is the pessimistic case and the one the budgets are for.
+		outcome, stats, ledger := runH1PathRerollProbe(t, &settings, transit, duration,
+			func(elapsed time.Duration, connectionOrdinal int) h1PathRerollProbeShape {
+				shape := h1PathRerollProbeShape{rel: transit + queue, rxByteRate: 700_000}
+				if elapsed%c.ackEvery == 0 {
+					shape.ackRtt = transit + queue
+				}
+				return shape
+			})
+		snapshot := stats.snapshot()
+		state := testingH1PathLedgerSnapshot(ledger)
+		t.Logf(
+			"ack echo every %s: %s unimproved=%d unresolved=%d",
+			c.ackEvery, outcome, snapshot.Unimproved, snapshot.Unresolved,
+		)
+		if outcome.improved != 0 {
+			t.Errorf(
+				"ack echo every %s: %s, want no credit while every replacement stayed collapsed",
+				c.ackEvery, outcome,
+			)
+		}
+		// the bound the file header claims, whatever the route can judge
+		if settings.MaxUnimprovedRerollsPerDay < outcome.rerolls {
+			t.Errorf(
+				"ack echo every %s: %s, want at most the daily budget's %d disconnects",
+				c.ackEvery, outcome, settings.MaxUnimprovedRerollsPerDay,
+			)
+		}
+		if c.judged {
+			// the replacement is convicted inside the window, so the latch is
+			// what stops it and the day is nowhere near spent
+			if outcome.suppressed[h1PathReasonLatched] == 0 || snapshot.Unimproved == 0 {
+				t.Errorf(
+					"ack echo every %s: %s, want the convictions charged as unimproved and the epoch latched",
+					c.ackEvery, outcome,
+				)
+			}
+			if snapshot.Unresolved != 0 {
+				t.Errorf(
+					"ack echo every %s: %s, want nothing to age out while the route answers inside the window",
+					c.ackEvery, outcome,
+				)
+			}
+			continue
+		}
+		// nothing is ever unimproved here, so the latch cannot be what stops it
+		if snapshot.Unimproved != 0 || state.epochUnimproved != 0 {
+			t.Errorf(
+				"ack echo every %s: ledger = %+v, want no conviction inside the window",
+				c.ackEvery, state,
+			)
+		}
+		if snapshot.Unresolved != uint64(outcome.rerolls) {
+			t.Errorf(
+				"ack echo every %s: %s aged out %d of them, want every re-roll unresolved",
+				c.ackEvery, outcome, snapshot.Unresolved,
+			)
+		}
+		if outcome.rerolls != settings.MaxUnimprovedRerollsPerDay ||
+			outcome.suppressed[h1PathReasonDailyBudget] == 0 {
+			t.Errorf(
+				"ack echo every %s: %s, want the daily budget's %d and then refusals",
+				c.ackEvery, outcome, settings.MaxUnimprovedRerollsPerDay,
+			)
+		}
 	}
 }
 

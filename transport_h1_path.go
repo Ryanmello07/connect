@@ -115,6 +115,28 @@ import (
 // no clock here can check. A rollout that wants to re-price this reads
 // TicksAckUnknown against Ticks for the size of the population it applies to.
 //
+// The same cadence decides what the ledger is able to bound, and that is why
+// its two budgets read different things. A re-roll is judged by the connection
+// that replaced it, so the verdict arrives when the route next carries
+// evidence, and on this population that is the ack echo: an echo slower than
+// ImprovementWindow convicts the replacement after the window has closed, so
+// the re-roll before it is answered by nothing. A verdict of nothing cost
+// nothing, which is one break-before-make disconnect per ack cadence for ever
+// -- no latch, because nothing was ever unimproved, and no daily budget,
+// because only an unimproved re-roll reached it. So the latch reads verdicts
+// and the daily budget reads disconnects: a re-roll that ages out unresolved is
+// charged to the budget and not to the latch, which leaves the latch meaning
+// what it says while MaxUnimprovedRerollsPerDay bounds the device whatever its
+// route can judge. Measured over one simulated hour behind a 6 s queue that
+// only the ack echo reads
+// (TestH1PathRerollIsChargedWhateverTheRouteCanJudge): an echo every 30 s or
+// every 100 s falls inside the window and costs three re-rolls with the epoch
+// latched, and every 150 s and every 240 s fall outside it and cost 23 and 14
+// unbounded disconnects, or the budget's six once the age-out is charged. What
+// the charge costs is a re-roll that did work and could not be read, which is
+// charged too, because nothing here can tell that one from a re-roll that
+// changed nothing.
+//
 // This file holds the pure parts, with no call sites of their own:
 //   - the settings and their defaults (library default Observe), the
 //     environment variables and the process mode override, and the precedence
@@ -468,7 +490,9 @@ type H1PathRerollSettings struct {
 	// re-rolls on an unconfirmed conviction allowed in one network epoch; an
 	// improvement gives the budget back
 	MaxUnconfirmedRerolls int
-	// unimproved re-rolls in a rolling 24 hours that stop re-rolls (at most 32)
+	// re-rolls in a rolling 24 hours that were not resolved as improved --
+	// convicted again inside ImprovementWindow, or judged by nothing before it
+	// ran out -- that stop re-rolls (at most 32)
 	MaxUnimprovedRerollsPerDay int
 	LatchDuration              time.Duration
 	// a network change clears a latch only once it is at least this old
@@ -1316,6 +1340,14 @@ type h1PathPendingReroll struct {
 // MaxUnimprovedRerolls unimproved re-rolls in one network epoch set the latch
 // for LatchDuration.
 //
+// The two budgets read different things. The latch reads verdicts, so only a
+// conviction inside the window sets it: that is the reading that says the
+// replacement is as bad as what it replaced. The daily budget reads
+// disconnects, so everything that spent one and was not resolved as improved is
+// charged to it -- unimproved, aged out, or evicted (expirePendingWithLock) --
+// and it is what bounds a device whose route cannot produce a verdict inside
+// the window at all.
+//
 // An unconfirmed conviction is one nothing on this device could check: no
 // kernel loss counter, or a queue that stood on the sender's clock alone.
 // MaxUnconfirmedRerolls of those are allowed per network epoch, and an
@@ -1337,8 +1369,8 @@ type h1PathLedger struct {
 	latchUntil         time.Time
 	// the settings that set the latch decide when a network change may clear it
 	latchNetworkResetAge time.Duration
-	dayUnimprovedTimes   [h1PathDayRingSize]time.Time
-	dayUnimprovedNext    int
+	dayChargedTimes      [h1PathDayRingSize]time.Time
+	dayChargedNext       int
 	// Keyed weakly: the ledger outlives every transport in the process, and an
 	// entry waits out the improvement window whether or not anything still
 	// reads it, so a strong key would pin a route manager -- its match states,
@@ -1374,11 +1406,46 @@ func h1PathDefaultLedger() *h1PathLedger {
 	return h1PathDefaultLedgerValue
 }
 
+// Charges one re-roll to the rolling daily budget. Everything that spends a
+// break-before-make disconnect and is not resolved as improved passes through
+// here, so the budget counts disconnects and not verdicts.
+func (self *h1PathLedger) chargeDayWithLock(now time.Time) {
+	self.dayChargedTimes[self.dayChargedNext] = now
+	self.dayChargedNext = (self.dayChargedNext + 1) % h1PathDayRingSize
+}
+
+// Drops the pending entries that can no longer be judged, and charges the ones
+// whose improvement window simply ran out.
+//
+// An age-out is the case the window was too short for: a re-roll is judged by
+// the connection that replaced it, and that verdict arrives at the cadence of
+// whatever evidence the route carries, so on a route whose ack echo comes back
+// slower than ImprovementWindow the replacement is convicted after the window
+// has closed and the re-roll before it is answered by nothing. Charged to
+// nothing it costs a disconnect per ack cadence for ever, with neither the
+// latch nor the budget binding because nothing was ever unimproved -- measured
+// at the library defaults, 23 disconnects an hour at a 150 s echo and 14 at a
+// 240 s one (TestH1PathRerollIsChargedWhateverTheRouteCanJudge). It is charged
+// to the daily budget and not to the epoch latch because it is not the same
+// reading: a conviction inside the window says the replacement is as bad as
+// what it replaced, and an age-out says only that a disconnect was spent. The
+// cost of the charge is that a re-roll that did work and could not be read is
+// charged too; the levers are ImprovementWindow and MaxUnimprovedRerollsPerDay.
+//
+// A route manager collected under the weak key is not charged: its transport is
+// gone, so nothing is looping and no disconnect follows. Neither is an epoch
+// that ended (networkChanged), since a re-roll on the old network is no
+// evidence about the new one.
 func (self *h1PathLedger) expirePendingWithLock(settings *H1PathRerollSettings, now time.Time) {
 	for key, pending := range self.pendingRouteManagerRerolls {
-		if settings.ImprovementWindow < now.Sub(pending.rerollTime) || key.Value() == nil {
-			delete(self.pendingRouteManagerRerolls, key)
-			self.stats.Unresolved.Add(1)
+		collected := key.Value() == nil
+		if !collected && now.Sub(pending.rerollTime) <= settings.ImprovementWindow {
+			continue
+		}
+		delete(self.pendingRouteManagerRerolls, key)
+		self.stats.Unresolved.Add(1)
+		if !collected {
+			self.chargeDayWithLock(now)
 		}
 	}
 }
@@ -1401,8 +1468,7 @@ func (self *h1PathLedger) noteConviction(
 	}
 	delete(self.pendingRouteManagerRerolls, pendingKey)
 	self.epochUnimproved += 1
-	self.dayUnimprovedTimes[self.dayUnimprovedNext] = now
-	self.dayUnimprovedNext = (self.dayUnimprovedNext + 1) % h1PathDayRingSize
+	self.chargeDayWithLock(now)
 	if settings.MaxUnimprovedRerolls <= self.epochUnimproved {
 		self.latchStart = now
 		self.latchUntil = now.Add(settings.LatchDuration)
@@ -1430,13 +1496,13 @@ func (self *h1PathLedger) allow(
 	if now.Before(self.latchUntil) {
 		return false, h1PathReasonLatched
 	}
-	dayUnimproved := 0
-	for _, unimprovedTime := range self.dayUnimprovedTimes {
-		if !unimprovedTime.IsZero() && now.Sub(unimprovedTime) < 24*time.Hour {
-			dayUnimproved += 1
+	dayCharged := 0
+	for _, chargedTime := range self.dayChargedTimes {
+		if !chargedTime.IsZero() && now.Sub(chargedTime) < 24*time.Hour {
+			dayCharged += 1
 		}
 	}
-	if min(settings.MaxUnimprovedRerollsPerDay, h1PathDayRingSize) <= dayUnimproved {
+	if min(settings.MaxUnimprovedRerollsPerDay, h1PathDayRingSize) <= dayCharged {
 		return false, h1PathReasonDailyBudget
 	}
 	if !self.lastReroll.IsZero() && now.Sub(self.lastReroll) < settings.DeviceRerollSpacing {
@@ -1494,8 +1560,12 @@ func (self *h1PathLedger) noteReroll(
 				oldestSet = true
 			}
 		}
+		// the oldest re-roll stops being tracked before anything judged it,
+		// and it spent a disconnect like any other, so it is charged here
+		// rather than dropped for free
 		delete(self.pendingRouteManagerRerolls, oldestKey)
 		self.stats.Unresolved.Add(1)
+		self.chargeDayWithLock(now)
 	}
 	self.pendingRouteManagerRerolls[pendingKey] = h1PathPendingReroll{
 		rerollTime: now,
@@ -1688,7 +1758,10 @@ type h1PathStats struct {
 	// queue gone (h1PathConvicted), so a replacement nothing could read on that
 	// measure is Unresolved and not Improved: a rollout reading Improved against
 	// Rerolls is reading how often a re-roll was seen to work, and Unresolved is
-	// how often nothing could tell either way
+	// how often nothing could tell either way. Unimproved and Unresolved are
+	// both charged to the daily budget, since both spent a disconnect; only
+	// Unimproved reaches the latch, and SuppressedDailyBudget against these two
+	// is where a route that cannot be judged inside the window shows up
 	Improved            atomic.Uint64
 	Unimproved          atomic.Uint64
 	Unresolved          atomic.Uint64
