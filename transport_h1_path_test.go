@@ -2595,23 +2595,32 @@ type h1PathRerollProbeShape struct {
 	// sparse sends
 	ackRtt     time.Duration
 	rxByteRate float64
+	// the kernel's send side for the tick: a zero rate leaves the counters
+	// unknown, as they are on a platform with no kernel socket to read
+	txAckedByteRate float64
+	txNotSent       uint64
+	// out-of-order data, the monitor's receive loss evidence: every tick by
+	// default, else one tick in this many
+	rxOooEveryTicks int
 	// the source the packs come from; the zero Id keeps the previous one
 	sourceId Id
 }
 
-// What a probe run cost the device.
+// What a probe run cost the device, and what its ticks could have credited.
 type h1PathRerollProbeOutcome struct {
 	convictions int
 	rerolls     int
 	rerollTimes []time.Duration
 	improved    uint64
+	cleanTicks  h1PathCleanTicks
 	suppressed  map[h1PathReason]int
 }
 
 func (self h1PathRerollProbeOutcome) String() string {
 	return fmt.Sprintf(
-		"convictions=%d rerolls=%d at=%v improved=%d suppressed=%v",
-		self.convictions, self.rerolls, self.rerollTimes, self.improved, self.suppressed,
+		"convictions=%d rerolls=%d at=%v improved=%d clean=%+v suppressed=%v",
+		self.convictions, self.rerolls, self.rerollTimes, self.improved,
+		self.cleanTicks, self.suppressed,
 	)
 }
 
@@ -2685,9 +2694,16 @@ func runH1PathRerollProbe(
 		sample.writeMessageCount += 1
 		sample.readByteCount += byteCount
 		sample.rxBytes += byteCount
-		// out-of-order data every tick, so the loss evidence is never what
-		// decides
-		sample.rxOoo += 3
+		// out-of-order data every tick unless the shape thins it out, so the
+		// loss evidence is not what decides unless an arm asks for it
+		if tickShape.rxOooEveryTicks <= 1 || k%tickShape.rxOooEveryTicks == 0 {
+			sample.rxOoo += 3
+		}
+		sample.txKnown = 0 < tickShape.txAckedByteRate
+		if sample.txKnown {
+			sample.txAckedBytes += uint64(tickShape.txAckedByteRate * h1PathTestStep.Seconds())
+			sample.txNotSent = tickShape.txNotSent
+		}
 		sample.queueDelay = 0
 		sample.queueDelaySamples = 0
 		sample.queueDelaySlotTime = time.Time{}
@@ -2704,6 +2720,15 @@ func runH1PathRerollProbe(
 		connection.decide(now, &decision)
 		if decision.convicted {
 			outcome.convictions += 1
+		}
+		if decision.cleanRxAck {
+			outcome.cleanTicks.rxAck += 1
+		}
+		if decision.cleanRxPack {
+			outcome.cleanTicks.rxPack += 1
+		}
+		if decision.cleanTx {
+			outcome.cleanTicks.tx += 1
 		}
 		switch decision.action {
 		case h1PathActionReroll:
@@ -2804,6 +2829,39 @@ func TestH1PathRerollOntoAnotherSlowMemberStillLatches(t *testing.T) {
 	}
 	if state := testingH1PathLedgerSnapshot(ledger); state.epochUnconfirmed != 1 {
 		t.Errorf("ledger = %+v, want the unconfirmed budget still spent", state)
+	}
+
+	// And the send direction, which was never what the receive conviction was
+	// about. A replacement still behind the same queue whose out-of-order
+	// counter advances once in forty ticks has every conviction denied for want
+	// of loss, so nothing resets its clean run, while its uplink is healthy and
+	// moving bytes on every tick. Those ticks are a real reading of the send
+	// direction and no reading at all of the one that convicted.
+	outcome, _, ledger = runH1PathRerollProbe(t, &settings, transit, 3*time.Minute,
+		func(elapsed time.Duration, connectionOrdinal int) h1PathRerollProbeShape {
+			shape := h1PathRerollProbeShape{
+				rel:             transit + queue,
+				ackRtt:          transit + queue,
+				rxByteRate:      700_000,
+				txAckedByteRate: 200_000,
+			}
+			if 0 < connectionOrdinal {
+				shape.rxOooEveryTicks = 40
+			}
+			return shape
+		})
+	t.Logf("a replacement collapsed on the receive side with a healthy uplink: %s", outcome)
+	if outcome.rerolls != 1 {
+		t.Errorf("%s, want the one re-roll this arm is judging", outcome)
+	}
+	if outcome.cleanTicks.tx < settings.CleanTicks {
+		t.Errorf("%s, want the send direction clean for at least the credit's window", outcome)
+	}
+	if outcome.suppressed[h1PathReasonLossDenied] == 0 {
+		t.Errorf("%s, want the replacement still collapsing and denied for want of loss", outcome)
+	}
+	if outcome.improved != 0 {
+		t.Errorf("%s, want no credit from the direction that did not convict", outcome)
 	}
 }
 
