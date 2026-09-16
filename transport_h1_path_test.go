@@ -2646,6 +2646,10 @@ func runH1PathRerollProbe(
 		}
 		monitor.stats = connection.stats
 		connection.monitor = monitor
+		// the dial builds a connection as well as a monitor, and its clean
+		// ticks and its first-conviction mark start again with it
+		connection.cleanTicks = h1PathCleanTicks{}
+		connection.convicted = false
 		// every frame is sampled, so a tick reads what the shape says
 		return newH1RouteObserver(baseline, 1), h1PathSample{
 			rxBytesKnown: true,
