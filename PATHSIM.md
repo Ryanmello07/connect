@@ -74,16 +74,26 @@ Each scenario prints a `digest` line hashing its integer results; three runs of 
 processes print identical digests (checked when this was written). A digest that moves between two runs of the
 same tree is a new race, not noise.
 
-S9 is the one scenario whose digest is per host rather than per tree. Its re-roll draws a source port from the
+S9 is the one scenario with digests that are per host rather than per tree. Its re-roll draws a source port from the
 production plan, and the plan draws from the kernel's ephemeral range: 32768–60999 on linux and android,
 49152–65535 elsewhere. The same seed therefore picks 42171 on linux and 60160 on darwin. Both are healthy
 under the arm's hash, so every other integer of the run — convictions, switches, recovery, bytes — is
 identical on the two; only the port, and the digest that hashes it, differ.
 
+That is not one arm. Every arm that re-rolls under the far-random plan draws its own port, so on the two hosts
+2 of the fast tier's 49 digests differ (`hash=independent/port=far` and `ack=measured`) and 5 of the full
+tier's 62 (those two, `ooo=third`, which is byte-identical to the first, `hash=block64/port=far`, and
+`members=1/ack=measured`, which draws twice: 60160 then 51018 on darwin, 42171 then 37366 on linux). A tree
+compared across hosts is therefore compared on the other arms and on these arms' tables — the digests of a
+second host are a second baseline, not a mismatch.
+
 ## Running
 
     go test -run TestPathsim -v .                          # fast tier, a few wall seconds
     CONNECT_PATHSIM_FULL=1 go test -run TestPathsim -v .   # long offers and the whole S7 grid
+
+Where the environment does not reach the test host — a runner that forwards only `go test` arguments — the full
+tier is selected with `-exec 'env CONNECT_PATHSIM_FULL=1'` instead, which sets it on the test binary.
 
 `-v` is needed to see the tables (`go test` buffers a passing package's output). Each scenario logs one table: arm,
 goodput over the offer and steady (second half) in Mb/s, writes, resends, timeout resends (`rto`), selective-gap

@@ -737,8 +737,14 @@ const pathRerollSeed = uint64(7)
 // Under the independent model with this seed, 49154 is on the lossy member and
 // 49152 is not. The far-random replacement is the production plan's first pick
 // with 49154 excluded: 42171 where the ephemeral range is linux's 32768-60999
-// and 60160 where it is 49152-65535, both healthy, so the arm reads the same on
-// either kind of host even though the port does not travel.
+// and 60160 where it is 49152-65535. Both are healthy, so an arm that draws one
+// reads the same table on either kind of host -- and not the same digest, since
+// the digest hashes the ports it drew (pathResult.digest). Two arms of the fast
+// tier draw a far-random port and five of the full tier do, so that many
+// digests are per host rather than per tree, and a tree compared across hosts
+// is compared on the other arms and on these arms' tables. Measured on the two:
+// 2 of 49 fast-tier digests and 5 of 62 full-tier ones differ, with every other
+// integer of those arms equal.
 //
 // Under the block64 model 40960 is the first port of a lossy block of 64
 // (40960/64 = 640, and 640 mod 8 is 0), which is where the kernel's own re-roll
@@ -752,7 +758,8 @@ const pathRerollBlockLossyPort = 40960
 // nothing for the monitor.
 //
 // The fast tier read this when it was written (linux; darwin reads the same
-// except for the far-random port, see pathRerollLossyPort):
+// table, and a different digest in the two arms that draw a far-random port,
+// see pathRerollLossyPort):
 //
 //	arm                                              Mb/s  steady  writes  resend  dup
 //	S9/mode=off/leg=healthy                         300.8   303.0   18473       0    0
@@ -828,7 +835,8 @@ const pathRerollBlockLossyPort = 40960
 // the far-random plan can pick lands where the last one did: this is the one
 // session in a hundred that the ground truth's 11-in-100 leaves, the client
 // that would re-roll for ever. It convicts at 13.0 s, re-rolls 49154 -> 60160
-// -> 51018, is credited no improvement for either, and the epoch latches with
+// -> 51018 on darwin and 49154 -> 42171 -> 37366 on linux, is credited no
+// improvement for either, and the epoch latches with
 // it still on a collapsed member at 4.9 Mb/s, refusing the fourteen convictions
 // that follow. Without this arm nothing in the simulation tier reaches the
 // latch at all.
