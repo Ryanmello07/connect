@@ -1532,3 +1532,117 @@ func TestH1PathMonitorCleanTicksSurviveReceiveBackpressure(t *testing.T) {
 		}
 	}
 }
+
+// The demand floor is what keeps an application-limited connection off the
+// receive rule, and it is the only thing that does: a session delivering
+// 40 KB/s behind a 3 s queue, with out-of-order data and an ack round trip that
+// carries the queue too, has every other input of a receive conviction. In Act
+// that conviction is a real disconnect of a connection that is merely idle-ish.
+func TestH1PathMonitorRequiresReceiveDemand(t *testing.T) {
+	// the floor is MinTickByteCount over a tick, so the rate that meets it is
+	// 32 KiB per 500 ms
+	appLimited := func(byteRate float64) func(k int) h1PathTickShape {
+		return func(k int) h1PathTickShape {
+			return h1PathTickShape{
+				rxByteRate:        byteRate,
+				queueDelay:        3 * time.Second,
+				queueDelaySamples: 4,
+				rxOooAdvance:      true,
+				ackRtt:            3100 * time.Millisecond,
+			}
+		}
+	}
+	for _, c := range []struct {
+		name     string
+		byteRate float64
+		convicts bool
+	}{
+		{name: "40 KB/s of an idle-ish session", byteRate: 40_000},
+		{name: "one byte under the demand floor", byteRate: 2 * (32*1024 - 1)},
+		{name: "exactly the demand floor", byteRate: 2 * 32 * 1024, convicts: true},
+	} {
+		settings := DefaultH1PathRerollSettings()
+		monitor, stats := newH1PathTestMonitor(t, &settings, 105*time.Millisecond)
+		decisions := runH1PathMonitorShape(monitor, 60, appLimited(c.byteRate))
+		ticks := h1PathConvictionTicks(decisions)
+		if c.convicts != (0 < len(ticks)) {
+			t.Errorf("%s: conviction ticks = %v, want convictions %t", c.name, ticks, c.convicts)
+		}
+		if snapshot := stats.snapshot(); c.convicts != (0 < snapshot.RxConvictions) {
+			t.Errorf("%s: stats = %+v", c.name, snapshot)
+		}
+	}
+
+	// a tick after an idle gap does not pass on bytes that trickled in over the
+	// whole gap: the floor scales with the tick
+	settings := DefaultH1PathRerollSettings()
+	monitor, _ := newH1PathTestMonitor(t, &settings, 105*time.Millisecond)
+	sample := h1PathSample{
+		rxBytesKnown: true,
+		rxOooKnown:   true,
+		minRtt:       105 * time.Millisecond,
+		rcvMss:       1448,
+		sndMss:       1448,
+		queueDelay:   3 * time.Second,
+		// samples enough for the delay to be known, and no ack to read
+		queueDelaySamples: 4,
+	}
+	// ten-second ticks carrying 40 KB each: over the floor for a 500 ms tick,
+	// well under it for the tick that actually elapsed
+	for k := 0; k < 12; k += 1 {
+		sample.now = h1PathTestOrigin.Add(time.Duration(k) * 10 * time.Second)
+		sample.readMessageCount += 3
+		sample.writeMessageCount += 1
+		sample.readByteCount += 40_000
+		sample.rxBytes = sample.readByteCount
+		sample.rxOoo += 3
+		if decision := monitor.tick(sample); decision.convicted {
+			t.Fatalf("a 40 kB tick over 10 s convicted at %s", sample.now.Sub(h1PathTestOrigin))
+		}
+	}
+}
+
+// The pack-sample floor is what keeps a queue delay resting on a single frame
+// from convicting. At its default of 2 nothing exercised it: the unit shapes
+// feed 4 to 400 samples, the platform rig hard-codes 4, and pathsim S9 lowers
+// it to 1 because at 16 KiB payloads a collapsed connection yields about one
+// sample a tick -- the one scenario that would have covered the default turns
+// it off.
+func TestH1PathMonitorRequiresTwoPackSamples(t *testing.T) {
+	if samples := DefaultH1PathRerollSettings().MinTickPackSamples; samples != 2 {
+		t.Fatalf("the default pack sample floor = %d, want 2", samples)
+	}
+	collapse := func(samples int) func(k int) h1PathTickShape {
+		return func(k int) h1PathTickShape {
+			shape := h1PathCollapseShape(k)
+			shape.queueDelay = 6 * time.Second
+			shape.queueDelaySamples = samples
+			shape.ackRtt = 6100 * time.Millisecond
+			return shape
+		}
+	}
+	for _, c := range []struct {
+		name     string
+		samples  int
+		floor    int
+		convicts bool
+	}{
+		{name: "one sample in the tick", samples: 1, floor: 2},
+		{name: "two samples in the tick", samples: 2, floor: 2, convicts: true},
+		// what pathsim S9 sets, where the frame size and not the detector is
+		// what the simulator cannot reproduce
+		{name: "one sample against a floor of one", samples: 1, floor: 1, convicts: true},
+	} {
+		settings := DefaultH1PathRerollSettings()
+		settings.MinTickPackSamples = c.floor
+		monitor, _ := newH1PathTestMonitor(t, &settings, 105*time.Millisecond)
+		decisions := runH1PathMonitorShape(monitor, 60, collapse(c.samples))
+		ticks := h1PathConvictionTicks(decisions)
+		if c.convicts != (0 < len(ticks)) {
+			t.Errorf("%s: conviction ticks = %v, want convictions %t", c.name, ticks, c.convicts)
+		}
+		if known := decisions[59].queueDelayKnown; known != (c.floor <= c.samples) {
+			t.Errorf("%s: queue delay known = %t", c.name, known)
+		}
+	}
+}
