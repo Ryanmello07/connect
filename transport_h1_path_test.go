@@ -2117,6 +2117,53 @@ func TestH1PathMonitorConvictsACollapseStandingAtTheFirstSample(t *testing.T) {
 // needed -- bytes alone withdraw the evidence from any client with a full
 // batch on a fast uplink, and a drain time alone withdraws it from an idle
 // socket -- and the two arms below are each half failing on its own.
+// A queue the ack round trip reads is bounded by BaselineRisePerMinute exactly
+// as a queue the pack tags read is: visible for (q - thr) / rise and then gone,
+// rather than convicting for as long as it stands. The hour this runs for is
+// the check that it is gone and stays gone -- a reference that restarts against
+// itself hides the queue, reads the hidden queue as a healthy route, drops back
+// and convicts again on the same cycle for ever.
+func TestH1PathMonitorAckQueueDecaysAtTheBaselineRise(t *testing.T) {
+	const pathRtt = 101 * time.Millisecond
+	const queue = 3 * time.Second
+	// 700 KB/s under thin, a queue only the acks carry from 10 s on, and
+	// out-of-order data every tick
+	settings := DefaultH1PathRerollSettings()
+	monitor, stats := newH1PathTestMonitor(t, &settings, pathRtt)
+	decisions := runH1PathMonitorShape(monitor, int(time.Hour/h1PathTestStep), func(k int) h1PathTickShape {
+		shape := h1PathTickShape{
+			rxByteRate:        700_000,
+			queueDelaySamples: 4,
+			rxOooAdvance:      true,
+			minRtt:            pathRtt,
+			ackRtt:            pathRtt,
+		}
+		if 20 <= k {
+			shape.ackRtt = pathRtt + queue
+		}
+		return shape
+	})
+	ticks := h1PathConvictionTicks(decisions)
+	if len(ticks) == 0 {
+		t.Fatal("a 3 s ack queue never convicted")
+	}
+	first := time.Duration(ticks[0]) * h1PathTestStep
+	last := time.Duration(ticks[len(ticks)-1]) * h1PathTestStep
+	if want := 12 * time.Second; first > want {
+		t.Errorf("first conviction at %s, want it inside %s of the queue standing", first, want)
+	}
+	// (3 s - 1.01 s of threshold) / 100 ms a minute, from the 10 s the queue
+	// starts at
+	if lower, upper := 19*time.Minute, 21*time.Minute; last < lower || upper < last {
+		t.Errorf(
+			"last of %d convictions at %s, want the rise to end them between %s and %s",
+			len(ticks), last, lower, upper,
+		)
+	}
+	t.Logf("3 s ack queue: %d convictions from %s to %s in an hour, %d collapsed ticks",
+		len(ticks), first, last, stats.snapshot().TicksCollapsed)
+}
+
 func TestH1PathMonitorDoesNotReadOurOwnSendQueueAsTheReceiveQueue(t *testing.T) {
 	// 700 KB/s down, no receive queue, and an uplink holding 400 KiB it takes
 	// 2 s to drain, which is what can put 7 s into every ack round trip
@@ -2304,25 +2351,31 @@ func TestH1PathEvidencePolicyOnTheMeasuredShapes(t *testing.T) {
 		t.Errorf("healthy 101 ms at 200 Mb/s: %s, want nothing collapsed in ten minutes", healthy)
 	}
 
-	// a saturated 20 Mb/s access link whose large window holds 1.5 s of
-	// bufferbloat from 10 s on. The bloat is a real queue and the acks carry
-	// it, so nothing denies it: this is the residual false positive, and the
-	// ledger is the whole of what bounds it
-	bloat := runH1PathPolicyShape(t, &settings, pathRtt, 1200, func(k int) h1PathTickShape {
-		queue := time.Duration(0)
-		if 20 <= k {
-			queue = 1500 * time.Millisecond
+	// A saturated 20 Mb/s access link whose large window holds bufferbloat from
+	// 10 s on. The bloat is a real queue and the acks carry it, so nothing
+	// denies it: this is the residual false positive, and it is bounded by the
+	// ledger and by BaselineRisePerMinute together. Two hours is long enough
+	// for the epoch's latch to expire twice, so an arm that never decayed would
+	// keep re-rolling here until the daily budget was gone.
+	bloatShape := func(depth time.Duration) func(k int) h1PathTickShape {
+		return func(k int) h1PathTickShape {
+			queue := time.Duration(0)
+			if 20 <= k {
+				queue = depth
+			}
+			return h1PathTickShape{
+				rxByteRate:        2_500_000,
+				queueDelay:        queue,
+				queueDelaySamples: 16,
+				rxOooAdvance:      true,
+				minRtt:            pathRtt,
+				ackRtt:            pathRtt + queue,
+			}
 		}
-		return h1PathTickShape{
-			rxByteRate:        2_500_000,
-			queueDelay:        queue,
-			queueDelaySamples: 16,
-			rxOooAdvance:      true,
-			minRtt:            pathRtt,
-			ackRtt:            pathRtt + queue,
-		}
-	})
-	t.Logf("bufferbloated 20 Mb/s access link: %s", bloat)
+	}
+	const bloatTicks = int(2 * time.Hour / h1PathTestStep)
+	bloat := runH1PathPolicyShape(t, &settings, pathRtt, bloatTicks, bloatShape(1500*time.Millisecond))
+	t.Logf("bufferbloated 20 Mb/s access link, 1.5 s over two hours: %s", bloat)
 	if bloat.unconfirmed != 0 || bloat.confirmed == 0 {
 		t.Errorf("bufferbloated 20 Mb/s access link: %s, want confirmed convictions", bloat)
 	}
@@ -2334,6 +2387,46 @@ func TestH1PathEvidencePolicyOnTheMeasuredShapes(t *testing.T) {
 	}
 	if want := 11500 * time.Millisecond; bloat.firstConviction != want {
 		t.Errorf("bufferbloated 20 Mb/s access link convicted at %s, want %s", bloat.firstConviction, want)
+	}
+	// (1.5 s - 1.01 s of threshold) / 100 ms a minute, from the 10 s the bloat
+	// starts at
+	if want := 5 * time.Minute; bloat.lastConviction < want-time.Minute ||
+		bloat.lastConviction > want+time.Minute {
+		t.Errorf(
+			"bufferbloated 20 Mb/s access link convicted last at %s, want the rise to end it near %s",
+			bloat.lastConviction, want,
+		)
+	}
+	if 0 < bloat.suppressed[h1PathReasonDailyBudget] {
+		t.Errorf("bufferbloated 20 Mb/s access link: %s, want the epoch bounded before the day", bloat)
+	}
+
+	// four times the bloat is four times as long visible, not the same forever:
+	// the rise is the lever the header names, and it has to move the reading
+	deepBloat := runH1PathPolicyShape(t, &settings, pathRtt, bloatTicks, bloatShape(6*time.Second))
+	t.Logf("bufferbloated 20 Mb/s access link, 6 s over two hours: %s", deepBloat)
+	if deepBloat.rerolls != 3 {
+		t.Errorf(
+			"bufferbloated 20 Mb/s access link at 6 s: %s, want the third re-roll the second latch allows and no more",
+			deepBloat,
+		)
+	}
+	if deepBloat.lastConviction <= bloat.lastConviction {
+		t.Errorf(
+			"a 6 s queue stayed visible for %s and a 1.5 s queue for %s; the rise bounds neither",
+			deepBloat.lastConviction, bloat.lastConviction,
+		)
+	}
+	// and (6 s - 1.01 s) / 100 ms a minute for four times the queue
+	if want := 50 * time.Minute; deepBloat.lastConviction < want-time.Minute ||
+		deepBloat.lastConviction > want+time.Minute {
+		t.Errorf(
+			"bufferbloated 20 Mb/s access link at 6 s convicted last at %s, want the rise to end it near %s",
+			deepBloat.lastConviction, want,
+		)
+	}
+	if 0 < deepBloat.suppressed[h1PathReasonDailyBudget] {
+		t.Errorf("bufferbloated 20 Mb/s access link at 6 s: %s, want the epoch bounded before the day", deepBloat)
 	}
 
 	// the measured collapse: 0.5 MB/s behind a queue that grows from the start

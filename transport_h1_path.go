@@ -37,13 +37,19 @@ import (
 //   - a saturated 20 Mb/s access link with bufferbloat: a real false positive
 //     and the residual cost of the feature. 2.5 MB/s is under thin, the bloat
 //     is a real queue that the acks carry too, so nothing denies it and the
-//     conviction is confirmed. It convicts 1.5 s after the queue stands and
-//     the ledger is what bounds it: two unimproved re-rolls latch the epoch
-//     for LatchDuration, so the cost is two or three break-before-make
-//     disconnects per network epoch on a link that was never going to improve.
-//     The lever if the field disagrees is BaselineRisePerMinute, which sets
-//     how long a queue of q stays visible ((q - thr) / rise, 4.9 min at 1.5 s),
-//     not the threshold, which is what keeps the measured collapse in.
+//     conviction is confirmed. It convicts 1.5 s after the queue stands, and
+//     two things bound it together. The ledger bounds the re-rolls: two
+//     unimproved ones latch the epoch for LatchDuration. BaselineRisePerMinute
+//     bounds the visibility, and it has to bound both measures or it bounds
+//     nothing -- a reference that cannot rise is a queue that never lifts and a
+//     conviction that never stops, which is how one bloated link spent a whole
+//     daily budget while the pack side was decaying on schedule. A queue of q
+//     is visible for (q - thr) / rise on each measure, so over two hours on one
+//     epoch a 1.5 s bloat costs two break-before-make disconnects and stops
+//     convicting at 5m03, and a 6 s bloat costs three and stops at 50m03, with
+//     the daily budget untouched in both. The lever if the field disagrees is
+//     that rise, not the threshold, which is what keeps the measured collapse
+//     in.
 //   - the measured collapse, 0.5 MB/s behind a 6-10 s queue on a 101 ms path:
 //     convicted 2 s after the queue reaches the threshold, confirmed by the
 //     kernel's out-of-order counter and by an ack round trip that carries the
@@ -642,8 +648,8 @@ type h1PathDecision struct {
 	ackQueuedTicks  int
 	queueDelay      time.Duration
 	queueDelayKnown bool
-	// the latest ack round trip over the path round trip, and whether one was
-	// fresh enough to read
+	// the latest ack round trip over its own risen reference, and whether one
+	// was fresh enough to read
 	ackQueue      time.Duration
 	ackQueueKnown bool
 	// delivered bytes per second in the direction evaluated
@@ -660,8 +666,9 @@ type h1PathDecision struct {
 //     least SendBacklogByteCount and take at least thr to drain at the rate
 //     the wire is acking. One bar, read the same way by both directions;
 //   - rx collapsed: not excluded, demand, rate below thin, and a queue of at
-//     least thr -- a fresh ack round trip that holds one over the path round
-//     trip, or, with no fresh ack to read, a queue delay that holds one. A
+//     least thr -- a fresh ack round trip that holds one over its own risen
+//     reference (ackBaseline), or, with no fresh ack to read, a queue delay
+//     that holds one over the pack baseline, which rises the same way. A
 //     fresh ack round trip below thr denies the tick whatever the queue delay
 //     says, and a backlogged send queue, which would inflate that round trip
 //     by our own uplink, makes it no evidence either way;
@@ -707,6 +714,9 @@ type h1PathMonitor struct {
 	// the latest ack round trip and when it was read
 	ackRtt     time.Duration
 	ackRttTime time.Time
+	// the ack round trip's own floor and when it was last reached
+	ackFloor     time.Duration
+	ackFloorTime time.Time
 
 	rxCollapsedRing uint16
 	txCollapsedRing uint16
@@ -731,7 +741,62 @@ func newH1PathMonitor(
 		stats:    &h1PathProcessStats,
 		start:    start,
 		dialRtt:  dialRtt,
+		// the dial measured the path before this connection carried a byte, so
+		// it is a queue-free reference for an ack round trip whatever the
+		// connection does afterwards
+		ackFloor:     dialRtt,
+		ackFloorTime: start,
 	}
+}
+
+// The reference an ack round trip's queue is read against, and the floor
+// behind it: the ack side of the rule the pack baseline already follows
+// (transport_h1_observer.go). The floor starts at the dial round trip, which is
+// what lets an ack read a queue that was already standing when the connection
+// opened, and is lowered by any shorter path the kernel or an ack reports. The
+// reference may rise above the floor by BaselineRisePerMinute for each minute
+// since the acks last came back to it, and the rolling minimum over
+// AckRttWindow caps that rise, so a link whose new normal is a standing queue
+// settles on it instead of climbing past it.
+//
+// Without the rise the reference is a lifetime minimum, and a queue that never
+// lifts is a conviction that never stops: a bloated access link convicted for
+// as long as it stayed bloated, at 1.5 s exactly as at 6 s, which spent the
+// device's whole daily budget instead of an epoch's two or three re-rolls. With
+// it, a queue of q is visible for (q - thr) / rise, the same lever and the same
+// arithmetic the pack side has always had, now on both measures.
+//
+// The rise restarts when the acks come back within the threshold of the floor,
+// not within the threshold of the risen reference. The second test is the
+// oscillation it looks like a shorthand for: the reference rises until it
+// hides the queue, the hidden queue reads as an unqueued route, the reference
+// drops back to the floor and the same queue convicts again, for ever, in
+// cycles of (q - thr) / rise.
+func (self *h1PathMonitor) ackBaseline(
+	sample *h1PathSample,
+	pathRtt time.Duration,
+	queueDelayThreshold time.Duration,
+) time.Duration {
+	if pathRtt < self.ackFloor {
+		self.ackFloor = pathRtt
+		self.ackFloorTime = sample.now
+	}
+	if 0 < sample.ackRttSamples {
+		if sample.ackRtt < self.ackFloor {
+			self.ackFloor = sample.ackRtt
+		}
+		if sample.ackRtt-self.ackFloor < queueDelayThreshold {
+			self.ackFloorTime = sample.now
+		}
+	}
+	rise := max(self.settings.BaselineRisePerMinute, 0)
+	base := self.ackFloor + time.Duration(
+		float64(rise)*sample.now.Sub(self.ackFloorTime).Minutes(),
+	)
+	if 0 < sample.ackRttMin {
+		base = min(base, sample.ackRttMin)
+	}
+	return base
 }
 
 // the minimum known round trip; the dial round trip is always known
@@ -779,6 +844,14 @@ func (self *h1PathMonitor) tick(sample h1PathSample) h1PathDecision {
 		self.stats.ConnectionsDormant.Add(1)
 		return h1PathDecision{dormant: true, pathRtt: pathRtt}
 	}
+	queueDelayThreshold := max(
+		settings.QueueDelayFloor,
+		time.Duration(settings.QueueDelayRttMultiple)*pathRtt,
+	)
+	// maintained on every tick the connection is alive for, accepted or not: it
+	// measures how long the route has gone without showing itself unqueued, and
+	// an idle tick is part of that
+	ackBase := self.ackBaseline(&sample, pathRtt, queueDelayThreshold)
 	if !self.primed {
 		self.primed = true
 		self.prev = sample
@@ -817,10 +890,6 @@ func (self *h1PathMonitor) tick(sample h1PathSample) h1PathDecision {
 	rxByteRate := float64(rxByteCount) / seconds
 	rxThinByteRate := self.thinByteRate(pathRtt, sample.rcvMss)
 	rxDemand := demandByteCount <= float64(rxByteCount)
-	queueDelayThreshold := max(
-		settings.QueueDelayFloor,
-		time.Duration(settings.QueueDelayRttMultiple)*pathRtt,
-	)
 	queueDelayKnown := 0 < sample.queueDelaySamples &&
 		settings.MinTickPackSamples <= sample.queueDelaySamples
 	// Deliberately not one of the three disjoint readings above: the receive
@@ -881,7 +950,7 @@ func (self *h1PathMonitor) tick(sample h1PathSample) h1PathDecision {
 	if !ackFresh {
 		self.stats.TicksAckUnknown.Add(1)
 	}
-	ackQueue := self.ackRtt - pathRtt
+	ackQueue := self.ackRtt - ackBase
 	ackQueued := ackQueueKnown && queueDelayThreshold <= ackQueue
 	packQueued := queueDelayKnown && queueDelayThreshold <= sample.queueDelay
 	// The two measures of the same queue disagree in both directions, and the

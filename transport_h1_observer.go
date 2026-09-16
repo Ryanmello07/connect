@@ -57,7 +57,10 @@ import (
 // one window. What the floor cannot absorb is a backward clock step on the
 // sender, which reads exactly like a queue for as long: the receive rule
 // answers that with the ack round trip, measured on this client's own clock
-// (transport_h1_path.go).
+// (transport_h1_path.go). That round trip carries a floor and a rise of its
+// own, for the same reason and with the same arithmetic. One measure that can
+// rise and one that cannot is no bound at all: the queue that never lifts goes
+// on convicting on whichever of the two stood still.
 //
 // Both types are safe for concurrent use.
 
