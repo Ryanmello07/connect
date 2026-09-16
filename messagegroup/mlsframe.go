@@ -37,9 +37,24 @@
 //
 // WHAT IT COSTS, MEASURED ON THIS TREE rather than taken from the ruling. A two member group, a
 // thirty two octet group id, ciphersuite C5, aad_mls at thirty two octets: the frame's overhead
-// over the application plaintext is a STEP FUNCTION, because RFC 9420's varint widens at 64 and
-// at 16,384 -- 193 octets for P < 64, 194 for 64 <= P < 16,384 and 198 for P >= 16,384. The
-// usable application body per rung falls from 252/1,020/4,092/16,380/65,532 to
+// over the application plaintext is a STEP FUNCTION with FOUR steps, because TWO nested varints
+// widen -- varint(P) inside the ciphertext at 64 and at 16,384, and varint(C) around it, where
+// C is about P + 82, at C = 16,384 and therefore at P = 16,300:
+//
+//	193   for       0 <= P <     64
+//	194   for      64 <= P < 16,300
+//	196   for  16,300 <= P < 16,384
+//	198   for  16,384 <= P
+//
+// THIS COMMENT CARRIED THE THREE STEP FORM UNTIL 2026-09-17 and the 16,300..16,383 band was
+// missing from it, which is ledger item 218 and MASTER section 8.4.4's own correction: the ladder
+// was measured by WALKING and the step function beside it was DERIVED by hand, and only the
+// derived one was wrong. It is load bearing now, because MASTER section 8.4.6's early size
+// refusal is arithmetic over this function -- which is exactly why nothing in this package
+// transcribes these four numbers: mls.FramedApplicationLength builds the frame's own structures
+// and marshals them, and the four above are the expected ANSWER rather than an input.
+//
+// The usable application body per rung falls from 252/1,020/4,092/16,380/65,532 to
 // 59/826/3,898/16,186/65,334. mlsframe_test.go publishes that ladder as a case and the query
 // beside it, so the numbers in this comment are re-measured rather than re-asserted.
 //
@@ -50,14 +65,22 @@
 // APPLICATION BODY AT ALL, not even a zero length one, which mlsframe_test.go measures rather
 // than asserts. A rung that carries nothing turns every reaction into a 1 KiB record.
 //
-// AND THE ONE THING THAT STOPS WORKING, which is not in MASTER section 8.4 and is not a cost of
-// the digest: A MEMBER CAN NO LONGER OPEN ITS OWN APPLICATION RECORD. Protect consumes a
-// generation of this leaf's own sending ratchet, and mls has no receiving ratchet for a leaf's
-// own messages, so Unprotect of one's own frame answers "mls: ratchet generation already
-// consumed". That is inherent to MLS rather than to this file -- a sender renders its own message
-// from the copy it kept, never by decrypting the record -- but it is a real change to what
-// OpenRecord does, spec A section 5.2's "it does not make a working call stop working" is false
-// of it, and this package's fixtures had to move from one member to two to say so. Open item MG-4.
+// AND THE ONE THING THAT STOPS WORKING, which is not a cost of the digest: A MEMBER CANNOT OPEN
+// ITS OWN APPLICATION RECORD. The seal consumes a generation of this leaf's own sending ratchet,
+// and mls derives no receiving ratchet for a leaf's own messages, so an open of one's own frame
+// answers "mls: ratchet generation already consumed". That is inherent to MLS rather than to this
+// file, and spec A section 5.2's "it does not make a working call stop working" is false of it --
+// this package's fixtures had to move from one member to two to say so.
+//
+// RULED 2026-09-17, MASTER section 8.4.7 (1), ledger item 214: A DEVICE RENDERS ITS OWN SENT LINES
+// FROM A COPY IT KEPT, never by decrypting the record it wrote, and an own record it holds no copy
+// of is AUTHENTICATED by that very refusal, counted, and is not a failure. sdk had already built
+// that answer before the ruling landed -- the ownSealed copy, PutSentRecord, the restore that reads
+// it back and the counters beside it -- and the ruling RATIFIES it rather than commissioning it.
+// The two refused options are recorded there so they are refused rather than rediscovered, and the
+// second of them matters here: exempting a record at this member's own sender_handle from the inner
+// open would re-open exactly the forgery MASTER section 8.4 closed, narrowed to self-attribution.
+// Open item MG-4 is CLOSED.
 package messagegroup
 
 import (
@@ -71,9 +94,52 @@ import (
 
 // The domain separation label of the inner frame's aad. Raw ascii, never length prefixed, which
 // is every other label in this package's shape.
-const aadMlsLabel = "URmessage/v1/aad/mls"
+//
+// THE LABEL IS THE VERSION, and that is a decision rather than a spelling. MASTER section 8.4.2 v2
+// adds two terms to the preimage and no octet to the wire, so there is no format_version bump and
+// no wire signal a reader could branch on -- deliberately, because format_version names the
+// record's octet layout, which does not move, and its only reader is the SERVER, which must learn
+// nothing about a change inside an AEAD it cannot open. What separates v1 from v2 is therefore this
+// string: a v1 opener handed a v2 frame rebuilds v1's preimage, gets a different digest and refuses
+// at R2. That is the fail-closed direction in BOTH directions, and it is also why ledger item 217
+// exists -- the two versions do not interoperate and the flag day is the owner's.
+const aadMlsLabel = "URmessage/v2/aad/mls"
 
-// aadMls is MASTER section 8.4.2's authenticated_data: H("URmessage/v1/aad/mls" | AAD_body).
+// The width of aad_mls on the wire, which is the width of H rather than a number.
+//
+// It is DERIVED from sha256.Size and never written as 32, because MASTER section 8.4.6's early size
+// refusal is arithmetic over it: a digest that changed width and a constant that did not would
+// refuse a legal body or admit one the seal must then refuse late. It is the same at v1 and at v2,
+// which is the whole reason v2 costs zero wire octets -- the 36 octets v2 adds are added to a
+// PREIMAGE, and a preimage has no width on any wire.
+const aadMlsBytes = sha256.Size
+
+// aadMls is MASTER section 8.4.2 v2's authenticated_data:
+//
+//	aad_mls = H("URmessage/v2/aad/mls" | AAD_body | u32(generation) | head_commit)     32 octets
+//
+// The preimage is 160 octets and has exactly four terms, concatenated in this order with no
+// separator, no padding and no framing: the 20 octet label, AAD_body's own 104 octets verbatim,
+// the frame's generation as four BIG ENDIAN octets, and the full 32 octet HMAC output head_commit
+// carries. u32 and not u64 because u32 is the width RFC 9420 section 6.3.2 gives the field, and a
+// second width here is a preimage no MLS implementation reproduces.
+//
+// WHY THE GENERATION IS IN IT, stated as the attack it stops. The generation is NOT in the
+// signature preimage: RFC 9420 section 6.1's FramedContentTBS is ProtocolVersion | WireFormat |
+// FramedContent | GroupContext, and FramedContent carries the group id, the epoch, the sender, the
+// authenticated_data, the content type and the content -- and no generation. The generation lives
+// in SenderData, sealed under the epoch's GROUP SHARED sender_data_secret, so every member can
+// write one; and section 9 derives every leaf's ratchet from the group shared encryption_secret, so
+// every member can seal AT one. So a member who cannot forge Alice's signature can open Alice's
+// frame, keep her FramedContent and her signature octets unchanged, and re-seal them at a
+// generation of its own choosing. Under v1 that record passed R1 and R2 and the receiver obeyed the
+// attacker's generation -- and an accepted frame COMMITS its generation, so Alice's own later frame
+// at that generation was then refused for ever. Measured on this tree by
+// TestAReEnvelopedGenerationIsRefusedAndTheVictimsRecordsSurvive: before the bind, three
+// substitutes were accepted and seven of the victim's seven genuine records were dead.
+//
+// WHY THE HEAD IS IN IT is headCommit's own header, and the reason it is a KEYED commitment rather
+// than a bare hash is there too.
 //
 // IT IS AAD_body AND NOT A NEW PREIMAGE, and that is the decision this function embodies.
 // AAD_body already carries exactly the six fields that fix a record's identity and its position
@@ -98,41 +164,25 @@ const aadMlsLabel = "URmessage/v1/aad/mls"
 // whose inner aad names a position it is not in.
 //
 // WHAT IT CANNOT DEFEND, stated here because the complement is the part a reader has to be told,
-// and the complement is SIX things and not five.
+// and the complement is FIVE things. IT WAS SIX UNTIL 2026-09-17 and the sixth was the head
+// plaintext, which v2's fourth term binds; open item MG-6 and ledger item 204 are CLOSED by that
+// term and the entry is struck from this list rather than left standing with a note.
 //
 // AAD_head is NOT bound and CANNOT be in either form: AAD_head contains body_hash = H(ct_body), and
 // ct_body is sealed over the frame this aad is inside. That is MASTER section 8's construction
-// order seen from the inside. The five fields AAD_head carries and AAD_body does not -- is_commit,
-// size_bucket, expire_at, blob_id, H(server_attachment) -- are therefore still authenticated by the
-// group alone, and is_commit is the one the SERVER acts on. Ledger open item 199.
-//
-// AND THE SIXTH IS THE HEAD PLAINTEXT, which this paragraph omitted and which is the one item on
-// the list with a live consumer. ct_head is sealed under the same record_key EVERY member derives,
-// and no field of the inner frame covers what it says. So a member can take another member's
-// GENUINE body -- frame, signature and all -- and re-issue it at the SAME position under a head of
-// its own writing: R1 passes because the frame really is that member's, R2 passes because the
-// position really is that record's, and the record opens to the true sender's plaintext under an
-// attacker's head. The head is not decoration: sdk/urmessage/group.go decodes sent_at_ms out of it,
-// so a head another member wrote is a timestamp another member wrote, and a head that FAILS to
-// decode is three attempts and then a permanent hole. The substitute also lands at the true
-// sender's own stream index, so accepting it walks the ladder past the genuine record and that
-// record stops opening. TestTheHeadPlaintextIsNotBoundByTheFrame measures all of it.
-//
-// IT IS NOT REPAIRED HERE AND THE REASON IS JURISDICTION, not difficulty. Binding it is one field
-// in this preimage -- the sealer holds headPlain before it frames the body and the opener holds it
-// before it unframes one, so the order is not circular the way AAD_head's is -- but aad_mls is
-// MASTER section 8.4.2's construction, written out there as H(label | AAD_body), and a second field
-// in it is a wire change and a spec edit rather than a repair this package may take on its own
-// authority. A naive bind would also hand the SERVER a guessable commitment to the head: AAD_body
-// is public, so H(public | timestamp) is a few million guesses. The bind has to be keyed under
-// record_key, which is one more reason it is a section 8 decision. Open item MG-6.
+// order seen from the inside, and it is a cycle rather than an ordering -- unlike the head
+// PLAINTEXT, which both sides hold at the right moment, which is exactly why one of the two could
+// be bound and the other cannot. The five fields AAD_head carries and AAD_body does not --
+// is_commit, size_bucket, expire_at, blob_id, H(server_attachment) -- are therefore still
+// authenticated by the group alone, and is_commit is the one the SERVER acts on. Ledger open item
+// 199, still open and unchanged in substance.
 //
 // IT TAKES NO alg_id, and that is this package's own gate rather than a simplification.
 // TestEveryAadCallInEitherHalfPassesTheRecordAeadAlgId requires every AADBody call in either half
 // of the record layer to pass RecordAeadAlgId itself, on the argument that a literal, an X-Wing
 // identifier or an attachment identifier is an aad no second implementation reconstructs. A
 // parameter here would have put the one call this file makes outside that rule.
-func aadMls(binding message.BodyBinding) ([32]byte, error) {
+func aadMls(binding message.BodyBinding, generation uint32, head [32]byte) ([32]byte, error) {
 	aadBody, err := message.AADBody(RecordAeadAlgId, binding)
 	if err != nil {
 		return [32]byte{}, err
@@ -140,6 +190,15 @@ func aadMls(binding message.BodyBinding) ([32]byte, error) {
 	writer := syntax.NewWriter()
 	writer.WriteRaw([]byte(aadMlsLabel))
 	writer.WriteRaw(aadBody)
+	// BIG ENDIAN, four octets, most significant first, written out rather than taken from a
+	// helper for the reason every label in a preimage is transcribed: the width and the order
+	// are the wire, and MASTER section 8.4.3's mutation (d) is a sealer that writes them the
+	// other way round -- which produces a well formed digest that no peer computes.
+	writer.WriteRaw([]byte{
+		byte(generation >> 24), byte(generation >> 16), byte(generation >> 8), byte(generation),
+	})
+	// RAW, no length prefix, the full 32 octet HMAC output.
+	writer.WriteRaw(head[:])
 	preimage, err := writer.Bytes()
 	if err != nil {
 		return [32]byte{}, err
@@ -170,24 +229,40 @@ func isApplicationRecord(isCommit bool, serverAttachment []byte) bool {
 // index is reserved. That is why this runs inside newRecordBuilderOnLoop, after Next, rather than
 // in front of it where a reader's instinct puts it.
 //
-// A SECOND WRITE-ONCE RESOURCE IS CONSUMED HERE. Protect takes a generation of this leaf's MLS
+// A SECOND WRITE-ONCE RESOURCE IS CONSUMED HERE. The seal takes a generation of this leaf's MLS
 // ratchet and persists group state whether or not the record is ever submitted, exactly as the
 // reservation takes an index whether or not it is. A refused submit therefore leaves a legal gap
 // in TWO sequences. Both are monotonic and both tolerate gaps; the bound is ledger open item 201
 // and mls's MaxGenerationSkip is 1,024.
 //
+// IT GOES THROUGH ProtectBound AND NOT Protect, AND THE BUILDER IS WHY. MASTER section 8.4.2 v2
+// puts u32(generation) inside aad_mls, and the seal chooses the generation INSIDE, from the sender
+// ratchet -- so there is no value this function could compute and hand over. What it hands over is
+// the BUILDER below, which mls calls with the generation it is about to spend, under one hold of
+// the group's own lock, and which mls then PINS: if the generation consumed is not the one the
+// builder was handed, the seal emits nothing. See (*mls.Group).ProtectBound for the four part race
+// argument and for why the pin is a rule rather than an assertion.
+//
+// THE HEAD PLAINTEXT IS AN ARGUMENT NOW, and that is the whole of what the head bind cost this
+// signature. sealRecordOnLoop has held headPlain since before the stream index was reserved, and
+// the rung exists by the time this runs, so both inputs to head_commit are in hand -- which is the
+// non-circularity headCommit's header states, read from the caller's side.
+//
 // The caller is the loop goroutine, which is what lets it touch self.handle at all.
 func (self *GroupSession) frameBodyOnLoop(isCommit bool, serverAttachment []byte,
-	binding message.BodyBinding, bodyPlain []byte) ([]byte, error) {
+	binding message.BodyBinding, recordKey []byte, headPlain []byte, bodyPlain []byte) ([]byte, error) {
 
 	if !isApplicationRecord(isCommit, serverAttachment) {
 		return bodyPlain, nil
 	}
-	aad, err := aadMls(binding)
-	if err != nil {
-		return nil, err
-	}
-	inner, err := self.handle.Protect(aad[:], bodyPlain)
+	head := headCommit(recordKey, headPlain)
+	inner, err := self.handle.ProtectBound(func(generation uint32) ([]byte, error) {
+		aad, err := aadMls(binding, generation, head)
+		if err != nil {
+			return nil, err
+		}
+		return aad[:], nil
+	}, bodyPlain)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrRecordInnerFrame, err)
 	}
@@ -215,6 +290,11 @@ func (self *GroupSession) frameBodyOnLoop(isCommit bool, serverAttachment []byte
 // which is a different condition about a body that opened.
 //
 // The caller is the loop goroutine.
+// R2 IS NOW A FUNCTION OF THE GENERATION AND THE HEAD AS WELL AS THE POSITION, which is v2, and the
+// caller is what supplies them: this function compares one digest against another and does not care
+// which terms went into either. The position digest is built ONCE per reading by the caller, out of
+// this record's own header, its own rung and the generation the reading answered, so the two
+// readings cannot come to disagree about what "this record's aad" is.
 func (self *GroupSession) refuseFrameBindingsOnLoop(header *message.RecordHeader,
 	position [32]byte, senderLeaf uint32, aad []byte) error {
 
@@ -268,30 +348,59 @@ func (self *GroupSession) refuseFrameBindingsOnLoop(header *message.RecordHeader
 // a denial it causes. That is the same sentence as the paragraph above, about the other of the two
 // receiver ratchets a record passes through.
 //
+// R3 IS WHAT v2 TURNS FROM A DEFENCE INTO THE REFUSAL ITSELF, and it is the reason the pre-reading
+// now has to answer THREE values. Under v1 the pre-reading was a defence against a denial channel
+// and a correct opener could have been written without it. Under v2 the GENERATION is one of the
+// values being bound, and OPENING a frame is what commits its generation at this receiver -- so an
+// opener that checked R2 after the open would have implemented the check and kept the vulnerability
+// whole. peekInnerFrameSender answers the leaf, the aad AND the generation out of one SenderData
+// open, so all three are in hand before any ratchet is reached.
+//
+// AND ONE HALF OF THE SECOND READING IS PREDICTED TO DEFEND NOTHING. For the leaf and the aad the
+// second reading is load bearing in the ordinary way. For the GENERATION it is not, and the reason
+// is mechanical: the content AEAD's key is derived from the generation the sender data named, so a
+// frame that OPENS AT ALL opened at exactly the generation the pre-reading read, and a disagreement
+// between the two readings is unreachable through any octets. MASTER section 8.4.3 requires the
+// implementing pass to DELETE the generation half of the second reading, run this package's suite
+// and mls's, and say by name whether anything went red. It was done and NOTHING went red -- the
+// measurement is in this package's OPENITEMS.md under MG-6. The clause is written anyway, because
+// the alternative is an argument a reader has to reconstruct rather than a rule, and because its
+// premise -- one SenderData open feeding both the pre-reading and the key derivation -- is a
+// property of mls's implementation rather than of any document.
+//
 // The caller is the loop goroutine.
-func (self *GroupSession) unframeBodyOnLoop(header *message.RecordHeader,
-	bodyPlain []byte) ([]byte, error) {
+func (self *GroupSession) unframeBodyOnLoop(header *message.RecordHeader, recordKey []byte,
+	headPlain []byte, bodyPlain []byte) ([]byte, error) {
 
 	if !isApplicationRecord(header.IsCommit, header.ServerAttachment) {
 		return bodyPlain, nil
 	}
-	// the aad this record's position produces, built from the same BodyBinding the sealer used
-	// and by the same function. It is computed once and handed to both readings, so the early
-	// refusal and the deciding one cannot come to disagree about where this record is.
-	position, err := aadMls(header.BodyBinding())
-	if err != nil {
-		return nil, err
-	}
-	peekLeaf, peekAad, err := peekInnerFrameSender(self.handle, bodyPlain)
+	// head_commit over THIS record's own rung and THIS record's own head plaintext, computed
+	// once. The opener holds headPlain because openRecordOnLoop opened ct_head above this call,
+	// which is the non-circularity headCommit's header states from the opening side.
+	head := headCommit(recordKey, headPlain)
+	binding := header.BodyBinding()
+	peekLeaf, peekAad, peekGeneration, err := peekInnerFrameSender(self.handle, bodyPlain)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrRecordInnerFrame, err)
 	}
-	if err := self.refuseFrameBindingsOnLoop(header, position, peekLeaf, peekAad); err != nil {
+	// the aad this record's position, generation and head produce. It is built per reading
+	// because the GENERATION is an input to it and each reading answers its own -- which is the
+	// whole of what makes the second reading a second reading rather than a repetition.
+	peekPosition, err := aadMls(binding, peekGeneration, head)
+	if err != nil {
 		return nil, err
 	}
-	aad, plaintext, senderLeaf, err := self.handle.Unprotect(bodyPlain)
+	if err := self.refuseFrameBindingsOnLoop(header, peekPosition, peekLeaf, peekAad); err != nil {
+		return nil, err
+	}
+	aad, plaintext, senderLeaf, generation, err := self.handle.Unprotect(bodyPlain)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrRecordInnerFrame, err)
+	}
+	position, err := aadMls(binding, generation, head)
+	if err != nil {
+		return nil, err
 	}
 	// and again, on what the signature covers. This is the reading that decides.
 	if err := self.refuseFrameBindingsOnLoop(header, position, senderLeaf, aad); err != nil {
@@ -299,3 +408,4 @@ func (self *GroupSession) unframeBodyOnLoop(header *message.RecordHeader,
 	}
 	return plaintext, nil
 }
+

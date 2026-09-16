@@ -17,6 +17,7 @@ package messagegroup
 
 import (
 	"bytes"
+	"crypto/hmac"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -94,16 +95,10 @@ func TestOneMemberCannotForgeAMessageFromAnother(t *testing.T) {
 
 	// THE FORGERY. B protects under its own credential, with the aad the record it is about to
 	// build produces, and then envelopes it at A's handle on A's ladder.
-	aad, err := aadMls(forgeBodyBinding(forgerSession, victimLeaf, 0))
-	if err != nil {
-		t.Fatalf("aadMls over the forged position: %v", err)
-	}
-	inner, err := forger.Protect(aad[:], []byte("Alice never wrote this"))
-	if err != nil {
-		t.Fatalf("B's Protect: %v", err)
-	}
-	forged := repairForgeRecord(t, forgerSession, victimLeaf, 0,
-		[]byte("a head attributed to A"), inner)
+	forgedHead := []byte("a head attributed to A")
+	inner := forgeProtectBoundAt(t, forger, forgerSession, victimLeaf, 0, forgedHead,
+		[]byte("Alice never wrote this"))
+	forged := repairForgeRecord(t, forgerSession, victimLeaf, 0, forgedHead, inner)
 	if forged.Header.SenderHandle != SenderHandle(forgerSession.groupHandleKey, victimLeaf) {
 		t.Fatal("the forged record does not carry A's sender_handle, so it is not the record this case is about")
 	}
@@ -154,18 +149,14 @@ func TestASignedFrameCannotBeReEnvelopedIntoAnotherPosition(t *testing.T) {
 		t.Fatalf("A tracks B's durable ladder: %v", err)
 	}
 
-	// the frame B signs for its own handle at index 0, which is where it belongs.
-	aad, err := aadMls(forgeBodyBinding(forgerSession, pair.openerLeaf, 0))
-	if err != nil {
-		t.Fatalf("aadMls: %v", err)
-	}
-	inner, err := forger.Protect(aad[:], []byte("a message B really wrote"))
-	if err != nil {
-		t.Fatalf("B's Protect: %v", err)
-	}
+	// the frame B signs for its own handle at index 0, under the head that record carries, which
+	// is where it belongs.
+	head := []byte("head")
+	inner := forgeProtectBoundAt(t, forger, forgerSession, pair.openerLeaf, 0, head,
+		[]byte("a message B really wrote"))
 
 	// THE CONTROL: at the position it was signed for, the same frame opens.
-	atHome := repairForgeRecord(t, forgerSession, pair.openerLeaf, 0, []byte("head"), inner)
+	atHome := repairForgeRecord(t, forgerSession, pair.openerLeaf, 0, head, inner)
 	_, gotBody, err := opener.OpenRecord(atHome)
 	if err != nil {
 		t.Fatalf("a frame at the position it was signed for did not open, so nothing below is about the position: %v", err)
@@ -177,11 +168,9 @@ func TestASignedFrameCannotBeReEnvelopedIntoAnotherPosition(t *testing.T) {
 	// MOVED ONE POSITION ALONG. Everything about the record is well formed: B's own handle, B's
 	// own ladder, B's own signature, a mac under the group's write key. The frame names index 0
 	// and the record is at index 1.
-	moved, err := forger.Protect(aad[:], []byte("a message B really wrote"))
-	if err != nil {
-		t.Fatalf("B's second Protect: %v", err)
-	}
-	replayed := repairForgeRecord(t, forgerSession, pair.openerLeaf, 1, []byte("head"), moved)
+	moved := forgeProtectBoundAt(t, forger, forgerSession, pair.openerLeaf, 0, head,
+		[]byte("a message B really wrote"))
+	replayed := repairForgeRecord(t, forgerSession, pair.openerLeaf, 1, head, moved)
 	if _, _, err := opener.OpenRecord(replayed); !errors.Is(err, ErrRecordPositionBinding) {
 		t.Errorf("a frame signed for stream_index 0 and sealed at stream_index 1 opened with %v; want ErrRecordPositionBinding. Without it, any member can replay a message into a later conversational position",
 			err)
@@ -435,30 +424,64 @@ func TestWhichRecordsCarryAnInnerFrameIsMasterSection841sTable(t *testing.T) {
 // The label is written out here rather than read off aadMlsLabel for the same reason every other
 // transcription in this package is: reading it off the package would move both halves together.
 func TestAadMlsIsMasterSection842sDigest(t *testing.T) {
-	const label = "URmessage/v1/aad/mls"
-	for _, binding := range []message.BodyBinding{
-		{RetentionClass: message.RetentionDurable},
+	// THE FOUR TERMS, transcribed. The label carries the VERSION, which is the whole of what
+	// separates a v1 opener from a v2 one -- there is no wire signal and format_version
+	// deliberately does not bump, so a v2 label written as v1 is a build that interoperates with
+	// the wrong half of the world in silence.
+	const label = "URmessage/v2/aad/mls"
+	const headBindInfo = "rec/v1/head-bind"
+	referenceRecordKey := bytes.Repeat([]byte{0x5c}, 32)
+	referenceHeadCommit := func(recordKey []byte, headPlain []byte) []byte {
+		bindKey := keyScheduleReferenceExpand(recordKey, []byte(headBindInfo), 32)
+		mac := hmac.New(sha256.New, bindKey)
+		mac.Write(headPlain)
+		return mac.Sum(nil)
+	}
+	referenceU32 := func(v uint32) []byte {
+		return []byte{byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v)}
+	}
+
+	for _, row := range []struct {
+		binding    message.BodyBinding
+		generation uint32
+		head       []byte
+	}{
+		{binding: message.BodyBinding{RetentionClass: message.RetentionDurable}, generation: 0, head: nil},
 		{
-			GroupId:        [32]byte{0x01, 0x02},
-			SenderHandle:   [16]byte{0xAA},
-			Epoch:          9,
-			StreamIndex:    4096,
-			RetentionClass: message.RetentionEph,
-			EphBucket:      3,
-			EphWindow:      1 << 33,
+			binding: message.BodyBinding{
+				GroupId:        [32]byte{0x01, 0x02},
+				SenderHandle:   [16]byte{0xAA},
+				Epoch:          9,
+				StreamIndex:    4096,
+				RetentionClass: message.RetentionEph,
+				EphBucket:      3,
+				EphWindow:      1 << 33,
+			},
+			generation: 0x01020304,
+			head:       []byte("a head of nine"),
 		},
 	} {
-		aadBody, err := message.AADBody(RecordAeadAlgId, binding)
+		aadBody, err := message.AADBody(RecordAeadAlgId, row.binding)
 		if err != nil {
 			t.Fatalf("AADBody: %v", err)
 		}
-		want := sha256.Sum256(append([]byte(label), aadBody...))
-		got, err := aadMls(binding)
+		head := referenceHeadCommit(referenceRecordKey, row.head)
+		preimage := append([]byte(label), aadBody...)
+		preimage = append(preimage, referenceU32(row.generation)...)
+		preimage = append(preimage, head...)
+		// the whole preimage is 160 octets: 20 + 104 + 4 + 32. Asserted rather than assumed,
+		// because a term that grew a length prefix would still hash to something.
+		if len(preimage) != 160 {
+			t.Fatalf("the transcribed preimage is %d octets and MASTER section 8.4.2 fixes it at 160", len(preimage))
+		}
+		want := sha256.Sum256(preimage)
+		got, err := aadMls(row.binding, row.generation, headCommit(referenceRecordKey, row.head))
 		if err != nil {
 			t.Fatalf("aadMls: %v", err)
 		}
 		if got != want {
-			t.Errorf("aadMls answered %x and MASTER section 8.4.2's H(%q | AAD_body) is %x", got, label, want)
+			t.Errorf("aadMls answered %x and MASTER section 8.4.2's H(%q | AAD_body | u32(generation) | head_commit) is %x",
+				got, label, want)
 		}
 		if len(got) != 32 {
 			t.Errorf("aad_mls is %d octets and MASTER section 8.4.2 fixes it at 32", len(got))
@@ -472,7 +495,8 @@ func TestAadMlsIsMasterSection842sDigest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AADBody: %v", err)
 	}
-	got, err := aadMls(binding)
+	zeroHead := headCommit(referenceRecordKey, nil)
+	got, err := aadMls(binding, 0, zeroHead)
 	if err != nil {
 		t.Fatalf("aadMls: %v", err)
 	}
@@ -482,27 +506,66 @@ func TestAadMlsIsMasterSection842sDigest(t *testing.T) {
 	if unlabelled := sha256.Sum256(aadBody); got == unlabelled {
 		t.Error("aad_mls is an UNLABELLED digest of AAD_body; the domain separation label is what keeps this preimage out of every other digest in the system")
 	}
-	// and every field of AAD_body reaches it, which is what "the six fields that fix a record's
-	// identity and position" means once it is a comparison rather than a sentence.
-	base, err := aadMls(message.BodyBinding{RetentionClass: message.RetentionDurable})
+	// THE v1 LABEL IS A DIFFERENT DIGEST, which is MASTER section 8.4.2's fail-closed direction
+	// in both directions and is the only thing that separates the two versions on the wire.
+	v1Preimage := append([]byte("URmessage/v1/aad/mls"), aadBody...)
+	if got == sha256.Sum256(v1Preimage) {
+		t.Error("aad_mls is still v1's digest; a v2 frame must not verify against a v1 opener's preimage and the label is the only thing that says so")
+	}
+
+	// and every field of AAD_body reaches it, AND SO DO THE TWO NEW TERMS -- which is what "four
+	// terms" means once it is a comparison rather than a sentence.
+	base, err := aadMls(message.BodyBinding{RetentionClass: message.RetentionDurable}, 0, zeroHead)
 	if err != nil {
 		t.Fatalf("aadMls: %v", err)
 	}
-	for name, moved := range map[string]message.BodyBinding{
-		"group_id":        {RetentionClass: message.RetentionDurable, GroupId: [32]byte{0x01}},
-		"sender_handle":   {RetentionClass: message.RetentionDurable, SenderHandle: [16]byte{0x01}},
-		"epoch":           {RetentionClass: message.RetentionDurable, Epoch: 1},
-		"stream_index":    {RetentionClass: message.RetentionDurable, StreamIndex: 1},
-		"retention_class": {RetentionClass: message.RetentionPermanent},
-		"eph_window":      {RetentionClass: message.RetentionDurable, EphWindow: 1},
+	for name, moved := range map[string]struct {
+		binding    message.BodyBinding
+		generation uint32
+		head       [32]byte
+	}{
+		"group_id":        {binding: message.BodyBinding{RetentionClass: message.RetentionDurable, GroupId: [32]byte{0x01}}, head: zeroHead},
+		"sender_handle":   {binding: message.BodyBinding{RetentionClass: message.RetentionDurable, SenderHandle: [16]byte{0x01}}, head: zeroHead},
+		"epoch":           {binding: message.BodyBinding{RetentionClass: message.RetentionDurable, Epoch: 1}, head: zeroHead},
+		"stream_index":    {binding: message.BodyBinding{RetentionClass: message.RetentionDurable, StreamIndex: 1}, head: zeroHead},
+		"retention_class": {binding: message.BodyBinding{RetentionClass: message.RetentionPermanent}, head: zeroHead},
+		"eph_window":      {binding: message.BodyBinding{RetentionClass: message.RetentionDurable, EphWindow: 1}, head: zeroHead},
+		"generation":      {binding: message.BodyBinding{RetentionClass: message.RetentionDurable}, generation: 1, head: zeroHead},
+		"head_commit":     {binding: message.BodyBinding{RetentionClass: message.RetentionDurable}, head: headCommit(referenceRecordKey, []byte("x"))},
 	} {
-		got, err := aadMls(moved)
+		got, err := aadMls(moved.binding, moved.generation, moved.head)
 		if err != nil {
 			t.Fatalf("aadMls with %s moved: %v", name, err)
 		}
 		if got == base {
 			t.Errorf("moving %s does not move aad_mls, so a frame signed for one record's position verifies at another's", name)
 		}
+	}
+
+	// THE GENERATION IS BIG ENDIAN, and that is a separate assertion because a little endian
+	// encoder produces a perfectly well formed digest that no peer computes. MASTER section
+	// 8.4.3's mutation (d) is exactly this, on the sealer only. 0x01000000 and 0x00000001 are
+	// each other's byte reversal, so a build that wrote the four octets the other way round
+	// answers this pair swapped.
+	bigEndian, err := aadMls(binding, 0x01000000, zeroHead)
+	if err != nil {
+		t.Fatalf("aadMls: %v", err)
+	}
+	wantBigEndian := sha256.Sum256(append(append(append([]byte(label), aadBody...),
+		0x01, 0x00, 0x00, 0x00), zeroHead[:]...))
+	if bigEndian != wantBigEndian {
+		t.Errorf("u32(0x01000000) is not encoded most significant octet first; MASTER section 8.4.2 fixes the order and a reversal is a preimage no MLS implementation reproduces")
+	}
+
+	// AND head_commit IS KEYED: the same head under a different record_key is a different
+	// commitment. Without the key the server, which holds AAD_body and sees aad_mls in the clear,
+	// could confirm a guessed sent_at in a few million tries.
+	otherKey := bytes.Repeat([]byte{0x5d}, 32)
+	if headCommit(referenceRecordKey, []byte("same head")) == headCommit(otherKey, []byte("same head")) {
+		t.Error("head_commit does not depend on record_key[i], so it is an unkeyed commitment to the head and the server can confirm a guessed sent_at")
+	}
+	if headCommit(referenceRecordKey, []byte("a")) == headCommit(referenceRecordKey, []byte("b")) {
+		t.Error("head_commit does not depend on the head plaintext at all")
 	}
 }
 
@@ -659,49 +722,88 @@ func TestTheNinetyEightOctetBandAtTheCeilingNoLongerFits(t *testing.T) {
 // index is reserved and after Protect has consumed a generation, and without the early refusal a
 // caller handing in a megabyte would burn one of each on every attempt.
 //
-// WHAT IT DOES NOT COVER, and the second clause says so rather than leaving it implied: the 198
-// octet band at the ceiling passes the early refusal and fails the real one, so a body in THAT
-// band does spend both. That is ledger open item 203 and it is the price of the frame sitting
-// inside the rung.
+// THE BAND AT THE CEILING IS COVERED NOW AND IT WAS NOT, which is MASTER section 8.4.6, RULED
+// 2026-09-17, and ledger open item 203's DEFECT half. The early refusal used to run on
+// len(bodyPlain), which is necessary and not sufficient, so a body of 65,335..65,532 octets passed
+// it, reserved an index, spent a generation, was framed, and was only then refused. It now runs on
+// framed_length(len(bodyPlain)), so a body in the band costs nothing either. The PRODUCT half of
+// 203 stays open: such a body still has nowhere to go until the blob plane exists.
+//
+// THIS IS MASTER SECTION 8.4.6's OWN FALSIFIABLE, written as it is written there: seal an over-long
+// body twice, then a legal one, and read the legal record's stream_index. Under the old rule the
+// band case answered 2; under this one it answers the first index the reserver hands out.
 func TestABodyNoRungCouldHoldCostsNeitherAnIndexNorAGeneration(t *testing.T) {
-	fixture := newTestSession(t, "too-long-costs-nothing")
-	tooLong := make([]byte, message.SizeBucketBytes(message.SizeBucket64K)+1)
-	if _, err := fixture.session.SealRecord(message.RetentionDurable, 0, false,
-		[]byte("head"), tooLong, 0, nil); !errors.Is(err, ErrBodyTooLong) {
-		t.Fatalf("a body longer than the largest rung answered %v, want ErrBodyTooLong", err)
-	}
-	record, err := fixture.session.SealRecord(message.RetentionDurable, 0, false,
-		[]byte("head"), []byte("body"), 0, nil)
-	if err != nil {
-		t.Fatalf("SealRecord after the refusal: %v", err)
-	}
 	// THE FIRST INDEX THIS RESERVER HANDS OUT IS 1 AND NOT 0, measured rather than assumed: the
 	// fake hands out the first index above its high water and its high water starts at zero. So
 	// "nothing was spent" is "the next record is still the first one".
-	if record.Header.StreamIndex != 1 {
-		t.Errorf("the first record sealed after a refused over-long body is at stream_index %d, want 1; the refusal must be taken before the reservation, or a caller that hands in a body no rung can hold burns one index and one MLS generation per attempt",
-			record.Header.StreamIndex)
+	const firstIndex = uint64(1)
+	for name, body := range map[string][]byte{
+		"longer than the largest rung": make([]byte, message.SizeBucketBytes(message.SizeBucket64K)+1),
+		// 65,400 octets: inside MASTER section 8.4.6's own band, which is the length that
+		// ruling names and the one the old rule charged an index and a generation for.
+		"in the band at the ceiling": make([]byte, 65400),
+		// and both ends of the band, so the boundary is measured rather than sampled.
+		"one octet over the framed ceiling": make([]byte, applicationBodyCapacity[message.SizeBucket64K]+1),
+		"the last octet the rung admits": make([]byte,
+			message.SizeBucketBytes(message.SizeBucket64K)-lpPrefixBytes),
+	} {
+		fixture := newTestSession(t, "too-long-costs-nothing")
+		// TWICE, which is the shape section 8.4.6 publishes: one refusal that spends an index is
+		// a defect and two are the same defect counted, and a case that sealed once could not
+		// tell "the refusal spent nothing" from "the reserver starts at one".
+		for attempt := 0; attempt < 2; attempt += 1 {
+			if _, err := fixture.session.SealRecord(message.RetentionDurable, 0, false,
+				[]byte("head"), body, 0, nil); !errors.Is(err, ErrBodyTooLong) {
+				t.Fatalf("a body %s (%d octets), attempt %d, answered %v, want ErrBodyTooLong",
+					name, len(body), attempt, err)
+			}
+		}
+		record, err := fixture.session.SealRecord(message.RetentionDurable, 0, false,
+			[]byte("head"), []byte("body"), 0, nil)
+		if err != nil {
+			t.Fatalf("SealRecord after two refusals of a body %s: %v", name, err)
+		}
+		if record.Header.StreamIndex != firstIndex {
+			t.Errorf("after two refused bodies %s the next record is at stream_index %d, want %d; the refusal must be taken before the reservation and before the generation, or every attempt burns one of each on a call that can never succeed",
+				name, record.Header.StreamIndex, firstIndex)
+		}
 	}
-
-	// and the band that DOES spend them, which is item 203 held as a measurement rather than as
-	// a note: this body passes the early refusal, is framed, and fails the real one.
-	band := newTestSession(t, "the-203-band")
-	inBand := make([]byte, applicationBodyCapacity[message.SizeBucket64K]+1)
-	if _, err := band.session.SealRecord(message.RetentionDurable, 0, false,
-		[]byte("head"), inBand, 0, nil); !errors.Is(err, ErrBodyTooLong) {
-		t.Fatalf("a body in the 203 band answered %v, want ErrBodyTooLong", err)
-	}
-	after, err := band.session.SealRecord(message.RetentionDurable, 0, false,
-		[]byte("head"), []byte("body"), 0, nil)
-	if err != nil {
-		t.Fatalf("SealRecord after the band refusal: %v", err)
-	}
-	if after.Header.StreamIndex != 2 {
-		t.Errorf("a body in the 203 band left the next record at stream_index %d and the measured answer is 2; if it is 1 the early refusal has widened to cover the band, and this comment and ledger open item 203 are what have to change",
-			after.Header.StreamIndex)
-	}
-	t.Logf("a body no rung could hold spends nothing; a body in the %d octet band at the ceiling spends one stream index and one MLS generation (ledger open item 203)",
+	t.Logf("a body no rung could hold under ANY framing spends neither a stream index nor an MLS generation, at both ends of the %d octet band MASTER section 8.4.6 rules (ledger item 203's defect half)",
 		message.SizeBucketBytes(message.SizeBucket64K)-lpPrefixBytes-applicationBodyCapacity[message.SizeBucket64K])
+}
+
+// THE CEILING IS 65,334 AND A BODY OF EXACTLY IT STILL SEALS, which is the other half of the rule
+// above: an early refusal that was merely CONSERVATIVE would also spend nothing and would refuse
+// legal bodies, and no assertion about an unspent index can tell the two apart.
+//
+// It walks the whole ladder rather than the top rung alone, because the early refusal is arithmetic
+// over a step function and MASTER section 8.4.4 records that the step function published three of
+// its four steps for two days -- a build that transcribed the three step form refuses a legal
+// 16,300..16,383 octet body, and rung 3's capacity is 16,186, so only a sweep at the boundary sees
+// it.
+func TestTheFramedEarlyRefusalAdmitsEveryBodyThatFits(t *testing.T) {
+	for bucket, capacity := range applicationBodyCapacity {
+		fixture := newTestSession(t, fmt.Sprintf("ceiling-rung-%d", bucket))
+		record, err := fixture.session.SealRecord(message.RetentionDurable, 0, false,
+			[]byte("head"), make([]byte, capacity), 0, nil)
+		if err != nil {
+			t.Fatalf("a body of exactly rung %d's capacity (%d octets) was refused: %v; the early refusal runs on a DERIVED framed length and a conservative one refuses legal bodies",
+				bucket, capacity, err)
+		}
+		if int(record.Header.SizeBucket) != bucket {
+			t.Errorf("a body of rung %d's capacity landed on rung %d", bucket, record.Header.SizeBucket)
+		}
+	}
+	// AND THE BAND THE THREE STEP FORM GETS WRONG, driven by its own length rather than by a
+	// rung's: 16,350 octets is inside 16,300..16,383, where varint(C) widens and varint(P) has
+	// not. A build carrying MASTER section 8.4.4's old three step overhead computes 194 here and
+	// the truth is 196.
+	fixture := newTestSession(t, "the-four-step-band")
+	if _, err := fixture.session.SealRecord(message.RetentionDurable, 0, false,
+		[]byte("head"), make([]byte, 16350), 0, nil); err != nil {
+		t.Errorf("a 16,350 octet body was refused with %v; it is inside the band MASTER section 8.4.4's corrected step function adds and it fits the 64 KiB rung",
+			err)
+	}
 }
 
 // octet_length(ct_body) does not move at any rung, which is the claim MASTER section 8.4.4 makes
@@ -879,6 +981,12 @@ type driftingHandle struct {
 	GroupHandle
 	leafDrift uint32
 	aadDrift  bool
+	// generationDrift is the THIRD value v2 made R2 a function of, and it is the one MASTER
+	// section 8.4.3 predicts no octets can move: the content AEAD's key is derived from the
+	// generation the sender data named, so over the real engine a frame that opens at all opened
+	// at exactly the generation the peek read. An ENGINE can disagree with itself, which is what
+	// this field is: the seam, not the wire.
+	generationDrift uint32
 }
 
 // Close is a NO-OP, because three sessions in this case share one handle and a GroupSession closes
@@ -887,16 +995,16 @@ type driftingHandle struct {
 // fixture standing where the property should be.
 func (self *driftingHandle) Close() error { return nil }
 
-func (self *driftingHandle) Unprotect(frame []byte) ([]byte, []byte, uint32, error) {
-	aad, plaintext, senderLeaf, err := self.GroupHandle.Unprotect(frame)
+func (self *driftingHandle) Unprotect(frame []byte) ([]byte, []byte, uint32, uint32, error) {
+	aad, plaintext, senderLeaf, generation, err := self.GroupHandle.Unprotect(frame)
 	if err != nil {
-		return nil, nil, 0, err
+		return nil, nil, 0, 0, err
 	}
 	if self.aadDrift && 0 < len(aad) {
 		aad = append([]byte(nil), aad...)
 		aad[0] ^= 0xff
 	}
-	return aad, plaintext, senderLeaf + self.leafDrift, err
+	return aad, plaintext, senderLeaf + self.leafDrift, generation + self.generationDrift, err
 }
 
 // The second reading is the one that decides, and an engine whose two readings disagree is refused.
@@ -938,6 +1046,19 @@ func TestTheReadingThatDecidesIsTheOneTheSignatureCovers(t *testing.T) {
 		{
 			what:     "Unprotect answers another aad than the peek read",
 			drift:    &driftingHandle{GroupHandle: chain.joined, aadDrift: true},
+			sentinel: ErrRecordPositionBinding,
+		},
+		// THE THIRD ROW IS THE ONE MASTER SECTION 8.4.3 PREDICTS NO OCTETS CAN REACH, and it is
+		// written anyway because this fixture can reach it. Over the real engine the content
+		// AEAD's key is derived from the generation the sender data named, so a frame that opens
+		// at all opened at exactly the generation the peek read -- and the owed deletion measured
+		// that directly: with the second reading's generation replaced by the peek's, the whole of
+		// ./messagegroup/ stayed green. What this row separates is an ENGINE whose two answers
+		// disagree, which is the seam rather than the wire, and it is what keeps the clause from
+		// being a sentence nothing can turn red.
+		{
+			what:     "Unprotect answers another generation than the peek read",
+			drift:    &driftingHandle{GroupHandle: chain.joined, generationDrift: 1},
 			sentinel: ErrRecordPositionBinding,
 		},
 	}
@@ -1142,6 +1263,56 @@ func forgeBodyBinding(session *GroupSession, leaf uint32, streamIndex uint64) me
 	}
 }
 
+// forgeRecordKeyAt is the DURABLE rung of one leaf's ladder at one stream index, out of symbols
+// every member of the group holds: RecordKeyZero(class_key, leaf) walked to the index, where the
+// class key is group shared by construction. It is repairForgeRecord's own derivation reached by a
+// second name, so a case that needs the rung WITHOUT sealing a record can have it.
+func forgeRecordKeyAt(session *GroupSession, leaf uint32, streamIndex uint64) []byte {
+	recordKey := RecordKeyZero(append([]byte(nil), session.classKeys.Durable...), leaf)
+	for walked := uint64(0); walked < streamIndex; walked += 1 {
+		recordKey = stepRecordKey(recordKey)
+	}
+	return recordKey
+}
+
+// forgeAadAt is the v2 aad_mls that a DURABLE record at (leaf, streamIndex), carrying this head
+// plaintext and framed at this generation, produces.
+//
+// IT IS WHAT A FORGER HAS TO BE ABLE TO COMPUTE, and the fact that it can is the finding rather
+// than the fixture: every input is group shared. What v2 changes is not that a member can build the
+// aad -- it always could -- but that the aad the member builds is now pinned to the generation the
+// seal actually spends and to the head the record actually carries, so a frame lifted out of one
+// record cannot be put under another generation or another head.
+func forgeAadAt(t *testing.T, session *GroupSession, leaf uint32, streamIndex uint64,
+	generation uint32, headPlain []byte) [32]byte {
+
+	t.Helper()
+	recordKey := forgeRecordKeyAt(session, leaf, streamIndex)
+	defer zeroize(recordKey)
+	aad, err := aadMls(forgeBodyBinding(session, leaf, streamIndex), generation,
+		headCommit(recordKey, headPlain))
+	if err != nil {
+		t.Fatalf("aadMls over the forged position: %v", err)
+	}
+	return aad
+}
+
+// forgeProtectBoundAt is ProtectBound over forgeAadAt: a member seals a frame whose aad names the
+// position, the head and the generation of the record it is about to build.
+func forgeProtectBoundAt(t *testing.T, handle GroupHandle, session *GroupSession, leaf uint32,
+	streamIndex uint64, headPlain []byte, bodyPlain []byte) []byte {
+
+	t.Helper()
+	frame, err := handle.ProtectBound(func(generation uint32) ([]byte, error) {
+		aad := forgeAadAt(t, session, leaf, streamIndex, generation, headPlain)
+		return aad[:], nil
+	}, bodyPlain)
+	if err != nil {
+		t.Fatalf("ProtectBound over the forged position: %v", err)
+	}
+	return frame
+}
+
 // protectLength answers how many octets one plaintext frames to, over the pair's founder handle.
 //
 // It takes a fresh aad of the width aad_mls is at every call, because the aad's LENGTH is inside
@@ -1149,7 +1320,10 @@ func forgeBodyBinding(session *GroupSession, leaf uint32, streamIndex uint64) me
 // ladder.
 func protectLength(t *testing.T, pair *testPair, plaintext int) (int, error) {
 	t.Helper()
-	aad, err := aadMls(message.BodyBinding{RetentionClass: message.RetentionDurable})
+	// the aad's VALUE cannot change any length -- MASTER section 8.4.4 measured that at twelve
+	// lengths against three different 32 octet values -- so the generation and the head commit
+	// here are whatever is cheapest. Its WIDTH is what matters and is 32 at v1 and v2 alike.
+	aad, err := aadMls(message.BodyBinding{RetentionClass: message.RetentionDurable}, 0, [32]byte{})
 	if err != nil {
 		return 0, err
 	}
@@ -1294,13 +1468,14 @@ func TestAForgedGenerationInTheFrameHeaderCostsTheTrueSenderNothing(t *testing.T
 	}
 	at := genuine.Header.StreamIndex + 1
 
-	aad, err := aadMls(forgeBodyBinding(pair.opener, pair.senderLeaf, at))
-	if err != nil {
-		t.Fatalf("aadMls: %v", err)
-	}
+	// the aad is built AT the forged generation and under the attacker's own head, which is what
+	// v2 obliges the attacker to do: an aad naming any other generation or any other head is
+	// refused at R2 by the PEEK, and this case needs the refusal to land at mls instead -- see the
+	// vacuity guard below.
+	attackerHead := []byte("a head the attacker chose")
+	aad := forgeAadAt(t, pair.opener, pair.senderLeaf, at, mls.MaxGenerationSkip, attackerHead)
 	frame := forgeFrameAtGeneration(t, pair.opener.handle, pair.senderLeaf, mls.MaxGenerationSkip, aad[:])
-	forged := repairForgeRecord(t, pair.opener, pair.senderLeaf, at,
-		[]byte("a head the attacker chose"), frame)
+	forged := repairForgeRecord(t, pair.opener, pair.senderLeaf, at, attackerHead, frame)
 
 	if _, _, err := pair.opener.OpenRecord(forged); err == nil {
 		t.Fatal("the forged record OPENED, which is a different and worse finding")
@@ -1335,16 +1510,15 @@ func TestForgedGenerationsAreRepeatableAtOneStreamIndexAndCostNothing(t *testing
 
 	// the attacker moves FIRST. The victim has written nothing at all.
 	const at = uint64(0)
-	aad, err := aadMls(forgeBodyBinding(pair.opener, pair.senderLeaf, at))
-	if err != nil {
-		t.Fatalf("aadMls: %v", err)
-	}
+	attackerHead := []byte("a head the attacker chose")
 	const rounds = 3
 	for round := 1; round <= rounds; round += 1 {
-		frame := forgeFrameAtGeneration(t, pair.opener.handle, pair.senderLeaf,
-			uint32(round)*mls.MaxGenerationSkip, aad[:])
-		forged := repairForgeRecord(t, pair.opener, pair.senderLeaf, at,
-			[]byte("a head the attacker chose"), frame)
+		// each round's aad names that round's own forged generation, which is what v2 makes the
+		// attacker do to get past the peek at all.
+		generation := uint32(round) * mls.MaxGenerationSkip
+		aad := forgeAadAt(t, pair.opener, pair.senderLeaf, at, generation, attackerHead)
+		frame := forgeFrameAtGeneration(t, pair.opener.handle, pair.senderLeaf, generation, aad[:])
+		forged := repairForgeRecord(t, pair.opener, pair.senderLeaf, at, attackerHead, frame)
 		if _, _, err := pair.opener.OpenRecord(forged); err == nil {
 			t.Fatalf("round %d: the forged record OPENED", round)
 		} else if !errors.Is(err, ErrRecordInnerFrame) {
@@ -1369,6 +1543,218 @@ func TestForgedGenerationsAreRepeatableAtOneStreamIndexAndCostNothing(t *testing
 			t.Fatalf("message %d opened to %q, want %q", wrote, body, plaintext)
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// the generation bind: MASTER section 8.4.2 v2 term (3), driven end to end
+// ---------------------------------------------------------------------------
+
+// reEnvelopeKeySource seals the CONTENT of a re-enveloped frame under the victim leaf's REAL
+// message key at a generation of the attacker's choosing.
+//
+// EVERY INPUT IT USES IS GROUP SHARED and that is the finding rather than the fixture. RFC 9420
+// section 9 derives every leaf's ratchet from the epoch's encryption_secret, which the GroupHandle
+// hands over because MASTER section 8.2 requires it for archive_secret -- so a member holds any
+// other member's message key at any generation it likes. Combined with sender_data_secret, also
+// group shared, a member can therefore re-seal another member's frame at any generation.
+//
+// It is a SENDER side source only: the framing layer calls NextMessageKey once per seal, and the
+// three other methods are refusals so a misuse is loud.
+type reEnvelopeKeySource struct {
+	tree       *mls.SecretTree
+	generation uint32
+}
+
+func (self *reEnvelopeKeySource) NextMessageKey(contentType mls.ContentType,
+	leaf mls.LeafIndex) ([]byte, []byte, uint32, error) {
+
+	key, nonce, err := self.tree.MessageKey(contentType, leaf, self.generation)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	return key, nonce, self.generation, nil
+}
+
+func (self *reEnvelopeKeySource) MessageKey(mls.ContentType, mls.LeafIndex, uint32) ([]byte, []byte, error) {
+	return nil, nil, errors.New("messagegroup: the re-envelope source is a sender side source only")
+}
+
+func (self *reEnvelopeKeySource) CommitMessageKey(mls.ContentType, mls.LeafIndex, uint32) error {
+	return errors.New("messagegroup: the re-envelope source is a sender side source only")
+}
+
+func (self *reEnvelopeKeySource) EraseMessageKey(mls.ContentType, mls.LeafIndex, uint32) {}
+
+// reEnvelopeAtGeneration takes a genuine frame and re-seals it AT ANOTHER GENERATION, keeping the
+// victim's FramedContent and the victim's SIGNATURE OCTETS byte for byte.
+//
+// This is the attack MASTER section 8.4.2's term (3) exists for, assembled out of what any member
+// holds: open the frame with a secret tree built from the group's own encryption_secret, then seal
+// the very same AuthenticatedContent under a source that names whatever generation the attacker
+// wants. Nothing about the signature, the leaf, the aad or the position changes -- the ONE variable
+// is the generation in the sender data.
+func reEnvelopeAtGeneration(t *testing.T, handle GroupHandle, victimLeaf uint32,
+	generation uint32, frame []byte) []byte {
+
+	t.Helper()
+	contextBytes, err := handle.GroupContextBytes()
+	if err != nil {
+		t.Fatalf("GroupContextBytes: %v", err)
+	}
+	context := &mls.GroupContext{}
+	if err := syntax.Unmarshal(contextBytes, context); err != nil {
+		t.Fatalf("unmarshal the group context: %v", err)
+	}
+	crypto, err := mls.NewCryptoProvider(context.CipherSuite)
+	if err != nil {
+		t.Fatalf("NewCryptoProvider: %v", err)
+	}
+	senderDataSecret, err := handle.SenderDataSecret()
+	if err != nil {
+		t.Fatalf("SenderDataSecret: %v", err)
+	}
+	encryptionSecret, err := handle.EncryptionSecret()
+	if err != nil {
+		t.Fatalf("EncryptionSecret: %v", err)
+	}
+	snapshot, err := handle.RatchetTreeSnapshot()
+	if err != nil {
+		t.Fatalf("RatchetTreeSnapshot: %v", err)
+	}
+	tree, err := mls.UnmarshalRatchetTree(snapshot)
+	if err != nil {
+		t.Fatalf("UnmarshalRatchetTree: %v", err)
+	}
+	victim := tree.Leaf(mls.LeafIndex(victimLeaf))
+	if victim == nil {
+		t.Fatalf("leaf %d is blank in the ratchet tree", victimLeaf)
+	}
+	// two trees out of one secret: the first opens the genuine frame, which COMMITS the genuine
+	// generation on that copy, and the second is what the re-seal draws from. Two copies because
+	// an attacker running this twice would build two; nothing about the victim's own tree moves.
+	opening, err := mls.NewSecretTree(crypto, tree.LeafCount(), encryptionSecret)
+	if err != nil {
+		t.Fatalf("NewSecretTree: %v", err)
+	}
+	parsed, err := mls.ParseMLSMessage(frame)
+	if err != nil {
+		t.Fatalf("ParseMLSMessage: %v", err)
+	}
+	authContent, err := mls.OpenPrivateMessage(crypto, opening, senderDataSecret,
+		parsed.PrivateMessage, mls.StaticSignatureKey(victim.SignatureKey), contextBytes)
+	if err != nil {
+		t.Fatalf("a member could not open the frame it is re-enveloping: %v", err)
+	}
+	sealing, err := mls.NewSecretTree(crypto, tree.LeafCount(), encryptionSecret)
+	if err != nil {
+		t.Fatalf("NewSecretTree: %v", err)
+	}
+	private, err := mls.SealPrivateMessage(crypto,
+		&reEnvelopeKeySource{tree: sealing, generation: generation},
+		senderDataSecret, authContent, 0)
+	if err != nil {
+		t.Fatalf("re-seal at generation %d: %v", generation, err)
+	}
+	reEnveloped, err := mls.MarshalMLSMessage(&mls.MLSMessage{
+		Version: mls.ProtocolVersionMls10, WireFormat: mls.WireFormatPrivateMessage,
+		PrivateMessage: private,
+	})
+	if err != nil {
+		t.Fatalf("MarshalMLSMessage: %v", err)
+	}
+	return reEnveloped
+}
+
+// TestAReEnvelopedGenerationIsRefusedAndTheVictimsRecordsSurvive is MASTER section 8.4.2 v2's
+// CRITICAL channel, driven end to end through GroupSession.OpenRecord.
+//
+// THE ATTACK, and it is not the one the two forged-generation cases above drive. Those two build a
+// frame whose CONTENT never opens, so mls refuses them at the AEAD and what they measure is that
+// the refusal costs the victim nothing. This one keeps the victim's FramedContent and the victim's
+// SIGNATURE OCTETS byte for byte and changes only the generation in the sender data -- so under v1
+// the record passed R1 (the frame really is the victim's), passed R2 (the position really is that
+// record's), OPENED, and committed the attacker's generation at the receiver. Every one of the
+// victim's own frames at or below that generation was then refused for ever, because every
+// generation below a receiving head is consumed.
+//
+// MEASURED ON THIS TREE, with the query being this case: with term (3) removed from the preimage on
+// both sides, 3 of 3 substitutes were ACCEPTED and 7 of 7 of the victim's genuine records were then
+// dead. With it, 0 of 3 are accepted and 0 of 7 are dead. Three substitutes kill seven records
+// because a commit at generation g consumes every generation below g.
+//
+// THE REFUSAL MUST BE R2 AND NOT SOMETHING EARLIER, and that is the vacuity guard: if the substitute
+// were refused by mls instead, this case would be driving the channel the two cases above already
+// close and would pass on a build with the defect.
+func TestAReEnvelopedGenerationIsRefusedAndTheVictimsRecordsSurvive(t *testing.T) {
+	pair := newTestPair(t, "re-enveloped-generation")
+	pair.trackDurable(t)
+
+	// the victim writes seven records and NONE of them has been delivered yet -- messages in
+	// flight, which is the ordinary case and the one with something to lose.
+	const wrote = 7
+	heads := make([][]byte, 0, wrote)
+	bodies := make([][]byte, 0, wrote)
+	genuine := make([]*message.Record, 0, wrote)
+	for i := 0; i < wrote; i += 1 {
+		head := fmt.Appendf(nil, "head %d", i)
+		body := fmt.Appendf(nil, "the message being censored, number %d", i)
+		record, err := pair.sender.SealRecord(message.RetentionDurable, 0, false, head, body, 0, nil)
+		if err != nil {
+			t.Fatalf("SealRecord %d: %v", i, err)
+		}
+		heads = append(heads, head)
+		bodies = append(bodies, body)
+		genuine = append(genuine, record)
+	}
+
+	// THE SUBSTITUTES. Each takes one of the victim's own frames and re-seals it at a LATER
+	// generation, at the victim's own handle, at that record's own stream index, under that
+	// record's own head. Nothing but the generation differs, so R1 and R2's other three terms
+	// pass by construction.
+	substitutes := []uint32{3, 5, 7}
+	accepted := 0
+	for at, generation := range substitutes {
+		frame := repairLiftFrame(t, pair.opener, pair.senderLeaf, genuine[at])
+		reEnveloped := reEnvelopeAtGeneration(t, pair.opener.handle, pair.senderLeaf, generation, frame)
+		substitute := repairForgeRecord(t, pair.opener, pair.senderLeaf,
+			genuine[at].Header.StreamIndex, heads[at], reEnveloped)
+		_, _, err := pair.opener.OpenRecord(substitute)
+		if err == nil {
+			accepted += 1
+			continue
+		}
+		if !errors.Is(err, ErrRecordPositionBinding) {
+			t.Errorf("the substitute at generation %d was refused with %v, want ErrRecordPositionBinding: a refusal anywhere else means this case is not driving the channel it names",
+				generation, err)
+		}
+	}
+	// an ERROR and not a fatal, so a build with the defect reports BOTH halves of it: the
+	// substitutes that were accepted and the victim's records they killed. A case that stopped
+	// here would make its own repair a guess about what the acceptance cost.
+	if accepted != 0 {
+		t.Errorf("%d of %d re-enveloped substitutes were ACCEPTED; MASTER section 8.4.2 term (3) binds the generation and this is the channel it closes",
+			accepted, len(substitutes))
+	}
+
+	// THE STAKE. Every one of the victim's seven genuine records, written before any of this.
+	dead := 0
+	for i, record := range genuine {
+		gotHead, gotBody, err := pair.opener.OpenRecord(record)
+		if err != nil {
+			dead += 1
+			t.Errorf("the victim's record %d is unopenable after %d refused substitutes: %v",
+				i, len(substitutes), err)
+			continue
+		}
+		if !bytes.Equal(gotHead, heads[i]) || !bytes.Equal(gotBody, bodies[i]) {
+			t.Errorf("the victim's record %d opened to %q/%q", i, gotHead, gotBody)
+		}
+	}
+	if dead != 0 {
+		t.Errorf("%d of %d of the victim's genuine records are dead", dead, wrote)
+	}
+	t.Logf("%d of %d substitutes accepted, %d of %d of the victim's genuine records dead",
+		accepted, len(substitutes), dead, wrote)
 }
 
 // TestTheCeremonyDoorSpendsNoneOfTheHandleItNames is MG-5's DENIAL half, which that item filed as
@@ -1448,52 +1834,154 @@ func TestTheApplicationDoorStillSpendsTheRungItOpens(t *testing.T) {
 	}
 }
 
-// TestTheHeadPlaintextIsNotBoundByTheFrame is a FILED residual and not a repair, written as a case
-// so the complement aadMls prints is measured rather than asserted.
+// TestASubstitutedHeadIsRefusedAndTheGenuineRecordStillOpens is MG-6 CLOSED, driven end to end
+// through OpenRecord, and it is the inversion of the case that stood here.
 //
-// ct_head is sealed under the same record_key every member derives and no field of the inner frame
-// covers what it says, so a member can take another member's GENUINE body -- frame, signature and
-// all -- and re-issue it at the SAME position under a head of its own. R1 passes because the frame
-// really is that member's; R2 passes because the position really is that record's.
+// WHAT STOOD HERE UNTIL 2026-09-17, because a case that is inverted without saying what it used to
+// measure leaves the next reader unable to reconstruct the finding. It was
+// TestTheHeadPlaintextIsNotBoundByTheFrame, a FILED RESIDUAL written as a case: it required the
+// substitute to OPEN, logged the attacker's head and the true sender's body as evidence, and said
+// in its own header "this case goes red if somebody binds it, and that is the intended way for it
+// to end". MASTER section 8.4.2 v2's fourth term is the bind, and this is the person holding the
+// failure closing MG-6.
 //
-// WHY IT IS FILED RATHER THAN FIXED is in aadMls's own complement: aad_mls is MASTER section 8.4.2's
-// construction and a second field in it is a wire change and a spec edit. Open item MG-6.
+// THE ATTACK, unchanged. ct_head is sealed under the same record_key EVERY member derives, so a
+// member can lift another member's GENUINE body -- frame, signature and all -- and re-issue it at
+// the SAME position under a head of its own. R1 passed because the frame really is that member's,
+// R2 passed because the position really is that record's, and the record opened to the true sender's
+// plaintext under an attacker's head. The substitute also landed at the true sender's own stream
+// index, so ACCEPTING it walked the ladder past the genuine record and that record then never opened
+// again. Measured on this tree before the bind: the substitute opened to head "A HEAD THE ATTACKER
+// CHOSE" with the true sender's body, and the genuine record then answered ErrOutOfWindow.
 //
-// THIS CASE GOES RED IF SOMEBODY BINDS IT, and that is the intended way for it to end: a build whose
-// frame covered the head would refuse the substitute, this case would fail, and the person holding
-// the failure would be the person who closed MG-6.
-func TestTheHeadPlaintextIsNotBoundByTheFrame(t *testing.T) {
-	pair := newTestPair(t, "head-not-bound")
+// WHY IT IS REFUSED NOW. head_commit is HMAC-SHA-256 under a key expanded from this record's own
+// rung, over the head plaintext ct_head actually opened to, and it is the fourth term of the aad_mls
+// the sender signed. The substitute's head produces a different commitment, so the digest the opener
+// rebuilds is not the one in the frame, and R2 refuses -- by name, and BEFORE any ratchet moves,
+// which is the second half of what this case asserts.
+//
+// THE SINGLE VARIABLE IS THE HEAD. The frame, the signature, the leaf, the handle, the stream index
+// and the generation are all the genuine record's; only the head plaintext differs. So a refusal
+// here cannot be a refusal of the position or of the sender.
+func TestASubstitutedHeadIsRefusedAndTheGenuineRecordStillOpens(t *testing.T) {
+	pair := newTestPair(t, "head-bound")
 	pair.trackDurable(t)
 
 	plaintext := []byte("the body the sender really wrote")
+	genuineHead := []byte("the head the sender wrote")
 	genuine, err := pair.sender.SealRecord(message.RetentionDurable, 0, false,
-		[]byte("the head the sender wrote"), plaintext, 0, nil)
+		genuineHead, plaintext, 0, nil)
 	if err != nil {
 		t.Fatalf("SealRecord: %v", err)
 	}
 	// the attacker lifts the genuine frame out of the genuine record. The record key is
 	// RecordKeyZero(class_key, leaf) walked to this index, and the class key is group shared.
 	frame := repairLiftFrame(t, pair.opener, pair.senderLeaf, genuine)
+
+	// THE CONTROL FIRST: the same lift, re-issued under the SAME head at the SAME index, opens.
+	// Without it a refusal below could be a refusal of the lift rather than of the head, and the
+	// whole case would be about a fixture. It is taken on a separate opener so that accepting it
+	// does not spend the rung the substitute needs.
+	control := newTestPair(t, "head-bound-control")
+	control.trackDurable(t)
+	controlGenuine, err := control.sender.SealRecord(message.RetentionDurable, 0, false,
+		genuineHead, plaintext, 0, nil)
+	if err != nil {
+		t.Fatalf("the control's SealRecord: %v", err)
+	}
+	controlFrame := repairLiftFrame(t, control.opener, control.senderLeaf, controlGenuine)
+	reissued := repairForgeRecord(t, control.opener, control.senderLeaf,
+		controlGenuine.Header.StreamIndex, genuineHead, controlFrame)
+	gotHead, gotBody, err := control.opener.OpenRecord(reissued)
+	if err != nil {
+		t.Fatalf("a lifted frame re-issued under its OWN head at its OWN index was refused with %v, so nothing below is about the head",
+			err)
+	}
+	if !bytes.Equal(gotHead, genuineHead) || !bytes.Equal(gotBody, plaintext) {
+		t.Fatalf("the control opened to head %q body %q", gotHead, gotBody)
+	}
+
+	// THE SUBSTITUTE: one variable moved.
 	substituted := []byte("A HEAD THE ATTACKER CHOSE")
 	substitute := repairForgeRecord(t, pair.opener, pair.senderLeaf,
 		genuine.Header.StreamIndex, substituted, frame)
+	head, body, refusal := pair.opener.OpenRecord(substitute)
+	if !errors.Is(refusal, ErrRecordPositionBinding) {
+		t.Fatalf("a genuine frame re-issued at its own position under another member's head opened with %v; want ErrRecordPositionBinding. MG-6 is the case where it opened, and head_commit is what closes it",
+			refusal)
+	}
+	if head != nil || body != nil {
+		t.Errorf("the refusal returned %d octets of head and %d of body beside the error",
+			len(head), len(body))
+	}
 
-	head, body, err := pair.opener.OpenRecord(substitute)
+	// AND THE GENUINE RECORD STILL OPENS, which is the half that says the refusal spent nothing.
+	// Under the old build the substitute was ACCEPTED here, so the rung was gone and this call
+	// answered ErrOutOfWindow.
+	gotHead, gotBody, err = pair.opener.OpenRecord(genuine)
 	if err != nil {
-		t.Fatalf("MG-6 IS CLOSED AND THIS CASE IS THE RECORD OF IT BEING OPEN: the substitute was refused with %v. Delete this case, take the head plaintext out of aadMls's complement, and close MG-6",
+		t.Fatalf("the true sender's own record no longer opens after the substitute was refused at its index: %v. A refused record must move no receiver ratchet",
 			err)
 	}
-	if !bytes.Equal(head, substituted) || !bytes.Equal(body, plaintext) {
-		t.Fatalf("the substitute opened to head %q body %q, want head %q body %q",
-			head, body, substituted, plaintext)
+	if !bytes.Equal(gotHead, genuineHead) || !bytes.Equal(gotBody, plaintext) {
+		t.Fatalf("the genuine record opened to head %q body %q, want %q / %q",
+			gotHead, gotBody, genuineHead, plaintext)
 	}
-	t.Logf("RESIDUAL OPEN (MG-6): a record another member built opened with head=%q body=%q at the true sender's own handle and stream index",
-		head, body)
-	// and the second half of the cost: the substitute was ACCEPTED, so it spent the rung, and the
-	// sender's own record at that index is gone.
-	if _, _, err := pair.opener.OpenRecord(genuine); !errors.Is(err, ErrOutOfWindow) {
-		t.Fatalf("the sender's own record answered %v after the substitute was accepted at its index, want ErrOutOfWindow",
-			err)
+	t.Logf("MG-6 CLOSED: the substitute was refused with %v and the genuine record at the same index still opens", refusal)
+}
+
+// TestTheDerivedFramedLengthIsTheLengthTheSealEmits is what makes MASTER section 8.4.6's early
+// refusal honest rather than approximately right.
+//
+// THE RULE it stands under: an application record's early size refusal is taken over
+// framed_length(len(bodyPlain)), BEFORE the stream index is reserved and BEFORE the generation is
+// spent. That is only a rule if framed_length is the length the seal actually produces. One octet
+// short and the check admits a body the seal must then refuse late, after spending both; one octet
+// long and it refuses a legal body at the boundary.
+//
+// THE LENGTHS ARE THE STEP FUNCTION'S OWN BOUNDARIES AND NOT A SAMPLE. MASTER section 8.4.4 records
+// that the overhead has FOUR steps and that this corpus published three of them for two days,
+// because the ladder was measured by walking and the step function was derived by hand. So both
+// sides of each boundary are driven, including 16,300 -- the one the three step form omits, where
+// varint(C) widens and varint(P) has not.
+//
+// THE QUERY: mls.FramedApplicationLength over the pair's own suite and group id width against
+// len(Protect(aad, make([]byte, P))) on a real two member group, at each length below. It is the
+// same query MASTER section 8.4.4 publishes, run here rather than transcribed.
+func TestTheDerivedFramedLengthIsTheLengthTheSealEmits(t *testing.T) {
+	pair := newTestPair(t, "derived-framed-length")
+	overheads := map[int]int{}
+	for _, plaintext := range []int{
+		0, 1, 63, 64, 65,
+		applicationBodyCapacity[0], applicationBodyCapacity[1], applicationBodyCapacity[2],
+		16186, 16299, 16300, 16350, 16383, 16384,
+		applicationBodyCapacity[4],
+	} {
+		derived, err := framedApplicationLength(pair.chain.founder, plaintext)
+		if err != nil {
+			t.Fatalf("framedApplicationLength(%d): %v", plaintext, err)
+		}
+		sealed, err := protectLength(t, pair, plaintext)
+		if err != nil {
+			t.Fatalf("Protect(%d): %v", plaintext, err)
+		}
+		if derived != sealed {
+			t.Errorf("the derived framed length of a %d octet body is %d and the seal emitted %d; MASTER section 8.4.6's early refusal is arithmetic over the derived number and a disagreement is a body admitted or refused at the wrong boundary",
+				plaintext, derived, sealed)
+		}
+		overheads[plaintext] = sealed - plaintext
 	}
+	// AND THE FOUR STEPS ARE THE ANSWER MASTER SECTION 8.4.4 PUBLISHES, which is the second half:
+	// agreement between two wrong numbers is still agreement. These four are this document's
+	// expected answer at ciphersuite 0x0003 with a 32 octet group id, and nothing in this
+	// package's production source carries them.
+	for plaintext, want := range map[int]int{
+		0: 193, 63: 193, 64: 194, 16299: 194, 16300: 196, 16383: 196, 16384: 198,
+	} {
+		if got := overheads[plaintext]; got != want {
+			t.Errorf("the frame's overhead at a %d octet plaintext is %d and MASTER section 8.4.4's corrected step function gives %d",
+				plaintext, got, want)
+		}
+	}
+	t.Logf("overheads by plaintext length: %v", overheads)
 }

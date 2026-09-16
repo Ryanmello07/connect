@@ -391,8 +391,26 @@ and about nothing else — it is not evidence that this row is smaller than it w
 
 ## MG-4 — a member can no longer open its own application record, and no document says so
 
-**Status: OPEN, FILED NOT RULED. Measured on 2026-09-15 while wiring MASTER §8.4. The behaviour is
-correct and inherent to MLS; what is unruled is what the product does about it.**
+**Status: RULED AND CLOSED 2026-09-17. MASTER §8.4.7 (1), ledger item 214.** The ruling is the first
+of the three options below: **a device renders its own sent lines from a copy it kept, never by
+decrypting the record it wrote**, and an own record it holds no copy of is AUTHENTICATED by that
+very refusal, counted, and is not a failure. The other two options are recorded as REFUSED in
+§8.4.7, and the second of them matters most: exempting a record at this member's own
+`sender_handle` from the inner open re-opens exactly the forgery §8.4 closed, narrowed to
+self-attribution.
+
+**IT WAS BUILT BEFORE IT WAS RULED AND THE RULING SAYS SO.** `sdk` chose this option and implemented
+it — `ownIndices`/`ownSealed`, `DeviceStore.PutSentRecord`, `Device.Restore` reading it back, the
+`withoutCopy` table and `Stats.SkippedOwn` / `OpenedOwn` / `OwnWithoutCopy` — while MASTER still said
+the opposite. **Nothing in `sdk` has to change**, which is the point of ratifying rather than
+choosing again. **Nothing in `connect` changed for it either**: this item closes by ruling, and the
+behaviour it describes is unaltered.
+
+**The measurement this pass owes and does not have:** `sdk`'s `cp3b` count is another agent's tree
+and was not run here. Ledger item 214 carries the figure with its owner and names the query a later
+pass owes: `go test ./cp3b/ -count=1 -json` at a named `sdk` commit.
+
+**The historical filing follows, unedited.**
 
 ### The property
 
@@ -481,6 +499,34 @@ belongs to the epoch machinery and not to a record door — and a check taken he
 *peeked* sender leaf would be worse than none, because the sender data a peek reads is sealed under
 a group-shared secret and would read as authentication while authenticating nothing.
 
+### Ruling, 2026-09-17: MASTER §8.4.7 (2), RULED IN PART
+
+**The ceremony arm carries no signature by design and full adoption does not change that.** §8.4.1
+row 3 — a wrap, an epoch fan-out, a completion marker — carries no MLS frame at all, every key it
+uses is group-shared, and neither a wrap (HPKE addressed to a device) nor an epoch marker (a
+counter) is a thing a `PrivateMessage` could carry without changing what it is. So the ruling is
+what the shape already forces, in three parts:
+
+- **(a) A ceremony record's `sender_handle` is a ROUTING LABEL and MUST NOT be rendered, attributed,
+  or used as evidence that a particular member wrote anything.** This is the sentence that was
+  missing and it is the whole of what this item was about. `OpenCeremonyRecord`'s own header already
+  says the octets are nobody's; the ruling makes that normative rather than a caveat.
+- **(b) A door named for opening a message MUST refuse the ceremony arm** — built, and it is
+  `OpenRecord`'s `ErrRecordNotAnApplicationRecord`.
+- **(c) An acceptance on the ceremony arm MUST spend nothing** — built, and it is
+  `TestTheCeremonyDoorSpendsNoneOfTheHandleItNames`.
+
+**WHAT IS NOT RULED AND IS NOT THIS DOOR'S:** the COMMIT row. A commit record's body is an
+`MLSMessage` and is signed, and what authenticates it is PROCESSING the commit — the epoch
+machinery's job, which MUST require the commit to be one MLS accepts **and** to have been signed by
+the leaf the record's `sender_handle` names. **That machinery is NOT BUILT.** A check taken at the
+record door on the frame's *peeked* sender leaf would be WORSE than none, because that leaf comes
+out of sender data sealed under a group-shared secret and would read as authentication while
+authenticating nothing.
+
+**Status: RULED IN PART. (a) is ruled and is the part that was missing; the commit row's
+authentication is owed by the epoch machinery and is not built.**
+
 ### Correction, 2026-09-15: this item had only the ATTRIBUTION half, and the DENIAL half was open
 
 Everything above measures the residual as *"attacker-chosen octets under a victim's
@@ -541,9 +587,54 @@ than the only thing standing between a forged arm and a rendered message, which 
 
 ## MG-6 — the head plaintext is not bound by the inner frame, and one member can re-issue another's body under a head of its own
 
-**Status: OPEN, FILED NOT RULED. Measured on 2026-09-15 in the third pass over MASTER §8.4, in the
-same commit that closed the two denial channels beside it. It is filed rather than repaired because
-the repair is a §8 wire change and not this package's to take.**
+**Status: RULED AND CLOSED 2026-09-17. MASTER §8.4.2 v2 term (4), ledger items 213 and 204.** The
+bind is
+`head_commit = HMAC-SHA-256(HKDF-Expand(record_key[i], "rec/v1/head-bind", 32), head_plain)`,
+carried **inside** the `aad_mls` SHA-256 preimage so `aad_mls` stays 32 octets and **zero wire
+octets move**. It is KEYED and not a bare hash because `AAD_body` is public and `aad_mls` travels in
+the clear as the frame's `authenticated_data`, so an unkeyed commitment to a nine-octet head whose
+only variable is a millisecond timestamp would hand the **server** a confirmable `sent_at`.
+
+**THE CASE THAT FILED IT IS NOW ITS INVERSE.** `TestTheHeadPlaintextIsNotBoundByTheFrame` required
+the substitute to OPEN and said in its own header that it would go red the day somebody bound the
+head. It is now
+`TestASubstitutedHeadIsRefusedAndTheGenuineRecordStillOpens`: the substitute is refused with
+`ErrRecordPositionBinding`, and the genuine record at the same index **still opens**, which is the
+half that says the refusal spent nothing. A control in the same case re-issues the lifted frame
+under its OWN head at its OWN index and requires it to open, so the refusal is of the head and not
+of the lift.
+
+**WHAT THE aad_mls COMPLEMENT LOSES.** `mlsframe.go` printed SIX things `aad_mls` cannot defend and
+the sixth was the head plaintext. It is now FIVE — `is_commit`, `size_bucket`, `expire_at`,
+`blob_id`, `H(server_attachment)` — which is ledger item 199 and is **not** closed. The head was the
+only entry on that list with a live consumer.
+
+**THE DELETION §8.4.3 OWED, RUN AND REPORTED.** §8.4.3 predicts that the GENERATION half of the
+second (post-open) reading in `unframeBodyOnLoop` defends nothing, because a frame that opens at all
+opened at the generation the pre-reading read. **Measured: with the second reading's generation
+replaced by the peek's (`position, err := aadMls(binding, peekGeneration, head)` and the open's
+generation dropped), `go test ./messagegroup/ -count=1 -timeout 900s` was `ok` — NOTHING went red.**
+`./mls/` is unaffected by construction: it does not import `messagegroup` and the edit is confined to
+`messagegroup/mlsframe.go`. That is the predicted answer and it is reported rather than hidden.
+
+The clause is kept, because its premise is a property of `mls`'s implementation rather than of any
+document — and `TestTheReadingThatDecidesIsTheOneTheSignatureCovers` now carries a `generation` drift
+row that DOES separate it. What that row drives is an ENGINE whose peek and open disagree, not any
+octets: over the real engine the two cannot, which is exactly why the deletion above turned nothing
+red. Both measurements are true and they are about different things.
+
+**AND ONE PREDICTION OF §8.4.3 IS FALSE ON THIS BUILD, reported rather than left standing.** Its
+mutation (f) — replace `HMAC-SHA-256(head_bind_key, ·)` with `SHA-256(·)` — is predicted to change
+no refusal and turn NOTHING red, on the argument that the clause defends a confidentiality property
+no refusal can see. **Measured: three named cases go red.**
+`TestAadMlsIsMasterSection842sDigest` (its transcription of the preimage, and the assertion that the
+same head under two different rungs commits differently), `TestTheReproductionRecomputesHeadCommit-
+FromItsOwnLadder` (the CP3b reproduction rebuilds `aad_mls` from its own ladder and disagrees with
+the frame the sealer emitted), and `TestTheLadderLabelsAreSeparateConstantsAndNoneIsBuiltFromAnother`
+(the head-bind label stops reaching the kdf at all). The clause is held by cases here and not only by
+a stated rule.
+
+**The historical filing follows, unedited.**
 
 ### The property
 

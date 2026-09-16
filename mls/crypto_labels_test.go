@@ -720,6 +720,12 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		// input, with no vector in it for any limit to cap. What the DECODE side is here for is
 		// the other half of syntax.Unmarshal -- it joins the decoder's answer with Done, so a
 		// plaintext of twelve good octets and a tail is refused rather than attributed.
+		// and the same structure MEASURED rather than sealed: MASTER section 8.4.6 makes a
+		// sealer's early size refusal arithmetic over the framed length, and
+		// FramedApplicationLength marshals a zero valued SenderData to learn how many octets the
+		// header costs rather than counting its fields by hand. Same structure, same default
+		// limit, same unreachable bound.
+		"framing_protect.go: syntax.Marshal(&SenderData{})",
 		"framing_protect.go: syntax.Marshal(senderData)",
 		// section 6.3.1's PrivateMessageContent, which opens a Reader and a Writer by hand
 		// rather than being a structure handed to syntax.Marshal. It has to: the content arm is
@@ -797,6 +803,11 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		// p7 task 13's commit generation encodes the group context a FOURTH time, the one the
 		// commit is signed against, at the DEFAULT limit and for the reason above: these octets
 		// are inlined into a FramedContentTBS with no length prefix of their own.
+		"group.go: syntax.Marshal(self.context)",
+		// and MASTER section 8.4.2 v2's ProtectBound encodes it once more, for exactly Protect's
+		// reason: it signs a FramedContentTBS of its own, and the only thing about it that is not
+		// Protect's is that the AAD inside that preimage is built from the generation the seal is
+		// about to consume.
 		"group.go: syntax.Marshal(self.context)",
 		// and the post-commit tree the commit publishes for out of band Welcome delivery, at the
 		// RAISED limit for the reason the persisted blob is: it is the same structure tree.go's own
@@ -1924,6 +1935,21 @@ var labelConstructionsOverAnyProvider = map[string]string{
 	// the nonce off the AEAD call itself.
 	"SealPrivateMessage": "draws a fresh reuse guard per message, so two calls of one row differ whatever provider they were handed and the comparison this gate makes cannot fail",
 	"sealPrivateMessage": "draws a fresh reuse guard per message, so two calls of one row differ whatever provider they were handed and the comparison this gate makes cannot fail",
+
+	// MASTER section 8.4.2 v2's three: the seal that REPORTS the generation it consumed, the
+	// same seal under the S3 pin, and the open that reports the generation it opened at. Each is
+	// the body one of the entries above now delegates to, so each carries that entry's limit
+	// unchanged and for the same reason -- the two seals draw a fresh reuse guard per message,
+	// and the open answers a verdict and a view over the message it was handed.
+	//
+	// None of them is unheld. sealPrivateMessageAt and openPrivateMessageAt are the bodies every
+	// section 6.3 case in framing_protect_test.go runs, including the ones that hold the seal and
+	// the open to mlswg's published message protection vectors; sealPrivateMessageBound is held
+	// by TestTheSealRefusesWhenTheGenerationConsumedIsNotTheOneTheAadNames over a key source that
+	// skips a generation, which is the mutation MASTER section 8.4.2 names for it.
+	"sealPrivateMessageAt":    "draws a fresh reuse guard per message, so two calls of one row differ whatever provider they were handed and the comparison this gate makes cannot fail",
+	"sealPrivateMessageBound": "draws a fresh reuse guard per message, so two calls of one row differ whatever provider they were handed and the comparison this gate makes cannot fail",
+	"openPrivateMessageAt":    "answers a verdict and a view over the message it was handed, and both AEAD opens it reaches fail rather than answer under a wrapper that flips every answer",
 }
 
 // A construction handed a provider computes with that provider and not with one of its

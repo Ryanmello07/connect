@@ -333,7 +333,7 @@ func TestTheHeadCannotBeSealedBeforeTheBodyHashIsBound(t *testing.T) {
 	var err error
 	if postErr := fixture.session.do(func() {
 		builder, err = fixture.session.newRecordBuilderOnLoop(message.RetentionDurable, 0, 0, false,
-			bodyPlain, 0, nil)
+			[]byte("the head this record carries"), bodyPlain, 0, nil)
 	}); postErr != nil {
 		t.Fatalf("post the builder command: %v", postErr)
 	}

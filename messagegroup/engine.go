@@ -118,8 +118,27 @@ type GroupHandle interface {
 	Process(message []byte) (*EngineProcessed, error)
 	ApplyCommit(processed *EngineProcessed) error
 
+	// AMENDED 2026-09-17 FOR MASTER SECTION 8.4.2 v2, in three places, all forced by the same
+	// sentence: the GENERATION is now inside aad_mls.
+	//
+	// ProtectBound takes a BUILDER rather than an aad, because the seal chooses the generation
+	// INSIDE, from the sender ratchet, so no caller can compute the aad before the call. Protect
+	// is KEPT beside it for a caller whose aad is a constant -- a commit's is -- and no
+	// production site in this package may reach it for an application record:
+	// TestNoProductionSiteReachesTheUnboundProtect is what says so, derived off this package's
+	// own source rather than off a reviewer's memory.
+	//
+	// Unprotect answers the generation because MASTER section 8.4.3's R2 is a function of it and
+	// the deciding reading is the one taken on what the open AUTHENTICATED.
+	//
+	// PeekSender answers the generation for the same reason one step earlier, and that one is
+	// what section 8.4.3's R3 turns from an optimisation into a requirement: all three values
+	// come out of ONE SenderData open under a secret every member already holds, so the refusal
+	// is taken before any ratchet is reached.
 	Protect(aad []byte, plaintext []byte) ([]byte, error)
-	Unprotect(message []byte) (aad []byte, plaintext []byte, senderLeaf uint32, err error)
+	ProtectBound(aad func(generation uint32) ([]byte, error), plaintext []byte) ([]byte, error)
+	Unprotect(message []byte) (aad []byte, plaintext []byte, senderLeaf uint32, generation uint32, err error)
+	PeekSender(frame []byte) (senderLeaf uint32, aad []byte, generation uint32, err error)
 
 	Close() error
 }
@@ -721,25 +740,59 @@ func (self *connectMlsHandle) ApplyCommit(processed *EngineProcessed) error {
 	return self.group.ApplyCommit(staged.processed)
 }
 
-// Protect seals one application message under the current epoch.
+// Protect seals one application message under the current epoch, for a caller whose aad is a
+// constant. An application record's is not; see ProtectBound.
 func (self *connectMlsHandle) Protect(aad []byte, plaintext []byte) ([]byte, error) {
 	return self.group.Protect(aad, plaintext)
 }
 
-// Unprotect opens one application message, projecting *mls.ApplicationMessage to three values.
+// ProtectBound seals one application message whose aad NAMES the generation it is sealed at.
+//
+// The builder travels through verbatim: mls calls it with the generation it is about to spend, and
+// PINS the answer -- a frame whose aad names a generation the frame is not at is never emitted. See
+// (*mls.Group).ProtectBound for the four part argument about why the two cannot diverge.
+func (self *connectMlsHandle) ProtectBound(aad func(generation uint32) ([]byte, error),
+	plaintext []byte) ([]byte, error) {
+
+	return self.group.ProtectBound(aad, plaintext)
+}
+
+// Unprotect opens one application message, projecting *mls.ApplicationMessage to four values.
 //
 // The projection is total: mls answers an error for everything it refuses, and a nil message with
 // a nil error is not a state mls can produce -- but it is refused here anyway, because the
-// alternative to refusing it is three zero values that read as an empty message from leaf 0.
-func (self *connectMlsHandle) Unprotect(message []byte) ([]byte, []byte, uint32, error) {
+// alternative to refusing it is four zero values that read as an empty message from leaf 0 at
+// generation 0.
+func (self *connectMlsHandle) Unprotect(message []byte) ([]byte, []byte, uint32, uint32, error) {
 	application, err := self.group.Unprotect(message)
 	if err != nil {
-		return nil, nil, 0, err
+		return nil, nil, 0, 0, err
 	}
 	if application == nil {
-		return nil, nil, 0, fmt.Errorf("%w: an opened application message with no content", ErrEngineProcessedArm)
+		return nil, nil, 0, 0, fmt.Errorf("%w: an opened application message with no content", ErrEngineProcessedArm)
 	}
-	return application.AuthenticatedData, application.Plaintext, uint32(application.SenderLeaf), nil
+	return application.AuthenticatedData, application.Plaintext,
+		uint32(application.SenderLeaf), application.Generation, nil
+}
+
+// PeekSender is MASTER section 8.4.3's PRE-RATCHET reading: the leaf, the aad and the generation an
+// inner frame names, read without touching a ratchet.
+//
+// IT MOVED ONTO THE INTERFACE ON 2026-09-17 and it used to be a free function over SenderDataSecret
+// and GroupContextBytes. What that cost is worth recording rather than leaving to be noticed: the
+// free form reached EVERY implementation of this interface for nothing, including ones in other
+// repositories, and this form requires each of them to provide it. What it buys is spec A section
+// 8.2's own amendment -- the peek is one of the three doors v2 names -- and an engine that can
+// answer the three values out of state it already holds instead of rebuilding a crypto provider out
+// of its own group context on every application record (the cost the free form's own comment
+// flagged, ledger item MG-5).
+//
+// IT AUTHENTICATES NOTHING AND IS NEVER THE ANSWER. All three values come out of sender data sealed
+// under a secret every member holds plus a cleartext header field, so all three are an attacker's
+// claim. A refusal on a claim is honest; an acceptance on one is not, which is why
+// unframeBodyOnLoop takes R1 and R2 a SECOND time on what mls has authenticated.
+func (self *connectMlsHandle) PeekSender(frame []byte) (uint32, []byte, uint32, error) {
+	return peekWithGroupSecrets(self, frame)
 }
 
 // Close releases the group, erasing the epoch secrets it holds.
@@ -747,8 +800,63 @@ func (self *connectMlsHandle) Close() error {
 	return self.group.Close()
 }
 
-// peekInnerFrameSender reads the two fields of an inner MLS frame that MASTER section 8.4.3's
+// framedApplicationLength answers how many octets an application record's ct_body plaintext will be
+// for a caller body of plaintextLen, WITHOUT reserving a stream index or spending a generation.
+//
+// MASTER SECTION 8.4.6 IS WHY IT EXISTS and newRecordBuilderOnLoop's own comment says what the old
+// rule cost. What this one adds is where the three inputs come from: the ciphersuite and the group
+// id's width are read out of the handle's own group context, and the aad's width is aadMlsBytes --
+// the digest's width, which is 32 at v1 and at v2 alike and is what makes the whole function a pure
+// function of the plaintext's length.
+//
+// IT IS IN THIS FILE for peekWithGroupSecrets' reason: this file is the one place in the package
+// that names connect/mls, and the seam is unchanged by it -- it reaches only GroupContextBytes,
+// which GroupHandle already declares.
+//
+// THE COST is one group context parse per application seal, which is the same cost the open path
+// already pays per application record and is written this way rather than cached for the same
+// reason: a cache on the session would be a fourth piece of epoch state to invalidate.
+func framedApplicationLength(handle GroupHandle, plaintextLen int) (int, error) {
+	if handle == nil {
+		return 0, ErrNilGroupHandle
+	}
+	contextBytes, err := handle.GroupContextBytes()
+	if err != nil {
+		return 0, err
+	}
+	context := &mls.GroupContext{}
+	if err := syntax.Unmarshal(contextBytes, context); err != nil {
+		return 0, err
+	}
+	return mls.FramedApplicationLength(context.CipherSuite, len(context.GroupId),
+		aadMlsBytes, plaintextLen)
+}
+
+// peekInnerFrameSender is the record layer's door onto GroupHandle.PeekSender, and it is a door
+// rather than a direct call for one reason: the nil handle.
+//
+// A nil GroupHandle is a caller's wiring mistake and a nil interface method call is a panic that
+// takes the caller's process rather than its call, so the refusal is stated once here rather than
+// at each of the places a reading is taken.
+func peekInnerFrameSender(handle GroupHandle, frame []byte) (senderLeaf uint32, aad []byte,
+	generation uint32, err error) {
+
+	if handle == nil {
+		return 0, nil, 0, ErrNilGroupHandle
+	}
+	return handle.PeekSender(frame)
+}
+
+// peekWithGroupSecrets reads the three fields of an inner MLS frame that MASTER section 8.4.3's
 // refusals are functions of, WITHOUT letting the frame touch a receiving ratchet.
+//
+// THE THIRD FIELD IS THE GENERATION AND IT ARRIVED WITH v2. MASTER section 8.4.2 puts
+// u32(generation) inside aad_mls, so R2 is a function of it; MASTER section 8.4.3's R3 requires R1
+// and R2 to be DECIDED before any ratchet moves; and opening a frame is what commits its
+// generation. A reading that answered the leaf and the aad but not the generation would therefore
+// leave the refusal to be taken after the open, which is after the commit -- the check implemented
+// and the vulnerability kept. All three come out of the SAME single sender data open, so the third
+// value costs no AEAD, no derivation and no ratchet.
 //
 // WHY A SECOND READING OF THE SAME TWO FIELDS EXISTS AT ALL, because a reader's first instinct is
 // that it is redundant with what Unprotect already answers. It is not redundant, it is EARLIER, and
@@ -779,32 +887,34 @@ func (self *connectMlsHandle) Close() error {
 // and a struct, and it is on the open path of every application record. It is written this way
 // rather than cached because a cache on the session would be a fourth piece of epoch state to
 // invalidate, and nothing has measured the call as hot. Ledger item MG-5.
-func peekInnerFrameSender(handle GroupHandle, frame []byte) (senderLeaf uint32, aad []byte, err error) {
+func peekWithGroupSecrets(handle GroupHandle, frame []byte) (senderLeaf uint32, aad []byte,
+	generation uint32, err error) {
+
 	if handle == nil {
-		return 0, nil, ErrNilGroupHandle
+		return 0, nil, 0, ErrNilGroupHandle
 	}
 	contextBytes, err := handle.GroupContextBytes()
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, 0, err
 	}
 	context := &mls.GroupContext{}
 	if err := syntax.Unmarshal(contextBytes, context); err != nil {
-		return 0, nil, err
+		return 0, nil, 0, err
 	}
 	crypto, err := mls.NewCryptoProvider(context.CipherSuite)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, 0, err
 	}
 	senderDataSecret, err := handle.SenderDataSecret()
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, 0, err
 	}
 	defer zeroize(senderDataSecret)
-	leaf, authenticatedData, err := mls.PeekPrivateMessageSender(crypto, senderDataSecret, frame)
+	leaf, authenticatedData, frameGeneration, err := mls.PeekPrivateMessageSender(crypto, senderDataSecret, frame)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, 0, err
 	}
-	return uint32(leaf), authenticatedData, nil
+	return uint32(leaf), authenticatedData, frameGeneration, nil
 }
 
 // stagedProcessed is what this adapter puts in EngineProcessed.stagedRef: the mls value ApplyCommit

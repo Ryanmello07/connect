@@ -201,11 +201,18 @@ func DeriveClassKeys(storageRoot []byte) *ClassKeys {
 // two ciphertexts are sealed under one key and one nonce is a record whose Poly1305 one time
 // key an attacker recovers. The first two are separated by their first octet, which is inside
 // the shorter of them, so nothing following one can turn it into the other.
+// The head bind label is the FIFTH and arrived with MASTER section 8.4.2 v2 on 2026-09-17. It
+// stays at v1 because it names a derivation off the v1 record ladder -- the rung is unchanged and
+// the ladder is unchanged; what is new is a fourth thing expanded from a rung that already produces
+// three. It shares the "rec/v1/" stem with the two above and is separated from both by its length
+// and by its ninth octet, and like them it is a whole constant rather than a stem with a word
+// appended.
 const (
 	recordKeyZeroInfo  = "sender/v1"
 	recordKeyNextInfo  = "ratchet/v1"
 	recordAeadHeadInfo = "rec/v1/head"
 	recordAeadBodyInfo = "rec/v1/body"
+	recordHeadBindInfo = "rec/v1/head-bind"
 )
 
 // The width of one rung of the ladder, and the width of the material one rung expands into.
@@ -303,6 +310,51 @@ func RecordAeadHead(recordKey []byte) (key []byte, nonce []byte) {
 // halves of a record under one key and one nonce.
 func RecordAeadBody(recordKey []byte) (key []byte, nonce []byte) {
 	return recordAeadMaterial(recordKey, recordAeadBodyInfo)
+}
+
+// headCommit is MASTER section 8.4.2 v2's fourth term of the aad_mls preimage: the KEYED
+// commitment to a record's head plaintext that the sender's own MLS signature then covers.
+//
+//	head_bind_key = HKDF-Expand(record_key[i], "rec/v1/head-bind", 32)
+//	head_commit   = HMAC-SHA-256(head_bind_key, head_plain)
+//
+// WHAT IT CLOSES, which is a measured attack and not a tidiness. ct_head is sealed under the same
+// record_key[i] EVERY member derives, and before v2 no field of the inner frame covered what the
+// head said. So a member could lift another member's GENUINE body -- frame, signature and all --
+// and re-issue it at the SAME position under a head of its own writing: R1 passed because the frame
+// really was that member's, R2 passed because the position really was that record's, and the record
+// opened to the true sender's plaintext under an attacker's head. The head is not decoration: it
+// carries sent_at, which is what a conversation is ordered by. And the substitute was ACCEPTED, so
+// it spent the rung and the genuine record at that index then could not open at all. That is open
+// item MG-6 and ledger item 204, and this is the derivation that closes both.
+//
+// IT IS KEYED AND NEVER A BARE H(head_plain), AND THE REASON IS A LEAK RATHER THAN A PREFERENCE.
+// AAD_body is public to the server and aad_mls travels IN THE CLEAR as the frame's
+// authenticated_data, so an unkeyed commitment to a nine octet head whose only variable is a
+// millisecond timestamp is a few million guesses -- which would hand the SERVER a confirmable
+// sent_at, the one clock value the record layer deliberately keeps inside an AEAD. record_key[i] is
+// the key because both sides hold it at the right moment and no non-member ever does.
+//
+// AND THAT CLAUSE DEFENDS NOTHING ANY REFUSAL CAN SEE, which is said here rather than left to be
+// discovered: replacing the HMAC with a bare SHA-256 of head_plain changes no refusal anywhere and
+// turns nothing red. MASTER section 8.4.3's mutation (f) names that as the expected answer. The
+// clause is held by this paragraph and by the KAT beside it, not by a case.
+//
+// IT IS NOT CIRCULAR, and that is what separates it from AAD_head, which cannot be bound in any
+// form. The sealer is handed head_plain as an argument and frames the body AFTER the rung exists
+// and BEFORE ct_head is sealed; the opener opens ct_head ABOVE the point where it unframes the
+// body. Both sides therefore hold both inputs at the moment they need the digest. AAD_head contains
+// body_hash = H(ct_body) and ct_body is sealed over the very frame the aad would sit in, which is a
+// cycle rather than an ordering.
+//
+// head_plain is passed through with NO length prefix, no padding, no re-encoding and no
+// canonicalisation: it is the same array that is sealed into ct_head, of whatever length including
+// zero. A second encoding here would be a second opinion about what the head is.
+func headCommit(recordKey []byte, headPlain []byte) [32]byte {
+	refuseWrongWidthRecordKey(recordKey)
+	bindKey := keyScheduleExpand(recordKey, []byte(recordHeadBindInfo), recordKeyBytes)
+	defer zeroize(bindKey)
+	return [32]byte(keyScheduleCrypto.Mac(bindKey, headPlain))
 }
 
 // The one expansion the two aead derivations share, so the split of the fifty six octets is

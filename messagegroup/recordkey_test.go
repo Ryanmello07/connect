@@ -9,6 +9,7 @@
 package messagegroup
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"go/ast"
@@ -324,23 +325,67 @@ func TestTheLadderLabelsAreSeparateConstantsAndNoneIsBuiltFromAnother(t *testing
 	if len(labels) == 0 {
 		t.Fatal("no string constant of this package reaches an expansion as an info, so this gate held no label to anything")
 	}
-	for _, wanted := range []string{"recordAeadBodyInfo", "recordAeadHeadInfo", "recordKeyNextInfo", "recordKeyZeroInfo"} {
+	for _, wanted := range []string{"recordAeadBodyInfo", "recordAeadHeadInfo", "recordHeadBindInfo",
+		"recordKeyNextInfo", "recordKeyZeroInfo"} {
 		if !slices.Contains(labels, wanted) {
 			t.Errorf("%s is a label of the ladder and this gate's derived class did not reach it: %v", wanted, labels)
 		}
 	}
+	// THE ONE PREFIX PAIR THIS PACKAGE IS NOT FREE TO AVOID, named rather than excused.
+	//
+	// MASTER section 8.4.2 fixes head_commit's info string as the raw ascii "rec/v1/head-bind",
+	// 16 octets, and says in as many words that it is written "exactly as 'rec/v1/head' and
+	// 'rec/v1/body' already are". That makes "rec/v1/head" the WHOLE of it, which is the relation
+	// the rule below refuses -- so this pair is here because the wire is normative and this gate
+	// is connect's own stricter rule, not because the rule was found inconvenient.
+	//
+	// WHY IT IS SAFE HERE, and it is an argument about HKDF rather than about care. HKDF-Expand's
+	// first block is HMAC(prk, info | 0x01), so the two preimages are "rec/v1/head" | 0x01 and
+	// "rec/v1/head-bind" | 0x01 -- different octets and different lengths, with no choice of
+	// anything that follows one making it the other. The hazard the rule names is a TRUNCATION,
+	// and reaching the shorter label from the longer takes a deliberate slice rather than a
+	// mis-spelling. The second half of this gate, which refuses an info BUILT by concatenating
+	// two constants, is untouched and is what would catch "rec/v1/head" + "-bind".
+	//
+	// AND THE EXEMPTION IS EXACTLY ONE PAIR. A second prefix relation fails here whatever it is,
+	// including one built out of this label -- so the carve-out is a fact about one normative
+	// string rather than a hole in the rule. WHAT WOULD REMOVE IT: a spec label that is not an
+	// extension of an existing one ("rec/v1/hbind" would do), which is msgrepo's to choose and is
+	// reported as such rather than taken here.
+	exempt := map[string]bool{"recordAeadHeadInfo|recordHeadBindInfo": true}
+	exercised := map[string]bool{}
 	for i, left := range labels {
 		for _, right := range labels[i+1:] {
 			if constants[left] == constants[right] {
 				t.Errorf("%s and %s are the same label %q; two derivations under one label are one key", left, right, constants[left])
 			}
 			if strings.HasPrefix(constants[left], constants[right]) || strings.HasPrefix(constants[right], constants[left]) {
+				pair := left + "|" + right
+				if exempt[pair] {
+					exercised[pair] = true
+					continue
+				}
 				// a shared prefix is legal -- rec/v1/head and rec/v1/body have one -- but
 				// one label being the WHOLE of another means a truncation makes them equal
 				t.Errorf("%s (%q) is the whole of %s (%q); a truncation of the longer one is the shorter one",
 					left, constants[left], right, constants[right])
 			}
 		}
+	}
+	// AN EXEMPTION THAT IS NEVER REACHED IS A CLAIM NOBODY MEASURED, so the carve-out has to be
+	// exercised by the labels this package actually declares. A build that renamed the head bind
+	// label out of the prefix relation reports here rather than leaving a dead entry behind.
+	for pair := range exempt {
+		if !exercised[pair] {
+			t.Errorf("the prefix exemption %q was never reached, so it is describing a pair this package no longer has; delete it", pair)
+		}
+	}
+	// and the two labels of the exempted pair expand ONE rung to different keys, which is the
+	// property the prefix rule was standing in for.
+	rung := bytes.Repeat([]byte{0x4b}, recordKeyBytes)
+	if bytes.Equal(keyScheduleExpand(rung, []byte(recordAeadHeadInfo), 32),
+		keyScheduleExpand(rung, []byte(recordHeadBindInfo), 32)) {
+		t.Error("rec/v1/head and rec/v1/head-bind expand one rung to the same 32 octets")
 	}
 	// and no label is BUILT: every one of them is a plain literal in a const declaration,
 	// which keyScheduleStringConstantsOf is what says, and no expansion's info argument is a

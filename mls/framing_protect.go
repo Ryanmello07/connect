@@ -989,17 +989,74 @@ func SealPrivateMessage(crypto CryptoProvider, keys MessageKeySource, senderData
 func sealPrivateMessage(crypto CryptoProvider, keys MessageKeySource, senderDataSecret []byte,
 	authContent *AuthenticatedContent, padding []byte) (*PrivateMessage, error) {
 
+	message, _, err := sealPrivateMessageAt(crypto, keys, senderDataSecret, authContent, padding)
+	return message, err
+}
+
+// errSealGenerationNotBound is MASTER section 8.4.2's S3, and it is the PIN rather than a report.
+//
+// S1 says the sealer builds aad_mls from the generation the frame is ACTUALLY sealed under, and S2
+// says the read of that generation and the construction of the aad are atomic with respect to every
+// other seal on this group's own sender ratchets. S3 is what makes S1 a RULE rather than an
+// argument: if the generation the seal consumed is ever not the one the aad names, the seal emits
+// NOTHING.
+//
+// WHY THE ASYMMETRY IS THE WHOLE REASON. A frame whose aad names a generation the frame is not at
+// is refused by EVERY peer, at R2, for a reason the sender cannot see -- so a wrong atomicity
+// argument would turn into a sender every one of whose messages is silently dropped by its own
+// group. Refusing here costs one local refusal and one generation, which is an ordinary gap exactly
+// like a refused submit (ledger open item 201). Loud at the sender beats silent everywhere else.
+//
+// THE GENERATION IS SPENT BY THE TIME THIS IS RETURNED and the caller owes the record of that. The
+// ratchet moved inside the seal below, so a caller holding this error must still persist the
+// position -- (*Group).sealAndRecordBoundLocked is the caller and its body says so. A refusal that
+// dropped the persist would leave a restored member drawing a generation it has already used, which
+// is the one thing the persist exists to prevent.
+var errSealGenerationNotBound = errors.New("mls: the frame was sealed at a generation its authenticated_data does not name")
+
+// sealPrivateMessageBound is sealPrivateMessage plus MASTER section 8.4.2's S3 pin.
+//
+// It is the unexported half deliberately: the only production caller is (*Group).ProtectBound, and
+// an exported door here would be a second way to seal an application message whose relationship to
+// the aad nothing checks. What the pin is held by is
+// TestTheSealRefusesWhenTheGenerationConsumedIsNotTheOneTheAadNames, which hands it a key source
+// that skips a generation -- the mutation MASTER section 8.4.2 names for this clause -- and
+// requires no octets to come back.
+func sealPrivateMessageBound(crypto CryptoProvider, keys MessageKeySource, senderDataSecret []byte,
+	authContent *AuthenticatedContent, padding []byte, boundGeneration uint32) (*PrivateMessage, error) {
+
+	message, generation, err := sealPrivateMessageAt(crypto, keys, senderDataSecret, authContent, padding)
+	if err != nil {
+		return nil, err
+	}
+	if generation != boundGeneration {
+		return nil, fmt.Errorf("%w: the aad names generation %d and the seal consumed generation %d",
+			errSealGenerationNotBound, boundGeneration, generation)
+	}
+	return message, nil
+}
+
+// sealPrivateMessageAt is the seal itself, and it REPORTS the generation it consumed.
+//
+// The report exists for one caller and one reason: MASTER section 8.4.2 term (3) puts the generation
+// inside aad_mls, the aad is an INPUT to the signature, and Protect chooses the generation INSIDE --
+// so the only way a sealer can keep the two in agreement is to be told which generation it actually
+// spent. Every other caller drops the value, which is why sealPrivateMessage above still exists at
+// its old arity rather than every call site in this package growing a blank.
+func sealPrivateMessageAt(crypto CryptoProvider, keys MessageKeySource, senderDataSecret []byte,
+	authContent *AuthenticatedContent, padding []byte) (*PrivateMessage, uint32, error) {
+
 	if crypto == nil {
-		return nil, fmt.Errorf("%w: the content and the sender data are two AEAD seals through it", ErrNilCryptoProvider)
+		return nil, 0, fmt.Errorf("%w: the content and the sender data are two AEAD seals through it", ErrNilCryptoProvider)
 	}
 	if keys == nil {
-		return nil, errNilMessageKeySource
+		return nil, 0, errNilMessageKeySource
 	}
 	if authContent == nil {
-		return nil, errNilAuthenticatedContent
+		return nil, 0, errNilAuthenticatedContent
 	}
 	if authContent.WireFormat != WireFormatPrivateMessage {
-		return nil, ErrWireFormatMismatch
+		return nil, 0, ErrWireFormatMismatch
 	}
 	content := &authContent.Content
 	// section 6.3.2 gives a PrivateMessage sender data a leaf_index and nothing else, so a non
@@ -1007,28 +1064,28 @@ func sealPrivateMessage(crypto CryptoProvider, keys MessageKeySource, senderData
 	// is refused here rather than encoded as leaf zero, which is a real member ratchet and
 	// would be a message sealed under somebody else keys.
 	if content.Sender.SenderType != SenderTypeMember {
-		return nil, ErrSenderNotMember
+		return nil, 0, ErrSenderNotMember
 	}
 
 	plaintext, err := marshalPrivateMessageContentWithPadding(content, &authContent.Auth, padding)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	var reuseGuard [senderDataReuseGuardSize]byte
 	copy(reuseGuard[:], crypto.Random(len(reuseGuard)))
 
 	key, nonce, generation, err := keys.NextMessageKey(content.ContentType, content.Sender.LeafIndex)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	aad, err := privateContentAAD(content.GroupId, content.Epoch, content.ContentType,
 		content.AuthenticatedData)
 	if err != nil {
-		return nil, err
+		return nil, generation, err
 	}
 	ciphertext, err := crypto.AeadSeal(key, applyReuseGuard(nonce, reuseGuard), aad, plaintext)
 	if err != nil {
-		return nil, err
+		return nil, generation, err
 	}
 	// forward secrecy: the generation this message was sealed under stops existing the moment
 	// the message exists. It is erased on the SUCCESS path only -- a seal that failed produced
@@ -1050,10 +1107,10 @@ func sealPrivateMessage(crypto CryptoProvider, keys MessageKeySource, senderData
 	}
 	encryptedSenderData, err := sealSenderData(crypto, senderDataSecret, senderData, message, ciphertext)
 	if err != nil {
-		return nil, err
+		return nil, generation, err
 	}
 	message.EncryptedSenderData = encryptedSenderData
-	return message, nil
+	return message, generation, nil
 }
 
 // OpenPrivateMessage decrypts a section 6.3 PrivateMessage and verifies the sender signature.
@@ -1102,23 +1159,43 @@ func sealPrivateMessage(crypto CryptoProvider, keys MessageKeySource, senderData
 func OpenPrivateMessage(crypto CryptoProvider, keys MessageKeySource, senderDataSecret []byte,
 	message *PrivateMessage, resolve SignatureKeyResolver, groupContext []byte) (*AuthenticatedContent, error) {
 
+	authContent, _, err := openPrivateMessageAt(crypto, keys, senderDataSecret, message, resolve, groupContext)
+	return authContent, err
+}
+
+// openPrivateMessageAt is the open itself, and it REPORTS the generation the frame was sealed at.
+//
+// WHY A CALLER ABOVE MLS WANTS IT, because RFC 9420 gives it no reason to. MASTER section 8.4.2 v2
+// puts the generation inside aad_mls, so section 8.4.3's R2 is a function of it: the record layer
+// has to rebuild the digest the sender signed, and one of its four terms is this number. It comes
+// out of the sender data the open has already had to decrypt in order to find the ratchet, so
+// reporting it costs nothing and derives nothing new.
+//
+// AND THE VALUE IT REPORTS IS THE ONE THE CONTENT ACTUALLY OPENED UNDER, which is the sentence that
+// makes the second (post-open) reading of the generation what it is. The content AEAD's key is
+// keyed on exactly this leaf and this generation, so a frame that opened at all opened at the
+// generation the sender data named -- see (*GroupSession).unframeBodyOnLoop for what that predicts
+// about the second reading, and MASTER section 8.4.3's owed deletion for the measurement.
+func openPrivateMessageAt(crypto CryptoProvider, keys MessageKeySource, senderDataSecret []byte,
+	message *PrivateMessage, resolve SignatureKeyResolver, groupContext []byte) (*AuthenticatedContent, uint32, error) {
+
 	if crypto == nil {
-		return nil, fmt.Errorf("%w: the sender data and the content are two AEAD opens through it", ErrNilCryptoProvider)
+		return nil, 0, fmt.Errorf("%w: the sender data and the content are two AEAD opens through it", ErrNilCryptoProvider)
 	}
 	if keys == nil {
-		return nil, errNilMessageKeySource
+		return nil, 0, errNilMessageKeySource
 	}
 	if message == nil {
-		return nil, errNilPrivateMessage
+		return nil, 0, errNilPrivateMessage
 	}
 	if resolve == nil {
-		return nil, errNilSignatureKeyResolver
+		return nil, 0, errNilSignatureKeyResolver
 	}
 
 	senderData, err := openSenderData(crypto, senderDataSecret, message.EncryptedSenderData,
 		message, message.Ciphertext)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	sender := Sender{SenderType: SenderTypeMember, LeafIndex: senderData.LeafIndex}
 
@@ -1131,24 +1208,24 @@ func OpenPrivateMessage(crypto CryptoProvider, keys MessageKeySource, senderData
 	// can replay.
 	key, nonce, err := keys.MessageKey(message.ContentType, senderData.LeafIndex, senderData.Generation)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	aad, err := privateContentAAD(message.GroupId, message.Epoch, message.ContentType,
 		message.AuthenticatedData)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	plaintext, err := crypto.AeadOpen(key, applyReuseGuard(nonce, senderData.ReuseGuard),
 		aad, message.Ciphertext)
 	if err != nil {
 		// p2 ErrAeadOpen never escapes: every open failure on this path is ValSem006, and
 		// distinguishing them would be a decryption oracle.
-		return nil, errDecryptFailed
+		return nil, 0, errDecryptFailed
 	}
 
 	content, auth, err := unmarshalPrivateMessageContent(plaintext, message, sender)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	authContent := &AuthenticatedContent{
 		WireFormat: WireFormatPrivateMessage,
@@ -1157,10 +1234,10 @@ func OpenPrivateMessage(crypto CryptoProvider, keys MessageKeySource, senderData
 	}
 	pub, err := resolve(sender)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if err := VerifyAuthenticatedContent(crypto, pub, authContent, groupContext); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	// LAST, AND IT IS THE ONLY STATEMENT ON THIS PATH THAT MOVES THIS LEAF'S RATCHET. Every
 	// refusal above leaves it exactly where it was -- including the two that come before the
@@ -1171,9 +1248,9 @@ func OpenPrivateMessage(crypto CryptoProvider, keys MessageKeySource, senderData
 	// a second open of one message. It is answered rather than swallowed, because swallowing it
 	// would accept that message twice.
 	if err := keys.CommitMessageKey(message.ContentType, senderData.LeafIndex, senderData.Generation); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	return authContent, nil
+	return authContent, senderData.Generation, nil
 }
 
 // errPeekWireFormat is what the pre-ratchet peek answers a caller holding octets that are not a
@@ -1182,12 +1259,22 @@ func OpenPrivateMessage(crypto CryptoProvider, keys MessageKeySource, senderData
 // one is about octets that never parsed.
 var errPeekWireFormat = errors.New("mls: the peeked message is not a PrivateMessage")
 
-// PeekPrivateMessageSender answers the two things about a marshalled PrivateMessage that can be
-// read WITHOUT touching a ratchet: the leaf its sender data names, and the authenticated_data its
-// header carries in the clear.
+// PeekPrivateMessageSender answers the THREE things about a marshalled PrivateMessage that can be
+// read WITHOUT touching a ratchet: the leaf its sender data names, the authenticated_data its
+// header carries in the clear, and the GENERATION its sender data names.
+//
+// THE GENERATION ARRIVED WITH MASTER SECTION 8.4.2 v2 ON 2026-09-17 AND IS NOT AN ADDITION FOR
+// CONVENIENCE. v2 puts u32(generation) inside aad_mls, so section 8.4.3's R2 -- "the frame's
+// authenticated_data is this record's own aad_mls" -- is now a function of it, and section 8.4.3's
+// R3 requires R1 and R2 to be DECIDED on a reading that steps no ratchet and erases no key. A peek
+// that answered the leaf and the aad but not the generation would leave the caller with a rule it
+// could only take after the open, which is after the erase: the refusal would be correct and the
+// denial channel would still be there. So the pre-ratchet reading must answer all three, and it
+// does so out of the SAME single sender data open -- no extra AEAD, no extra derivation, and still
+// no ratchet, because a ratchet is keyed on the leaf and the generation this call READS.
 //
 // WHY IT EXISTS, AND IT IS NOT A SECOND RECEIVE PATH. A caller above MLS may have refusals of its
-// own that are functions of those two fields -- connect/messagegroup's MASTER section 8.4.3 is
+// own that are functions of those fields -- connect/messagegroup's MASTER section 8.4.3 is
 // exactly that, one refusal on the sender leaf and one on the authenticated_data -- and a refusal
 // taken AFTER OpenPrivateMessage is a refusal taken after the erase. That is a denial channel even
 // when the erase itself is correctly placed, because a member can lift another member's genuine
@@ -1225,25 +1312,136 @@ var errPeekWireFormat = errors.New("mls: the peeked message is not a PrivateMess
 //     already answers storage of its own. That is a property of the CODEC and not of this call,
 //     and the callers of this one refuse on the value and then keep it, so the copy stays.
 func PeekPrivateMessageSender(crypto CryptoProvider, senderDataSecret []byte,
-	marshalled []byte) (senderLeaf LeafIndex, authenticatedData []byte, err error) {
+	marshalled []byte) (senderLeaf LeafIndex, authenticatedData []byte, generation uint32, err error) {
 
 	if crypto == nil {
-		return 0, nil, fmt.Errorf("%w: the sender data is one AEAD open through it", ErrNilCryptoProvider)
+		return 0, nil, 0, fmt.Errorf("%w: the sender data is one AEAD open through it", ErrNilCryptoProvider)
 	}
 	parsed, err := ParseMLSMessage(marshalled)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, 0, err
 	}
 	if parsed.WireFormat != WireFormatPrivateMessage || parsed.PrivateMessage == nil {
-		return 0, nil, fmt.Errorf("%w: wire format %d", errPeekWireFormat, parsed.WireFormat)
+		return 0, nil, 0, fmt.Errorf("%w: wire format %d", errPeekWireFormat, parsed.WireFormat)
 	}
 	message := parsed.PrivateMessage
 	senderData, err := openSenderData(crypto, senderDataSecret, message.EncryptedSenderData,
 		message, message.Ciphertext)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, 0, err
 	}
-	return senderData.LeafIndex, cloneBytes(message.AuthenticatedData), nil
+	return senderData.LeafIndex, cloneBytes(message.AuthenticatedData), senderData.Generation, nil
+}
+
+// errFramedLengthSuiteWidth is what FramedApplicationLength answers for a suite whose registered
+// signature width is zero.
+//
+// A zero Nsig is not a suite with short signatures; it is a SuiteParams that was assembled rather
+// than looked up, which is a shape this package's own tests produce (crypto_labels_test.go's
+// synthetic entry is one). Answering a length for it would answer a number 66 octets short of the
+// truth, and MASTER section 8.4.6's whole point is that a sealer refuses on this number BEFORE it
+// spends anything -- so a length that is quietly wrong admits a body it must then refuse late,
+// which is the defect this function exists to end.
+var errFramedLengthSuiteWidth = errors.New("mls: the suite registers no signature width, so no framed length can be derived")
+
+// FramedApplicationLength answers how many octets Protect emits for an application plaintext of
+// plaintextLen, WITHOUT sealing anything, signing anything or touching a ratchet.
+//
+// MASTER SECTION 8.4.6 IS WHY IT EXISTS. A sealer's early size refusal has to run on the FRAMED
+// length rather than on the caller's own, and it has to run BEFORE the stream index is reserved and
+// BEFORE the generation is spent -- so the length must be computable with no key material at all.
+// It is: section 8.4.4 measures that len(frame) depends on len(plaintext) alone for a given epoch,
+// because the AAD's VALUE cannot change any length and aad_mls's WIDTH is 32 octets at v1 and v2
+// alike.
+//
+// IT IS DERIVED BY BUILDING THE FRAME'S OWN STRUCTURES AND MARSHALLING THEM, and not by adding up
+// a table. MASTER section 8.4.6 forbids hard coding 193, 194, 196 and 198 -- those are the expected
+// ANSWER at ciphersuite 0x0003 with a 32 octet group id, for a second implementation to check
+// itself against -- and section 8.4.4 records that this corpus published three of those four
+// correctly and the fourth not at all for two days, because the ladder was measured by walking and
+// the step function beside it was derived by hand. A second assembly here would be the same mistake
+// with a compiler in front of it: RFC 9420's varint widens at 64 and at 16,384 in TWO nested
+// places, and the arithmetic that gets it wrong still compiles. What this body does instead is run
+// the same marshaller the seal runs, over placeholder octets of exactly the widths the real values
+// have, so there is no arithmetic to be wrong.
+//
+// THE THREE WIDTHS IT TAKES FROM THE SUITE are the tag (Nt, twice -- the sender data and the
+// content are two AEADs) and the signature (Nsig). Everything else is a length the caller supplies
+// or a fixed field of section 6.3's structures.
+//
+// WHAT IT COSTS is two buffers the size of the frame per call, which is the price of the answer
+// being the marshaller's rather than a formula's. It runs once per application seal, in front of
+// the reservation, and against what it replaces -- a body that walked the whole seal and was
+// refused after a write once index and a write once MLS generation had been spent -- that is not a
+// cost worth optimising blind. TestTheDerivedFramedLengthIsTheLengthProtectActuallyEmits is what
+// says it agrees with the seal here, swept across both varint boundaries; connect/messagegroup
+// runs the same sweep over a real two member group and reads MASTER section 8.4.4's four step
+// overhead off it.
+func FramedApplicationLength(suite CipherSuite, groupIdLen int, aadLen int, plaintextLen int) (int, error) {
+	params, err := LookupSuite(suite)
+	if err != nil {
+		return 0, err
+	}
+	return framedApplicationLengthFor(params, groupIdLen, aadLen, plaintextLen)
+}
+
+// framedApplicationLengthFor is the derivation over parameters the caller already holds.
+//
+// It is split from the lookup so the suite width refusal below is REACHABLE: every registered suite
+// carries an Nsig, so a body that only ever saw registry entries could not be handed a zero, and a
+// guard nothing can fire is a guard nobody has looked at. This package assembles SuiteParams by
+// hand in its own tests -- crypto_labels_test.go's synthetic entry is one -- which is exactly the
+// shape a zero arrives in.
+func framedApplicationLengthFor(params *SuiteParams, groupIdLen int, aadLen int,
+	plaintextLen int) (int, error) {
+
+	if params == nil {
+		return 0, fmt.Errorf("%w: no suite parameters", errFramedLengthSuiteWidth)
+	}
+	if params.Nsig <= 0 {
+		return 0, fmt.Errorf("%w: suite %#04x", errFramedLengthSuiteWidth, uint16(params.Suite))
+	}
+	if groupIdLen < 0 || aadLen < 0 || plaintextLen < 0 {
+		return 0, fmt.Errorf("%w: group id %d, aad %d, plaintext %d octets",
+			ErrInvalidPaddingSize, groupIdLen, aadLen, plaintextLen)
+	}
+	// section 6.3.1's PrivateMessageContent, through the serializer the seal uses: the content
+	// arm, then the auth data, then PaddingSizeV1's padding. The signature is placeholder octets
+	// of the suite's own width, which is the only thing about it any length depends on.
+	contentPlaintext, err := marshalPrivateMessageContentWithPadding(
+		&FramedContent{
+			GroupId:         make([]byte, groupIdLen),
+			Sender:          Sender{SenderType: SenderTypeMember},
+			ContentType:     ContentTypeApplication,
+			ApplicationData: make([]byte, plaintextLen),
+		},
+		&FramedContentAuthData{Signature: make([]byte, params.Nsig)},
+		make([]byte, PaddingSizeV1))
+	if err != nil {
+		return 0, err
+	}
+	// section 6.3.2's SenderData is three fixed width fields, so its marshalled length does not
+	// depend on the values -- and it is marshalled rather than counted for that reason rather
+	// than in spite of it: a field added to SenderData moves this with it.
+	senderDataPlaintext, err := syntax.Marshal(&SenderData{})
+	if err != nil {
+		return 0, err
+	}
+	frame, err := MarshalMLSMessage(&MLSMessage{
+		Version:    ProtocolVersionMls10,
+		WireFormat: WireFormatPrivateMessage,
+		PrivateMessage: &PrivateMessage{
+			GroupId:             make([]byte, groupIdLen),
+			ContentType:         ContentTypeApplication,
+			AuthenticatedData:   make([]byte, aadLen),
+			EncryptedSenderData: make([]byte, len(senderDataPlaintext)+params.Nt),
+			Ciphertext:          make([]byte, len(contentPlaintext)+params.Nt),
+		},
+	})
+	if err != nil {
+		return 0, err
+	}
+	return len(frame), nil
 }
 
 // ---------------------------------------------------------------------------

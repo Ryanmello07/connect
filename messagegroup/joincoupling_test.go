@@ -136,7 +136,7 @@ func TestTheJoinLeavesThisDeviceAndItsNewHandleAbleToWork(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the joined handle's Protect: %v", err)
 	}
-	aadBack, plainBack, senderLeaf, err := fixture.handle.Unprotect(protected)
+	aadBack, plainBack, senderLeaf, _, err := fixture.handle.Unprotect(protected)
 	if err != nil {
 		t.Fatalf("the founder opening a record the joiner sealed: %v. The joiner's group signed it with a key the founder cannot verify against the signature_key the joiner's own leaf names -- the join retained the material's SignPrivate rather than cloning it, and the deferred erase reached the group",
 			err)
@@ -354,7 +354,7 @@ func TestTheFounderSurvivesFoundingAndClosingItsOwnGroup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the founder's Protect in the group it founded after the close: %v", err)
 	}
-	aadBack, plainBack, senderLeaf, err := joined.Unprotect(protected)
+	aadBack, plainBack, senderLeaf, _, err := joined.Unprotect(protected)
 	if err != nil {
 		t.Fatalf("the peer opening a record this device sealed after founding and closing a group: %v. The peer verifies the signature against the signature_key the sender's own leaf names, so this is the founder having stopped being able to sign as itself",
 			err)

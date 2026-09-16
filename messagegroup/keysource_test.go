@@ -160,6 +160,7 @@
 package messagegroup
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/binary"
@@ -197,6 +198,7 @@ const (
 	keySourceRecordKeyNextInfo = "ratchet/v1"
 	keySourceAeadHeadInfo      = "rec/v1/head"
 	keySourceAeadBodyInfo      = "rec/v1/body"
+	keySourceHeadBindInfo      = "rec/v1/head-bind"
 	keySourceWriteKeyInfo      = "write/v1"
 )
 
@@ -206,6 +208,10 @@ const (
 	keySourceAadHeadLabel   = "URmessage/v1/aad/head"
 	keySourceAadBodyLabel   = "URmessage/v1/aad/body"
 	keySourceWriteAuthLabel = "URmessage/v1/write"
+	// MASTER section 8.4.2 v2's label, transcribed. THE LABEL IS THE VERSION: there is no wire
+	// signal and format_version deliberately does not bump, so a v2 preimage built under v1's
+	// label is a build that agrees with the wrong half of the world in silence.
+	keySourceAadMlsLabel = "URmessage/v2/aad/mls"
 )
 
 // The widths and the two code points, transcribed.
@@ -280,6 +286,19 @@ type keySourceShape struct {
 	// nothing here reads an octet of it. MASTER section 8.4, and the file header says at
 	// length why it is injected rather than derived and what that costs.
 	innerFrame []byte
+	// the GENERATION that frame was sealed at and the authenticated_data it carries in the
+	// clear, both read off the frame by the fixture. Neither is a key and neither is secret:
+	// the generation is four octets of a header sealed under a GROUP SHARED secret, and the
+	// authenticated_data is a cleartext field of the frame anybody holding the record can read.
+	//
+	// THEY ARRIVED WITH MASTER SECTION 8.4.2 v2 ON 2026-09-17 and they are here for ledger item
+	// 206: v2 adds ONE new keyed octet-producer to the record path -- head_commit, an HMAC under
+	// a key expanded from this record's own rung -- and a reproduction that accepted it inside
+	// the injected frame would be the one thing the CP3b property does not cover. With these two
+	// the reproduction recomputes head_commit from its OWN ladder and rebuilds the whole 160
+	// octet preimage, so the new key is inside the same statement as every other one.
+	generation uint32
+	frameAad   []byte
 }
 
 // keySourceReproduction is what the three values alone produce: the record's two ciphertexts,
@@ -293,6 +312,13 @@ type keySourceReproduction struct {
 	bodyHash     [32]byte
 	ctHead       []byte
 	writeAuth    [32]byte
+	// MASTER section 8.4.2 v2's fourth preimage term and the digest it goes into, both rebuilt
+	// from this reproduction's OWN rung. They are not octets of the record -- the digest travels
+	// inside the frame, which is injected -- so they are not part of the four comparisons above;
+	// what they are is ledger item 206's clause, and the test that reads them compares them
+	// against the frame the sealer actually emitted.
+	headBind [32]byte
+	innerAad [32]byte
 }
 
 // reproduceRecordFromTheExporterOutput rebuilds one whole sealed record from mls_secret,
@@ -420,12 +446,31 @@ func reproduceRecordFromTheExporterOutput(t *testing.T, mlsSecret []byte, pqSecr
 	mac := hmac.New(sha256.New, writeKey)
 	mac.Write(preimage)
 
+	// MASTER section 8.4.2 v2's third and fourth terms, rebuilt from THIS reproduction's own
+	// rung. head_bind_key is a fourth expansion off record_key[i] -- beside key_head, nonce_head,
+	// key_body and nonce_body -- and head_commit is HMAC-SHA-256 under it over the head plaintext
+	// exactly as it is sealed into ct_head, with no length prefix and no re-encoding.
+	headBindKey := keyScheduleReferenceExpand(recordKey, []byte(keySourceHeadBindInfo), keySourceKeyBytes)
+	headBinder := hmac.New(sha256.New, headBindKey)
+	headBinder.Write(shape.headPlain)
+	headBound := [32]byte(headBinder.Sum(nil))
+	// and the 160 octet preimage: the 20 octet label, AAD_body's own 104 octets, four BIG ENDIAN
+	// octets of generation and the 32 octet commitment, with no separator and no padding.
+	innerAadPreimage := keySourceJoin(
+		[]byte(keySourceAadMlsLabel),
+		aadBody,
+		keySourceU32(shape.generation),
+		headBound[:],
+	)
+
 	return keySourceReproduction{
 		senderHandle: senderHandle,
 		ctBody:       ctBody,
 		bodyHash:     bodyHash,
 		ctHead:       ctHead,
 		writeAuth:    [32]byte(mac.Sum(nil)),
+		headBind:     headBound,
+		innerAad:     sha256.Sum256(innerAadPreimage),
 	}
 }
 
@@ -463,6 +508,12 @@ func keySourceU64(v uint64) []byte {
 	return binary.BigEndian.AppendUint64(nil, v)
 }
 
+// u32, BIG ENDIAN, which MASTER section 8.4.2's term (3) fixes and which is the width RFC 9420
+// gives SenderData.generation. Written out here for the reason every other encoder in this file is.
+func keySourceU32(v uint32) []byte {
+	return binary.BigEndian.AppendUint32(nil, v)
+}
+
 func keySourceIsCommitByte(isCommit bool) byte {
 	if isCommit {
 		return 1
@@ -486,7 +537,7 @@ func keySourceJoin(parts ...[]byte) []byte {
 // read without a key -- and the two fields that are NOT such values, sender_handle and
 // body_hash, have nowhere in the shape to go.
 func keySourceShapeOf(t *testing.T, record *message.Record, leaf uint32,
-	headPlain []byte, innerFrame []byte) keySourceShape {
+	headPlain []byte, innerFrame []byte, generation uint32, frameAad []byte) keySourceShape {
 
 	t.Helper()
 	header := record.Header
@@ -531,6 +582,8 @@ func keySourceShapeOf(t *testing.T, record *message.Record, leaf uint32,
 		attachment:    header.ServerAttachment,
 		headPlain:     headPlain,
 		innerFrame:    innerFrame,
+		generation:    generation,
+		frameAad:      frameAad,
 	}
 }
 
@@ -568,6 +621,11 @@ type keySourceSealed struct {
 	// header for what this binds and what it stopped binding.
 	openRefusals               []string
 	openRefusedAtTheInnerFrame []bool
+	// the generation each frame was sealed at and the authenticated_data each carries in the
+	// clear, read off the frame by the fixture. Neither is a key; see keySourceShape's own note
+	// and ledger item 206 for why v2 makes them necessary.
+	frameGenerations []uint32
+	frameAads        [][]byte
 }
 
 // The head plaintext is EIGHTEEN octets on every record, so ct_head is thirty four, and every
@@ -623,6 +681,14 @@ func keySourceSealRecords(t *testing.T, name string) *keySourceSealed {
 		// derives its rung from the exporter through RFC 5869 -- would rebuild a different
 		// ct_body and go red.
 		inner := keySourceInnerFrameOf(t, fixture, record)
+		// THE FIFTH AND SIXTH INJECTED VALUES, read off that frame here and nowhere else. The
+		// peek opens the frame's sender data under a secret every member of the group holds and
+		// reads the cleartext authenticated_data beside it; neither answer is a key and neither
+		// is something the reproduction could compute, which is exactly server_nonce's standing.
+		_, frameAad, frameGeneration, err := peekInnerFrameSender(fixture.handle, inner)
+		if err != nil {
+			t.Fatalf("peek the inner frame of record %d: %v", i, err)
+		}
 		// THE OPEN HALF OF THE CLASS, run HERE for the same reason, and it is a REFUSAL now. A
 		// member has no receiving ratchet for its own leaf, so this one member fixture cannot
 		// open the frame it sealed (open item MG-4). What the refusal still binds is in (6) of
@@ -636,6 +702,8 @@ func keySourceSealRecords(t *testing.T, name string) *keySourceSealed {
 		sealed.openRefusals = append(sealed.openRefusals, fmt.Sprint(openErr))
 		sealed.openRefusedAtTheInnerFrame = append(sealed.openRefusedAtTheInnerFrame,
 			errors.Is(openErr, ErrRecordInnerFrame))
+		sealed.frameGenerations = append(sealed.frameGenerations, frameGeneration)
+		sealed.frameAads = append(sealed.frameAads, frameAad)
 	}
 	// the group's OWN exporter, under the label MASTER section 7 names, at the width it names.
 	// This is the one secret the reproduction is handed, and it comes off the real mls.Group the
@@ -674,7 +742,8 @@ func (self *keySourceSealed) reproduceOverFrame(t *testing.T, i int, mlsSecret [
 	inner []byte) keySourceReproduction {
 
 	t.Helper()
-	shape := keySourceShapeOf(t, self.records[i], self.leaf, self.heads[i], inner)
+	shape := keySourceShapeOf(t, self.records[i], self.leaf, self.heads[i], inner,
+		self.frameGenerations[i], self.frameAads[i])
 	return reproduceRecordFromTheExporterOutput(t, mlsSecret, self.pqSecret, self.serverNonce, shape)
 }
 
@@ -1855,4 +1924,66 @@ func TestTheFixtureCanHandTheReproductionNothingItCouldSealWith(t *testing.T) {
 			subject)
 	}
 	t.Logf("%d fields on the boundary, %d of them reaching the module: %v", fields, len(carrying), carrying)
+}
+
+// TestTheReproductionRecomputesHeadCommitFromItsOwnLadder is ledger item 206's owed clause, and it
+// is the one thing v2 adds that the four comparisons above cannot see.
+//
+// WHAT v2 ADDED, and why it is exactly one thing. MASTER section 8.4.2's term (4) is
+// head_commit = HMAC-SHA-256(HKDF-Expand(record_key[i], "rec/v1/head-bind", 32), head_plain) -- a
+// FIFTH expansion off the same rung that already produces key_head, nonce_head, key_body and
+// nonce_body, and the only new keyed octet-producer on the record path since this file was
+// written. It travels inside the aad_mls digest, which travels inside the FRAME, and the frame is
+// an injected opaque blob here -- so a reproduction that accepted it as it stands would be
+// accepting the one key it is supposed to be reproducing.
+//
+// SO IT IS RECOMPUTED. The reproduction derives its own storage root, its own class key and its own
+// rung from the exporter output through RFC 5869 written out, expands head_bind_key under the
+// transcribed label, macs the head plaintext, and rebuilds the whole 160 octet preimage: the 20
+// octet label, AAD_body's own 104 octets, four big endian octets of generation and the 32 octet
+// commitment. What it is compared against is the authenticated_data the SEALER actually put on the
+// wire, read off the frame by the fixture.
+//
+// THAT COMPARISON IS THE STATEMENT. If head_bind_key came from anywhere but record_key[i] -- a
+// constant, a second exporter label, an entropy draw, a leftover rung -- the digest the sealer
+// signed would not be the digest this rebuilds, and this goes red. The negative control beside it
+// is the same one the rest of this file uses: flipping a bit of the exporter output must move it.
+func TestTheReproductionRecomputesHeadCommitFromItsOwnLadder(t *testing.T) {
+	sealed := keySourceSealRecords(t, "head-commit-from-the-ladder")
+	for i := range sealed.records {
+		got := sealed.reproduce(t, i, sealed.mlsSecret)
+		if len(sealed.frameAads[i]) != 32 {
+			t.Fatalf("record %d's frame carries %d octets of authenticated_data and aad_mls is 32",
+				i, len(sealed.frameAads[i]))
+		}
+		if !bytes.Equal(got.innerAad[:], sealed.frameAads[i]) {
+			t.Errorf("record %d: the reproduction rebuilt aad_mls as %x and the frame the sealer emitted carries %x; head_commit is the only term of that preimage this file derives a KEY for, so a disagreement is a key that did not come from the exporter",
+				i, got.innerAad, sealed.frameAads[i])
+		}
+	}
+
+	// THE NEGATIVE CONTROL, which is what says the comparison is capable of failing: a single bit
+	// of the exporter output moves the rung, so it moves head_bind_key, so it moves head_commit,
+	// so it moves the digest. Every bit, for the reason the sweep next door gives.
+	base := sealed.reproduce(t, 0, sealed.mlsSecret)
+	moved := 0
+	for bit := 0; bit < len(sealed.mlsSecret)*8; bit += 1 {
+		flipped := append([]byte(nil), sealed.mlsSecret...)
+		flipped[bit/8] ^= 1 << (bit % 8)
+		got := sealed.reproduce(t, 0, flipped)
+		if got.headBind == base.headBind {
+			t.Errorf("bit %d of the exporter output does not reach head_commit", bit)
+			continue
+		}
+		if got.innerAad == base.innerAad {
+			t.Errorf("bit %d of the exporter output does not reach aad_mls", bit)
+			continue
+		}
+		moved += 1
+	}
+	if moved != len(sealed.mlsSecret)*8 {
+		t.Errorf("%d of %d bits of the exporter output move head_commit", moved, len(sealed.mlsSecret)*8)
+	}
+	t.Logf("aad_mls rebuilt from the exporter output for %d records, and all %d bits of it move head_commit",
+		len(sealed.records), moved)
 }

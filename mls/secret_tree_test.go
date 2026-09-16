@@ -2166,17 +2166,17 @@ func TestReceiverKeyOutOfOrderUsesTheWindow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSecretTree: %v", err)
 	}
-	got3, _, err := receiver.ReceiverKey(5, RatchetHandshake, 3)
+	got3, _, err := receiver.receiverKey(5, RatchetHandshake, 3)
 	if err != nil {
-		t.Fatalf("ReceiverKey(3): %v", err)
+		t.Fatalf("receiverKey(3): %v", err)
 	}
 	if !bytes.Equal(got3, expected[3]) {
 		t.Fatalf("generation 3 key mismatch")
 	}
 	for _, generation := range []uint32{0, 1, 2} {
-		got, _, err := receiver.ReceiverKey(5, RatchetHandshake, generation)
+		got, _, err := receiver.receiverKey(5, RatchetHandshake, generation)
 		if err != nil {
-			t.Fatalf("ReceiverKey(%d): %v", generation, err)
+			t.Fatalf("receiverKey(%d): %v", generation, err)
 		}
 		if !bytes.Equal(got, expected[generation]) {
 			t.Fatalf("generation %d key mismatch", generation)
@@ -2196,21 +2196,21 @@ func TestReceiverKeyIsSingleUse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSecretTree: %v", err)
 	}
-	if _, _, err := tree.ReceiverKey(1, RatchetApplication, 0); err != nil {
-		t.Fatalf("ReceiverKey: %v", err)
+	if _, _, err := tree.receiverKey(1, RatchetApplication, 0); err != nil {
+		t.Fatalf("receiverKey: %v", err)
 	}
-	if _, _, err := tree.ReceiverKey(1, RatchetApplication, 0); !errors.Is(err, ErrRatchetGenerationConsumed) {
+	if _, _, err := tree.receiverKey(1, RatchetApplication, 0); !errors.Is(err, ErrRatchetGenerationConsumed) {
 		t.Fatalf("err = %v, want ErrRatchetGenerationConsumed", err)
 	}
 	// and the same for a generation that came out of the WINDOW rather than off the head,
 	// which is the path with the delete in it.
-	if _, _, err := tree.ReceiverKey(1, RatchetApplication, 4); err != nil {
-		t.Fatalf("ReceiverKey(4): %v", err)
+	if _, _, err := tree.receiverKey(1, RatchetApplication, 4); err != nil {
+		t.Fatalf("receiverKey(4): %v", err)
 	}
-	if _, _, err := tree.ReceiverKey(1, RatchetApplication, 2); err != nil {
-		t.Fatalf("ReceiverKey(2) out of the window: %v", err)
+	if _, _, err := tree.receiverKey(1, RatchetApplication, 2); err != nil {
+		t.Fatalf("receiverKey(2) out of the window: %v", err)
 	}
-	if _, _, err := tree.ReceiverKey(1, RatchetApplication, 2); !errors.Is(err, ErrRatchetGenerationConsumed) {
+	if _, _, err := tree.receiverKey(1, RatchetApplication, 2); !errors.Is(err, ErrRatchetGenerationConsumed) {
 		t.Fatalf("a window generation was handed out twice: err = %v, want ErrRatchetGenerationConsumed", err)
 	}
 }
@@ -2233,12 +2233,12 @@ func TestReceiverKeyRefusesUnboundedSkip(t *testing.T) {
 		t.Fatalf("NewSecretTree: %v", err)
 	}
 	refusals := uint32(0)
-	_, _, err = tree.ReceiverKey(1, RatchetApplication, MaxGenerationSkip+1)
+	_, _, err = tree.receiverKey(1, RatchetApplication, MaxGenerationSkip+1)
 	if !errors.Is(err, ErrRatchetGenerationTooFarAhead) {
 		t.Fatalf("err = %v, want ErrRatchetGenerationTooFarAhead", err)
 	}
 	refusals += 1
-	if _, _, err := tree.ReceiverKey(1, RatchetApplication, ^uint32(0)); !errors.Is(err, ErrRatchetGenerationTooFarAhead) {
+	if _, _, err := tree.receiverKey(1, RatchetApplication, ^uint32(0)); !errors.Is(err, ErrRatchetGenerationTooFarAhead) {
 		t.Fatalf("err = %v, want ErrRatchetGenerationTooFarAhead", err)
 	}
 	refusals += 1
@@ -2845,7 +2845,7 @@ func TestNoTwoRatchetsShareAKeyNoncePairAtAnyGeneration(t *testing.T) {
 // the receiving path must reach the SAME key the sending path produced for that leaf and
 // that type, and a different one for every other leaf and type.
 //
-// The negative half is what makes it a routing test rather than a round trip. A ReceiverKey
+// The negative half is what makes it a routing test rather than a round trip. A receiverKey
 // that ignored its leaf argument would agree with a sender for one leaf and be wrong for the
 // other seven, and a round trip over a single leaf reports that as green.
 func TestSenderAndReceiverAgreeForEveryLeafAndKindAndDisagreeAcrossThem(t *testing.T) {
@@ -2884,9 +2884,9 @@ func TestSenderAndReceiverAgreeForEveryLeafAndKindAndDisagreeAcrossThem(t *testi
 		if err != nil {
 			t.Fatalf("NewSecretTree: %v", err)
 		}
-		key, nonce, err := receiver.ReceiverKey(at.leaf, at.kind, at.generation)
+		key, nonce, err := receiver.receiverKey(at.leaf, at.kind, at.generation)
 		if err != nil {
-			t.Fatalf("ReceiverKey(%d, %d, %d): %v", at.leaf, at.kind, at.generation, err)
+			t.Fatalf("receiverKey(%d, %d, %d): %v", at.leaf, at.kind, at.generation, err)
 		}
 		if got := append(append([]byte(nil), key...), nonce...); !bytes.Equal(got, want) {
 			t.Fatalf("leaf %d kind %d generation %d: the receiver derived %x and the sender produced %x",
@@ -3000,9 +3000,9 @@ func TestRatchetReadsItsKeyAndNonceWidthsOffTheProviderItWasHanded(t *testing.T)
 	if err != nil {
 		t.Fatalf("NewSecretTree: %v", err)
 	}
-	gotKey, gotNonce, err := receiver.ReceiverKey(5, RatchetApplication, 0)
+	gotKey, gotNonce, err := receiver.receiverKey(5, RatchetApplication, 0)
 	if err != nil {
-		t.Fatalf("ReceiverKey: %v", err)
+		t.Fatalf("receiverKey: %v", err)
 	}
 	if len(gotKey) != nk || len(gotNonce) != nn {
 		t.Fatalf("the receiver produced a %d byte key and a %d byte nonce, want %d and %d", len(gotKey), len(gotNonce), nk, nn)
@@ -3023,10 +3023,10 @@ func TestRatchetReadsItsKeyAndNonceWidthsOffTheProviderItWasHanded(t *testing.T)
 // thousand messages of an epoch.
 func TestReceiverKeySkipBoundIsExactlyMaxGenerationSkip(t *testing.T) {
 	tree := stNewTree(t, 8)
-	if _, _, err := tree.ReceiverKey(1, RatchetApplication, MaxGenerationSkip); err != nil {
+	if _, _, err := tree.receiverKey(1, RatchetApplication, MaxGenerationSkip); err != nil {
 		t.Fatalf("a skip of exactly MaxGenerationSkip (%d) was refused: %v", MaxGenerationSkip, err)
 	}
-	if _, _, err := tree.ReceiverKey(3, RatchetApplication, MaxGenerationSkip+1); !errors.Is(err, ErrRatchetGenerationTooFarAhead) {
+	if _, _, err := tree.receiverKey(3, RatchetApplication, MaxGenerationSkip+1); !errors.Is(err, ErrRatchetGenerationTooFarAhead) {
 		t.Fatalf("a skip of MaxGenerationSkip+1 (%d) answered %v, want ErrRatchetGenerationTooFarAhead", MaxGenerationSkip+1, err)
 	}
 	// leaf 1's head is now one past the generation it served, and the same distance ahead of
@@ -3038,7 +3038,7 @@ func TestReceiverKeySkipBoundIsExactlyMaxGenerationSkip(t *testing.T) {
 	if head != MaxGenerationSkip+1 {
 		t.Fatalf("the head is %d after serving generation %d", head, MaxGenerationSkip)
 	}
-	if _, _, err := tree.ReceiverKey(1, RatchetApplication, head+MaxGenerationSkip); err != nil {
+	if _, _, err := tree.receiverKey(1, RatchetApplication, head+MaxGenerationSkip); err != nil {
 		t.Fatalf("a skip of MaxGenerationSkip from a head of %d was refused: %v", head, err)
 	}
 	moved, err := tree.SenderGeneration(1, RatchetApplication)
@@ -3048,7 +3048,7 @@ func TestReceiverKeySkipBoundIsExactlyMaxGenerationSkip(t *testing.T) {
 	if moved <= head {
 		t.Fatalf("the head did not move past %d, so the check below is the same one as above", head)
 	}
-	if _, _, err := tree.ReceiverKey(1, RatchetApplication, moved+MaxGenerationSkip+1); !errors.Is(err, ErrRatchetGenerationTooFarAhead) {
+	if _, _, err := tree.receiverKey(1, RatchetApplication, moved+MaxGenerationSkip+1); !errors.Is(err, ErrRatchetGenerationTooFarAhead) {
 		t.Fatalf("a skip of MaxGenerationSkip+1 from a head of %d answered %v, want ErrRatchetGenerationTooFarAhead", moved, err)
 	}
 }
@@ -3085,8 +3085,8 @@ func TestReceiverKeyWindowIsBoundedAndEvictsTheOldest(t *testing.T) {
 	head := uint32(0)
 	for range hops {
 		asked := head + MaxGenerationSkip
-		if _, _, err := tree.ReceiverKey(leaf, kind, asked); err != nil {
-			t.Fatalf("ReceiverKey(%d): %v", asked, err)
+		if _, _, err := tree.receiverKey(leaf, kind, asked); err != nil {
+			t.Fatalf("receiverKey(%d): %v", asked, err)
 		}
 		requested = append(requested, asked)
 		head = asked + 1
@@ -3121,10 +3121,10 @@ func TestReceiverKeyWindowIsBoundedAndEvictsTheOldest(t *testing.T) {
 	// and the eviction is visible through the API rather than only in the field: the oldest
 	// skipped generation now reads as consumed, which is the visible gap the product needs,
 	// and the newest retained one is still usable.
-	if _, _, err := tree.ReceiverKey(leaf, kind, skipped[0]); !errors.Is(err, ErrRatchetGenerationConsumed) {
+	if _, _, err := tree.receiverKey(leaf, kind, skipped[0]); !errors.Is(err, ErrRatchetGenerationConsumed) {
 		t.Fatalf("generation %d survived a window that overflowed: err = %v", skipped[0], err)
 	}
-	if _, _, err := tree.ReceiverKey(leaf, kind, want[len(want)-1]); err != nil {
+	if _, _, err := tree.receiverKey(leaf, kind, want[len(want)-1]); err != nil {
 		t.Fatalf("the newest retained generation %d was not usable: %v", want[len(want)-1], err)
 	}
 }
@@ -3145,8 +3145,8 @@ func TestReceiverKeyWindowStaysBoundedUnderARepeatedMaximalSkip(t *testing.T) {
 	head := uint32(0)
 	for at := range rounds {
 		asked := head + MaxGenerationSkip
-		if _, _, err := tree.ReceiverKey(leaf, kind, asked); err != nil {
-			t.Fatalf("ReceiverKey(%d): %v", asked, err)
+		if _, _, err := tree.receiverKey(leaf, kind, asked); err != nil {
+			t.Fatalf("receiverKey(%d): %v", asked, err)
 		}
 		head = asked + 1
 		if len(r.window) > RatchetWindowSize {
@@ -3175,8 +3175,8 @@ func TestSecretTreeZeroizeLeavesNoRatchetOrWindowSecretAnywhereOnTheType(t *test
 	if _, _, _, err := tree.NextSenderKey(0, RatchetApplication); err != nil {
 		t.Fatalf("NextSenderKey: %v", err)
 	}
-	if _, _, err := tree.ReceiverKey(2, RatchetHandshake, 6); err != nil {
-		t.Fatalf("ReceiverKey: %v", err)
+	if _, _, err := tree.receiverKey(2, RatchetHandshake, 6); err != nil {
+		t.Fatalf("receiverKey: %v", err)
 	}
 
 	targets := map[string]string{}
@@ -3329,8 +3329,8 @@ func TestZeroizeIsIdempotentAndRefusesEveryLaterDerivation(t *testing.T) {
 			if _, _, _, err := tree.NextSenderKey(leaf, kind); !errors.Is(err, ErrEpochErased) {
 				t.Errorf("NextSenderKey(%d, %d) after Zeroize answered %v, want ErrEpochErased", leaf, kind, err)
 			}
-			if _, _, err := tree.ReceiverKey(leaf, kind, 0); !errors.Is(err, ErrEpochErased) {
-				t.Errorf("ReceiverKey(%d, %d, 0) after Zeroize answered %v, want ErrEpochErased", leaf, kind, err)
+			if _, _, err := tree.receiverKey(leaf, kind, 0); !errors.Is(err, ErrEpochErased) {
+				t.Errorf("receiverKey(%d, %d, 0) after Zeroize answered %v, want ErrEpochErased", leaf, kind, err)
 			}
 			if _, err := tree.SenderGeneration(leaf, kind); !errors.Is(err, ErrEpochErased) {
 				t.Errorf("SenderGeneration(%d, %d) after Zeroize answered %v, want ErrEpochErased", leaf, kind, err)
@@ -3442,8 +3442,8 @@ func TestSenderAndReceiverPathsShareOneRatchetPerLeafAndKind(t *testing.T) {
 	}
 	// generation 0 has been handed out already, so the receiving path must call it consumed
 	// rather than deriving it a second time from a ratchet of its own.
-	if _, _, err := tree.ReceiverKey(4, RatchetApplication, 0); !errors.Is(err, ErrRatchetGenerationConsumed) {
-		t.Fatalf("ReceiverKey(0) after the sender took it answered %v, want ErrRatchetGenerationConsumed", err)
+	if _, _, err := tree.receiverKey(4, RatchetApplication, 0); !errors.Is(err, ErrRatchetGenerationConsumed) {
+		t.Fatalf("receiverKey(0) after the sender took it answered %v, want ErrRatchetGenerationConsumed", err)
 	}
 	// and the other type of the same leaf is untouched by all of it.
 	if other, err := tree.SenderGeneration(4, RatchetHandshake); err != nil || other != 0 {
@@ -3463,8 +3463,8 @@ func TestEvictedWindowKeysAreErasedInPlace(t *testing.T) {
 	tree := stNewTree(t, 8)
 	const leaf = LeafIndex(1)
 	const kind = RatchetApplication
-	if _, _, err := tree.ReceiverKey(leaf, kind, MaxGenerationSkip); err != nil {
-		t.Fatalf("ReceiverKey(%d): %v", MaxGenerationSkip, err)
+	if _, _, err := tree.receiverKey(leaf, kind, MaxGenerationSkip); err != nil {
+		t.Fatalf("receiverKey(%d): %v", MaxGenerationSkip, err)
 	}
 	r, err := tree.ratchetFor(leaf, kind)
 	if err != nil {
@@ -3491,8 +3491,8 @@ func TestEvictedWindowKeysAreErasedInPlace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SenderGeneration: %v", err)
 	}
-	if _, _, err := tree.ReceiverKey(leaf, kind, head+extra); err != nil {
-		t.Fatalf("ReceiverKey(%d): %v", head+extra, err)
+	if _, _, err := tree.receiverKey(leaf, kind, head+extra); err != nil {
+		t.Fatalf("receiverKey(%d): %v", head+extra, err)
 	}
 
 	evicted, survived := 0, 0
@@ -3530,8 +3530,8 @@ func TestZeroizeErasesTheRetainedWindowKeysInPlace(t *testing.T) {
 	tree := stNewTree(t, 8)
 	const leaf = LeafIndex(2)
 	const kind = RatchetHandshake
-	if _, _, err := tree.ReceiverKey(leaf, kind, 6); err != nil {
-		t.Fatalf("ReceiverKey: %v", err)
+	if _, _, err := tree.receiverKey(leaf, kind, 6); err != nil {
+		t.Fatalf("receiverKey: %v", err)
 	}
 	r, err := tree.ratchetFor(leaf, kind)
 	if err != nil {
@@ -3678,7 +3678,7 @@ func stRetainedByteCount(t *testing.T, tree *SecretTree) int {
 	return total
 }
 
-// stForgeAHeaderPerRatchet drives one maximal forged ReceiverKey skip at every leaf of every
+// stForgeAHeaderPerRatchet drives one maximal forged receiverKey skip at every leaf of every
 // kind, which is what an unauthenticated peer can do with nothing but a leaf index and a
 // generation number: ratchetFor -- and so takeLeafSecret -- runs before any generation check
 // and before any AEAD, so every one of these is served far enough to fill a window.
@@ -3691,7 +3691,7 @@ func stForgeAHeaderPerRatchet(t *testing.T, tree *SecretTree, leafCount LeafCoun
 	reached := 0
 	for _, leaf := range stLeavesOf(t, leafCount) {
 		for _, kind := range kinds {
-			if _, _, err := tree.ReceiverKey(leaf, kind, MaxGenerationSkip); err != nil {
+			if _, _, err := tree.receiverKey(leaf, kind, MaxGenerationSkip); err != nil {
 				t.Fatalf("a forged header for leaf %d kind %d was refused: %v", leaf, kind, err)
 			}
 			reached++
@@ -3795,7 +3795,7 @@ func TestATreeWideEvictionTakesFromTheFullestRatchetSoOneSenderCannotEvictAnothe
 	const kind = RatchetApplication
 	// an ordinary out of order delivery: a few generations skipped, then the one that arrived.
 	const honestSkip = uint32(4)
-	if _, _, err := tree.ReceiverKey(honest, kind, honestSkip); err != nil {
+	if _, _, err := tree.receiverKey(honest, kind, honestSkip); err != nil {
 		t.Fatalf("the honest sender's first message was refused: %v", err)
 	}
 	honestRatchet, err := tree.ratchetFor(honest, kind)
@@ -3816,7 +3816,7 @@ func TestATreeWideEvictionTakesFromTheFullestRatchetSoOneSenderCannotEvictAnothe
 	head := uint32(0)
 	for range rounds {
 		asked := head + MaxGenerationSkip
-		if _, _, err := tree.ReceiverKey(flooder, kind, asked); err != nil {
+		if _, _, err := tree.receiverKey(flooder, kind, asked); err != nil {
 			t.Fatalf("the flooder's request for generation %d was refused: %v", asked, err)
 		}
 		head = asked + 1
@@ -3842,7 +3842,7 @@ func TestATreeWideEvictionTakesFromTheFullestRatchetSoOneSenderCannotEvictAnothe
 		if stAllZero(pair[0]) || stAllZero(pair[1]) {
 			t.Fatalf("the honest sender's generation %d was erased under a flood from another leaf", generation)
 		}
-		key, nonce, err := tree.ReceiverKey(honest, kind, generation)
+		key, nonce, err := tree.receiverKey(honest, kind, generation)
 		if err != nil {
 			t.Fatalf("the honest sender's generation %d was evicted by another leaf's flood: %v", generation, err)
 		}
@@ -3880,8 +3880,8 @@ func TestTheTreeWideEvictionErasesWhatItDropsInPlace(t *testing.T) {
 		t.Fatalf("two shares of %d do not exceed the tree wide bound of %d, so nothing is evicted", share, MaxRetainedWindowKeys)
 	}
 
-	if _, _, err := tree.ReceiverKey(first, kind, share); err != nil {
-		t.Fatalf("ReceiverKey(first): %v", err)
+	if _, _, err := tree.receiverKey(first, kind, share); err != nil {
+		t.Fatalf("receiverKey(first): %v", err)
 	}
 	firstRatchet, err := tree.ratchetFor(first, kind)
 	if err != nil {
@@ -3898,8 +3898,8 @@ func TestTheTreeWideEvictionErasesWhatItDropsInPlace(t *testing.T) {
 		}
 	}
 
-	if _, _, err := tree.ReceiverKey(second, kind, share); err != nil {
-		t.Fatalf("ReceiverKey(second): %v", err)
+	if _, _, err := tree.receiverKey(second, kind, share); err != nil {
+		t.Fatalf("receiverKey(second): %v", err)
 	}
 	if retained := stTotalRetainedWindowKeys(tree); retained != MaxRetainedWindowKeys {
 		t.Fatalf("the tree retains %d generation keys, want the bound of %d", retained, MaxRetainedWindowKeys)
@@ -4768,13 +4768,13 @@ func TestMessageKeyDoesNotConsumeUntilCommitted(t *testing.T) {
 	if _, _, err := tree.MessageKey(ContentTypeApplication, 3, 1); err != nil {
 		t.Errorf("committing generation 2 also took generation 1: %v", err)
 	}
-	// and ReceiverKey, which shares the ratchet, keeps its single use semantics across the
+	// and receiverKey, which shares the ratchet, keeps its single use semantics across the
 	// split that made MessageKey repeatable.
-	if _, _, err := tree.ReceiverKey(3, RatchetApplication, 0); err != nil {
-		t.Fatalf("ReceiverKey: %v", err)
+	if _, _, err := tree.receiverKey(3, RatchetApplication, 0); err != nil {
+		t.Fatalf("receiverKey: %v", err)
 	}
-	if _, _, err := tree.ReceiverKey(3, RatchetApplication, 0); !errors.Is(err, ErrRatchetGenerationConsumed) {
-		t.Errorf("ReceiverKey answered generation 0 twice: %v", err)
+	if _, _, err := tree.receiverKey(3, RatchetApplication, 0); !errors.Is(err, ErrRatchetGenerationConsumed) {
+		t.Errorf("receiverKey answered generation 0 twice: %v", err)
 	}
 }
 
@@ -4930,7 +4930,7 @@ func TestAnErasedEpochOutranksAnUnknownContentType(t *testing.T) {
 // TestMessageKeyHoldsTheWholeTreesRetainedKeysToOneBound is the decrypt path's half of the
 // bound SecretTree.pruneRetained exists for.
 //
-// ReceiverKey applies it and MessageKey has to as well, because the two reach the same
+// receiverKey applies it and MessageKey has to as well, because the two reach the same
 // retention from the same place: a leaf index and a generation number in a header nobody
 // authenticated. Without it the retained key memory is RatchetWindowSize multiplied by the
 // number of ratchets, and the number of ratchets is the other members' choice rather than this
@@ -5350,14 +5350,14 @@ func stKeySourceRows() []stKeySourceRow {
 			}
 			return key, nonce
 		}},
-		{name: "ReceiverKey", call: func(t *testing.T, tree *SecretTree) ([]byte, []byte) {
-			t.Helper()
-			key, nonce, err := tree.ReceiverKey(2, RatchetHandshake, 3)
-			if err != nil {
-				t.Fatalf("ReceiverKey: %v", err)
-			}
-			return key, nonce
-		}},
+		// receiverKey had a row here until 2026-09-17 and does not any more. MASTER section
+		// 8.4.7 (3) ruled it unexported and this package's own stub gate then moved the
+		// declaration into test source, so it is not an exported key source at all -- and the
+		// class this table is held to is the EXPORTED ones. Its answer is still a caller's own
+		// storage (commitFor hands out what it walked, and a retained entry is deleted as it is
+		// handed over), and what says so is that nothing in this file writes through it; but
+		// that is not a property of the exported surface and this sweep is about the exported
+		// surface.
 	}
 }
 
@@ -5410,7 +5410,7 @@ func stMethodsAnsweringBytes(t *testing.T) []string {
 //
 // Measured, not supposed: with MessageKey answering keys.key and keys.nonce straight out of
 // the window entry it deliberately leaves behind, this gate fails on that row and passes on
-// the other three -- which is the exact shape of the defect. ReceiverKey is safe because
+// the other three -- which is the exact shape of the defect. receiverKey is safe because
 // keyFor deletes the entry as it returns it, and the two sender paths are safe because step's
 // keys never enter a window at all.
 func TestEveryExportedKeySourceHandsTheCallerStorageTheTreeNeverWritesThrough(t *testing.T) {
@@ -5630,9 +5630,9 @@ func TestARetainedBoundEvictionDoesNotWriteThroughAKeyAlreadyHandedBack(t *testi
 func TestMessageKeyNeverAnswersWithKeyMaterialTheRetainedBoundHasZeroized(t *testing.T) {
 	const leaf = LeafIndex(0)
 	oracle := stNewTree(t, 8)
-	trueKey, trueNonce, err := oracle.ReceiverKey(leaf, RatchetApplication, 0)
+	trueKey, trueNonce, err := oracle.receiverKey(leaf, RatchetApplication, 0)
 	if err != nil {
-		t.Fatalf("the oracle's ReceiverKey: %v", err)
+		t.Fatalf("the oracle's receiverKey: %v", err)
 	}
 	if stAllZero(trueKey) || stAllZero(trueNonce) {
 		t.Fatal("the oracle answered zeros for generation 0, so every comparison below is against nothing")
@@ -5710,7 +5710,7 @@ func TestAReceiverPastTheSkipBoundStaysWhereItIs(t *testing.T) {
 	// key. Nothing here opens any more, so the only sender-side value this case needs is the one it
 	// takes from stSenderKeysThrough at the end, for the generation INSIDE the bound that still
 	// does.
-	if _, _, err := receiver.ReceiverKey(1, RatchetApplication, ahead); !errors.Is(err, ErrRatchetGenerationTooFarAhead) {
+	if _, _, err := receiver.receiverKey(1, RatchetApplication, ahead); !errors.Is(err, ErrRatchetGenerationTooFarAhead) {
 		t.Fatalf("a receiver at head 0 asked for generation %d answered %v, want ErrRatchetGenerationTooFarAhead",
 			ahead, err)
 	}
@@ -5725,7 +5725,7 @@ func TestAReceiverPastTheSkipBoundStaysWhereItIs(t *testing.T) {
 	// and the deafness is the disclosed cost: every later generation that peer reaches is refused
 	// the same way until the epoch changes.
 	for _, later := range []uint32{ahead + 1, ahead + 2, ahead + MaxGenerationSkip} {
-		if _, _, err := receiver.ReceiverKey(1, RatchetApplication, later); !errors.Is(err, ErrRatchetGenerationTooFarAhead) {
+		if _, _, err := receiver.receiverKey(1, RatchetApplication, later); !errors.Is(err, ErrRatchetGenerationTooFarAhead) {
 			t.Fatalf("generation %d answered %v, want ErrRatchetGenerationTooFarAhead: this case states the cost, and a build that answers something else has changed it",
 				later, err)
 		}
@@ -5734,7 +5734,7 @@ func TestAReceiverPastTheSkipBoundStaysWhereItIs(t *testing.T) {
 	// opens, under the key the sender drew for it.
 	inside := MaxGenerationSkip
 	senderKeys, senderNonces := stSenderKeysThrough(t, 1, RatchetApplication, inside)
-	gotKey, gotNonce, err := receiver.ReceiverKey(1, RatchetApplication, inside)
+	gotKey, gotNonce, err := receiver.receiverKey(1, RatchetApplication, inside)
 	if err != nil {
 		t.Fatalf("a generation at the bound answered %v, want it served", err)
 	}
@@ -6051,7 +6051,7 @@ func TestAPeekMovesNothingAndRetainsNothing(t *testing.T) {
 
 	// a real acceptance first: it leaves generations 0..seeded-1 retained and the head at
 	// seeded+1, which is a ratchet with something to lose.
-	if _, _, err := receiver.ReceiverKey(leaf, kind, seeded); err != nil {
+	if _, _, err := receiver.receiverKey(leaf, kind, seeded); err != nil {
 		t.Fatalf("the seeding acceptance at generation %d: %v", seeded, err)
 	}
 	before := stReadRatchetState(t, receiver, leaf, kind)
@@ -6220,11 +6220,11 @@ func TestARatchetPastTheSkipBoundRefusesAndMovesNothing(t *testing.T) {
 	}
 	// the exported consuming door answers the same way and moves nothing either, which is what
 	// stops the bound from being reachable through the other half of this surface.
-	if _, _, err := tree.ReceiverKey(leaf, kind, MaxGenerationSkip+1); !errors.Is(err, ErrRatchetGenerationTooFarAhead) {
-		t.Fatalf("ReceiverKey past the bound answered %v, want ErrRatchetGenerationTooFarAhead", err)
+	if _, _, err := tree.receiverKey(leaf, kind, MaxGenerationSkip+1); !errors.Is(err, ErrRatchetGenerationTooFarAhead) {
+		t.Fatalf("receiverKey past the bound answered %v, want ErrRatchetGenerationTooFarAhead", err)
 	}
 	if moved := stSameRatchetState(before, stReadRatchetState(t, tree, leaf, kind)); moved != "" {
-		t.Fatalf("a refused ReceiverKey %s", moved)
+		t.Fatalf("a refused receiverKey %s", moved)
 	}
 	// and the generation AT the bound is served, so the refusals above are the bound and not a
 	// ratchet that refuses everything.
@@ -6294,8 +6294,8 @@ func TestOneRatchetsWindowNeverExceedsItsOwnBound(t *testing.T) {
 	const leaf = LeafIndex(1)
 	const kind = RatchetApplication
 	tree := stNewTree(t, 8)
-	if _, _, err := tree.ReceiverKey(leaf, kind, MaxGenerationSkip); err != nil {
-		t.Fatalf("ReceiverKey(%d): %v", MaxGenerationSkip, err)
+	if _, _, err := tree.receiverKey(leaf, kind, MaxGenerationSkip); err != nil {
+		t.Fatalf("receiverKey(%d): %v", MaxGenerationSkip, err)
 	}
 	r, err := tree.ratchetFor(leaf, kind)
 	if err != nil {
@@ -6413,3 +6413,104 @@ func stKindsOf(entries []senderRatchetEntry) []RatchetType {
 	}
 	return kinds
 }
+
+// ---------------------------------------------------------------------------
+// receiverKey: a door that was exported, was ruled unexported, and is therefore
+// declared HERE, beside the only callers it will ever have
+// ---------------------------------------------------------------------------
+
+// WHY IT LIVES IN TEST SOURCE, which is this package's own rule and not a convenience.
+//
+// MASTER section 8.4.7 (3) ruled ReceiverKey UNEXPORTED on 2026-09-17, ledger item 216: it commits
+// a ratchet with no authentication of any kind, and a door whose safety rests on "there is no
+// caller to have learned it from" is held by an ABSENCE rather than by a rule. Unexported, it kept
+// that property and gained a new problem -- it became an unexported production declaration with no
+// production caller, which is exactly the shape TestNoStubShapesRemainInSource refuses, and which
+// that gate's excuse table cannot hold: an excuse there expires when a production caller arrives,
+// and this declaration must never have one.
+//
+// That gate states the remedy in as many words: "if the declaration will never have a production
+// caller it belongs in test source, beside the tests that are its only callers, the way
+// framing_protect_test.go holds the section 6.3.1 count form." So it is here. The ruling asked for
+// unexported and this is STRICTLY STRONGER: no package outside mls could reach it either way, and
+// this way it is not in the shipped binary at all.
+//
+// WHAT THE MOVE COSTS, printed rather than left to be noticed. The secret-tree vector family's key
+// path class is the exported doors of *SecretTree that answer key material, so this door leaves it:
+// the family compares 12 answers per generation where it compared 16, over three paths where it had
+// four. The receive side derivation is still compared against mlswg's published vectors through
+// MessageKey, which is the same ratchet walk's peek half; CommitMessageKey is the commit half and
+// answers no key material to compare. secret_tree_kat_test.go's own constants carry the numbers.
+//
+// It also leaves the lock discipline gate's scope and the caller storage sweep, both of which read
+// production source. What holds it now is this file's own 41 call sites.
+//
+// receiverKey returns one generation's key and nonce for another member's leaf.
+//
+// IT IS UNEXPORTED, RULED 2026-09-17, MASTER section 8.4.7 (3), ledger item 216. It was
+// ReceiverKey until then, and the reason the rename is a ruling rather than tidying is in the
+// paragraph below: this door commits a ratchet with no authentication of any kind, and its safety
+// rested entirely on "there is no caller to have learned it from" -- which is an ABSENCE, and an
+// absence is not a rule. The next caller is the defect and nothing in the type system was looking
+// for it. Unexported, no package outside mls can reach a ratchet commit that is not behind the
+// sender data AEAD, which is a property of the build rather than of a comment.
+//
+// WHAT THE RENAME COST, measured before it was made: grep -rn "\.ReceiverKey(" --include=*.go over
+// connect, sdk and msgrepo answered 42 lines in exactly two files, secret_tree_test.go and
+// secret_tree_kat_test.go, both package mls, and ZERO production call sites in any of the three
+// repositories. It is not a member of MessageKeySource, so no interface moves with it. The two
+// legitimate needs it used to serve -- look a generation up, then commit it -- are MessageKey and
+// CommitMessageKey, which sit BEHIND the sender data open in the framing path and are where a
+// receive path belongs.
+//
+// A returned error is a visible gap for the product, never a silent skip:
+// ErrRatchetGenerationConsumed and ErrRatchetGenerationTooFarAhead both say the key never
+// existed or no longer does, which is a different statement from ValSem006 -- that one is
+// the AEAD refusing a message whose key was found.
+//
+// IT BYPASSES SENDER DATA AUTHENTICATION, and this paragraph is what the rename above answers
+// rather than a caveat that has to hold on its own. Verified in this package's non test source:
+// this method has ZERO production
+// callers. The framing path reaches a generation number only after openSenderData has opened an
+// AEAD under the epoch's sender_data_secret, and every argument written elsewhere in this file
+// about what a peer can buy with one header -- peekFor's "the party choosing it is a member of this
+// group", pruneRetained's bound over forged headers -- rests on that AEAD. It is an argument about
+// the FRAMING PATH and not about this type's API, and this door is where the two come apart: a
+// caller that hands this method a leaf index, a kind and a generation taken off the wire has
+// skipped the AEAD, and what it buys per unauthenticated header is ratchetFor -- which takes the
+// leaf node secret out of the tree and materialises both of that leaf's ratchets, destructively and
+// for any leaf the tree has -- plus up to MaxGenerationSkip steps and the retention that goes with
+// them.
+//
+// TWO OF THOSE ARE BOUNDED AND THE THIRD IS NOT, and the sentence that stood here said "the leaf
+// index is the only thing here that is" bounded and then named a second bound in the next breath.
+// Both bounds are real: the leaf index by takeLeafSecret's pathToLeaf, and the retained key memory
+// by pruneRetained, tree wide. What has NO bound here is who is asking -- this door takes a leaf, a
+// kind and a generation and asks nothing about where they came from -- so the work and the
+// retention above are bounded PER CALL and unbounded in calls. So the first caller of this method
+// owes its own answer to that question before it writes the call; the framing layer's answer is not
+// inherited by coming through this door.
+func (self *SecretTree) receiverKey(leaf LeafIndex, kind RatchetType, generation uint32) (key []byte, nonce []byte, err error) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	r, err := self.ratchetFor(leaf, kind)
+	if err != nil {
+		return nil, nil, err
+	}
+	keys, err := r.commitFor(generation)
+	// the tree wide bound is applied whether or not the request was served. commitFor retains
+	// every generation it steps past, and a request that fails partway through -- an
+	// exhausted ratchet -- has retained them just the same, so a bound applied only on the
+	// success path is one a peer walks around by always failing.
+	//
+	// The keys just handed out are not at risk from this: commitFor never leaves the target in
+	// the window -- a retained one is deleted as it is handed over and a walked one is never
+	// stored -- so by the time the bound is applied the answer is no longer an entry anything
+	// can evict.
+	self.pruneRetained()
+	if err != nil {
+		return nil, nil, err
+	}
+	return keys.key, keys.nonce, nil
+}
+

@@ -579,7 +579,7 @@ func (self *ratchet) classify(generation uint32) error {
 // more writes. That is the only observable difference from the split this replaces, and it removes
 // the RatchetWindowSize+1 peak the old peek's own disclosure had to carry.
 //
-// ReceiverKey reaches it directly, because that door has no second call in which a caller says the
+// receiverKey reaches it directly, because that door has no second call in which a caller says the
 // message opened; CommitMessageKey reaches it after OpenPrivateMessage has verified the signature.
 //
 // The steps guard is kept for the reason the loop it replaces carried one: the bound in classify
@@ -669,7 +669,7 @@ func (self *ratchet) eraseKey(generation uint32) {
 // through a method call on the same receiver, and
 // TestEveryEraseHelperCarriesTheNoInlineDirective follows the hand-off through ARGUMENTS only.
 // Counting receivers would close the class over every exported method of this type that erases
-// anything anywhere, MessageKey and ReceiverKey included, and what separates those from an
+// anything anywhere, MessageKey and receiverKey included, and what separates those from an
 // erase helper is intent, which no matcher reads. So the line is drawn where a name is handed
 // over, and this paragraph says which side of it this function is on rather than claiming a
 // membership it does not have.
@@ -722,7 +722,7 @@ func ratchetKeyLess(left ratchetKey, right ratchetKey) bool {
 // to one bound.
 //
 // RatchetWindowSize bounds one ratchet, and the number of ratchets is not this receiver's
-// choice. ReceiverKey reaches ratchetFor -- and so takeLeafSecret -- before any generation
+// choice. receiverKey reaches ratchetFor -- and so takeLeafSecret -- before any generation
 // check and before any AEAD, because in section 9 the AEAD tag is the authentication and the
 // key has to exist before it can be checked. So a peer that picks leaf indices and generation
 // numbers out of the air materialises every leaf's two ratchets and fills every one of their
@@ -935,58 +935,6 @@ func (self *SecretTree) nextSenderKeyLocked(leaf LeafIndex, kind RatchetType) (g
 		return 0, nil, nil, err
 	}
 	return generation, keys.key, keys.nonce, nil
-}
-
-// ReceiverKey returns one generation's key and nonce for another member's leaf.
-//
-// A returned error is a visible gap for the product, never a silent skip:
-// ErrRatchetGenerationConsumed and ErrRatchetGenerationTooFarAhead both say the key never
-// existed or no longer does, which is a different statement from ValSem006 -- that one is
-// the AEAD refusing a message whose key was found.
-//
-// IT BYPASSES SENDER DATA AUTHENTICATION, and this paragraph is here because there is no caller to
-// have learned it from. Verified in this package's non test source: this method has ZERO production
-// callers. The framing path reaches a generation number only after openSenderData has opened an
-// AEAD under the epoch's sender_data_secret, and every argument written elsewhere in this file
-// about what a peer can buy with one header -- peekFor's "the party choosing it is a member of this
-// group", pruneRetained's bound over forged headers -- rests on that AEAD. It is an argument about
-// the FRAMING PATH and not about this type's API, and this door is where the two come apart: a
-// caller that hands this method a leaf index, a kind and a generation taken off the wire has
-// skipped the AEAD, and what it buys per unauthenticated header is ratchetFor -- which takes the
-// leaf node secret out of the tree and materialises both of that leaf's ratchets, destructively and
-// for any leaf the tree has -- plus up to MaxGenerationSkip steps and the retention that goes with
-// them.
-//
-// TWO OF THOSE ARE BOUNDED AND THE THIRD IS NOT, and the sentence that stood here said "the leaf
-// index is the only thing here that is" bounded and then named a second bound in the next breath.
-// Both bounds are real: the leaf index by takeLeafSecret's pathToLeaf, and the retained key memory
-// by pruneRetained, tree wide. What has NO bound here is who is asking -- this door takes a leaf, a
-// kind and a generation and asks nothing about where they came from -- so the work and the
-// retention above are bounded PER CALL and unbounded in calls. So the first caller of this method
-// owes its own answer to that question before it writes the call; the framing layer's answer is not
-// inherited by coming through this door.
-func (self *SecretTree) ReceiverKey(leaf LeafIndex, kind RatchetType, generation uint32) (key []byte, nonce []byte, err error) {
-	self.stateLock.Lock()
-	defer self.stateLock.Unlock()
-	r, err := self.ratchetFor(leaf, kind)
-	if err != nil {
-		return nil, nil, err
-	}
-	keys, err := r.commitFor(generation)
-	// the tree wide bound is applied whether or not the request was served. commitFor retains
-	// every generation it steps past, and a request that fails partway through -- an
-	// exhausted ratchet -- has retained them just the same, so a bound applied only on the
-	// success path is one a peer walks around by always failing.
-	//
-	// The keys just handed out are not at risk from this: commitFor never leaves the target in
-	// the window -- a retained one is deleted as it is handed over and a walked one is never
-	// stored -- so by the time the bound is applied the answer is no longer an entry anything
-	// can evict.
-	self.pruneRetained()
-	if err != nil {
-		return nil, nil, err
-	}
-	return keys.key, keys.nonce, nil
 }
 
 // SenderGeneration is the next generation this leaf's ratchet will hand out.
@@ -1394,7 +1342,7 @@ func (self *SecretTree) NextMessageKey(contentType ContentType, leaf LeafIndex) 
 // headers that never had to be authentic -- a number multiplied by the group size rather than a
 // bound. A peek retains nothing, so the only thing an unauthenticated header still grows here is
 // one ratchet per (leaf, kind) through ratchetFor, which is bounded by the tree. What retains is
-// CommitMessageKey and ReceiverKey, and those two apply the bound where the retention is.
+// CommitMessageKey and receiverKey, and those two apply the bound where the retention is.
 // TestAPeekRetainsNothingAcrossTheWholeTree is that, measured, rather than this
 // paragraph.
 func (self *SecretTree) MessageKey(contentType ContentType, leaf LeafIndex, generation uint32) (key []byte, nonce []byte, err error) {
@@ -1463,7 +1411,7 @@ func (self *SecretTree) CommitMessageKey(contentType ContentType, leaf LeafIndex
 		return err
 	}
 	keys, err := r.commitFor(generation)
-	// the tree wide bound is applied whether or not the commit was served, for ReceiverKey's
+	// the tree wide bound is applied whether or not the commit was served, for receiverKey's
 	// reason: a walk that fails partway through has retained what it passed just the same, so a
 	// bound applied only on the success path is one a peer walks around by always failing.
 	self.pruneRetained()

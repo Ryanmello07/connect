@@ -1027,6 +1027,44 @@ func (self *Group) sealAndRecordLocked(authenticated *AuthenticatedContent) (*Pr
 	return private, nil
 }
 
+// sealAndRecordBoundLocked is sealAndRecordLocked under MASTER section 8.4.2's S3 pin: the frame is
+// emitted only if the generation it was sealed at is the one the caller's aad_mls names.
+//
+// THE PERSIST RUNS ON THE PIN'S REFUSAL TOO, and that is the one thing about this body that is not
+// obvious. By the time the pin can fire, the ratchet has already moved -- the generation is spent
+// whether or not anybody ever sees the ciphertext -- so a refusal that skipped the persist would
+// leave the stored state standing where the ratchet was before it, and a later LoadGroup would draw
+// a generation this member has already used. That is the exact defect sealAndRecordLocked's own
+// header describes: two plaintexts of one epoch under one (key, base nonce) pair, with nothing but
+// the 32 bit reuse_guard between them and an AEAD nonce collision. The pin exists to be LOUD and
+// cheap, not to be free.
+//
+// A persist failure on that path is reported WITH the pin's refusal rather than instead of it,
+// because the two say different things to an operator: one is a rule this build enforced, the other
+// is a durability boundary that did not answer.
+//
+// The caller holds stateLock.
+func (self *Group) sealAndRecordBoundLocked(authenticated *AuthenticatedContent,
+	boundGeneration uint32) (*PrivateMessage, error) {
+
+	private, sealErr := sealPrivateMessageBound(self.crypto, self.secretTree,
+		self.senderDataSecretLocked(), authenticated, make([]byte, PaddingSizeV1), boundGeneration)
+	if errors.Is(sealErr, errSealGenerationNotBound) {
+		if persistErr := self.persist(); persistErr != nil {
+			return nil, fmt.Errorf("%w (and the persist that would have recorded the spent generation failed: %w)",
+				sealErr, persistErr)
+		}
+		return nil, sealErr
+	}
+	if sealErr != nil {
+		return nil, sealErr
+	}
+	if err := self.persist(); err != nil {
+		return nil, err
+	}
+	return private, nil
+}
+
 // groupStateBlobVersion is bumped when the blob layout changes, so a state written by an older
 // build is REFUSED rather than misread. The two are not the same failure: a misread blob decodes
 // into a group whose secrets nobody agrees with, and the first symptom of one is a member whose
@@ -3671,6 +3709,16 @@ type ApplicationMessage struct {
 	SenderLeaf        LeafIndex
 	AuthenticatedData []byte
 	Plaintext         []byte
+	// The RFC 9420 section 6.3.2 SenderData.generation this frame was sealed at.
+	//
+	// It is here because MASTER section 8.4.2 v2 puts it inside aad_mls and section 8.4.3's R2
+	// is therefore a function of it, so the record layer above has to be able to take that
+	// refusal a second time on what the open AUTHENTICATED rather than only on what the peek
+	// read. The value reported is the one the content AEAD's key was derived from, so a frame
+	// that opened at all opened at exactly this generation -- which is why section 8.4.3 names
+	// the generation half of that second reading as the clause predicted to defend nothing, and
+	// requires the pass that builds it to delete it, measure, and say so.
+	Generation uint32
 }
 
 // Processed is the result of ingesting one MLSMessage.
@@ -3736,13 +3784,17 @@ func (self *Group) ProcessMessage(message []byte) (*Processed, error) {
 		return nil, err
 	}
 
-	authenticated, err := OpenPrivateMessage(self.crypto, self.secretTree,
+	// the GENERATION comes back beside the authenticated content, and only the application arm
+	// carries it onward. A proposal and a commit are judged by the transcript and the epoch rather
+	// than by a position in a record stream, so there is nothing above this layer that would read
+	// it for either.
+	authenticated, generation, err := openPrivateMessageAt(self.crypto, self.secretTree,
 		self.senderDataSecretLocked(), parsed.PrivateMessage,
 		self.signatureKeyResolverLocked(), groupContext)
 	if err != nil {
 		return nil, err
 	}
-	return self.processAuthenticatedLocked(authenticated)
+	return self.processAuthenticatedLocked(authenticated, generation)
 }
 
 // signatureKeyResolverLocked is what turns a Sender into the key the framing layer verifies
@@ -3803,7 +3855,8 @@ func (self *Group) signatureKeyResolverLocked() SignatureKeyResolver {
 // than listing one.
 //
 //go:noinline
-func (self *Group) processAuthenticatedLocked(authenticated *AuthenticatedContent) (*Processed, error) {
+func (self *Group) processAuthenticatedLocked(authenticated *AuthenticatedContent,
+	generation uint32) (*Processed, error) {
 	// ValSem002 and ValSem003, through the framing plan's one check so that the sender side and
 	// the receiver side cannot disagree about what "this group, this epoch" means. It runs AFTER
 	// the open because a PrivateMessage has no framed content until it has been decrypted.
@@ -3822,6 +3875,7 @@ func (self *Group) processAuthenticatedLocked(authenticated *AuthenticatedConten
 				SenderLeaf:        sender.LeafIndex,
 				AuthenticatedData: authenticated.Content.AuthenticatedData,
 				Plaintext:         authenticated.Content.ApplicationData,
+				Generation:        generation,
 			},
 		}, nil
 	case ContentTypeProposal:
@@ -4369,6 +4423,101 @@ func (self *Group) Protect(aad, plaintext []byte) ([]byte, error) {
 		PrivateMessage: private,
 	})
 }
+
+// ProtectBound is Protect for an AAD that has to NAME the generation the frame is sealed at.
+//
+// WHY IT IS A BUILDER AND NOT A VALUE, which is the whole of the design and not a style choice.
+// MASTER section 8.4.2 v2 makes u32(generation) the third term of aad_mls, and Protect chooses the
+// generation INSIDE, from the sender ratchet -- so the AAD cannot exist before the call, and the
+// generation cannot be looked up and passed in without two calls, two lock acquisitions and a
+// window between them. The AAD is also an INPUT to the signature, so there is no shape in which the
+// caller is handed the generation afterwards and rebuilds it. What is left is this: the seal reads
+// the next generation, calls the caller's builder with it, signs and seals -- all under ONE hold of
+// the lock that already serialises this group's seals.
+//
+// WHY IT CANNOT RACE, in four parts, the fourth of which is the one that makes S1 a rule.
+//
+//	(i)   ONE CONSUMER. The only thing that advances a leaf's APPLICATION ratchet is the
+//	      application seal's own keys.NextMessageKey(ContentTypeApplication, leaf). A proposal and
+//	      a commit draw ContentTypeProposal and ContentTypeCommit, which select the HANDSHAKE
+//	      ratchet -- a different ratchet of the same leaf.
+//	(ii)  NO EXTERNAL DOOR. self.secretTree is unexported and is never returned by anything on this
+//	      type, and the SecretTree's own generation doors -- NextSenderKey, NextMessageKey,
+//	      SenderGeneration, receiverKey -- have no caller outside this package's own source and
+//	      tests. receiverKey is unexported for exactly that reason, MASTER section 8.4.7 (3).
+//	(iii) ONE LOCK HOLD spans the read, the build, the signature and the seal, so no other seal on
+//	      this group can interleave between the read and the consume.
+//	(iv)  THE PIN. sealAndRecordBoundLocked refuses and emits nothing if the generation consumed is
+//	      not the one the builder was handed. If (i) to (iii) are ever wrong, the cost is one local
+//	      refusal and one spent generation -- an ordinary gap, exactly like a refused submit --
+//	      instead of a sender every one of whose messages its own peers refuse at R2 for a reason
+//	      it cannot see. That asymmetry is why the pin is a MUST and not an assertion.
+//
+// THE GENERATION IS READ THROUGH SenderGeneration, which is the tree's own answer to "what will the
+// next Next hand out" and is not a second derivation of it. It materialises the ratchet if this leaf
+// has not sent yet, which is the same materialisation the seal below would have done a moment later.
+//
+// Protect is kept beside this for callers whose AAD is a constant. An application record's is not,
+// and what keeps the record layer off it is a gate in connect/messagegroup, derived over that
+// package's own production source, which refuses any call of .Protect outside the one method whose
+// whole body is the interface delegation.
+func (self *Group) ProtectBound(aad func(generation uint32) ([]byte, error),
+	plaintext []byte) ([]byte, error) {
+
+	if aad == nil {
+		return nil, errNilAadBuilder
+	}
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.closed {
+		return nil, errGroupClosed
+	}
+	generation, err := self.secretTree.SenderGeneration(self.ownLeaf, RatchetApplication)
+	if err != nil {
+		return nil, err
+	}
+	authenticatedData, err := aad(generation)
+	if err != nil {
+		return nil, err
+	}
+	groupContext, err := syntax.Marshal(self.context)
+	if err != nil {
+		return nil, err
+	}
+	content := &FramedContent{
+		GroupId:           cloneBytes(self.context.GroupId),
+		Epoch:             self.context.Epoch,
+		Sender:            Sender{SenderType: SenderTypeMember, LeafIndex: self.ownLeaf},
+		AuthenticatedData: authenticatedData,
+		ContentType:       ContentTypeApplication,
+		ApplicationData:   plaintext,
+	}
+	authenticated, err := SignAuthenticatedContent(self.crypto, self.signer,
+		WireFormatPrivateMessage, content, groupContext)
+	if err != nil {
+		return nil, err
+	}
+	// LAST, for Protect's reason, and PINNED for this one's: the seal consumes a generation of
+	// this leaf's ratchet whether or not the message is ever sent, and the frame is emitted only
+	// if the generation it consumed is the one the AAD above names.
+	private, err := self.sealAndRecordBoundLocked(authenticated, generation)
+	if err != nil {
+		return nil, err
+	}
+	return MarshalMLSMessage(&MLSMessage{
+		Version:        ProtocolVersionMls10,
+		WireFormat:     WireFormatPrivateMessage,
+		PrivateMessage: private,
+	})
+}
+
+// errNilAadBuilder is what ProtectBound answers a caller that passed no builder.
+//
+// It is refused rather than defaulted to an empty AAD, which is the difference between a caller
+// whose wiring is wrong and a caller that meant to send an unbound frame: an empty AAD is a legal
+// value, so a default here would seal a frame naming no position and no generation and answer it as
+// though it had been bound.
+var errNilAadBuilder = errors.New("mls: a bound protect requires an aad builder")
 
 // Unprotect opens an application message.
 //

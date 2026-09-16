@@ -2853,6 +2853,10 @@ var packageConstructionsAnsweringNoBytes = map[string]string{
 	// are the decoder's own copies. The half that matters is the one that still runs -- the key
 	// source, the secret, the message and the group context are all read again after the call.
 	"OpenPrivateMessage": "answers a verdict and a view over the message it was handed, and no bytes of its own",
+	// the body OpenPrivateMessage delegates to since MASTER section 8.4.2 v2, which adds one
+	// uint32 to the answer and no bytes: the generation the frame was sealed at, read out of the
+	// sender data the open already had to decrypt.
+	"openPrivateMessageAt": "answers a verdict, a view over the message it was handed and a generation, and no bytes of its own",
 	// section 6's ValSem002 and ValSem003, on VerifyAuthenticatedContent's terms exactly.
 	"CheckFramedContentContext": "answers an error and no bytes; what it produces is a verdict",
 	// RFC 9420 section 7.3's commit door, on VerifyAuthenticatedContent's terms and for its
@@ -3772,7 +3776,7 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 			if marshalErr != nil {
 				t.Fatalf("marshal the message the peek row reads: %v", marshalErr)
 			}
-			_, aad, peekErr := PeekPrivateMessageSender(crypto,
+			_, aad, _, peekErr := PeekPrivateMessageSender(crypto,
 				take(signed.senderDataSecret), take(marshalled))
 			if peekErr != nil {
 				t.Fatalf("PeekPrivateMessageSender refused a message it had just sealed: %v", peekErr)
@@ -3852,6 +3856,67 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 				t.Fatalf("sealPrivateMessage: %v", sealErr)
 			}
 			return [][]byte{message.EncryptedSenderData, message.Ciphertext}
+		}},
+		// MASTER section 8.4.2 v2's three bodies, on exactly the two rows above's terms: the seal
+		// that reports the generation it consumed, the same seal under the S3 pin, and the open
+		// that reports the generation it opened at. Each is the body one of the neighbouring rows
+		// delegates to, so each is swept over the same borrowed arrays for the same reason.
+		{name: "sealPrivateMessageAt", call: func(take func([]byte) []byte) [][]byte {
+			sealer := mustProviderOver(t, crypto.Suite(), constantReader{value: 0x99})
+			message, _, sealErr := sealPrivateMessageAt(sealer, framingNewKeySource(sealer, 0x4b, 0),
+				take(bytes.Repeat([]byte{0x6d}, sealer.HashSize())), &AuthenticatedContent{
+					WireFormat: WireFormatPrivateMessage,
+					Content:    *framingStubFramedContentOver(take),
+					Auth:       FramedContentAuthData{Signature: take(bytes.Repeat([]byte{0x51}, 64))},
+				}, take(bytes.Repeat([]byte{0x71}, 16)))
+			if sealErr != nil {
+				t.Fatalf("sealPrivateMessageAt: %v", sealErr)
+			}
+			return [][]byte{message.EncryptedSenderData, message.Ciphertext}
+		}},
+		{name: "sealPrivateMessageBound", call: func(take func([]byte) []byte) [][]byte {
+			sealer := mustProviderOver(t, crypto.Suite(), constantReader{value: 0x99})
+			message, sealErr := sealPrivateMessageBound(sealer, framingNewKeySource(sealer, 0x4b, 0),
+				take(bytes.Repeat([]byte{0x6d}, sealer.HashSize())), &AuthenticatedContent{
+					WireFormat: WireFormatPrivateMessage,
+					Content:    *framingStubFramedContentOver(take),
+					Auth:       FramedContentAuthData{Signature: take(bytes.Repeat([]byte{0x51}, 64))},
+				}, take(bytes.Repeat([]byte{0x71}, 16)), 0)
+			if sealErr != nil {
+				t.Fatalf("sealPrivateMessageBound: %v", sealErr)
+			}
+			return [][]byte{message.EncryptedSenderData, message.Ciphertext}
+		}},
+		{name: "openPrivateMessageAt", call: func(take func([]byte) []byte) [][]byte {
+			sealer := mustProviderOver(t, crypto.Suite(), constantReader{value: 0x99})
+			priv, pub, keyErr := sealer.SignatureKeyPair()
+			if keyErr != nil {
+				t.Fatalf("the key pair the bound open row reads: %v", keyErr)
+			}
+			groupContext := framingStubGroupContext(t, sealer)
+			secret := bytes.Repeat([]byte{0x6d}, sealer.HashSize())
+			signed, signErr := SignAuthenticatedContent(sealer, priv, WireFormatPrivateMessage,
+				framingStubFramedContent(), groupContext)
+			if signErr != nil {
+				t.Fatalf("sign the message the bound open row reads: %v", signErr)
+			}
+			message, sealErr := SealPrivateMessage(sealer, framingNewKeySource(sealer, 0x4b, 0),
+				secret, signed, 16)
+			if sealErr != nil {
+				t.Fatalf("seal the message the bound open row reads: %v", sealErr)
+			}
+			if _, _, openErr := openPrivateMessageAt(sealer, framingNewKeySource(sealer, 0x4b, 0),
+				take(secret), &PrivateMessage{
+					GroupId:             take(message.GroupId),
+					Epoch:               message.Epoch,
+					ContentType:         message.ContentType,
+					AuthenticatedData:   take(message.AuthenticatedData),
+					EncryptedSenderData: take(message.EncryptedSenderData),
+					Ciphertext:          take(message.Ciphertext),
+				}, StaticSignatureKey(pub), take(groupContext)); openErr != nil {
+				t.Fatalf("openPrivateMessageAt refused a message it had just sealed: %v", openErr)
+			}
+			return nil
 		}},
 		{name: "OpenPrivateMessage", call: func(take func([]byte) []byte) [][]byte {
 			sealer := mustProviderOver(t, crypto.Suite(), constantReader{value: 0x99})
@@ -4526,7 +4591,10 @@ var providerConstructionValues = map[string]any{
 	"openSenderData":                openSenderData,
 	"SealPrivateMessage":            SealPrivateMessage,
 	"sealPrivateMessage":            sealPrivateMessage,
+	"sealPrivateMessageAt":          sealPrivateMessageAt,
+	"sealPrivateMessageBound":       sealPrivateMessageBound,
 	"OpenPrivateMessage":            OpenPrivateMessage,
+	"openPrivateMessageAt":          openPrivateMessageAt,
 	"PeekPrivateMessageSender":      PeekPrivateMessageSender,
 }
 
@@ -5561,6 +5629,11 @@ var providerStreamDependentOperations = []string{
 	"SealWithLabel",
 	"SignatureKeyPair",
 	"sealPrivateMessage",
+	// MASTER section 8.4.2 v2's two seal bodies, stream dependent for sealPrivateMessage's
+	// reason and for no reason of their own: the reuse guard is four fresh octets per message,
+	// and neither the generation report nor the S3 pin draws anything.
+	"sealPrivateMessageAt",
+	"sealPrivateMessageBound",
 }
 
 // The operations with no argument to move and no draw to make, each with the registry
@@ -5664,6 +5737,20 @@ var providerConstructionsWithUndefinedResults = map[string][]string{
 	// stub. The entry stops being correct the day this row carries a commit, at which point it
 	// fails.
 	"OpenPrivateMessage": {"result 0 field 4 is empty"},
+	// the body that open delegates to since MASTER section 8.4.2 v2, which carries
+	// OpenPrivateMessage's entry plus one of its own: result 1 is the GENERATION the frame was
+	// sealed at, and this gate's base call reads a frame sealed at generation ZERO. Zero is the
+	// correct answer for it rather than a stub, and it is the first generation of every ratchet
+	// this package ever hands out, so a row built over a later one would be a row built over a
+	// fixture rather than over the first message of an epoch. The entry stops being correct the
+	// day this row's message is sealed at any other generation, at which point it fails.
+	"openPrivateMessageAt": {"result 0 field 4 is empty", "result 1 is zero"},
+	// the seal one layer down, on the same reading from the other side: result 1 is the
+	// generation it CONSUMED, and this gate's pinned key source stands at generation zero.
+	"sealPrivateMessageAt": {"result 1 is zero"},
+	// the pre-ratchet peek, on exactly that reading: result 2 is the generation, and the frame
+	// it peeks is the same one, sealed at generation zero.
+	"PeekPrivateMessageSender": {"result 2 is zero"},
 }
 
 // A construction whose answer is not a function of its arguments alone, named with the reason
@@ -8302,6 +8389,11 @@ var providerStreamDraws = map[string]func(params *SuiteParams) int{
 	// one of the two entries in this table that is not a registry field.
 	"SealPrivateMessage": func(params *SuiteParams) int { return senderDataReuseGuardSize },
 	"sealPrivateMessage": func(params *SuiteParams) int { return senderDataReuseGuardSize },
+	// the same four octets through MASTER section 8.4.2 v2's two bodies, which are the seal one
+	// layer down and the seal under the S3 pin. Neither draws anything of its own: the pin is a
+	// comparison of two integers and the generation report is a value the seal already had.
+	"sealPrivateMessageAt":    func(params *SuiteParams) int { return senderDataReuseGuardSize },
+	"sealPrivateMessageBound": func(params *SuiteParams) int { return senderDataReuseGuardSize },
 }
 
 // Every operation draws exactly the bytes it uses and no others.

@@ -84,6 +84,21 @@ type SuiteParams struct {
 	Nsk         int
 	NsigPub     int
 	NsigPriv    int
+	// Nsig is the WIDTH OF A SIGNATURE this suite's scheme produces, which is not a key width
+	// and is therefore not NsigPub under another name: ed25519 has 32 octet keys and a 64 octet
+	// signature.
+	//
+	// It is here because MASTER section 8.4.6 requires a sealer to compute framed_length BEFORE
+	// it reserves a stream index, and the signature is a term of that length -- an application
+	// frame's plaintext is the content arm, then opaque signature<V>, then padding. That section
+	// requires the length to be DERIVED from the ciphersuite, the group id's width, the
+	// signature's width and the 32 octet aad_mls, and never hard coded, so the signature's width
+	// has to be a suite parameter rather than a literal 64 sitting beside the arithmetic.
+	//
+	// Nothing lets the registry disagree with the scheme:
+	// TestTheRegisteredSignatureWidthIsTheWidthTheProviderProduces signs with each registered
+	// suite's own provider and compares.
+	Nsig int
 }
 
 // The whole registry. The two entries differ in their aead and therefore in Nk, which
@@ -108,6 +123,7 @@ var registeredSuiteParams = map[CipherSuite]SuiteParams{
 		Nsk:         32,
 		NsigPub:     32,
 		NsigPriv:    32,
+		Nsig:        64,
 	},
 	CipherSuiteX25519ChaCha20Sha256Ed25519: {
 		Suite:       CipherSuiteX25519ChaCha20Sha256Ed25519,
@@ -126,6 +142,7 @@ var registeredSuiteParams = map[CipherSuite]SuiteParams{
 		Nsk:         32,
 		NsigPub:     32,
 		NsigPriv:    32,
+		Nsig:        64,
 	},
 }
 

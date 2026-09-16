@@ -360,7 +360,7 @@ func namesWrittenThrough(function *ast.FuncDecl, reaching []string) []string {
 // An argument and NOT a receiver. A method called on the same object -- self.pruneRetained()
 // -- reaches that object's storage too, but so does every exported method of a type that
 // erases anything anywhere, so counting receivers closes the class over the whole type and
-// ends by demanding the directive of MessageKey and ReceiverKey. What separates those from an
+// ends by demanding the directive of MessageKey and receiverKey. What separates those from an
 // erase helper is intent, and no matcher reads intent. The line is drawn where a name is
 // handed over, which is the shape zeroizeSecret is called in everywhere here.
 //
@@ -3095,6 +3095,18 @@ var groupMethodArgumentRows = map[string]func(t *testing.T, group *Group) [][]re
 			reflect.ValueOf([]byte("the plaintext this sweep protects")),
 		}}
 	},
+	// MASTER section 8.4.2 v2's bound seal, driven exactly as Protect is: the AAD is a BUILDER
+	// rather than a value, so the row hands over a builder that answers the same octets whatever
+	// generation it is called with -- the sweep is about what the ANSWER carries, and the
+	// generation is not something epoch_secret could hide in.
+	"ProtectBound": func(t *testing.T, group *Group) [][]reflect.Value {
+		return [][]reflect.Value{{
+			reflect.ValueOf(func(generation uint32) ([]byte, error) {
+				return []byte("the aad this sweep protects"), nil
+			}),
+			reflect.ValueOf([]byte("the plaintext this sweep protects")),
+		}}
+	},
 	"ProcessMessage": func(t *testing.T, group *Group) [][]reflect.Value {
 		return [][]reflect.Value{{reflect.ValueOf(epochSecretSweepInboundMessage(t, group,
 			[]byte("the aad this sweep processes"), []byte("the plaintext this sweep processes")))}}
@@ -5376,6 +5388,47 @@ func TestEveryConstructionHandedAProviderReadsKdfNhFromIt(t *testing.T) {
 			}
 			return nil
 		}},
+		// MASTER section 8.4.2 v2's three bodies, each on the row above it's terms: the seal one
+		// layer down, the seal under the S3 pin, and the open one layer down. What is at risk for
+		// all three is the same thing as for their delegating names -- the sender data key and
+		// nonce come off ExpandWithLabel, so a body that read a width from anywhere but the
+		// provider works at 32 and produces a key nobody else computes at 48.
+		{name: "sealPrivateMessageAt", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
+			signed := framingPrivateSignedContent(t, crypto, framingTestMemberContent())
+			message, _, sealErr := sealPrivateMessageAt(crypto, framingNewKeySource(crypto, 0x4b, 0),
+				signed.senderDataSecret, signed.authContent, bytes.Repeat([]byte{0x71}, 16))
+			if sealErr != nil {
+				t.Fatalf("sealPrivateMessageAt over a provider whose KDF.Nh is %d: %v",
+					crypto.HashSize(), sealErr)
+			}
+			return [][]byte{message.EncryptedSenderData}
+		}},
+		{name: "sealPrivateMessageBound", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
+			signed := framingPrivateSignedContent(t, crypto, framingTestMemberContent())
+			message, sealErr := sealPrivateMessageBound(crypto, framingNewKeySource(crypto, 0x4b, 0),
+				signed.senderDataSecret, signed.authContent, bytes.Repeat([]byte{0x71}, 16), 0)
+			if sealErr != nil {
+				t.Fatalf("sealPrivateMessageBound over a provider whose KDF.Nh is %d: %v",
+					crypto.HashSize(), sealErr)
+			}
+			return [][]byte{message.EncryptedSenderData}
+		}},
+		{name: "openPrivateMessageAt", call: func(t *testing.T, crypto CryptoProvider) [][]byte {
+			signed := framingPrivateSignedContent(t, crypto, framingTestMemberContent())
+			message, sealErr := SealPrivateMessage(crypto, framingNewKeySource(crypto, 0x4b, 0),
+				signed.senderDataSecret, signed.authContent, PaddingSizeV1)
+			if sealErr != nil {
+				t.Fatalf("seal the message the bound open row reads, over a provider whose KDF.Nh is %d: %v",
+					crypto.HashSize(), sealErr)
+			}
+			if _, _, openErr := openPrivateMessageAt(crypto, framingNewKeySource(crypto, 0x4b, 0),
+				signed.senderDataSecret, message, StaticSignatureKey(signed.pub),
+				signed.groupContext); openErr != nil {
+				t.Fatalf("openPrivateMessageAt over a provider whose KDF.Nh is %d refused a message it had just sealed: %v",
+					crypto.HashSize(), openErr)
+			}
+			return nil
+		}},
 		// the pre-ratchet peek. What it answers is the caller's own authenticated_data, whose
 		// width is the caller's and not KDF.Nh -- so what this row states is openSenderData's
 		// row's statement and not more: that the call WORKS at either hash width, which for a
@@ -5397,7 +5450,7 @@ func TestEveryConstructionHandedAProviderReadsKdfNhFromIt(t *testing.T) {
 				t.Fatalf("marshal the message the peek row reads, over a provider whose KDF.Nh is %d: %v",
 					crypto.HashSize(), marshalErr)
 			}
-			_, aad, peekErr := PeekPrivateMessageSender(crypto, signed.senderDataSecret, marshalled)
+			_, aad, _, peekErr := PeekPrivateMessageSender(crypto, signed.senderDataSecret, marshalled)
 			if peekErr != nil {
 				t.Fatalf("PeekPrivateMessageSender over a provider whose KDF.Nh is %d refused a message it had just sealed: %v",
 					crypto.HashSize(), peekErr)
@@ -10424,6 +10477,13 @@ var epochSecretMethodsTheSweepDrivesInstead = map[string]string{
 	"(*Group).Protect": "seals an application message and records the generation it spent, so it " +
 		"reaches the parent secret through persist and answers the ciphertext; " +
 		"bytesTheGroupHandsOut drives it and compares every octet of that",
+	// the SIXTH sending door, MASTER section 8.4.2 v2's, on exactly Protect's terms: it seals the
+	// same message under an aad the caller BUILDS from the generation the seal is about to spend,
+	// and it records that generation through the same persist. What it answers is the same
+	// ciphertext, and the same sweep drives it with a builder and compares every octet.
+	"(*Group).ProtectBound": "seals an application message under a caller-built aad and records the " +
+		"generation it spent, so it reaches the parent secret through persist and answers the " +
+		"ciphertext; bytesTheGroupHandsOut drives it and compares every octet of that",
 	"(*Group).ProposeAdd": "seals a proposal and records the generation it spent, so it reaches " +
 		"the parent secret through persist and answers the encoded message; " +
 		"bytesTheGroupHandsOut drives it and compares every octet of that",

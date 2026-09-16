@@ -27,7 +27,7 @@
 //     runner adds and it is why it is worth having: a left/right swap in pathToLeaf is
 //     invisible to every other test in this package that reads this file.
 //   - EVERY path to one generation, derived. A generation is reachable by four exported
-//     methods -- NextSenderKey and ReceiverKey, keyed on the ratchet type, and NextMessageKey
+//     methods -- NextSenderKey and receiverKey, keyed on the ratchet type, and NextMessageKey
 //     and MessageKey, keyed on the ContentType the framing layer carries -- and the corpus
 //     answers for all of them. They are compared separately rather than one assumed to follow
 //     another, because step(), keyFor() and peekFor() are different code and an asymmetry
@@ -96,11 +96,19 @@ const (
 	secretTreeKatGenerations = 2
 	// the sender data header does not ratchet: one key and one nonce for the whole case.
 	secretTreeKatSenderDataChecks = 2
-	// sixteen per published generation: two ratchet types, a key and a nonce each, reached
-	// once through each of the four exported paths to a leaf's key material. Both factors are
+	// twelve per published generation: two ratchet types, a key and a nonce each, reached once
+	// through each of the three exported paths to a leaf's key material. Both factors are
 	// DERIVED and this transcription is held to them by
 	// TestSecretTreeFamilyChecksAreEveryPathToAGeneration.
-	secretTreeKatChecksPerGeneration = 16
+	//
+	// IT WAS SIXTEEN OVER FOUR PATHS UNTIL 2026-09-17, and the fourth was ReceiverKey. MASTER
+	// section 8.4.7 (3) ruled that door unexported, and this package's own stub gate then put the
+	// declaration in test source -- so it is not an exported path to a leaf's key material any
+	// more and this family does not compare it. What is NOT lost is the receive side's
+	// derivation: MessageKey is the same ratchet walk's peek half and is still compared against
+	// mlswg's published answers at every generation. See secret_tree_test.go's receiverKey block
+	// for the move and what else it costs.
+	secretTreeKatChecksPerGeneration = 12
 	secretTreeKatComparisons         = secretTreeKatCovered*secretTreeKatSenderDataChecks +
 		secretTreeKatLeaves*secretTreeKatGenerations*secretTreeKatChecksPerGeneration
 	// the distinct published answers those comparisons are made against: each leaf answer is
@@ -110,7 +118,7 @@ const (
 	// the paths a generation is reachable by, which is the factor above that is about this
 	// package's own surface rather than about the corpus. Written down for the reason the
 	// counts above are, and held to the class stMethodsAnsweringBytes derives.
-	secretTreeKatKeyPaths = 4
+	secretTreeKatKeyPaths = 3
 	// a key and a nonce.
 	secretTreeKatAnswersPerRatchet = 2
 )
@@ -233,7 +241,7 @@ type secretTreeKeyPathDriver struct {
 //
 // A map keyed on the derived name rather than a list of names, so the two cannot drift:
 // secretTreeKeyPaths is fatal on a member of the class with no driver here. The list this
-// replaces held NextSenderKey and ReceiverKey and called them the only two ways to ask; there
+// replaces held NextSenderKey and receiverKey and called them the only two ways to ask; there
 // were four, and adding a fifth changed nothing about what this family compared.
 var secretTreeKeyPathDrivers = map[string]secretTreeKeyPathDriver{
 	"NextSenderKey": {
@@ -252,22 +260,6 @@ var secretTreeKeyPathDrivers = map[string]secretTreeKeyPathDriver{
 				key, aeadNonce, generation, err := tree.NextMessageKey(contentType, leaf)
 				return generation, key, aeadNonce, err
 			})
-		},
-	},
-	"ReceiverKey": {
-		retainsSkipped: true,
-		collect: func(t *testing.T, tree *SecretTree, leaf LeafIndex, kind RatchetType,
-			published []secretTreeGeneration) (map[uint32]secretTreeAnswer, error) {
-			collected := map[uint32]secretTreeAnswer{}
-			for _, want := range published {
-				key, aeadNonce, err := tree.ReceiverKey(leaf, kind, want.Generation)
-				if err != nil {
-					return nil, fmt.Errorf("generation %d: %w", want.Generation, err)
-				}
-				collected[want.Generation] = secretTreeAnswer{
-					key: bytes.Clone(key), aeadNonce: bytes.Clone(aeadNonce)}
-			}
-			return collected, nil
 		},
 	},
 	"MessageKey": {
@@ -699,7 +691,7 @@ type secretTreeAnswer struct {
 // Two trees, and the reason is the surface rather than the corpus. NextSenderKey advances the
 // leaf's ratchet past the generation it hands out and there is no way to ask for one twice, so a
 // tree driven from the sender side cannot then be asked the same question from the receiver
-// side. ReceiverKey consumes as well, which is why its generations are walked in the ascending
+// side. receiverKey consumes as well, which is why its generations are walked in the ascending
 // order the case publishes them in -- an order this comparator REQUIRES rather than sorts into,
 // because a corpus that published them descending would otherwise be reported as this
 // implementation refusing a replay.
@@ -1022,7 +1014,7 @@ func TestSecretTreeFamilyIsInstalled(t *testing.T) {
 // driver for a method that no longer exists is a check name that describes nothing.
 //
 // Measured, and the reason the class is no longer a list: with the two names that list held, a
-// third exported key source added to secret_tree.go -- ProbeKey, delegating to ReceiverKey --
+// third exported key source added to secret_tree.go -- ProbeKey, delegating to receiverKey --
 // left every test in this file green. It was caught only by the two gates in secret_tree_test.go
 // that derive the same class, one file away and unused here.
 func TestSecretTreeFamilyChecksAreEveryPathToAGeneration(t *testing.T) {
@@ -1575,7 +1567,7 @@ func independentSenderDataKeyNonce(t *testing.T, senderDataSecret []byte, cipher
 //
 // This is the shape that makes the generate direction worth running, and it is not the shape the
 // plan's version has. A generator that computed its answers with NewSecretTree and NextSenderKey
-// and a verifier that checked them with NewSecretTree and ReceiverKey round trip perfectly and
+// and a verifier that checked them with NewSecretTree and receiverKey round trip perfectly and
 // say nothing about conformance at all -- they prove this code agrees with itself, which it would
 // whatever it computed. Nothing below reaches package mls, which is asserted rather than
 // described: TestTheGenerateDirectionSharesNoCodePathWithVerify derives the production function

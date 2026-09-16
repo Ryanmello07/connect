@@ -906,11 +906,11 @@ func TestProcessingAContentTypeOutsideTheRegistryIsRefused(t *testing.T) {
 		},
 	}
 	// the live control: the same value under a content type the registry DOES declare is processed
-	if _, err := receiver.processAuthenticatedLocked(content); err != nil {
+	if _, err := receiver.processAuthenticatedLocked(content, 0); err != nil {
 		t.Fatalf("the control content was refused: %v", err)
 	}
 	content.Content.ContentType = ContentType(0xfe)
-	if _, err := receiver.processAuthenticatedLocked(content); !errors.Is(err, errProcessContentType) {
+	if _, err := receiver.processAuthenticatedLocked(content, 0); !errors.Is(err, errProcessContentType) {
 		t.Fatalf("a framed content of type 0xfe was refused with %v, want errProcessContentType", err)
 	}
 }

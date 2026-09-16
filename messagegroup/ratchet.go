@@ -820,7 +820,7 @@ type ReceiverRatchetKey struct {
 //
 // A ratchet is TRACKED and never auto-created, which is what keeps the table's size a fact about
 // the group rather than a choice an attacker makes. connect/mls's own pruneRetained exists
-// because its ReceiverKey materialises a ratchet for any leaf a forged header names; here a
+// because its receiverKey materialises a ratchet for any leaf a forged header names; here a
 // sender this session has not installed a ratchet for is refused with ErrNoReceiverRatchet, so
 // the only unbounded quantity left is the retained keys, which is what the bound below is on.
 type ReceiverRatchets struct {

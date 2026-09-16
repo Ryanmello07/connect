@@ -240,6 +240,21 @@ func providerStubFramingArguments(t *testing.T, fixture CryptoProvider, priv Sig
 	// non-zero padding, which is the whole reason this variant exists: zeros here would leave
 	// the padding argument indistinguishable from an argument the seal ignored.
 	arguments["sealPrivateMessage.padding"] = bytes.Repeat([]byte{0x71}, 16)
+	// MASTER section 8.4.2 v2's three bodies, on the rows above's terms. sealPrivateMessageAt is
+	// the seal that reports the generation it consumed and openPrivateMessageAt the open that
+	// reports the generation it opened at; sealPrivateMessageBound is the first under the S3 pin,
+	// and its boundGeneration is the generation this pinned key source actually hands out -- 0 --
+	// because a base call that refused would leave every perturbation below it comparing one
+	// refusal against another, which is this gate's own rule.
+	arguments["sealPrivateMessageAt.keys"] = framingPinnedKeySource(fixture, 0x4b, 0)
+	arguments["sealPrivateMessageAt.senderDataSecret"] = senderDataSecret
+	arguments["sealPrivateMessageAt.authContent"] = signed
+	arguments["sealPrivateMessageAt.padding"] = bytes.Repeat([]byte{0x71}, 16)
+	arguments["sealPrivateMessageBound.keys"] = framingPinnedKeySource(fixture, 0x4b, 0)
+	arguments["sealPrivateMessageBound.senderDataSecret"] = senderDataSecret
+	arguments["sealPrivateMessageBound.authContent"] = signed
+	arguments["sealPrivateMessageBound.padding"] = bytes.Repeat([]byte{0x71}, 16)
+	arguments["sealPrivateMessageBound.boundGeneration"] = uint32(0)
 	privateMessage, err := SealPrivateMessage(privateSealer, framingPinnedKeySource(fixture, 0x4b, 0),
 		senderDataSecret, signed, 16)
 	if err != nil {
@@ -250,6 +265,11 @@ func providerStubFramingArguments(t *testing.T, fixture CryptoProvider, priv Sig
 	arguments["OpenPrivateMessage.message"] = privateMessage
 	arguments["OpenPrivateMessage.resolve"] = StaticSignatureKey(pub)
 	arguments["OpenPrivateMessage.groupContext"] = encodedGroupContext
+	arguments["openPrivateMessageAt.keys"] = framingPinnedKeySource(fixture, 0x4b, 0)
+	arguments["openPrivateMessageAt.senderDataSecret"] = senderDataSecret
+	arguments["openPrivateMessageAt.message"] = privateMessage
+	arguments["openPrivateMessageAt.resolve"] = StaticSignatureKey(pub)
+	arguments["openPrivateMessageAt.groupContext"] = encodedGroupContext
 
 	// the pre-ratchet peek, over the SAME message the open row reads, marshalled. It takes the
 	// marshalled form rather than the structure because that is what its one caller holds -- an
@@ -7126,7 +7146,7 @@ func TestARefusedOpenLeavesTheMessageKeyWhereItWasAndAnAcceptedOneErasesIt(t *te
 }
 
 // TestThePeekAgreesWithTheOpenOnEveryMessageThatOpens is what makes PeekPrivateMessageSender safe
-// to refuse on: the two values it reads before the ratchet are the two values the signature covers.
+// to refuse on: the THREE values it reads before the ratchet are values the open then confirms.
 //
 // A caller uses the peek to take its own refusals EARLY, and then takes them again on what
 // OpenPrivateMessage answers. That is only a pre-filter rather than a second, weaker rule if the
@@ -7134,6 +7154,12 @@ func TestARefusedOpenLeavesTheMessageKeyWhereItWasAndAnAcceptedOneErasesIt(t *te
 // the leaf is the sender data's and the open builds its Sender from the same field, and the
 // authenticated_data is a cleartext header field the content AEAD covers -- and construction is
 // what this case turns into a measurement, over every boundary generation.
+//
+// THE GENERATION IS THE THIRD, since MASTER section 8.4.2 v2 made it one of the values a caller's
+// R2 is a function of. It is confirmed against the generation the message was SEALED at, which is
+// the strongest form available here and is why this case is where the claim lives: a frame's
+// content key is derived from the generation the sender data names, so a frame that opens at all
+// opened at the generation the peek read.
 //
 // THE OTHER DIRECTION IS THE ONE THAT MATTERS AND IT IS HERE TOO: a message whose cleartext
 // authenticated_data has been moved does not open at all, so there is no message that opens and
@@ -7159,9 +7185,13 @@ func TestThePeekAgreesWithTheOpenOnEveryMessageThatOpens(t *testing.T) {
 		if err != nil {
 			t.Fatalf("marshal at generation %d: %v", generation, err)
 		}
-		peekLeaf, peekAad, err := PeekPrivateMessageSender(crypto, signed.senderDataSecret, marshalled)
+		peekLeaf, peekAad, peekGeneration, err := PeekPrivateMessageSender(crypto, signed.senderDataSecret, marshalled)
 		if err != nil {
 			t.Fatalf("peek at generation %d: %v", generation, err)
+		}
+		if peekGeneration != generation {
+			t.Fatalf("the peek read generation %d for a frame sealed at generation %d",
+				peekGeneration, generation)
 		}
 		opened, err := OpenPrivateMessage(crypto,
 			framingSecretTreeAt(t, crypto, leaf, contentType, generation),
@@ -7196,7 +7226,7 @@ func TestThePeekAgreesWithTheOpenOnEveryMessageThatOpens(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal the moved message: %v", err)
 	}
-	_, peekAad, err := PeekPrivateMessageSender(crypto, signed.senderDataSecret, marshalled)
+	_, peekAad, _, err := PeekPrivateMessageSender(crypto, signed.senderDataSecret, marshalled)
 	if err != nil {
 		t.Fatalf("peek the moved message: %v", err)
 	}
@@ -7238,11 +7268,11 @@ func TestThePeekRefusesEveryShapeItCannotRead(t *testing.T) {
 		"a truncated MLSMessage": marshalled[:len(marshalled)/2],
 	}
 	for what, octets := range rows {
-		gotLeaf, gotAad, err := PeekPrivateMessageSender(crypto, signed.senderDataSecret, octets)
+		gotLeaf, gotAad, gotGeneration, err := PeekPrivateMessageSender(crypto, signed.senderDataSecret, octets)
 		if err == nil {
 			t.Errorf("%s peeked to leaf %d / aad %x with no error", what, gotLeaf, gotAad)
 		}
-		if gotLeaf != 0 || gotAad != nil {
+		if gotLeaf != 0 || gotAad != nil || gotGeneration != 0 {
 			t.Errorf("%s answered leaf %d and %d octets of aad beside its error", what, gotLeaf, len(gotAad))
 		}
 	}
@@ -7263,12 +7293,12 @@ func TestThePeekRefusesEveryShapeItCannotRead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal a PublicMessage: %v", err)
 	}
-	if _, _, err := PeekPrivateMessageSender(crypto, signed.senderDataSecret, public); !errors.Is(err, errPeekWireFormat) {
+	if _, _, _, err := PeekPrivateMessageSender(crypto, signed.senderDataSecret, public); !errors.Is(err, errPeekWireFormat) {
 		t.Errorf("a PublicMessage peeked with %v, want errPeekWireFormat", err)
 	}
 
 	// and a nil provider is refused rather than dereferenced.
-	if _, _, err := PeekPrivateMessageSender(nil, signed.senderDataSecret, marshalled); !errors.Is(err, ErrNilCryptoProvider) {
+	if _, _, _, err := PeekPrivateMessageSender(nil, signed.senderDataSecret, marshalled); !errors.Is(err, ErrNilCryptoProvider) {
 		t.Errorf("a nil crypto provider peeked with %v, want ErrNilCryptoProvider", err)
 	}
 }
@@ -7313,4 +7343,385 @@ func TestSealPrivateMessageRefusesRatherThanWrappingTheGenerationCounter(t *test
 			t.Fatalf("seal %d past the end of the counter answered a message at generation %d", i, generation)
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// MASTER section 8.4.2 v2: the S3 pin and the derived framed length
+// ---------------------------------------------------------------------------
+
+// framingSkippingKeySource is a key source whose NextMessageKey answers a generation OTHER than the
+// one it hands keys for -- the exact shape MASTER section 8.4.2 names as the mutation for S1.
+//
+// It is not a hypothetical about a hostile tree. It is what any drift between the generation a
+// sealer READ and the generation the seal CONSUMED looks like from inside the seal, and the whole
+// point of S3 is that the seal must be able to see it without knowing how it happened.
+type framingSkippingKeySource struct {
+	inner *framingKeySource
+	skip  uint32
+}
+
+func (self *framingSkippingKeySource) NextMessageKey(contentType ContentType,
+	leaf LeafIndex) ([]byte, []byte, uint32, error) {
+
+	key, nonce, generation, err := self.inner.NextMessageKey(contentType, leaf)
+	return key, nonce, generation + self.skip, err
+}
+
+func (self *framingSkippingKeySource) MessageKey(contentType ContentType, leaf LeafIndex,
+	generation uint32) ([]byte, []byte, error) {
+
+	return self.inner.MessageKey(contentType, leaf, generation)
+}
+
+func (self *framingSkippingKeySource) CommitMessageKey(contentType ContentType, leaf LeafIndex,
+	generation uint32) error {
+
+	return self.inner.CommitMessageKey(contentType, leaf, generation)
+}
+
+func (self *framingSkippingKeySource) EraseMessageKey(contentType ContentType, leaf LeafIndex,
+	generation uint32) {
+
+	self.inner.EraseMessageKey(contentType, leaf, generation)
+}
+
+// TestTheSealRefusesWhenTheGenerationConsumedIsNotTheOneTheAadNames is MASTER section 8.4.2's S3,
+// held as a case rather than as an argument.
+//
+// THE PROPERTY, and it is not the same as S1: every frame a sealer EMITS names, in its AAD, the
+// generation it is sealed under. S1 is the obligation and this is what makes it checkable -- a
+// build in which the two came apart would emit a frame every peer refuses at R2, for a reason the
+// sender cannot see, on every message it ever writes. The pin turns that into one local refusal.
+//
+// THE MUTATION MASTER SECTION 8.4.2 NAMES IS THE FIXTURE: hand the seal a key source that skips one
+// generation and require the call to refuse rather than return octets. Deleting the comparison in
+// sealPrivateMessageBound turns this red.
+//
+// THE CONTROL IS THE SAME CALL WITH NO SKIP, so the refusal is about the disagreement rather than
+// about a fixture that never sealed anything.
+func TestTheSealRefusesWhenTheGenerationConsumedIsNotTheOneTheAadNames(t *testing.T) {
+	crypto := newTestCrypto(t)
+	signed := framingPrivateSignedMember(t)
+
+	// the control: the generation the source hands out IS the one the aad names.
+	agreeing := framingNewKeySource(crypto, 0x31, 7)
+	message, err := sealPrivateMessageBound(crypto, agreeing, signed.senderDataSecret,
+		signed.authContent, nil, 7)
+	if err != nil {
+		t.Fatalf("a seal whose consumed generation is the one the aad names was refused: %v", err)
+	}
+	if message == nil {
+		t.Fatal("the control seal answered no message and no error")
+	}
+	if got := framingSenderDataOf(t, crypto, signed.senderDataSecret, message).Generation; got != 7 {
+		t.Fatalf("the control sealed at generation %d, want 7", got)
+	}
+
+	// and the skips, in both directions, because a pin written as "greater than" would admit half
+	// of them.
+	for _, skip := range []uint32{1, 1024} {
+		skipping := &framingSkippingKeySource{inner: framingNewKeySource(crypto, 0x31, 7), skip: skip}
+		message, err := sealPrivateMessageBound(crypto, skipping, signed.senderDataSecret,
+			signed.authContent, nil, 7)
+		if !errors.Is(err, errSealGenerationNotBound) {
+			t.Errorf("a seal that consumed generation %d while its aad named 7 answered %v, want errSealGenerationNotBound",
+				7+skip, err)
+		}
+		if message != nil {
+			t.Errorf("the refused seal returned a message beside its error; MASTER section 8.4.2's S3 is that it MUST emit NOTHING")
+		}
+	}
+	// the other direction: the aad names a generation the seal never reaches.
+	behind := framingNewKeySource(crypto, 0x31, 7)
+	if message, err := sealPrivateMessageBound(crypto, behind, signed.senderDataSecret,
+		signed.authContent, nil, 9); !errors.Is(err, errSealGenerationNotBound) || message != nil {
+		t.Errorf("a seal whose aad named generation 9 while the ratchet stood at 7 answered (%v, %v), want no message and errSealGenerationNotBound",
+			message != nil, err)
+	}
+}
+
+// TestTheRegisteredSignatureWidthIsTheWidthTheProviderProduces holds SuiteParams.Nsig to the
+// scheme rather than to a number somebody typed.
+//
+// WHY IT MATTERS RATHER THAN BEING TIDY: Nsig is a term of FramedApplicationLength, which MASTER
+// section 8.4.6 makes a sealer's early size refusal arithmetic. A registry that disagreed with the
+// scheme by even one octet would refuse a legal body at one boundary, or admit one the seal must
+// then refuse late -- after a stream index and an MLS generation are spent, which is the whole
+// defect section 8.4.6 exists to end.
+func TestTheRegisteredSignatureWidthIsTheWidthTheProviderProduces(t *testing.T) {
+	for _, suite := range Suites() {
+		crypto, err := NewCryptoProvider(suite)
+		if err != nil {
+			t.Fatalf("NewCryptoProvider(%#04x): %v", uint16(suite), err)
+		}
+		params, err := LookupSuite(suite)
+		if err != nil {
+			t.Fatalf("LookupSuite(%#04x): %v", uint16(suite), err)
+		}
+		priv, _, err := crypto.SignatureKeyPair()
+		if err != nil {
+			t.Fatalf("SignatureKeyPair over %#04x: %v", uint16(suite), err)
+		}
+		signature, err := crypto.SignWithLabel(priv, framedContentTBSLabel, []byte("a preimage of some length"))
+		if err != nil {
+			t.Fatalf("SignWithLabel over %#04x: %v", uint16(suite), err)
+		}
+		if len(signature) != params.Nsig {
+			t.Errorf("suite %#04x registers Nsig %d and its provider produced a %d octet signature; MASTER section 8.4.6's framed length is arithmetic over this number",
+				uint16(suite), params.Nsig, len(signature))
+		}
+		// and it is not NsigPub under another name, which is the transposition a reader makes:
+		// ed25519 has 32 octet keys and 64 octet signatures.
+		if params.Nsig == params.NsigPub {
+			t.Errorf("suite %#04x registers Nsig and NsigPub at the same %d octets, so a body that read the key width where it wanted the signature width would compute the same answer",
+				uint16(suite), params.Nsig)
+		}
+	}
+}
+
+// TestFramedApplicationLengthRefusesASuiteWithNoRegisteredSignatureWidth is the fail-closed half.
+//
+// A zero Nsig is a SuiteParams that was assembled rather than looked up, and this package's own
+// tests build those. Answering a length for one would answer a number 66 octets short of the truth
+// -- which is not a wrong number, it is an early refusal that admits a body the seal must then
+// refuse after spending a write once index and a write once generation.
+func TestFramedApplicationLengthRefusesASuiteWithNoRegisteredSignatureWidth(t *testing.T) {
+	if _, err := FramedApplicationLength(CipherSuite(0xfffe), 32, 32, 0); !errors.Is(err, ErrUnknownCipherSuite) {
+		t.Errorf("an unregistered suite answered %v, want ErrUnknownCipherSuite", err)
+	}
+	for _, suite := range Suites() {
+		if _, err := FramedApplicationLength(suite, 32, 32, -1); err == nil {
+			t.Errorf("suite %#04x answered a length for a negative plaintext", uint16(suite))
+		}
+	}
+}
+
+// TestFramedApplicationLengthRefusesASuiteWithNoSignatureWidth reaches the guard the registry can
+// never fire, which is why framedApplicationLengthFor is split out at all.
+//
+// A zero Nsig is a SuiteParams that was assembled rather than looked up. Answering a length for one
+// would answer a number 66 octets short of the truth -- not a wrong number in the abstract, but an
+// early refusal that ADMITS a body the seal must then refuse after spending a write once stream
+// index and a write once MLS generation, which is the whole defect MASTER section 8.4.6 ends.
+func TestFramedApplicationLengthRefusesASuiteWithNoSignatureWidth(t *testing.T) {
+	assembled := SuiteParams{Suite: CipherSuite(0xfffe), Nt: 16}
+	if _, err := framedApplicationLengthFor(&assembled, 32, 32, 0); !errors.Is(err, errFramedLengthSuiteWidth) {
+		t.Errorf("a suite with no registered signature width answered %v, want errFramedLengthSuiteWidth", err)
+	}
+	if _, err := framedApplicationLengthFor(nil, 32, 32, 0); !errors.Is(err, errFramedLengthSuiteWidth) {
+		t.Errorf("nil parameters answered %v, want errFramedLengthSuiteWidth", err)
+	}
+	// and the control: the same call over a registered suite's own parameters answers a length.
+	params, err := LookupSuite(CipherSuiteX25519ChaCha20Sha256Ed25519)
+	if err != nil {
+		t.Fatalf("LookupSuite: %v", err)
+	}
+	if length, err := framedApplicationLengthFor(params, 32, 32, 0); err != nil || length == 0 {
+		t.Errorf("a registered suite answered (%d, %v), want a length and no error", length, err)
+	}
+}
+
+// TestProtectBoundBindsTheGenerationTheFrameIsSealedAt is MASTER section 8.4.2's S1 and S2 driven
+// over a real group, and it is where errNilAadBuilder is reached.
+//
+// WHAT IT OBSERVES, and it is the sentence the builder shape exists for: the generation the builder
+// is HANDED is the generation the frame is actually sealed at, so an AAD built out of it names the
+// frame's own position in the sender's ratchet. The peek reads that generation back before any
+// ratchet moves, and the open reports the same one -- which is what makes MASTER section 8.4.3's R2
+// checkable at all.
+func TestProtectBoundBindsTheGenerationTheFrameIsSealedAt(t *testing.T) {
+	crypto := testCrypto(t)
+	sender, receiver, _, _ := testTwoMemberGroup(t, crypto)
+
+	// the refusal first: a bound seal with no builder is a caller whose wiring is wrong, and an
+	// empty AAD is a legal value, so defaulting would seal a frame naming no position at all and
+	// answer it as though it had been bound.
+	if _, err := sender.ProtectBound(nil, []byte("no builder")); !errors.Is(err, errNilAadBuilder) {
+		t.Errorf("a bound seal with no aad builder answered %v, want errNilAadBuilder", err)
+	}
+
+	senderDataSecret, err := sender.EpochSecret(EpochSecretSenderData)
+	if err != nil {
+		t.Fatalf("EpochSecret: %v", err)
+	}
+	seen := []uint32{}
+	for i := 0; i < 4; i += 1 {
+		handed := uint32(0)
+		built := 0
+		frame, err := sender.ProtectBound(func(generation uint32) ([]byte, error) {
+			handed = generation
+			built += 1
+			// the AAD NAMES the generation, which is the whole shape: four big endian
+			// octets of it, exactly as MASTER section 8.4.2's term (3) writes them.
+			return []byte{byte(generation >> 24), byte(generation >> 16),
+				byte(generation >> 8), byte(generation)}, nil
+		}, fmt.Appendf(nil, "message %d", i))
+		if err != nil {
+			t.Fatalf("ProtectBound %d: %v", i, err)
+		}
+		if built != 1 {
+			t.Errorf("the builder was called %d times for one seal, want 1", built)
+		}
+		// the PEEK, which is the reading MASTER section 8.4.3's R3 requires to answer the
+		// generation before any ratchet is reached.
+		_, peekAad, peekGeneration, err := PeekPrivateMessageSender(crypto, senderDataSecret, frame)
+		if err != nil {
+			t.Fatalf("peek %d: %v", i, err)
+		}
+		if peekGeneration != handed {
+			t.Errorf("the builder was handed generation %d and the frame's sender data names %d; MASTER section 8.4.2's S1 is that these are the same number",
+				handed, peekGeneration)
+		}
+		want := []byte{byte(handed >> 24), byte(handed >> 16), byte(handed >> 8), byte(handed)}
+		if !bytes.Equal(peekAad, want) {
+			t.Errorf("the frame carries aad %x and the generation it is sealed at is %d", peekAad, handed)
+		}
+		// and the OPEN reports the same generation, which is the second reading R2 is taken on.
+		opened, err := receiver.Unprotect(frame)
+		if err != nil {
+			t.Fatalf("Unprotect %d: %v", i, err)
+		}
+		if opened.Generation != handed {
+			t.Errorf("the open reports generation %d and the seal consumed %d", opened.Generation, handed)
+		}
+		if !bytes.Equal(opened.AuthenticatedData, want) {
+			t.Errorf("the open authenticated aad %x, want %x", opened.AuthenticatedData, want)
+		}
+		seen = append(seen, handed)
+	}
+	// the generations advance by one per seal and none repeats, which is what says the builder is
+	// reading the ratchet rather than a constant.
+	for i, generation := range seen {
+		if i > 0 && generation != seen[i-1]+1 {
+			t.Errorf("the seals ran at generations %v; an application ratchet advances by one per seal", seen)
+			break
+		}
+	}
+}
+
+// TestTheDerivedFramedLengthIsTheLengthProtectActuallyEmits is what makes MASTER section 8.4.6's
+// early size refusal a rule rather than an approximation.
+//
+// THE RULE it stands under: an application record's size refusal is taken over
+// framed_length(len(bodyPlain)), BEFORE a stream index is reserved and BEFORE a generation is
+// spent. That is only a rule if framed_length is the length the seal actually emits. One octet
+// short and the check admits a body the seal must then refuse late, after spending both; one octet
+// long and it refuses a legal body at the boundary.
+//
+// THE LENGTHS ARE THE STEP FUNCTION'S OWN BOUNDARIES AND NOT A SAMPLE. MASTER section 8.4.4 records
+// that the frame's overhead has FOUR steps and that the corpus published three of them for two
+// days, because the ladder was measured by walking and the step function beside it was derived by
+// hand. Two nested varints widen: varint(P) inside the ciphertext at 64 and at 16,384, and
+// varint(C) around it at C = 16,384, which is P = 16,300. Both sides of all three boundaries are
+// driven here.
+//
+// IT IS SEALED WITH A REAL SIGNATURE, which is what makes the signature width a measurement rather
+// than a transcription: framingPrivateSignedMember signs with the suite's own scheme, so a registry
+// whose Nsig disagreed with the provider moves this comparison rather than agreeing with itself.
+func TestTheDerivedFramedLengthIsTheLengthProtectActuallyEmits(t *testing.T) {
+	crypto := newTestCrypto(t)
+	signed := framingPrivateSignedMember(t)
+	content := signed.authContent.Content
+	leaf := content.Sender.LeafIndex
+	contentType := content.ContentType
+	aad := bytes.Repeat([]byte{0x5a}, 32)
+
+	overheads := map[int]int{}
+	for _, plaintext := range []int{0, 1, 63, 64, 65, 16299, 16300, 16350, 16383, 16384, 65334} {
+		authContent := &AuthenticatedContent{
+			WireFormat: WireFormatPrivateMessage,
+			Content: FramedContent{
+				GroupId:           content.GroupId,
+				Epoch:             content.Epoch,
+				Sender:            content.Sender,
+				AuthenticatedData: aad,
+				ContentType:       contentType,
+				ApplicationData:   make([]byte, plaintext),
+			},
+			Auth: signed.authContent.Auth,
+		}
+		message, err := SealPrivateMessage(crypto, framingSecretTreeAt(t, crypto, leaf, contentType, 0),
+			signed.senderDataSecret, authContent, PaddingSizeV1)
+		if err != nil {
+			t.Fatalf("seal a %d octet plaintext: %v", plaintext, err)
+		}
+		marshalled, err := MarshalMLSMessage(&MLSMessage{
+			Version:        ProtocolVersionMls10,
+			WireFormat:     WireFormatPrivateMessage,
+			PrivateMessage: message,
+		})
+		if err != nil {
+			t.Fatalf("marshal a %d octet plaintext's frame: %v", plaintext, err)
+		}
+		derived, err := FramedApplicationLength(crypto.Suite(), len(content.GroupId), len(aad), plaintext)
+		if err != nil {
+			t.Fatalf("FramedApplicationLength(%d): %v", plaintext, err)
+		}
+		if derived != len(marshalled) {
+			t.Errorf("the derived framed length of a %d octet plaintext is %d and the seal emitted %d",
+				plaintext, derived, len(marshalled))
+		}
+		overheads[plaintext] = len(marshalled) - plaintext
+	}
+	// AND THE STEP FUNCTION HAS FOUR STEPS, held as the SHAPE rather than as the four numbers.
+	// MASTER section 8.4.4's 193 / 194 / 196 / 198 are its expected answer at a 32 OCTET group id,
+	// and this fixture's group id is shorter -- so the absolute column belongs to
+	// connect/messagegroup's sweep, which runs over a real 32 octet one, and what belongs here is
+	// the part that is a property of the encoding: three boundaries, each widening by exactly the
+	// varint it widens, and nothing moving between them. A build carrying the old THREE step form
+	// answers the 16,300 row equal to the 16,299 row and fails here.
+	for _, boundary := range []struct {
+		below, at, widensBy int
+	}{
+		{below: 63, at: 64, widensBy: 1},
+		{below: 16299, at: 16300, widensBy: 2},
+		{below: 16383, at: 16384, widensBy: 2},
+	} {
+		if got := overheads[boundary.at] - overheads[boundary.below]; got != boundary.widensBy {
+			t.Errorf("the overhead widens by %d across the boundary at %d octets and RFC 9420's varint widens by %d there",
+				got, boundary.at, boundary.widensBy)
+		}
+	}
+	for _, band := range [][]int{{0, 1, 63}, {64, 65, 16299}, {16300, 16350, 16383}, {16384, 65334}} {
+		for _, plaintext := range band[1:] {
+			if overheads[plaintext] != overheads[band[0]] {
+				t.Errorf("the overhead at %d octets is %d and at %d octets is %d, and both are inside one band of the step function",
+					band[0], overheads[band[0]], plaintext, overheads[plaintext])
+			}
+		}
+	}
+	// and the AAD's VALUE moves nothing, which is the measurement that makes framed_length a
+	// function of the plaintext's length ALONE and therefore computable before anything is spent.
+	for _, value := range [][]byte{make([]byte, 32), bytes.Repeat([]byte{0xff}, 32), crypto.Random(32)} {
+		authContent := &AuthenticatedContent{
+			WireFormat: WireFormatPrivateMessage,
+			Content: FramedContent{
+				GroupId:           content.GroupId,
+				Epoch:             content.Epoch,
+				Sender:            content.Sender,
+				AuthenticatedData: value,
+				ContentType:       contentType,
+				ApplicationData:   make([]byte, 100),
+			},
+			Auth: signed.authContent.Auth,
+		}
+		message, err := SealPrivateMessage(crypto, framingSecretTreeAt(t, crypto, leaf, contentType, 0),
+			signed.senderDataSecret, authContent, PaddingSizeV1)
+		if err != nil {
+			t.Fatalf("seal under a %x aad: %v", value[:4], err)
+		}
+		marshalled, err := MarshalMLSMessage(&MLSMessage{
+			Version:        ProtocolVersionMls10,
+			WireFormat:     WireFormatPrivateMessage,
+			PrivateMessage: message,
+		})
+		if err != nil {
+			t.Fatalf("marshal under a %x aad: %v", value[:4], err)
+		}
+		if got := len(marshalled) - 100; got != overheads[65] {
+			t.Errorf("a 100 octet plaintext under a 32 octet aad of %x framed to overhead %d and the same band answers %d; the aad's VALUE must not move any length",
+				value[:4], got, overheads[65])
+		}
+	}
+	t.Logf("overheads by plaintext length: %v", overheads)
 }

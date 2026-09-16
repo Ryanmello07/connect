@@ -1719,6 +1719,17 @@ func groupAnswerRows(t *testing.T) []groupAnswerRow {
 				[]byte("the plaintext this gate reads"))
 			return []any{&answer, &err}
 		}, publishes: groupProposalHeader},
+		// ProtectBound is Protect for MASTER section 8.4.2 v2's aad, which NAMES the generation
+		// the frame is sealed at and therefore cannot be a value the caller passes. The builder's
+		// answer is the caller's own array on exactly Protect's terms -- read once into the
+		// signature preimage and into the AEAD -- so it is swept the same way and read through the
+		// same projection.
+		{name: "ProtectBound", call: func(group *Group) []any {
+			answer, err := group.ProtectBound(func(generation uint32) ([]byte, error) {
+				return []byte("the aad this gate reads"), nil
+			}, []byte("the plaintext this gate reads"))
+			return []any{&answer, &err}
+		}, publishes: groupProposalHeader},
 		{name: "ProcessMessage", call: func(group *Group) []any {
 			peer := groupAnswerPeer(t, group)
 			message, protectErr := peer.Protect([]byte("the aad this gate reads"),

@@ -1803,8 +1803,16 @@ var labelledFieldFrontier = []string{
 	"mlsKdfLabel label (open, so a caller must bound what it sends)",
 	"mlsSignContent content (open, so a caller must bound what it sends)",
 	"mlsSignContent label (open, so a caller must bound what it sends)",
+	"openPrivateMessageAt senderDataSecret (open, so a caller must bound what it sends)",
 	"openSenderData senderDataSecret (open, so a caller must bound what it sends)",
 	"sealPrivateMessage senderDataSecret (open, so a caller must bound what it sends)",
+	// MASTER section 8.4.2 v2's two seal bodies and the open one, each carrying the neighbouring
+	// name's reading unchanged: the secret reaches SenderDataKeyNonce's ExpandWithLabel exactly as
+	// it does through the name that delegates to them, and the bound is the caller's for the same
+	// reason -- this is an epoch secret, so a caller that handed over an unbounded one has already
+	// lost more than a panic.
+	"sealPrivateMessageAt senderDataSecret (open, so a caller must bound what it sends)",
+	"sealPrivateMessageBound senderDataSecret (open, so a caller must bound what it sends)",
 	"sealSenderData senderDataSecret (open, so a caller must bound what it sends)",
 }
 

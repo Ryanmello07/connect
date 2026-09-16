@@ -2917,7 +2917,7 @@ var framingCodePointRefusals = map[string]func(codePoint uint64) error{
 				Sender:      Sender{SenderType: SenderTypeMember},
 				ContentType: ContentType(codePoint),
 			},
-		})
+		}, 0)
 		return err
 	},
 	// framing.go's section 6.3 header, which is the FIRST place a content type off the wire is

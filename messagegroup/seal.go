@@ -172,7 +172,8 @@ func (self *GroupSession) sealRecordOnLoop(class message.RetentionClass, ephBuck
 	if err != nil {
 		return nil, err
 	}
-	builder, err := self.newRecordBuilderOnLoop(class, ephBucket, ephWindow, isCommit, bodyPlain, expireAt, serverAttachment)
+	builder, err := self.newRecordBuilderOnLoop(class, ephBucket, ephWindow, isCommit, headPlain,
+		bodyPlain, expireAt, serverAttachment)
 	if err != nil {
 		return nil, err
 	}
@@ -310,7 +311,7 @@ type recordBuilder struct {
 // through here, and seal_test.go walks the call graph to say so rather than trusting this
 // sentence.
 func (self *GroupSession) newRecordBuilderOnLoop(class message.RetentionClass, ephBucket uint8,
-	ephWindow uint64, isCommit bool, bodyPlain []byte, expireAt uint64,
+	ephWindow uint64, isCommit bool, headPlain []byte, bodyPlain []byte, expireAt uint64,
 	serverAttachment *message.ServerAttachment) (*recordBuilder, error) {
 
 	// (c): the encoder's answer and not a second nil check. A nil attachment and an
@@ -324,14 +325,41 @@ func (self *GroupSession) newRecordBuilderOnLoop(class message.RetentionClass, e
 	if err != nil {
 		return nil, err
 	}
-	// THE CHEAP HALF OF THE LADDER REFUSAL, TAKEN BEFORE ANYTHING IS SPENT. It is necessary
-	// and NOT sufficient: the octets actually sealed are 193 to 198 longer than these for an
-	// application record, so the real bucket is computed below, over the frame. What this buys
-	// is that a body no rung could hold under ANY framing costs neither a stream index nor an
-	// MLS generation, which is what it cost before MASTER section 8.4 moved the bucket. The
-	// 198 octet band that fits here and not below is ledger open item 203, and a body in it
-	// spends both.
-	if _, err := bucketForBody(len(bodyPlain)); err != nil {
+	// THE LADDER REFUSAL, TAKEN BEFORE ANYTHING IS SPENT AND OVER THE LENGTH THAT WILL ACTUALLY
+	// BE SEALED. MASTER section 8.4.6, RULED 2026-09-17, ledger item 203's defect half.
+	//
+	// IT USED TO RUN ON len(bodyPlain), which is NECESSARY AND NOT SUFFICIENT: the octets
+	// actually sealed are 193 to 198 longer for an application record. So a body of 65,335 to
+	// 65,532 octets passed this check, RESERVED A STREAM INDEX, SPENT AN MLS GENERATION, built
+	// the frame, and was only then refused by the bucket below -- one write once index and one
+	// write once generation per attempt, on a call that can never succeed, with a caller in a
+	// retry loop walking its own ratchet toward MaxGenerationSkip. That is ledger open item
+	// 201's hazard reached by a cause that is pure waste.
+	//
+	// WHY IT IS COMPUTABLE HERE, which was the open question: MASTER section 8.4.4 measures that
+	// len(frame) depends on len(plaintext) ALONE -- swept at twelve lengths against three
+	// different 32 octet aad values, identical at every length -- and aad_mls is a 32 octet
+	// digest at v1 and v2 alike. So the framed length is a pure function this can evaluate with
+	// no key material, no signature, no ratchet step and no reserved index.
+	//
+	// IT IS DERIVED AND NOT TABULATED. mls.FramedApplicationLength builds the frame's own
+	// structures and marshals them; 193, 194, 196 and 198 appear nowhere in this package's
+	// production source, which is MASTER section 8.4.6's requirement and not a preference --
+	// this corpus published three of those four correctly and the fourth not at all for two
+	// days, and an implementation that transcribed them would mis-size on the first suite,
+	// group id width or signature algorithm that differed.
+	//
+	// THE PRODUCT HALF OF 203 IS STILL OPEN: a body above the ceiling has nowhere to go until
+	// the blob plane exists. This rules what it COSTS to refuse one, not where it goes.
+	sealedLength := len(bodyPlain)
+	if isApplicationRecord(isCommit, attachmentBytes) {
+		framed, err := framedApplicationLength(self.handle, len(bodyPlain))
+		if err != nil {
+			return nil, err
+		}
+		sealedLength = framed
+	}
+	if _, err := bucketForBody(sealedLength); err != nil {
 		return nil, err
 	}
 	ratchet, err := self.senderRatchetOnLoop(class, retentionWire, ephBucket, ephWindow)
@@ -353,7 +381,7 @@ func (self *GroupSession) newRecordBuilderOnLoop(class message.RetentionClass, e
 		RetentionClass: class,
 		EphBucket:      ephBucket,
 		EphWindow:      ephWindow,
-	}, bodyPlain)
+	}, recordKey, headPlain, bodyPlain)
 	if err != nil {
 		zeroize(recordKey)
 		return nil, err
@@ -829,7 +857,7 @@ func (self *GroupSession) openRecordOnLoop(record *message.Record,
 	// of what this ruling bought. It runs BEFORE the commit below for the reason
 	// unframeBodyOnLoop's comment gives: a forged envelope that moved the receiver's ladder
 	// would deny the true sender its own next index.
-	bodyPlain, err = self.unframeBodyOnLoop(&header, bodyPlain)
+	bodyPlain, err = self.unframeBodyOnLoop(&header, recordKey, headPlain, bodyPlain)
 	if err != nil {
 		return nil, nil, err
 	}

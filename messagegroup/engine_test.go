@@ -71,8 +71,16 @@ var sectionSixGroupHandle = map[string]string{
 	"Process":     "func(message []byte) (*EngineProcessed, error)",
 	"ApplyCommit": "func(processed *EngineProcessed) error",
 
-	"Protect":   "func(aad []byte, plaintext []byte) ([]byte, error)",
-	"Unprotect": "func(message []byte) (aad []byte, plaintext []byte, senderLeaf uint32, err error)",
+	// AMENDED 2026-09-17 for MASTER section 8.4.2 v2, transcribed from spec A section 8.2's own
+	// amendment block. Three changes, all forced by the generation being inside aad_mls: the seal
+	// takes a BUILDER because it cannot take a value, the open answers the generation because R2
+	// is a function of it, and the peek answers the generation because R3 requires R2 to be
+	// decided before any ratchet moves. Protect is KEPT for a caller whose aad is a constant, and
+	// TestNoProductionSiteReachesTheUnboundProtect is what keeps the record layer off it.
+	"Protect":      "func(aad []byte, plaintext []byte) ([]byte, error)",
+	"ProtectBound": "func(aad func(generation uint32) ([]byte, error), plaintext []byte) ([]byte, error)",
+	"Unprotect":    "func(message []byte) (aad []byte, plaintext []byte, senderLeaf uint32, generation uint32, err error)",
+	"PeekSender":   "func(frame []byte) (senderLeaf uint32, aad []byte, generation uint32, err error)",
 
 	"Close": "func() error",
 }
@@ -176,8 +184,13 @@ func TestTheEngineInterfacesAreExactlySectionSixsBlock(t *testing.T) {
 	}
 	// the two counts section 6 was measured at, so a block that gained a method AND a
 	// transcription row in one edit is still a failure somebody has to look at.
-	if len(sectionSixGroupEngine) != 4 || len(sectionSixGroupHandle) != 23 {
-		t.Errorf("section 6's block is transcribed as %d and %d methods; it was measured at 4 and 23, and a change to either is a change to the seam",
+	//
+	// IT WAS 4 AND 23 UNTIL 2026-09-17 and is 4 and 25 from MASTER section 8.4.2 v2: ProtectBound
+	// and PeekSender are the two spec A section 8.2's amendment adds, and Unprotect's signature
+	// moved beside them. Three changes to the seam, made deliberately with the ruling in hand,
+	// which is exactly the event this pair of numbers exists to make somebody look at.
+	if len(sectionSixGroupEngine) != 4 || len(sectionSixGroupHandle) != 25 {
+		t.Errorf("section 6's block is transcribed as %d and %d methods; it was measured at 4 and 25, and a change to either is a change to the seam",
 			len(sectionSixGroupEngine), len(sectionSixGroupHandle))
 	}
 }
@@ -243,6 +256,88 @@ func TestNoMethodOfEitherEngineInterfaceNamesAConnectMlsType(t *testing.T) {
 		t.Fatalf("this gate judged %d methods and section 6's block has %d; a class that is not the whole method set is a class the next method joins outside of",
 			judged, len(sectionSixGroupEngine)+len(sectionSixGroupHandle))
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Property 3b: the unbound seal has no production caller
+// ---------------------------------------------------------------------------
+
+// TestNoProductionSiteReachesTheUnboundProtect is what keeps GroupHandle.Protect from being the way
+// back to a frame whose aad does not name its generation.
+//
+// WHY THE METHOD IS STILL ON THE INTERFACE. Spec A section 8.2's amendment keeps it, for a caller
+// whose aad is a constant, and removing a published method is a larger call than adding one. What
+// that leaves behind is a door that compiles: an application record sealed through Protect gets an
+// aad_mls naming whatever generation the caller guessed, and every peer refuses it at R2 for a
+// reason the sender cannot see. Nothing in the type system says so.
+//
+// SO THE RULE IS STATED HERE RATHER THAN HELD BY AN ABSENCE, which is MASTER section 8.4.7 (3)'s
+// own argument about ReceiverKey applied one layer up: "there is no caller to have learned it from"
+// is not a rule, because the next caller is the defect and nothing is looking for it. This is what
+// looks for it.
+//
+// THE CLASS IS EVERY .Protect( CALL IN THIS PACKAGE'S PRODUCTION SOURCE and not a list of files, so
+// a second seal site added next month is judged without anybody extending this. It is the SELECTOR
+// and not the receiver's type, because the AST alone does not know types -- which makes the gate
+// broader than the rule rather than narrower, and a production caller that genuinely needed a
+// constant aad would have to come here and say so.
+//
+// EXACTLY ONE SITE IS EXEMPT AND IT IS THE INTERFACE METHOD ITSELF. (*connectMlsHandle).Protect
+// delegates to (*mls.Group).Protect, because the method is on GroupHandle and something has to
+// implement it; exempting the body of the method of that name is not a hole, because a SEAL site
+// that hid inside it would be a seal site inside the one function whose whole content is one
+// delegation. Anything else, in any file, is a failure.
+//
+// MUTATION: put self.handle.Protect(aad[:], bodyPlain) back into frameBodyOnLoop and this goes red.
+func TestNoProductionSiteReachesTheUnboundProtect(t *testing.T) {
+	fileSet, sources := messagegroupProductionSources(t)
+	found := 0
+	for _, source := range sources {
+		for _, declaration := range source.parsed.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || function.Body == nil {
+				continue
+			}
+			// the delegation the interface forces: func (self *connectMlsHandle) Protect(...)
+			if function.Name.Name == "Protect" && function.Recv != nil {
+				continue
+			}
+			ast.Inspect(function.Body, func(node ast.Node) bool {
+				call, isCall := node.(*ast.CallExpr)
+				if !isCall {
+					return true
+				}
+				selector, isSelector := call.Fun.(*ast.SelectorExpr)
+				if !isSelector || selector.Sel.Name != "Protect" {
+					return true
+				}
+				found += 1
+				t.Errorf("%s calls .Protect, and an application record's aad_mls names the generation the frame is sealed at -- which Protect cannot know. MASTER section 8.4.2's S1: the seal must go through ProtectBound",
+					fileSet.Position(call.Pos()))
+				return true
+			})
+		}
+	}
+	// and the gate is looking at something: ProtectBound IS reached from production, so a build
+	// where this scan read nothing at all reports rather than passing on an empty class.
+	bound := 0
+	for _, source := range sources {
+		ast.Inspect(source.parsed, func(node ast.Node) bool {
+			call, isCall := node.(*ast.CallExpr)
+			if !isCall {
+				return true
+			}
+			selector, isSelector := call.Fun.(*ast.SelectorExpr)
+			if isSelector && selector.Sel.Name == "ProtectBound" {
+				bound += 1
+			}
+			return true
+		})
+	}
+	if bound == 0 {
+		t.Fatal("no production site in this package calls ProtectBound, so this scan is reading a package with no seal in it and the refusal above is vacuous")
+	}
+	t.Logf("%d production calls to ProtectBound and %d to Protect", bound, found)
 }
 
 // ---------------------------------------------------------------------------

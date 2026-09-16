@@ -549,30 +549,54 @@ func nilArgumentRows(t *testing.T) map[string]nilArgumentRow {
 		// a default would either derive message keys from nothing, which every party in the world
 		// can compute, or answer one key for every generation, which is the AEAD nonce reuse the
 		// whole of section 9 exists to prevent.
-		"sealPrivateMessage(keys)": {sentinel: errNilMessageKeySource, call: func(t *testing.T) error {
-			_, err := sealPrivateMessage(crypto, nil, secret, &AuthenticatedContent{
+		//
+		// THE ROWS NAME sealPrivateMessageAt AND openPrivateMessageAt SINCE 2026-09-17, which is
+		// where the guards moved when MASTER section 8.4.2 v2 made the seal report the generation
+		// it consumed and the open report the generation it opened at. sealPrivateMessage and
+		// OpenPrivateMessage are one-line delegations now, so a row naming either would be a row
+		// about a body that refuses nothing -- which is exactly what this gate's derived class
+		// says when a row and a declaration come apart.
+		"sealPrivateMessageAt(keys)": {sentinel: errNilMessageKeySource, call: func(t *testing.T) error {
+			_, _, err := sealPrivateMessageAt(crypto, nil, secret, &AuthenticatedContent{
 				WireFormat: WireFormatPrivateMessage,
 				Content:    *framingTestMemberContent(),
 			}, nil)
 			return err
 		}},
-		"sealPrivateMessage(authContent)": {sentinel: errNilAuthenticatedContent, call: func(t *testing.T) error {
-			_, err := sealPrivateMessage(crypto, framingNewKeySource(crypto, 0x01, 0), secret, nil, nil)
+		"sealPrivateMessageAt(authContent)": {sentinel: errNilAuthenticatedContent, call: func(t *testing.T) error {
+			_, _, err := sealPrivateMessageAt(crypto, framingNewKeySource(crypto, 0x01, 0), secret, nil, nil)
 			return err
 		}},
-		"OpenPrivateMessage(keys)": {sentinel: errNilMessageKeySource, call: func(t *testing.T) error {
-			_, err := OpenPrivateMessage(crypto, nil, secret, &PrivateMessage{},
+		"openPrivateMessageAt(keys)": {sentinel: errNilMessageKeySource, call: func(t *testing.T) error {
+			_, _, err := openPrivateMessageAt(crypto, nil, secret, &PrivateMessage{},
 				StaticSignatureKey(nil), framingTestGroupContext(t))
 			return err
 		}},
-		"OpenPrivateMessage(message)": {sentinel: errNilPrivateMessage, call: func(t *testing.T) error {
-			_, err := OpenPrivateMessage(crypto, framingNewKeySource(crypto, 0x01, 0), secret, nil,
+		"openPrivateMessageAt(message)": {sentinel: errNilPrivateMessage, call: func(t *testing.T) error {
+			_, _, err := openPrivateMessageAt(crypto, framingNewKeySource(crypto, 0x01, 0), secret, nil,
 				StaticSignatureKey(nil), framingTestGroupContext(t))
 			return err
 		}},
-		"OpenPrivateMessage(resolve)": {sentinel: errNilSignatureKeyResolver, call: func(t *testing.T) error {
-			_, err := OpenPrivateMessage(crypto, framingNewKeySource(crypto, 0x01, 0), secret,
+		"openPrivateMessageAt(resolve)": {sentinel: errNilSignatureKeyResolver, call: func(t *testing.T) error {
+			_, _, err := openPrivateMessageAt(crypto, framingNewKeySource(crypto, 0x01, 0), secret,
 				&PrivateMessage{}, nil, framingTestGroupContext(t))
+			return err
+		}},
+		// MASTER section 8.4.2's aad BUILDER. It is refused rather than defaulted to an empty aad
+		// for the reason the key source above is refused: an empty aad is a LEGAL value, so a
+		// default here would seal a frame naming no position and no generation and answer it as
+		// though it had been bound.
+		"(*Group).ProtectBound(aad)": {sentinel: errNilAadBuilder, call: func(t *testing.T) error {
+			group := &Group{}
+			_, err := group.ProtectBound(nil, []byte("no builder"))
+			return err
+		}},
+		// MASTER section 8.4.6's framed length. Nil parameters are refused rather than read as a
+		// suite with zero-width everything, because the answer would be a length short by the
+		// signature and the tag -- an early size refusal that ADMITS a body the seal must then
+		// refuse after spending a write once index and a write once generation.
+		"framedApplicationLengthFor(params)": {sentinel: errFramedLengthSuiteWidth, call: func(t *testing.T) error {
+			_, err := framedApplicationLengthFor(nil, 32, 32, 0)
 			return err
 		}},
 		// the decoder, whose header is not an option but a third of its input: the group id, the
