@@ -1029,7 +1029,7 @@ func (self *tcpReturnRetransmitTestHarness) retransmitTimer() (rto time.Duration
 // The loss-recovery run, read under the sequence mutex: the consecutive
 // segments from the cumulative acknowledgement that recovery may have in
 // flight.
-func (self *tcpReturnRetransmitTestHarness) burstSegmentCountForTest() int {
+func (self *tcpReturnRetransmitTestHarness) burstRunSegmentCount() int {
 	self.sequence.mutex.Lock()
 	defer self.sequence.mutex.Unlock()
 	return self.sequence.returnRetransmit.burstSegmentCount
@@ -3005,7 +3005,7 @@ func TestTcpReturnRetransmitBurstRunHasACeilingAndRestartsAtOne(t *testing.T) {
 				if packetCount <= 0 {
 					continue
 				}
-				run := harness.burstSegmentCountForTest()
+				run := harness.burstRunSegmentCount()
 				if maxPacketCount == 0 {
 					firstRun = run
 				}
