@@ -920,13 +920,163 @@ func TestH1PathEffectiveModePrecedence(t *testing.T) {
 		settings.Mode = c.settingsMode
 		settings.Role = c.role
 		settings.AllowProviderAct = c.allowProviderAct
-		mode, source, envValid := h1PathEffectiveMode(&settings, c.overrideMode, c.overrideSet, c.envValue)
+		// the role the clamp reads comes from its own resolution, which with
+		// no override and no environment is the settings
+		role, _ := h1PathEffectiveRole(&settings, H1PathRerollRoleClient, false, "")
+		mode, source, envValid := h1PathEffectiveMode(&settings, role, c.overrideMode, c.overrideSet, c.envValue)
 		if mode != c.wantMode || source != c.wantSource || envValid != c.wantEnvValid {
 			t.Errorf(
 				"%s: mode = %s from %s (env valid %t); want %s from %s (env valid %t)",
 				c.name, mode, source, envValid, c.wantMode, c.wantSource, c.wantEnvValid,
 			)
 		}
+	}
+}
+
+// The role follows the same precedence as the mode, and an unknown role is the
+// provider, whose gates are the tighter ones.
+func TestH1PathRerollRolePrecedence(t *testing.T) {
+	for _, c := range []struct {
+		name         string
+		settingsRole H1PathRerollRole
+		envValue     string
+		overrideRole H1PathRerollRole
+		overrideSet  bool
+		wantRole     H1PathRerollRole
+		wantEnvValid bool
+	}{
+		{
+			name: "settings client", settingsRole: H1PathRerollRoleClient,
+			wantRole: H1PathRerollRoleClient, wantEnvValid: true,
+		},
+		{
+			name: "settings provider", settingsRole: H1PathRerollRoleProvider,
+			wantRole: H1PathRerollRoleProvider, wantEnvValid: true,
+		},
+		{
+			name: "env provider over settings client", envValue: " PROVIDER ",
+			wantRole: H1PathRerollRoleProvider, wantEnvValid: true,
+		},
+		{
+			name: "env client over settings provider", settingsRole: H1PathRerollRoleProvider, envValue: "client",
+			wantRole: H1PathRerollRoleClient, wantEnvValid: true,
+		},
+		{
+			name: "bad env keeps the settings", settingsRole: H1PathRerollRoleProvider, envValue: "bogus",
+			wantRole: H1PathRerollRoleProvider, wantEnvValid: false,
+		},
+		{
+			name: "override client over env provider", envValue: "provider",
+			overrideRole: H1PathRerollRoleClient, overrideSet: true,
+			wantRole: H1PathRerollRoleClient, wantEnvValid: true,
+		},
+		{
+			name:         "override provider over settings client",
+			overrideRole: H1PathRerollRoleProvider, overrideSet: true,
+			wantRole: H1PathRerollRoleProvider, wantEnvValid: true,
+		},
+		{
+			name:         "unknown override is the provider",
+			overrideRole: H1PathRerollRole(7), overrideSet: true,
+			wantRole: H1PathRerollRoleProvider, wantEnvValid: true,
+		},
+		{
+			name: "unknown settings role is the provider", settingsRole: H1PathRerollRole(7),
+			wantRole: H1PathRerollRoleProvider, wantEnvValid: true,
+		},
+	} {
+		settings := DefaultH1PathRerollSettings()
+		settings.Role = c.settingsRole
+		role, envValid := h1PathEffectiveRole(&settings, c.overrideRole, c.overrideSet, c.envValue)
+		if role != c.wantRole || envValid != c.wantEnvValid {
+			t.Errorf(
+				"%s: role = %s (env valid %t); want %s (env valid %t)",
+				c.name, role, envValid, c.wantRole, c.wantEnvValid,
+			)
+		}
+	}
+}
+
+// The role a transport resolves reaches the clamp, so an operator who sets act
+// in a provider process gets Observe. The two environment values are logged
+// independently, once per value.
+func TestH1PathRerollRoleEnvironmentClampsTheMode(t *testing.T) {
+	log := newRecordingLogger()
+	settings := DefaultPlatformTransportSettings()
+	settings.H1PathReroll.Mode = H1PathRerollModeAct
+	transport := &PlatformTransport{log: log, settings: settings}
+
+	if role := transport.h1PathEffectiveRole(); role != H1PathRerollRoleClient {
+		t.Fatalf("role = %s with no environment, want the settings client", role)
+	}
+	if mode, _ := transport.h1PathEffectiveMode(transport.h1PathEffectiveRole()); mode != H1PathRerollModeAct {
+		t.Fatalf("mode = %s for a client, want act", mode)
+	}
+
+	t.Setenv(H1PathRerollRoleEnv, "provider")
+	if role := transport.h1PathEffectiveRole(); role != H1PathRerollRoleProvider {
+		t.Fatalf("role = %s with the environment provider", role)
+	}
+	if mode, source := transport.h1PathEffectiveMode(transport.h1PathEffectiveRole()); mode != H1PathRerollModeObserve {
+		t.Fatalf("mode = %s from %s for a provider, want the clamp to observe", mode, source)
+	}
+	settings.H1PathReroll.AllowProviderAct = true
+	if mode, _ := transport.h1PathEffectiveMode(transport.h1PathEffectiveRole()); mode != H1PathRerollModeAct {
+		t.Fatalf("mode = %s for an allowed provider, want act", mode)
+	}
+
+	// each distinct bad value is logged once, and the mode's own bad value is
+	// counted apart from the role's
+	badRole := fmt.Sprintf("bogus-%s", NewId())
+	t.Setenv(H1PathRerollRoleEnv, badRole)
+	badMode := fmt.Sprintf("bogus-%s", NewId())
+	t.Setenv(H1PathRerollModeEnv, badMode)
+	for range 3 {
+		role := transport.h1PathEffectiveRole()
+		if role != H1PathRerollRoleClient {
+			t.Fatalf("role = %s for a bad environment value, want the settings client", role)
+		}
+		if mode, source := transport.h1PathEffectiveMode(role); mode != H1PathRerollModeAct || source != h1PathModeSourceSettings {
+			t.Fatalf("mode = %s from %s for a bad environment value", mode, source)
+		}
+	}
+	if lines := log.linesWith(badRole); len(lines) != 1 {
+		t.Fatalf("log lines for the bad role %s = %v, want one", badRole, lines)
+	}
+	if lines := log.linesWith(badMode); len(lines) != 1 {
+		t.Fatalf("log lines for the bad mode %s = %v, want one", badMode, lines)
+	}
+}
+
+// The process role override is set, read and cleared, and an unknown role is
+// stored as the provider rather than reaching the client gates.
+func TestH1PathRerollRoleOverrideApi(t *testing.T) {
+	previousRole, previousSet := H1PathRerollRoleOverride()
+	t.Cleanup(func() {
+		if previousSet {
+			SetH1PathRerollRoleOverride(previousRole)
+		} else {
+			ClearH1PathRerollRoleOverride()
+		}
+	})
+
+	ClearH1PathRerollRoleOverride()
+	if role, ok := H1PathRerollRoleOverride(); ok || role != H1PathRerollRoleClient {
+		t.Fatalf("override = %s, %t after clear", role, ok)
+	}
+	for _, wantRole := range []H1PathRerollRole{H1PathRerollRoleClient, H1PathRerollRoleProvider} {
+		SetH1PathRerollRoleOverride(wantRole)
+		if role, ok := H1PathRerollRoleOverride(); !ok || role != wantRole {
+			t.Errorf("override = %s, %t; want %s, true", role, ok, wantRole)
+		}
+	}
+	SetH1PathRerollRoleOverride(H1PathRerollRole(7))
+	if role, ok := H1PathRerollRoleOverride(); !ok || role != H1PathRerollRoleProvider {
+		t.Fatalf("override = %s, %t after an unknown role; want provider, true", role, ok)
+	}
+	ClearH1PathRerollRoleOverride()
+	if _, ok := H1PathRerollRoleOverride(); ok {
+		t.Fatal("the override survived a clear")
 	}
 }
 
@@ -975,7 +1125,7 @@ func TestH1PathRerollModeEnvironmentBadValueLogsOnce(t *testing.T) {
 	transport := &PlatformTransport{log: log, settings: settings}
 
 	t.Setenv(H1PathRerollModeEnv, "act")
-	if mode, source := transport.h1PathEffectiveMode(); mode != H1PathRerollModeAct || source != h1PathModeSourceEnv {
+	if mode, source := transport.h1PathEffectiveMode(H1PathRerollRoleClient); mode != H1PathRerollModeAct || source != h1PathModeSourceEnv {
 		t.Fatalf("mode = %s from %s, want act from env", mode, source)
 	}
 
@@ -983,7 +1133,7 @@ func TestH1PathRerollModeEnvironmentBadValueLogsOnce(t *testing.T) {
 	badValue := fmt.Sprintf("bogus-%s", NewId())
 	t.Setenv(H1PathRerollModeEnv, badValue)
 	for range 3 {
-		if mode, source := transport.h1PathEffectiveMode(); mode != H1PathRerollModeObserve || source != h1PathModeSourceSettings {
+		if mode, source := transport.h1PathEffectiveMode(H1PathRerollRoleClient); mode != H1PathRerollModeObserve || source != h1PathModeSourceSettings {
 			t.Fatalf("mode = %s from %s, want the settings observe", mode, source)
 		}
 	}
@@ -993,7 +1143,7 @@ func TestH1PathRerollModeEnvironmentBadValueLogsOnce(t *testing.T) {
 
 	otherBadValue := fmt.Sprintf("bogus-%s", NewId())
 	t.Setenv(H1PathRerollModeEnv, otherBadValue)
-	transport.h1PathEffectiveMode()
+	transport.h1PathEffectiveMode(H1PathRerollRoleClient)
 	if lines := log.linesWith(otherBadValue); len(lines) != 1 {
 		t.Fatalf("log lines for %s = %v, want one", otherBadValue, lines)
 	}

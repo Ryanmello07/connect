@@ -21,7 +21,10 @@ import (
 // order: the process override (SetH1PathRerollModeOverride), the environment
 // (CONNECT_H1_PATH_REROLL), then the transport's settings. A later dial
 // therefore picks up a mode the host changed, without a settings change of its
-// own. There is no connection, and no per-frame, timer or syscall cost, when:
+// own. Its role -- which selects the provider gates and the provider clamp --
+// is resolved the same way, from SetH1PathRerollRoleOverride,
+// CONNECT_H1_PATH_REROLL_ROLE and the settings, because a provider process is
+// the only thing that knows its websocket to the platform is a provider's. There is no connection, and no per-frame, timer or syscall cost, when:
 //   - the effective mode is Off;
 //   - the transport carries only control (a TransportGenerator is set);
 //   - the dial round trip, a third of the dial duration, is below MinPathRtt.
@@ -111,6 +114,7 @@ type h1PathConnection struct {
 	ordinal     int
 	mode        H1PathRerollMode
 	modeSource  h1PathModeSource
+	role        H1PathRerollRole
 	logTicks    bool
 	observeOnly bool
 
@@ -155,29 +159,57 @@ func h1PathConnectionMode(
 // the last bad CONNECT_H1_PATH_REROLL value logged by this process
 var h1PathBadModeEnvValue atomic.Pointer[string]
 
+// the last bad CONNECT_H1_PATH_REROLL_ROLE value logged by this process
+var h1PathBadRoleEnvValue atomic.Pointer[string]
+
 // True the first time this process sees the value, so a bad environment value
 // is logged once rather than at every dial. Two connections racing here can
 // both log.
-func h1PathNoteBadModeEnv(envValue string) bool {
-	if logged := h1PathBadModeEnvValue.Load(); logged != nil && *logged == envValue {
+func h1PathNoteBadEnv(logged *atomic.Pointer[string], envValue string) bool {
+	if previous := logged.Load(); previous != nil && *previous == envValue {
 		return false
 	}
-	h1PathBadModeEnvValue.Store(&envValue)
+	logged.Store(&envValue)
 	return true
 }
 
+// The role of a connection of this transport, reading the process override and
+// the environment at each dial. A provider process declares itself through one
+// of those two or through its settings; nothing here can tell a provider's
+// websocket from a client's.
+func (self *PlatformTransport) h1PathEffectiveRole() H1PathRerollRole {
+	overrideRole, overrideSet := H1PathRerollRoleOverride()
+	envValue := strings.TrimSpace(os.Getenv(H1PathRerollRoleEnv))
+	role, envValid := h1PathEffectiveRole(
+		&self.settings.H1PathReroll,
+		overrideRole,
+		overrideSet,
+		envValue,
+	)
+	if !envValid && h1PathNoteBadEnv(&h1PathBadRoleEnvValue, envValue) {
+		self.log.Infof(
+			"[t]h1 path: ignoring %s=%q, want client or provider\n",
+			H1PathRerollRoleEnv,
+			envValue,
+		)
+	}
+	return role
+}
+
 // The mode of a connection of this transport and where it came from, reading
-// the process override and the environment at each dial.
-func (self *PlatformTransport) h1PathEffectiveMode() (H1PathRerollMode, h1PathModeSource) {
+// the process override and the environment at each dial, with the role the
+// clamp applies.
+func (self *PlatformTransport) h1PathEffectiveMode(role H1PathRerollRole) (H1PathRerollMode, h1PathModeSource) {
 	overrideMode, overrideSet := H1PathRerollModeOverride()
 	envValue := strings.TrimSpace(os.Getenv(H1PathRerollModeEnv))
 	mode, source, envValid := h1PathEffectiveMode(
 		&self.settings.H1PathReroll,
+		role,
 		overrideMode,
 		overrideSet,
 		envValue,
 	)
-	if !envValid && h1PathNoteBadModeEnv(envValue) {
+	if !envValid && h1PathNoteBadEnv(&h1PathBadModeEnvValue, envValue) {
 		self.log.Infof(
 			"[t]h1 path: ignoring %s=%q, want off, observe or act\n",
 			H1PathRerollModeEnv,
@@ -255,7 +287,8 @@ func (self *PlatformTransport) newH1PathConnection(
 	proxied := self.clientStrategy != nil &&
 		self.clientStrategy.settings != nil &&
 		self.clientStrategy.settings.ProxySettings != nil
-	effectiveMode, modeSource := self.h1PathEffectiveMode()
+	role := self.h1PathEffectiveRole()
+	effectiveMode, modeSource := self.h1PathEffectiveMode(role)
 	mode, observeOnly := h1PathConnectionMode(self.settings, effectiveMode, proxied, extenderIp)
 	if self.settings.TransportGenerator == nil {
 		// a control-only transport is never monitored, whatever the mode says,
@@ -299,6 +332,7 @@ func (self *PlatformTransport) newH1PathConnection(
 		ordinal:     connectionOrdinal,
 		mode:        mode,
 		modeSource:  modeSource,
+		role:        role,
 		logTicks:    h1PathLogTicks(settings),
 		observeOnly: observeOnly,
 		monitor:     monitor,
@@ -314,12 +348,13 @@ func (self *PlatformTransport) newH1PathConnection(
 	stats.ConnectionsMonitored.Add(1)
 	if self.log.V(1).Enabled() {
 		self.log.Infof(
-			"[t]h1 path monitor dial_rtt=%s kernel=%t port=%d mode=%s source=%s observe_only=%t\n",
+			"[t]h1 path monitor dial_rtt=%s kernel=%t port=%d mode=%s source=%s role=%s observe_only=%t\n",
 			dialRtt,
 			connection.rawConn != nil,
 			connection.localPort,
 			mode,
 			modeSource,
+			role,
 			observeOnly,
 		)
 	}
@@ -465,11 +500,10 @@ func (self *h1PathConnection) decide(now time.Time, decision *h1PathDecision) {
 			self.observe(decision)
 			break
 		}
-		role := self.settings.Role
 		allowed, reason := ledger.allow(
 			self.settings,
 			now,
-			role,
+			self.role,
 			decision.confidence,
 			now.Sub(self.monitor.start),
 		)
@@ -479,7 +513,7 @@ func (self *h1PathConnection) decide(now time.Time, decision *h1PathDecision) {
 			self.stats.recordSuppression(reason)
 			break
 		}
-		ledger.noteReroll(key, self.settings, now, role, decision.confidence, self.localPort)
+		ledger.noteReroll(key, self.settings, now, self.role, decision.confidence, self.localPort)
 		// packs built for this connection, and their resends, carry old tags
 		// that must not convict the next one
 		self.transport.h1PathBaseline.markReroll(now, decision.pathRtt)
@@ -524,7 +558,7 @@ func (self *h1PathConnection) logVerdict(now time.Time, decision *h1PathDecision
 		ackQueue = decision.ackQueue.String()
 	}
 	self.transport.log.Infof(
-		"[t]h1 path %s dir=%s confidence=%s ticks=%d/%d qd=%s ack_queue=%s rate=%s thin=%s rtt=%s loss=%d/%d kernel=%t port=%d mode=%s source=%s observe_only=%t action=%s reason=%s\n",
+		"[t]h1 path %s dir=%s confidence=%s ticks=%d/%d qd=%s ack_queue=%s rate=%s thin=%s rtt=%s loss=%d/%d kernel=%t port=%d mode=%s source=%s role=%s observe_only=%t action=%s reason=%s\n",
 		verdict,
 		decision.direction,
 		decision.confidence,
@@ -541,6 +575,7 @@ func (self *h1PathConnection) logVerdict(now time.Time, decision *h1PathDecision
 		self.localPort,
 		self.mode,
 		self.modeSource,
+		self.role,
 		self.observeOnly,
 		decision.action,
 		decision.reason,

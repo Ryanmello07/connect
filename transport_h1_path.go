@@ -66,6 +66,19 @@ const H1PathRerollModeEnv = "CONNECT_H1_PATH_REROLL"
 // "1" logs one line per monitor tick, whatever the settings say.
 const H1PathRerollLogTicksEnv = "CONNECT_H1_PATH_REROLL_LOG_TICKS"
 
+// The environment variable that sets the role of every H1 connection dialed
+// after it is read: client or provider. It wins over the settings, and the
+// process override wins over it. A value that does not parse is ignored and
+// logged once.
+//
+// The role is what selects the provider gates, and a process that serves
+// clients has to say so: nothing in this package can tell a provider's
+// websocket to the platform from a client's. Without it, CONNECT_H1_PATH_REROLL
+// =act in a provider process re-rolls under the client gates -- no minimum
+// connection age and no provider spacing -- because the settings of a
+// host-built transport carry the zero role, which is client.
+const H1PathRerollRoleEnv = "CONNECT_H1_PATH_REROLL_ROLE"
+
 // Anything but Off, Observe and Act is Off, so a value from outside the
 // package cannot act by accident.
 func h1PathNormalizeMode(mode H1PathRerollMode) H1PathRerollMode {
@@ -127,11 +140,12 @@ func H1PathRerollModeOverride() (H1PathRerollMode, bool) {
 // process override, then the environment, then the settings. An empty
 // environment value, or one that does not parse, falls through; envValid is
 // false only for a value that was set and did not parse, so the caller can log
-// it once. A provider is then clamped to Observe unless AllowProviderAct,
-// whichever level chose Act: a provider's re-dial counts against its
-// reliability.
+// it once. The role is resolved the same way (h1PathEffectiveRole) and passed
+// in; a provider is then clamped to Observe unless AllowProviderAct, whichever
+// level chose Act: a provider's re-dial counts against its reliability.
 func h1PathEffectiveMode(
 	settings *H1PathRerollSettings,
+	role H1PathRerollRole,
 	overrideMode H1PathRerollMode,
 	overrideSet bool,
 	envValue string,
@@ -152,7 +166,7 @@ func h1PathEffectiveMode(
 		source = h1PathModeSourceOverride
 	}
 	if mode == H1PathRerollModeAct &&
-		settings.Role == H1PathRerollRoleProvider &&
+		role == H1PathRerollRoleProvider &&
 		!settings.AllowProviderAct {
 		mode = H1PathRerollModeObserve
 	}
@@ -181,6 +195,82 @@ const (
 	H1PathRerollRoleClient   H1PathRerollRole = 0
 	H1PathRerollRoleProvider H1PathRerollRole = 1
 )
+
+// Accepts client and provider, case-insensitive, with surrounding space
+// ignored.
+func ParseH1PathRerollRole(s string) (H1PathRerollRole, bool) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "client":
+		return H1PathRerollRoleClient, true
+	case "provider":
+		return H1PathRerollRoleProvider, true
+	default:
+		return H1PathRerollRoleClient, false
+	}
+}
+
+// Anything but Client and Provider is Provider, the role with the tighter
+// gates, so a value from outside the package cannot act by accident.
+func h1PathNormalizeRole(role H1PathRerollRole) H1PathRerollRole {
+	switch role {
+	case H1PathRerollRoleClient, H1PathRerollRoleProvider:
+		return role
+	default:
+		return H1PathRerollRoleProvider
+	}
+}
+
+// the process override as role + 1; zero is no override
+var h1PathRoleOverrideValue atomic.Int32
+
+// SetH1PathRerollRoleOverride sets the H1 path re-roll role of every connection
+// dialed after it, over the environment and over each transport's settings. A
+// provider process declares itself with this (or with CONNECT_H1_PATH_REROLL
+// _ROLE) so that its connections are clamped to Observe unless
+// AllowProviderAct, and go through the provider age and spacing gates when they
+// are allowed to act. An unknown role is stored as Provider.
+func SetH1PathRerollRoleOverride(role H1PathRerollRole) {
+	h1PathRoleOverrideValue.Store(int32(h1PathNormalizeRole(role)) + 1)
+}
+
+// ClearH1PathRerollRoleOverride returns to the environment and the settings.
+func ClearH1PathRerollRoleOverride() {
+	h1PathRoleOverrideValue.Store(0)
+}
+
+// H1PathRerollRoleOverride is the process override, and whether one is set.
+func H1PathRerollRoleOverride() (H1PathRerollRole, bool) {
+	value := h1PathRoleOverrideValue.Load()
+	if value == 0 {
+		return H1PathRerollRoleClient, false
+	}
+	return H1PathRerollRole(value - 1), true
+}
+
+// The role of a connection, in the same precedence order as the mode: the
+// process override, then the environment, then the settings. envValid is false
+// only for a value that was set and did not parse, so the caller can log it
+// once.
+func h1PathEffectiveRole(
+	settings *H1PathRerollSettings,
+	overrideRole H1PathRerollRole,
+	overrideSet bool,
+	envValue string,
+) (role H1PathRerollRole, envValid bool) {
+	role = h1PathNormalizeRole(settings.Role)
+	envValid = true
+	if envValue != "" {
+		if envRole, ok := ParseH1PathRerollRole(envValue); ok {
+			role = envRole
+		} else {
+			envValid = false
+		}
+	}
+	if overrideSet {
+		role = h1PathNormalizeRole(overrideRole)
+	}
+	return role, envValid
+}
 
 func (self H1PathRerollRole) String() string {
 	switch self {

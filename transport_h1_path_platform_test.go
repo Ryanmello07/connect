@@ -1140,6 +1140,71 @@ func TestPlatformTransportH1PathProviderRoleClampsToObserve(t *testing.T) {
 	})
 }
 
+// A provider process declares its role in the environment, which is the only
+// way the clamp can reach a transport whose settings a host built: an operator
+// who sets the mode to act in a provider process gets Observe, not a re-roll
+// under the client gates.
+func TestPlatformTransportH1PathProviderEnvironmentClampsToObserve(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	testingH1PathRestoreModeOverride(t)
+	ClearH1PathRerollModeOverride()
+	t.Setenv(H1PathRerollModeEnv, "act")
+	t.Setenv(H1PathRerollRoleEnv, "provider")
+
+	platform := newTestingPlatformServer(t)
+	rig := newTestingH1PathRig(testingH1PathCollapsedAlways)
+	// the settings say what a host's settings say: a client that may act
+	settings := testingH1PathTransportSettings(H1PathRerollModeAct, rig)
+
+	testingPlatformTransport(t, ctx, platform.url, settings)
+
+	testingH1PathWaitForConvictions(t, rig, 0, 2)
+	if dials := rig.dials(); len(dials) != 1 {
+		t.Fatalf("connections %v, want [0]: the provider re-rolled", dials)
+	}
+	for _, decision := range rig.connectionDecisions(0) {
+		if decision.convicted && decision.action != h1PathActionObserve {
+			t.Fatalf("provider conviction %+v, want it observed", decision)
+		}
+	}
+	if stats := rig.stats.snapshot(); stats.Rerolls != 0 || stats.SuppressedObserve < 2 {
+		t.Fatalf("stats = %+v, want the provider clamped to Observe", stats)
+	}
+	if state := testingH1PathLedgerSnapshot(rig.ledger); state.pendingCount != 0 || !state.lastReroll.IsZero() {
+		t.Fatalf("ledger = %+v, want untouched", state)
+	}
+}
+
+// An allowed provider that acts goes through the provider gates, which the
+// client gates do not have: a connection younger than ProviderMinConnectionAge
+// is refused however convincing its collapse.
+func TestPlatformTransportH1PathProviderEnvironmentAppliesTheProviderGates(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	testingH1PathRestoreModeOverride(t)
+	ClearH1PathRerollModeOverride()
+	t.Setenv(H1PathRerollRoleEnv, "provider")
+
+	platform := newTestingPlatformServer(t)
+	rig := newTestingH1PathRig(testingH1PathCollapsedAlways)
+	settings := testingH1PathTransportSettings(H1PathRerollModeAct, rig)
+	settings.H1PathReroll.AllowProviderAct = true
+
+	testingPlatformTransport(t, ctx, platform.url, settings)
+
+	testingH1PathWaitForConvictions(t, rig, 0, 2)
+	if dials := rig.dials(); len(dials) != 1 {
+		t.Fatalf("connections %v, want [0]: a young provider connection re-rolled", dials)
+	}
+	testingH1PathRequireSuppressed(t, rig, 0, h1PathReasonProviderGate)
+	if stats := rig.stats.snapshot(); stats.Rerolls != 0 || stats.SuppressedProviderGate < 2 {
+		t.Fatalf("stats = %+v, want the provider gate refusing", stats)
+	}
+}
+
 // A re-roll closes only the H1 connection. It does not kick the transport,
 // which would also close H3, reset the pinned backoff and re-evaluate the
 // family hold; a kick still re-dials H1 as before.
