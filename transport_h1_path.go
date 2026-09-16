@@ -594,9 +594,12 @@ type h1PathDecision struct {
 // delivery collapsed:
 //   - thr = max(QueueDelayFloor, QueueDelayRttMultiple x pathRtt), and
 //     thin = ThinSegmentsPerRtt x mss / max(pathRtt, RttFloor);
-//   - rx collapsed: not excluded, demand, queue delay known and at least thr,
-//     no fresh ack round trip below thr over the path round trip, rate below
-//     thin;
+//   - rx collapsed: not excluded, demand, rate below thin, and a queue of at
+//     least thr -- a fresh ack round trip that holds one over the path round
+//     trip, or, with no fresh ack to read, a queue delay that holds one. A
+//     fresh ack round trip below thr denies the tick whatever the queue delay
+//     says, and the send backlog that would inflate that round trip makes it
+//     no evidence either way;
 //   - tx collapsed: not excluded, kernel tx known, unsent at least
 //     SendBacklogByteCount, acked bytes advancing below thin;
 //   - clean: demand, a direction at or above thin, and no tick whose bytes
@@ -618,9 +621,10 @@ type h1PathDecision struct {
 // The monitor counts Ticks and, of those, how each was read: TicksUnread and
 // TicksReceiveFull for the ticks nothing could be judged from,
 // TicksQueueDelayUnknown for the ones with no queue delay to judge, and
-// TicksCollapsed for the ones a direction collapsed in. It also counts RxAckDeniedTicks, the
-// conviction counters, SuppressedLossDenied and ConnectionsDormant when a tick
-// makes it dormant. Not safe for concurrent use.
+// TicksCollapsed for the ones a direction collapsed in. It also counts
+// RxAckDeniedTicks, the conviction counters, SuppressedLossDenied and
+// ConnectionsDormant when a tick makes it dormant. Not safe for concurrent
+// use.
 type h1PathMonitor struct {
 	settings *H1PathRerollSettings
 	stats    *h1PathStats
@@ -768,17 +772,33 @@ func (self *h1PathMonitor) tick(sample h1PathSample) h1PathDecision {
 	// tags can tell the two apart. The ack echo carries our own send time, and
 	// an ack rides the same route as the packs, so a queue that holds the packs
 	// holds the acks with it: the measured collapse runs an ack round trip of
-	// 6-10 s against a 101 ms path. A fresh ack round trip with no queue in it
-	// therefore denies the tick; a tick with no recent ack says nothing either
-	// way and the queue delay stands alone.
+	// 6-10 s against a 101 ms path.
+	//
+	// Our own send backlog is in that round trip too, and the time our uplink
+	// takes to drain says nothing about the receive path, so a tick whose
+	// kernel reports a standing send queue has no ack evidence either way.
+	ownSendBacklog := sample.txKnown &&
+		uint64(settings.SendBacklogByteCount) <= sample.txNotSent
 	ackQueueKnown := 0 < settings.AckEvidenceWindow &&
 		!self.ackRttTime.IsZero() &&
-		sample.now.Sub(self.ackRttTime) <= settings.AckEvidenceWindow
+		sample.now.Sub(self.ackRttTime) <= settings.AckEvidenceWindow &&
+		!ownSendBacklog
 	ackQueue := self.ackRtt - pathRtt
-	rxQueued := queueDelayKnown &&
-		queueDelayThreshold <= sample.queueDelay &&
-		(!ackQueueKnown || queueDelayThreshold <= ackQueue)
-	if queueDelayKnown && !rxQueued && ackQueueKnown && queueDelayThreshold <= sample.queueDelay {
+	ackQueued := ackQueueKnown && queueDelayThreshold <= ackQueue
+	packQueued := queueDelayKnown && queueDelayThreshold <= sample.queueDelay
+	// The two measures of the same queue disagree in both directions, and the
+	// ack wins each time, because it is the one this client can check. A fresh
+	// ack round trip with no queue in it denies the tick. An ack round trip
+	// that holds a queue collapses the tick whatever the pack tags say, which
+	// is what reaches the session that was already deep in the far socket's
+	// queue when its source was first read: that queue is inside the source's
+	// baseline, so the queue delay reads zero for the connection's life, while
+	// the ack is measured against a dial round trip taken before any of it.
+	// The same reading covers a tick with too few pack samples, a source the
+	// baseline holds no slot for, and the window after a re-roll in which every
+	// arriving pack was built before the mark.
+	rxQueued := ackQueued || (packQueued && !ackQueueKnown)
+	if packQueued && ackQueueKnown && !ackQueued {
 		self.stats.RxAckDeniedTicks.Add(1)
 	}
 	rxCollapsed := !excluded &&

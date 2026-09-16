@@ -1886,21 +1886,25 @@ func TestH1PathMonitorRequiresReceiveDemand(t *testing.T) {
 }
 
 // The pack-sample floor is what keeps a queue delay resting on a single frame
-// from convicting. At its default of 2 nothing exercised it: the unit shapes
-// feed 4 to 400 samples, the platform rig hard-codes 4, and pathsim S9 lowers
-// it to 1 because at 16 KiB payloads a collapsed connection yields about one
-// sample a tick -- the one scenario that would have covered the default turns
-// it off.
+// from convicting on the pack tags alone. At its default of 2 nothing
+// exercised it: the unit shapes feed 4 to 400 samples, the platform rig
+// hard-codes 4, and pathsim S9 lowers it to 1 because at 16 KiB payloads a
+// collapsed connection yields about one sample a tick -- the one scenario that
+// would have covered the default turns it off.
+//
+// The floor governs the pack tags and nothing else. A tick with a fresh ack
+// round trip that holds the queue collapses however few packs it sampled,
+// because that reading needs no baseline and no sender clock.
 func TestH1PathMonitorRequiresTwoPackSamples(t *testing.T) {
 	if samples := DefaultH1PathRerollSettings().MinTickPackSamples; samples != 2 {
 		t.Fatalf("the default pack sample floor = %d, want 2", samples)
 	}
-	collapse := func(samples int) func(k int) h1PathTickShape {
+	collapse := func(samples int, ackRtt time.Duration) func(k int) h1PathTickShape {
 		return func(k int) h1PathTickShape {
 			shape := h1PathCollapseShape(k)
 			shape.queueDelay = 6 * time.Second
 			shape.queueDelaySamples = samples
-			shape.ackRtt = 6100 * time.Millisecond
+			shape.ackRtt = ackRtt
 			return shape
 		}
 	}
@@ -1908,6 +1912,7 @@ func TestH1PathMonitorRequiresTwoPackSamples(t *testing.T) {
 		name     string
 		samples  int
 		floor    int
+		ackRtt   time.Duration
 		convicts bool
 	}{
 		{name: "one sample in the tick", samples: 1, floor: 2},
@@ -1915,17 +1920,157 @@ func TestH1PathMonitorRequiresTwoPackSamples(t *testing.T) {
 		// what pathsim S9 sets, where the frame size and not the detector is
 		// what the simulator cannot reproduce
 		{name: "one sample against a floor of one", samples: 1, floor: 1, convicts: true},
+		// the ack carries the tick whatever the floor keeps out
+		{
+			name:     "one sample and an ack round trip that holds the queue",
+			samples:  1,
+			floor:    2,
+			ackRtt:   6100 * time.Millisecond,
+			convicts: true,
+		},
+		{
+			name:     "no sample at all and an ack round trip that holds the queue",
+			samples:  0,
+			floor:    2,
+			ackRtt:   6100 * time.Millisecond,
+			convicts: true,
+		},
 	} {
 		settings := DefaultH1PathRerollSettings()
 		settings.MinTickPackSamples = c.floor
 		monitor, _ := newH1PathTestMonitor(t, &settings, 105*time.Millisecond)
-		decisions := runH1PathMonitorShape(monitor, 60, collapse(c.samples))
+		decisions := runH1PathMonitorShape(monitor, 60, collapse(c.samples, c.ackRtt))
 		ticks := h1PathConvictionTicks(decisions)
 		if c.convicts != (0 < len(ticks)) {
 			t.Errorf("%s: conviction ticks = %v, want convictions %t", c.name, ticks, c.convicts)
 		}
-		if known := decisions[59].queueDelayKnown; known != (c.floor <= c.samples) {
+		if known := decisions[59].queueDelayKnown; known != (0 < c.samples && c.floor <= c.samples) {
 			t.Errorf("%s: queue delay known = %t", c.name, known)
 		}
+	}
+}
+
+// The population this detector exists for is a session that starts on the bad
+// member: the ground truth is a 4-tuple that rides a slow path for hours, so
+// the far socket is already deep when the transport reads its first frame. The
+// pack baseline is the smallest rel a source has ever shown and it only moves
+// down, so a queue standing at the first sample is inside the baseline and the
+// queue delay reads zero for the connection's whole life -- the connection the
+// feature was built for was the one it could not see.
+//
+// The ack echo needs no baseline and no sender clock: it is this client's own
+// send time, read against a dial round trip taken before any of the queue
+// existed. It therefore carries the queue whatever the pack tags hold, and a
+// collapse that was standing at birth is convicted on the same schedule as one
+// that arrives later.
+func TestH1PathMonitorConvictsACollapseStandingAtTheFirstSample(t *testing.T) {
+	const transit = 200 * time.Millisecond
+	const queue = 6 * time.Second
+	const pathRtt = 105 * time.Millisecond
+	settings := DefaultH1PathRerollSettings()
+	queueDelayThreshold := max(
+		settings.QueueDelayFloor,
+		time.Duration(settings.QueueDelayRttMultiple)*pathRtt,
+	)
+
+	for _, c := range []struct {
+		name       string
+		queueAfter time.Duration
+	}{
+		{name: "standing before the first frame", queueAfter: 0},
+		{name: "standing at 500 ms", queueAfter: 500 * time.Millisecond},
+		{name: "arriving at 10 s", queueAfter: 10 * time.Second},
+	} {
+		decisions, _ := runH1PathObserverMonitorShape(t, &settings, 3*time.Minute,
+			func(elapsed time.Duration) h1PathObserverTickShape {
+				shape := h1PathObserverTickShape{
+					rel:        transit,
+					ackRtt:     pathRtt,
+					rxByteRate: 700_000,
+				}
+				if c.queueAfter <= elapsed {
+					shape.rel += queue
+					shape.ackRtt += queue
+				}
+				return shape
+			})
+		ticks := h1PathConvictionTicks(decisions)
+		if len(ticks) == 0 {
+			t.Errorf("%s: a %s queue was never convicted", c.name, queue)
+			continue
+		}
+		// four collapsed ticks past MinConnectionAge, from the tick the queue
+		// is first read in
+		first := time.Duration(ticks[0]+1) * h1PathTestStep
+		if want := c.queueAfter + settings.MinConnectionAge + 2*time.Second; want < first {
+			t.Errorf("%s: first conviction at %s, want one by %s", c.name, first, want)
+		}
+	}
+
+	// the mechanism: with the queue standing at the first sample the pack tags
+	// never show it, so the conviction above is the ack's alone
+	decisions, stats := runH1PathObserverMonitorShape(t, &settings, time.Minute,
+		func(elapsed time.Duration) h1PathObserverTickShape {
+			return h1PathObserverTickShape{
+				rel:        transit + queue,
+				ackRtt:     pathRtt + queue,
+				rxByteRate: 700_000,
+			}
+		})
+	for k, decision := range decisions {
+		if queueDelayThreshold <= decision.queueDelay {
+			t.Fatalf(
+				"tick %d read a queue delay of %s from the pack tags, so this arm proves nothing",
+				k, decision.queueDelay,
+			)
+		}
+	}
+	if denied := stats.RxAckDeniedTicks.Load(); 0 < denied {
+		t.Errorf("%d ticks denied by the ack round trip, want the ack to carry the queue", denied)
+	}
+}
+
+// The ack round trip carries our own uplink's standing queue as well as the
+// receive path's, and the time our send buffer takes to drain says nothing
+// about what is arriving. A device uploading hard while it downloads therefore
+// reads an ack round trip of seconds on a receive path that has no queue at
+// all, and without the send backlog guard that alone would collapse every
+// receive tick.
+func TestH1PathMonitorDoesNotReadOurOwnSendQueueAsTheReceiveQueue(t *testing.T) {
+	// 700 KB/s down, no receive queue, and an uplink holding 400 KiB that puts
+	// 7 s into every ack round trip
+	uploader := func(k int) h1PathTickShape {
+		return h1PathTickShape{
+			rxByteRate:        700_000,
+			queueDelay:        20 * time.Millisecond,
+			queueDelaySamples: 4,
+			rxOooAdvance:      true,
+			ackRtt:            7 * time.Second,
+			txKnown:           true,
+			txAckedByteRate:   25_000_000,
+			txNotSent:         400 * 1024,
+		}
+	}
+	settings := DefaultH1PathRerollSettings()
+	monitor, stats := newH1PathTestMonitor(t, &settings, 105*time.Millisecond)
+	decisions := runH1PathMonitorShape(monitor, 60, uploader)
+	if ticks := h1PathConvictionTicks(decisions); len(ticks) != 0 {
+		t.Errorf("a saturated uplink convicted the receive path at ticks %v", ticks)
+	}
+	if snapshot := stats.snapshot(); snapshot.TicksCollapsed != 0 {
+		t.Errorf("stats = %+v, want no collapsed tick behind our own send queue", snapshot)
+	}
+
+	// the same shape with the send queue under the floor: the ack round trip
+	// is then the receive path's and it convicts, so the arm above is the
+	// guard and not the rest of the rule
+	monitor, _ = newH1PathTestMonitor(t, &settings, 105*time.Millisecond)
+	decisions = runH1PathMonitorShape(monitor, 60, func(k int) h1PathTickShape {
+		shape := uploader(k)
+		shape.txNotSent = 30 * 1024
+		return shape
+	})
+	if ticks := h1PathConvictionTicks(decisions); len(ticks) == 0 {
+		t.Error("with the send queue under the floor the ack round trip did not convict")
 	}
 }
