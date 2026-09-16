@@ -318,11 +318,16 @@ func TestPathsimS6InnerSegmentLossIsNotRetransmittedByTheProvider(t *testing.T) 
 // With the repair on the same drop costs one retransmission and exactly one
 // round trip, the queue behind the hole drains, and the origin's bytes arrive
 // exactly. Four drops, two of them consecutive, cost five retransmissions:
-// near the losses, not a storm. Without the guard on the duplicates its own
-// retransmissions draw, the verifier's probe measured thousands of
-// retransmissions for four losses on a flow of this shape, and with the
-// doubling burst unbounded it resent most of the window every round trip. The
-// lossless arm pays nothing at all.
+// one for each loss and one the burst guesses past the pair, asserted as that
+// number rather than as a ceiling with a dozen spurious segments of room in
+// it. Without the guard on the duplicates its own retransmissions draw, the
+// verifier's probe measured thousands of retransmissions for four losses on a
+// flow of this shape, and with the doubling burst unbounded it resent most of
+// the window every round trip. The lossless arm pays nothing at all, which is
+// also what it would pay with the repair off, so each arm reads the repair
+// back from the settings its flow was built with and carries it in the
+// digest: three arms fail when the flag is flipped, and that is what holds
+// the fourth to its name.
 //
 // The device's window is the reason the wedge looks the way it does. Its
 // receiver never moves its right edge left (RFC 1122 §4.2.2.16), so while the
@@ -668,7 +673,10 @@ type pathInnerArm struct {
 
 // What one arm produced, in virtual time.
 type pathInnerResult struct {
-	arm                string
+	arm string
+	// the provider's inner repair as the flow was actually built, read back
+	// from the settings the nat took rather than from the arm that asked
+	repairEnabled      bool
 	deliveredByteCount int
 	exact              bool
 	// from the kernel's drop to the in-order frontier passing it
@@ -697,7 +705,8 @@ type pathInnerResult struct {
 // The integer facts of an arm, hashed; three runs must print the same.
 func (self pathInnerResult) digest() string {
 	hash := fnv.New64a()
-	fmt.Fprintf(hash, "%d|%v|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d",
+	fmt.Fprintf(hash, "%v|%d|%v|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d",
+		self.repairEnabled,
 		self.deliveredByteCount, self.exact, self.repairTime, self.completeTime,
 		self.segmentCount, self.retransmitted, self.lossCount, self.maxOooByteCount,
 		self.oooByteCount, self.providerStats.PacketCount, self.providerStats.ByteCount,
@@ -785,6 +794,7 @@ func runPathInnerArm(t *testing.T, arm pathInnerArm) pathInnerResult {
 		natSocket, originSocket := net.Pipe()
 		natSettings := DefaultProviderLocalUserNatSettings()
 		natSettings.TcpBufferSettings.EnableReturnRetransmit = arm.returnRetransmit
+		result.repairEnabled = natSettings.TcpBufferSettings.EnableReturnRetransmit
 		natSettings.TcpBufferSettings.DialContextSettings = &DialContextSettings{
 			DialContext: func(dialCtx context.Context, network string, addr string) (net.Conn, error) {
 				return natSocket, nil
@@ -1006,6 +1016,17 @@ func TestPathsimS9InnerSegmentLossRepairedByTheProvider(t *testing.T) {
 		}
 	}
 
+	// Each arm ran with the repair its name says, read back from the settings
+	// its flow was built with rather than from the arm that asked for them.
+	// Three of the four fail outright when the flag is flipped; the lossless
+	// one cannot, because a repair with nothing to repair is silent in every
+	// number the device can see, so this and the digest are what hold its
+	// name to what it ran.
+	if off.repairEnabled || !on.repairEnabled || !four.repairEnabled || !clean.repairEnabled {
+		t.Errorf("S9: the arms ran with the repair off=%t, on=%t, four losses=%t, no loss=%t; want it off in the first and on in the other three",
+			off.repairEnabled, on.repairEnabled, four.repairEnabled, clean.repairEnabled)
+	}
+
 	// Off: the wedge the rig measured. The device answers every later segment
 	// with a duplicate acknowledgement, the provider sends up to the window
 	// edge that stuck acknowledgement froze and then sends nothing, and the
@@ -1069,12 +1090,19 @@ func TestPathsimS9InnerSegmentLossRepairedByTheProvider(t *testing.T) {
 		t.Errorf("S9: the four-loss arm delivered %d of %d bytes, and not the origin's bytes exactly",
 			four.deliveredByteCount, pathInnerOriginByteCount)
 	}
-	if maxRetransmitted := 2*four.lossCount + 8; maxRetransmitted < four.retransmitted {
-		t.Errorf("S9: the four-loss arm sent %d segments again for %d lost, above %d: that is a storm, not a repair",
-			four.retransmitted, four.lossCount, maxRetransmitted)
+	// Five segments exactly: one for each loss, and one the burst guesses
+	// past the consecutive pair, which is how the run grows from the head
+	// alone. A bound with slack in it would have let a dozen spurious
+	// segments through as a repair.
+	if want := four.lossCount + 1; four.retransmitted != want {
+		t.Errorf("S9: the four-loss arm sent %d segments again for %d lost, want %d: one for each loss and one guess past the pair",
+			four.retransmitted, four.lossCount, want)
 	}
 
-	// And the repair costs nothing when nothing is lost.
+	// And the repair costs nothing when nothing is lost. Nothing here tells
+	// this arm from the same flow with the repair off, which is why the arm
+	// reads its flow's own setting above: what it pins is that a flow with
+	// the repair on and no loss to repair sends not one segment twice.
 	if !clean.exact || 0 < clean.retransmitted || 0 < clean.providerStats.PacketCount {
 		t.Errorf("S9: the lossless arm delivered %d bytes and sent %d segments again (%d by the flow's own count), want the whole origin and none",
 			clean.deliveredByteCount, clean.retransmitted, clean.providerStats.PacketCount)
