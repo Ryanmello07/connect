@@ -997,10 +997,10 @@ func TestPathsimS9InnerSegmentLossRepairedByTheProvider(t *testing.T) {
 		}
 	}
 
-	// Off: the wedge the rig measured. The device answers with duplicate
-	// acknowledgements for ever, the provider sends until the window the hole
-	// closed is gone and then sends nothing, and the download stops where it
-	// stopped.
+	// Off: the wedge the rig measured. The device answers every later segment
+	// with a duplicate acknowledgement, the provider sends up to the window
+	// edge that stuck acknowledgement froze and then sends nothing, and the
+	// download stops where it stopped.
 	if off.exact || pathInnerOriginByteCount <= off.deliveredByteCount {
 		t.Errorf("S9: the disabled arm delivered %d of %d bytes; with no inner repair the hole is permanent",
 			off.deliveredByteCount, pathInnerOriginByteCount)
