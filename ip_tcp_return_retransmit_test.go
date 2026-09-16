@@ -107,10 +107,13 @@ func tcpReturnTestSourceTimestampValue() uint32 {
 	return uint32(time.Since(tcpTimestampEpoch)/time.Millisecond) + 1
 }
 
-// One acknowledgement on its way to the sequence.
+// One acknowledgement on its way to the sequence, with the out-of-order runs
+// the source held when the arrival caused it: a path a round trip away
+// delivers what was true when it left, not what the source holds on arrival.
 type tcpReturnTestDelayedAck struct {
-	ackNumber uint32
-	at        time.Time
+	ackNumber  uint32
+	sackBlocks []tcpSackBlock
+	at         time.Time
 }
 
 // A segment the sequence sent toward the source, as the source model saw it.
@@ -270,7 +273,11 @@ func (self *tcpReturnTestSource) receive(segment tcpReturnTestSegment) {
 			return
 		}
 		if 0 < self.ackDelay {
-			delayed := tcpReturnTestDelayedAck{ackNumber: self.rcvNxt, at: segment.at.Add(self.ackDelay)}
+			delayed := tcpReturnTestDelayedAck{
+				ackNumber:  self.rcvNxt,
+				sackBlocks: self.sackBlocksWithLock(),
+				at:         segment.at.Add(self.ackDelay),
+			}
 			if self.stepAcks {
 				self.steppedAcks = append(self.steppedAcks, delayed)
 				return
@@ -282,7 +289,7 @@ func (self *tcpReturnTestSource) receive(segment tcpReturnTestSegment) {
 			}
 			return
 		}
-		ackPacket, ackTcp = self.buildAckWithLock(self.rcvNxt)
+		ackPacket, ackTcp = self.buildAckWithLock(self.rcvNxt, self.sackBlocksWithLock())
 	}()
 	if ackPacket != nil {
 		self.harness.sendFromSource(&ackTcp, ackPacket)
@@ -355,27 +362,33 @@ func (self *tcpReturnTestSource) windowSizeWithLock() uint16 {
 	return uint16(tcpReturnTestWindowByteCount>>tcpReturnTestWindowScale) - 64 + self.windowGrowth
 }
 
-// Builds one pure acknowledgement at `ackNumber`, with SACK blocks for the
-// out-of-order runs when negotiated, a timestamp when negotiated, and the
-// current window. The lock must be held.
-func (self *tcpReturnTestSource) buildAckWithLock(ackNumber uint32) ([]byte, parsedTcp) {
+// The out-of-order runs the source holds now, as selective acknowledgement
+// blocks, when it negotiated them. The lock must be held.
+func (self *tcpReturnTestSource) sackBlocksWithLock() []tcpSackBlock {
+	if !self.sack {
+		return nil
+	}
 	var blocks []tcpSackBlock
-	if self.sack {
-		for _, queued := range self.ooo {
-			end := queued.seq + uint32(len(queued.payload))
-			if queued.fin {
-				end += 1
-			}
-			if 0 < len(blocks) && blocks[len(blocks)-1].end == queued.seq {
-				blocks[len(blocks)-1].end = end
-			} else {
-				blocks = append(blocks, tcpSackBlock{start: queued.seq, end: end})
-			}
+	for _, queued := range self.ooo {
+		end := queued.seq + uint32(len(queued.payload))
+		if queued.fin {
+			end += 1
 		}
-		if tcpMaxSackBlockCount < len(blocks) {
-			blocks = blocks[:tcpMaxSackBlockCount]
+		if 0 < len(blocks) && blocks[len(blocks)-1].end == queued.seq {
+			blocks[len(blocks)-1].end = end
+		} else {
+			blocks = append(blocks, tcpSackBlock{start: queued.seq, end: end})
 		}
 	}
+	if tcpMaxSackBlockCount < len(blocks) {
+		blocks = blocks[:tcpMaxSackBlockCount]
+	}
+	return blocks
+}
+
+// Builds one pure acknowledgement at `ackNumber` carrying `blocks`, a
+// timestamp when negotiated, and the current window. The lock must be held.
+func (self *tcpReturnTestSource) buildAckWithLock(ackNumber uint32, blocks []tcpSackBlock) ([]byte, parsedTcp) {
 	optionByteCount := 0
 	if self.timestamps {
 		optionByteCount += tcpTimestampOptionByteCount
@@ -430,7 +443,7 @@ func (self *tcpReturnTestSource) ackNow() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
 		self.holdAcks = false
-		ackPacket, ackTcp = self.buildAckWithLock(self.rcvNxt)
+		ackPacket, ackTcp = self.buildAckWithLock(self.rcvNxt, self.sackBlocksWithLock())
 	}()
 	self.harness.sendFromSource(&ackTcp, ackPacket)
 }
@@ -447,7 +460,20 @@ func (self *tcpReturnTestSource) sendAck(ackNumber uint32) {
 		if 0 < int32(ackNumber-self.rcvNxt) {
 			self.harness.t.Errorf("acknowledgement at %d past the source's frontier %d", ackNumber, self.rcvNxt)
 		}
-		ackPacket, ackTcp = self.buildAckWithLock(ackNumber)
+		ackPacket, ackTcp = self.buildAckWithLock(ackNumber, self.sackBlocksWithLock())
+	}()
+	self.harness.sendFromSource(&ackTcp, ackPacket)
+}
+
+// Sends one delayed acknowledgement: the number and the selective blocks the
+// arrival that caused it left, whatever the source holds now.
+func (self *tcpReturnTestSource) sendDelayedAck(delayed tcpReturnTestDelayedAck) {
+	var ackPacket []byte
+	var ackTcp parsedTcp
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		ackPacket, ackTcp = self.buildAckWithLock(delayed.ackNumber, delayed.sackBlocks)
 	}()
 	self.harness.sendFromSource(&ackTcp, ackPacket)
 }
@@ -462,7 +488,7 @@ func (self *tcpReturnTestSource) sendWindowUpdate(growth uint16) {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
 		self.windowGrowth += growth
-		ackPacket, ackTcp = self.buildAckWithLock(self.lastAckNumber)
+		ackPacket, ackTcp = self.buildAckWithLock(self.lastAckNumber, self.sackBlocksWithLock())
 	}()
 	self.harness.sendFromSource(&ackTcp, ackPacket)
 }
@@ -474,7 +500,7 @@ func (self *tcpReturnTestSource) sendDuplicateAck() {
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
-		ackPacket, ackTcp = self.buildAckWithLock(self.lastAckNumber)
+		ackPacket, ackTcp = self.buildAckWithLock(self.lastAckNumber, self.sackBlocksWithLock())
 	}()
 	self.harness.sendFromSource(&ackTcp, ackPacket)
 }
@@ -703,7 +729,7 @@ func newTcpReturnRetransmitTestHarness(t *testing.T, options tcpReturnTestOption
 						return
 					case <-time.After(time.Until(delayed.at)):
 					}
-					harness.source.sendAck(delayed.ackNumber)
+					harness.source.sendDelayedAck(delayed)
 				}
 			}
 		}()
@@ -813,35 +839,62 @@ func newTcpReturnRetransmitTestHarness(t *testing.T, options tcpReturnTestOption
 	return harness
 }
 
-// Advances `duration` of virtual time, sending each acknowledgement the source
-// queued whose time falls inside it, in the order its arrivals caused them and
-// at that time, with the sequence's goroutines run to rest before the next, as
-// they run between real arrivals. Retransmissions sent during the step arrive
+// Sends the next acknowledgement the source queued, at its own time, with the
+// sequence's goroutines run to rest afterwards, as they run between real
+// arrivals. Reports how many packets the sequence sent again in answer to it,
+// which for a flow inside its path mtu is the segments of one burst, and
+// whether there was one to send. Retransmissions sent during the step arrive
 // and queue their own acknowledgements behind those already waiting, as an
 // in-order path delivers them.
+func (self *tcpReturnRetransmitTestHarness) stepOneAck() (packetCount int64, stepped bool) {
+	self.t.Helper()
+	var next tcpReturnTestDelayedAck
+	stepped = func() bool {
+		self.source.stateLock.Lock()
+		defer self.source.stateLock.Unlock()
+		if len(self.source.steppedAcks) == 0 {
+			return false
+		}
+		next = self.source.steppedAcks[0]
+		self.source.steppedAcks = self.source.steppedAcks[1:]
+		return true
+	}()
+	if !stepped {
+		return 0, false
+	}
+	if wait := time.Until(next.at); 0 < wait {
+		time.Sleep(wait)
+	}
+	_, _, before, _ := self.retransmitState()
+	self.source.sendDelayedAck(next)
+	synctest.Wait()
+	_, _, after, _ := self.retransmitState()
+	return after - before, true
+}
+
+// The time of the next acknowledgement the source queued, and whether there
+// is one.
+func (self *tcpReturnRetransmitTestHarness) nextAckAt() (at time.Time, queued bool) {
+	self.source.stateLock.Lock()
+	defer self.source.stateLock.Unlock()
+	if len(self.source.steppedAcks) == 0 {
+		return time.Time{}, false
+	}
+	return self.source.steppedAcks[0].at, true
+}
+
+// Advances `duration` of virtual time, sending each acknowledgement the source
+// queued whose time falls inside it, in the order its arrivals caused them and
+// at that time.
 func (self *tcpReturnRetransmitTestHarness) stepAcks(duration time.Duration) {
 	self.t.Helper()
 	end := time.Now().Add(duration)
 	for {
-		var next tcpReturnTestDelayedAck
-		stepped := func() bool {
-			self.source.stateLock.Lock()
-			defer self.source.stateLock.Unlock()
-			if len(self.source.steppedAcks) == 0 || end.Before(self.source.steppedAcks[0].at) {
-				return false
-			}
-			next = self.source.steppedAcks[0]
-			self.source.steppedAcks = self.source.steppedAcks[1:]
-			return true
-		}()
-		if !stepped {
+		at, queued := self.nextAckAt()
+		if !queued || end.Before(at) {
 			break
 		}
-		if wait := time.Until(next.at); 0 < wait {
-			time.Sleep(wait)
-		}
-		self.source.sendAck(next.ackNumber)
-		synctest.Wait()
+		self.stepOneAck()
 	}
 	if wait := time.Until(end); 0 < wait {
 		time.Sleep(wait)
@@ -957,6 +1010,15 @@ func (self *tcpReturnRetransmitTestHarness) retransmitTimer() (rto time.Duration
 	defer self.sequence.mutex.Unlock()
 	state := &self.sequence.returnRetransmit
 	return time.Duration(state.rtoNanos), time.Duration(state.baseRtoNanos())
+}
+
+// The loss-recovery run, read under the sequence mutex: the consecutive
+// segments from the cumulative acknowledgement that recovery may have in
+// flight.
+func (self *tcpReturnRetransmitTestHarness) burstSegmentCountForTest() int {
+	self.sequence.mutex.Lock()
+	defer self.sequence.mutex.Unlock()
+	return self.sequence.returnRetransmit.burstSegmentCount
 }
 
 // Requires the source's reassembled stream to be exactly `want`, the bytes
@@ -1314,6 +1376,115 @@ func TestTcpReturnRetransmitSackBlockGrownOverARepairedHoleMarksIt(t *testing.T)
 	}
 }
 
+// A selective acknowledgement that arrives on an advancing acknowledgement,
+// outside loss recovery, retransmits nothing by itself: the three duplicates
+// are what tell loss from reordering, and a source reports its out-of-order
+// range on every acknowledgement it sends, the first of a reordered run
+// included. Marking those holes as they are reported sends a reordered
+// segment again for every crossover on the path, and does it before the
+// duplicates that would have shown the recovery spurious.
+func TestTcpReturnRetransmitSackOnAnAdvancingAckRetransmitsNothing(t *testing.T) {
+	const segmentCount = 8
+	const holeIndex = 1
+	runTcpReturnRetransmitTest(t, func(t *testing.T) {
+		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{sack: true})
+		harness.source.holdAcks = true
+		harness.source.dropCounts[harness.segmentSeq(holeIndex)] = 1
+		payload := harness.payload(segmentCount)
+		harness.write(payload)
+		synctest.Wait()
+
+		// the acknowledgement of the first segment, which also reports every
+		// segment the source holds past the hole
+		harness.source.sendAck(harness.segmentSeq(holeIndex))
+		synctest.Wait()
+		if _, _, packetCount, reasonCounts := harness.retransmitState(); packetCount != 0 {
+			t.Fatalf("retransmissions=%d reasons=%v on an advancing acknowledgement with selective blocks, want none", packetCount, reasonCounts)
+		}
+		harness.requireSeenCount(holeIndex, 1)
+
+		// three duplicates of it decide
+		for range returnRetransmitDupAckThreshold {
+			harness.source.sendDuplicateAck()
+		}
+		synctest.Wait()
+		harness.requireSeenCount(holeIndex, 2)
+		harness.source.ackNow()
+		synctest.Wait()
+
+		harness.requireStream(payload)
+		for segmentIndex := 0; segmentIndex < segmentCount; segmentIndex += 1 {
+			want := 1
+			if segmentIndex == holeIndex {
+				want = 2
+			}
+			harness.requireSeenCount(segmentIndex, want)
+		}
+		_, _, packetCount, reasonCounts := harness.retransmitState()
+		if packetCount != 1 || reasonCounts[tcpReturnRetransmitReasonSackHole] != 1 {
+			t.Fatalf("retransmissions=%d reasons=%v, want the hole once on its sack hole", packetCount, reasonCounts)
+		}
+		if stats := harness.counters.snapshot(); stats.TimeoutCount != 0 {
+			t.Fatalf("stats=%+v, want no timer expiry", stats)
+		}
+	})
+}
+
+// Hole selection stops at the highest selectively acknowledged byte: the
+// segment that starts exactly there is past everything the acknowledgement
+// reported and may be in flight, so it is not a hole. A source a round trip
+// away reports what it held when the acknowledgement left, and the segments
+// sent since are exactly the ones at and above that edge. Here the flight is
+// delivered in one instant and its acknowledgements arrive one by one a round
+// trip later, so the third duplicate reports four segments while nine have
+// been delivered: the segment at the edge must not go again with the hole.
+func TestTcpReturnRetransmitSackHolesStopAtTheHighestSelectiveByte(t *testing.T) {
+	const segmentCount = 9
+	const holeIndex = 1
+	// the segment at the edge the third duplicate's blocks reach
+	const edgeIndex = 5
+	runTcpReturnRetransmitTest(t, func(t *testing.T) {
+		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{
+			sack:     true,
+			ackDelay: tcpReturnTestStepRoundTrip,
+			stepAcks: true,
+		})
+		harness.source.dropCounts[harness.segmentSeq(holeIndex)] = 1
+		payload := harness.payload(segmentCount)
+		harness.writeSegments(payload, 0, segmentCount)
+
+		// the acknowledgement of the first segment and the three duplicates
+		// the next three arrivals caused
+		for step := 0; step < 1+returnRetransmitDupAckThreshold; step += 1 {
+			if _, stepped := harness.stepOneAck(); !stepped {
+				t.Fatalf("only %d acknowledgements were queued", step)
+			}
+		}
+		harness.requireSeenCount(holeIndex, 2)
+		harness.requireSeenCount(edgeIndex, 1)
+		if _, _, packetCount, reasonCounts := harness.retransmitState(); packetCount != 1 {
+			t.Fatalf("retransmissions=%d reasons=%v on the third duplicate, want the hole alone", packetCount, reasonCounts)
+		}
+
+		harness.stepAcks(4 * tcpReturnTestStepRoundTrip)
+		harness.requireStream(payload)
+		for segmentIndex := 0; segmentIndex < segmentCount; segmentIndex += 1 {
+			want := 1
+			if segmentIndex == holeIndex {
+				want = 2
+			}
+			harness.requireSeenCount(segmentIndex, want)
+		}
+		_, _, packetCount, reasonCounts := harness.retransmitState()
+		if packetCount != 1 || reasonCounts[tcpReturnRetransmitReasonSackHole] != 1 {
+			t.Fatalf("retransmissions=%d reasons=%v, want the hole once on its sack hole", packetCount, reasonCounts)
+		}
+		if stats := harness.counters.snapshot(); stats.TimeoutCount != 0 {
+			t.Fatalf("stats=%+v, want no timer expiry", stats)
+		}
+	})
+}
+
 // Two separated segments dropped, without SACK: the third duplicate
 // acknowledgement fills the first hole, and the partial acknowledgement that
 // answers it fills the second at once rather than waiting for three more
@@ -1398,6 +1569,46 @@ func TestTcpReturnRetransmitWindowUpdatesAreNotDuplicateAcks(t *testing.T) {
 	})
 }
 
+// The window an acknowledgement carries while nothing is retained is still
+// the window the next duplicate must repeat. Those acknowledgements take the
+// idle early return, which records the window and nothing else: without the
+// record the first duplicate of the next loss is compared with a window
+// older than the update and reads as a window update of its own, so one of
+// the three duplicates is spent and a three-duplicate loss waits a second for
+// the timer.
+func TestTcpReturnRetransmitWindowUpdateWhileIdleIsRecorded(t *testing.T) {
+	runTcpReturnRetransmitTest(t, func(t *testing.T) {
+		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{})
+		// nothing is retained, so this takes the idle path
+		harness.source.sendWindowUpdate(16)
+		synctest.Wait()
+		if _, retainedCount, _, _ := harness.retransmitState(); retainedCount != 0 {
+			t.Fatalf("%d segments retained before the flight, want the idle path", retainedCount)
+		}
+
+		start := time.Now()
+		// the head is lost, so exactly the three segments behind it answer,
+		// each with a duplicate carrying the window the update left
+		harness.source.dropCounts[harness.segmentSeq(0)] = 1
+		payload := harness.payload(1 + returnRetransmitDupAckThreshold)
+		harness.write(payload)
+		synctest.Wait()
+
+		harness.requireSeenCount(0, 2)
+		if got := harness.requireDelivery(harness.segmentSeq(0), 1).at; !got.Equal(start) {
+			t.Fatalf("the head was sent again at +%s, want at once on the third duplicate", got.Sub(start))
+		}
+		harness.requireStream(payload)
+		_, _, packetCount, reasonCounts := harness.retransmitState()
+		if packetCount != 1 || reasonCounts[tcpReturnRetransmitReasonDupAck] != 1 {
+			t.Fatalf("retransmissions=%d reasons=%v, want the head once on duplicate acks", packetCount, reasonCounts)
+		}
+		if stats := harness.counters.snapshot(); stats.TimeoutCount != 0 {
+			t.Fatalf("stats=%+v, want no timer expiry", stats)
+		}
+	})
+}
+
 // A data segment from the source repeats the cumulative acknowledgement when
 // it has nothing new to report, and is news of the upload rather than
 // evidence of a hole: a duplicate carries no payload (RFC 5681 §2). Three of
@@ -1455,6 +1666,55 @@ func TestTcpReturnRetransmitSourceDataIsNotADuplicateAck(t *testing.T) {
 		}
 		harness.requireSeenCount(0, 2)
 		harness.requireSeenCount(1, 1)
+	})
+}
+
+// One hole waits a whole round trip between retransmissions, not the floor:
+// on a path slower than the floor the duplicates of segments that left before
+// the repair keep arriving for a round trip after it, and each carries a
+// selective range the repair has not answered yet. With the interval fixed at
+// the floor the hole goes again 200 ms after its repair, inside the round
+// trip that would have acknowledged it, and every following duplicate costs
+// another copy. The flow's round trip is 300 ms, the repair goes at +300 ms,
+// and the last duplicate built before it arrives at +550 ms, 250 ms later.
+func TestTcpReturnRetransmitHoleWaitsARoundTripNotTheFloor(t *testing.T) {
+	const roundTrip = 300 * time.Millisecond
+	const lateWriteAt = 250 * time.Millisecond
+	const flightCount = 5
+	runTcpReturnRetransmitTest(t, func(t *testing.T) {
+		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{
+			sack:     true,
+			ackDelay: roundTrip,
+		})
+		harness.source.dropCounts[harness.segmentSeq(1)] = 1
+		start := time.Now()
+		payload := harness.payload(flightCount + 1)
+		harness.writeSegments(payload, 0, flightCount)
+
+		// one more segment, whose duplicate is built before the repair and
+		// arrives a quarter round trip short of the interval
+		time.Sleep(lateWriteAt)
+		harness.writeSegments(payload, flightCount, 1)
+		// the acknowledgements of the flight, the repair, and its own
+		// acknowledgement a round trip later
+		time.Sleep(3 * roundTrip)
+		synctest.Wait()
+
+		harness.requireStream(payload)
+		harness.requireSeenCount(1, 2)
+		if got := harness.requireDelivery(harness.segmentSeq(1), 1).at.Sub(start); got != roundTrip {
+			t.Fatalf("the hole was repaired at +%s, want +%s on the third duplicate", got, roundTrip)
+		}
+		if rto, _ := harness.retransmitTimer(); rto < 2*roundTrip {
+			t.Fatalf("timer %s, want the flow's round trip sampled so the interval is above the floor", rto)
+		}
+		_, _, packetCount, reasonCounts := harness.retransmitState()
+		if packetCount != 1 || reasonCounts[tcpReturnRetransmitReasonSackHole] != 1 {
+			t.Fatalf("retransmissions=%d reasons=%v, want the hole exactly once", packetCount, reasonCounts)
+		}
+		if stats := harness.counters.snapshot(); stats.TimeoutCount != 0 {
+			t.Fatalf("stats=%+v, want no timer expiry", stats)
+		}
 	})
 }
 
@@ -1770,6 +2030,101 @@ func TestTcpReturnRetransmitTimerExpiresAtTheBaseAfterProgressDropsItsBackoff(t 
 	})
 }
 
+// The timer and the no-progress clock are armed by a delivery with nothing
+// outstanding, and the deliveries behind it leave both alone. An upstream
+// that keeps producing while the source acknowledges nothing does not hold
+// the head's expiry off: the head goes again one timer after its own
+// delivery, however much followed it, and the bound still runs from there. A
+// clock re-armed by every delivery left the head unrepaired for as long as
+// the upstream trickled, and pushed the bound back with it.
+func TestTcpReturnRetransmitLaterDeliveriesLeaveTheHeadsTimerAlone(t *testing.T) {
+	const trickleCount = 8
+	// so the trickle outlasts the timer before a round-trip sample
+	const trickleInterval = returnRetransmitInitialRto / 4
+	runTcpReturnRetransmitTest(t, func(t *testing.T) {
+		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{})
+		harness.source.holdAcks = true
+		start := time.Now()
+		payload := harness.payload(trickleCount)
+		for segmentIndex := 0; segmentIndex < trickleCount; segmentIndex += 1 {
+			harness.writeSegments(payload, segmentIndex, 1)
+			time.Sleep(trickleInterval)
+		}
+		synctest.Wait()
+
+		// one initial timer after the head's own delivery, in the middle of
+		// the trickle
+		harness.requireTimerRetransmissionAt(0, start.Add(returnRetransmitInitialRto))
+		harness.requireSeenCount(1, 1)
+
+		// and the bound runs from that delivery too, not from the last one
+		harness.waitRunDone(defaultReturnRetransmitTimeout)
+		harness.source.stateLock.Lock()
+		rstReceived, rstAt := harness.source.rstReceived, harness.source.rstAt
+		harness.source.stateLock.Unlock()
+		if !rstReceived {
+			t.Fatal("no reset reached the source at the bound")
+		}
+		if got := rstAt.Sub(start); got != defaultReturnRetransmitTimeout {
+			t.Fatalf("reset at +%s, want +%s, one bound after the first delivery", got, defaultReturnRetransmitTimeout)
+		}
+		if stats := harness.counters.snapshot(); stats.AbandonCount != 1 {
+			t.Fatalf("stats=%+v, want one abandon", stats)
+		}
+	})
+}
+
+// The timer's smoothing and its floor in exact values (RFC 6298 §2.3): a
+// 100 ms sample leaves srtt 100 ms and rttvar 50 ms, and a 200 ms one after
+// it leaves srtt 112.5 ms and rttvar 62.5 ms, so the timer is
+// srtt + 4 rttvar = 362.5 ms; a path far below the floor keeps the floor
+// itself, which is TCP's own minimum and what stops a fast path from sending
+// a hole again on every acknowledgement. Only the first sample of a flow was
+// pinned anywhere, so the smoothing constants and the floor's value were
+// free. Each sample is shorter than the timer standing when it is taken, so
+// no expiry falls in the same instant as the acknowledgement that carries
+// it.
+func TestTcpReturnRetransmitTimerSmoothsItsSamplesAboveTheFloor(t *testing.T) {
+	for _, c := range []struct {
+		name     string
+		samples  []time.Duration
+		wantBase time.Duration
+	}{
+		{
+			name:     "a hundred then two hundred",
+			samples:  []time.Duration{100 * time.Millisecond, 200 * time.Millisecond},
+			wantBase: 362500 * time.Microsecond,
+		},
+		{
+			// the floor's own value, not the constant, which a test that
+			// read it could not pin
+			name:     "a path below the floor",
+			samples:  []time.Duration{20 * time.Millisecond, 20 * time.Millisecond},
+			wantBase: 200 * time.Millisecond,
+		},
+	} {
+		runTcpReturnRetransmitTest(t, func(t *testing.T) {
+			t.Logf("%s", c.name)
+			harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{})
+			// each segment is acknowledged by hand its own sample later
+			harness.source.holdAcks = true
+			payload := harness.payload(len(c.samples))
+			for index, sample := range c.samples {
+				harness.writeSegments(payload, index, 1)
+				time.Sleep(sample)
+				harness.source.sendAck(harness.segmentSeq(index + 1))
+				synctest.Wait()
+			}
+
+			harness.requireStream(payload)
+			rto, baseRto := harness.retransmitTimer()
+			if baseRto != c.wantBase || rto != baseRto {
+				t.Fatalf("%s: timer %s base %s after samples %v, want %s", c.name, rto, baseRto, c.samples, c.wantBase)
+			}
+		})
+	}
+}
+
 // A source that received every segment but whose acknowledgements a stall
 // held past the timer, and then arrive late: the expiry sends the head once
 // and nothing else follows, whether the late acknowledgements come one per
@@ -1910,6 +2265,65 @@ func TestTcpReturnRetransmitRealTimeoutRecoversOnTheDuplicateAck(t *testing.T) {
 	}
 }
 
+// A duplicate acknowledgement while a timer probe is still undecided shows
+// the expiry was real (RFC 5682 §2.1 step 2a), so the probe becomes loss
+// recovery there and then: the acknowledgement that follows reads as the
+// partial one it is and fills the next hole at once. A probe left undecided
+// by the duplicate reads that same acknowledgement as an advance past the
+// head it sent again, calls the expiry spurious, and leaves the next hole to
+// another expiry a second or more away. Two segments are lost, so the
+// acknowledgement after the probe's own repair stops at the second, with no
+// duplicate of its own left to come: exactly the shape whose only evidence
+// is the duplicate the probe already saw.
+func TestTcpReturnRetransmitDuplicateDuringAnUndecidedProbeIsLoss(t *testing.T) {
+	// long enough after the expiry that the acknowledgement can be the
+	// retransmission's own answer (see retransmissionExplainsWithLock)
+	const ackAfterExpiry = 3 * returnRetransmitInitialRto / 2
+	runTcpReturnRetransmitTest(t, func(t *testing.T) {
+		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{})
+		harness.source.holdAcks = true
+		harness.source.dropCounts[harness.segmentSeq(0)] = 1
+		harness.source.dropCounts[harness.segmentSeq(2)] = 1
+		start := time.Now()
+		payload := harness.payload(4)
+		harness.write(payload)
+		synctest.Wait()
+
+		// nothing has been acknowledged, so the expiry probes with the head
+		time.Sleep(returnRetransmitInitialRto)
+		synctest.Wait()
+		harness.requireSeenCount(0, 2)
+		harness.requireSeenCount(2, 1)
+
+		// the probe's head arrived, but the source is still missing the
+		// third segment and says so with a duplicate before its own
+		// acknowledgement of the head
+		time.Sleep(ackAfterExpiry)
+		harness.source.sendDuplicateAck()
+		synctest.Wait()
+		harness.source.sendAck(harness.segmentSeq(2))
+		synctest.Wait()
+
+		at := time.Now()
+		harness.requireSeenCount(2, 2)
+		if got := harness.requireDelivery(harness.segmentSeq(2), 1).at; !got.Equal(at) {
+			t.Fatalf("the second hole went again %s after the partial acknowledgement, want at once", got.Sub(at))
+		}
+		harness.source.ackNow()
+		synctest.Wait()
+		harness.requireStream(payload)
+		_, _, packetCount, reasonCounts := harness.retransmitState()
+		if packetCount != 2 ||
+			reasonCounts[tcpReturnRetransmitReasonTimeout] != 1 ||
+			reasonCounts[tcpReturnRetransmitReasonPartialAck] != 1 {
+			t.Fatalf("retransmissions=%d reasons=%v, want the head on the timer and the second hole on the partial acknowledgement", packetCount, reasonCounts)
+		}
+		if stats := harness.counters.snapshot(); stats.TimeoutCount != 1 {
+			t.Fatalf("stats=%+v, want one timer expiry, at +%s", stats, time.Since(start))
+		}
+	})
+}
+
 // The recovery point is the highest delivered segment, and the drain marks a
 // batch only when its callback returns, so a second hole inside the batch that
 // was being delivered when recovery began lay past the point. The
@@ -1978,6 +2392,99 @@ func TestTcpReturnRetransmitRecoveryCoversTheBatchItBeganInside(t *testing.T) {
 			reasonCounts[tcpReturnRetransmitReasonDupAck] != 1 ||
 			reasonCounts[tcpReturnRetransmitReasonPartialAck] != 1 {
 			t.Fatalf("retransmissions=%d reasons=%v, want the first hole on duplicates and the second on the partial acknowledgement", packetCount, reasonCounts)
+		}
+		if stats := harness.counters.snapshot(); stats.TimeoutCount != 0 {
+			t.Fatalf("stats=%+v, want no timer expiry", stats)
+		}
+	})
+}
+
+// A recovery ends on the acknowledgement that reaches its point exactly, not
+// one byte past it. The point is the end of the highest segment delivered
+// when the recovery began, and the acknowledgement of the repair reaches
+// exactly that end whenever the loss was the head of the flight, which is the
+// common shape. A recovery left standing on it costs twice: the same
+// acknowledgement reads as a partial one and its burst sends a segment the
+// source holds, and the next episode's own partial acknowledgement, being
+// past the stale point, reads as a full recovery, so its second hole waits
+// for the timer with its duplicates already spent. Here the flight's head is
+// lost, a later flight is delivered inside the recovery so the ring is not
+// emptied by the boundary acknowledgement, and that flight loses two segments
+// of its own.
+func TestTcpReturnRetransmitRecoveryEndsOnAnAcknowledgementThatReachesItsPoint(t *testing.T) {
+	// the hand-driven path delay: long enough that an acknowledgement can be
+	// the answer to a retransmission a step before it
+	const step = 100 * time.Millisecond
+	const firstCount = 4
+	const secondCount = 6
+	// the second flight loses its own first segment, so the boundary
+	// acknowledgement is also the source's frontier and nothing advances past
+	// the point before the new episode's duplicates
+	const firstHoleIndex = firstCount
+	const secondHoleIndex = firstCount + 2
+	runTcpReturnRetransmitTest(t, func(t *testing.T) {
+		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{})
+		harness.source.holdAcks = true
+		harness.source.dropCounts[harness.segmentSeq(0)] = 1
+		payload := harness.payload(firstCount + secondCount)
+		harness.writeSegments(payload, 0, firstCount)
+
+		// the head of the flight is lost and the three segments behind it
+		// draw the duplicates that repair it; the recovery's point is the end
+		// of the flight
+		time.Sleep(step)
+		for range returnRetransmitDupAckThreshold {
+			harness.source.sendDuplicateAck()
+		}
+		synctest.Wait()
+		harness.requireSeenCount(0, 2)
+
+		// a second flight, delivered inside the recovery, so it lies past the
+		// point and holds the ring open past the boundary acknowledgement
+		time.Sleep(step)
+		harness.source.dropCounts[harness.segmentSeq(firstHoleIndex)] = 1
+		harness.source.dropCounts[harness.segmentSeq(secondHoleIndex)] = 1
+		harness.writeSegments(payload, firstCount, secondCount)
+
+		// exactly the recovery's point, with the second flight outstanding
+		time.Sleep(step)
+		harness.source.sendAck(harness.segmentSeq(firstCount))
+		synctest.Wait()
+		harness.requireSeenCount(firstCount, 1)
+
+		// the second flight's own loss: its first hole on the duplicates, its
+		// second on the partial acknowledgement that follows
+		time.Sleep(step)
+		for range returnRetransmitDupAckThreshold {
+			harness.source.sendDuplicateAck()
+		}
+		synctest.Wait()
+		harness.requireSeenCount(firstHoleIndex, 2)
+
+		time.Sleep(2 * step)
+		harness.source.sendAck(harness.segmentSeq(secondHoleIndex))
+		synctest.Wait()
+		at := time.Now()
+		harness.requireSeenCount(secondHoleIndex, 2)
+		if got := harness.requireDelivery(harness.segmentSeq(secondHoleIndex), 1).at; !got.Equal(at) {
+			t.Fatalf("the second hole went again %s after the partial acknowledgement, want at once", got.Sub(at))
+		}
+
+		harness.source.ackNow()
+		synctest.Wait()
+		harness.requireStream(payload)
+		for segmentIndex := 1; segmentIndex < firstCount+secondCount; segmentIndex += 1 {
+			want := 1
+			if segmentIndex == firstHoleIndex || segmentIndex == secondHoleIndex {
+				want = 2
+			}
+			harness.requireSeenCount(segmentIndex, want)
+		}
+		_, _, packetCount, reasonCounts := harness.retransmitState()
+		if packetCount != 3 ||
+			reasonCounts[tcpReturnRetransmitReasonDupAck] != 2 ||
+			reasonCounts[tcpReturnRetransmitReasonPartialAck] != 1 {
+			t.Fatalf("retransmissions=%d reasons=%v, want two heads on duplicates and one hole on the partial acknowledgement", packetCount, reasonCounts)
 		}
 		if stats := harness.counters.snapshot(); stats.TimeoutCount != 0 {
 			t.Fatalf("stats=%+v, want no timer expiry", stats)
@@ -2196,6 +2703,10 @@ const tcpReturnTestBurstRoundTrip = 250 * time.Millisecond
 // The source's view of a recovery that ran in bursts: the stream is exact,
 // every segment in `lost` came again exactly once, and the in-order frontier
 // reached the end within `maxRoundTripCount` round trips of `recoveryAt`.
+// Both spans below recover in exactly 11.000 round trips of virtual time, so
+// the bound is the produced value: the doubling run is what makes it a
+// handful rather than one round trip per segment, and a bound with room to
+// spare would let a third of that speed back.
 func requireTcpReturnTestBurstRecovery(
 	t *testing.T,
 	harness *tcpReturnRetransmitTestHarness,
@@ -2217,7 +2728,7 @@ func requireTcpReturnTestBurstRecovery(
 	if time.Duration(maxRoundTripCount)*tcpReturnTestBurstRoundTrip < recovery {
 		t.Fatalf("%d lost segments recovered in %s, %.1f round trips, want at most %d", lostEndIndex-lostStartIndex, recovery, float64(recovery)/float64(tcpReturnTestBurstRoundTrip), maxRoundTripCount)
 	}
-	t.Logf("%d lost segments recovered in %.1f round trips", lostEndIndex-lostStartIndex, float64(recovery)/float64(tcpReturnTestBurstRoundTrip))
+	t.Logf("%d lost segments recovered in %s, %.3f round trips", lostEndIndex-lostStartIndex, recovery, float64(recovery)/float64(tcpReturnTestBurstRoundTrip))
 }
 
 // A source whose kernel drops one segment and then, when fast retransmit
@@ -2260,7 +2771,7 @@ func TestTcpReturnRetransmitPrunedSpanRecoversInBursts(t *testing.T) {
 			synctest.Wait()
 
 			fastRetransmitAt := harness.requireDelivery(harness.segmentSeq(1), 1).at
-			requireTcpReturnTestBurstRecovery(t, harness, payload, 2, segmentCount, fastRetransmitAt, 12)
+			requireTcpReturnTestBurstRecovery(t, harness, payload, 2, segmentCount, fastRetransmitAt, 11)
 			harness.requireSeenCount(0, 1)
 			harness.requireSeenCount(1, 2)
 			for segmentIndex := segmentCount; segmentIndex < segmentCount+laterSegmentCount; segmentIndex += 1 {
@@ -2315,7 +2826,7 @@ func TestTcpReturnRetransmitLostFlightRecoversInBurstsAfterTheProbe(t *testing.T
 			if got, want := lossAt.Sub(probeAt), tcpReturnTestBurstRoundTrip+2*rto; got != want {
 				t.Fatalf("second expiry %s after the probe, want %s", got, want)
 			}
-			requireTcpReturnTestBurstRecovery(t, harness, payload, 1, segmentCount, lossAt, 12)
+			requireTcpReturnTestBurstRecovery(t, harness, payload, 1, segmentCount, lossAt, 11)
 			harness.requireSeenCount(0, 1)
 			_, _, packetCount, reasonCounts := harness.retransmitState()
 			if packetCount != segmentCount-1 ||
@@ -2328,6 +2839,120 @@ func TestTcpReturnRetransmitLostFlightRecoversInBurstsAfterTheProbe(t *testing.T
 			}
 		})
 	}
+}
+
+// The loss-recovery run has a ceiling, and a new recovery starts again at the
+// head alone. Two pruned spans in one flow, each stepped acknowledgement by
+// acknowledgement: the first is large enough for the run to reach the
+// ceiling, and the second begins after it. Without the ceiling the run grows
+// to the whole span, and one acknowledgement that covers a burst can then ask
+// for a window of retransmissions at once; without the restart the next
+// recovery's first partial acknowledgement sends the previous run in one go,
+// and without selective acknowledgement those are segments the source may
+// hold.
+//
+// Produced: the first recovery's run reads 1, 2, 3 ... 128 and stays there,
+// every acknowledgement drawing two segments; the second's reads 1, 2 ...
+// 20. Without the ceiling the first run reaches 399; with the run kept the
+// second recovery reads 128 at its first acknowledgement and sends 38
+// segments on the next.
+func TestTcpReturnRetransmitBurstRunHasACeilingAndRestartsAtOne(t *testing.T) {
+	// the ceiling's own value, in consecutive segments from the cumulative
+	// acknowledgement: about 190 KB of full-size segments, which is the most
+	// one acknowledgement asks for and, without selective acknowledgement,
+	// the most it can send again that the source already held
+	const maxBurstSegmentCount = 128
+	const firstSpanCount = 400
+	const secondSpanCount = 40
+	const firstHoleIndex = 1
+	const secondHoleIndex = firstSpanCount + 1
+	runTcpReturnRetransmitTest(t, func(t *testing.T) {
+		if returnRetransmitMaxBurstSegmentCount != maxBurstSegmentCount {
+			t.Fatalf("the burst ceiling is %d segments, want %d", returnRetransmitMaxBurstSegmentCount, maxBurstSegmentCount)
+		}
+		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{
+			ackDelay: tcpReturnTestStepRoundTrip,
+			stepAcks: true,
+		})
+		payload := harness.payload(firstSpanCount + secondSpanCount)
+
+		// Steps every acknowledgement the source has queued, and reports the
+		// run at each one that drew retransmissions: the first, which is the
+		// recovery's own start, the largest, and the most packets any one
+		// acknowledgement drew.
+		stepRecovery := func() (firstRun int, maxRun int, maxPacketCount int64) {
+			for {
+				packetCount, stepped := harness.stepOneAck()
+				if !stepped {
+					return
+				}
+				if packetCount <= 0 {
+					continue
+				}
+				run := harness.burstSegmentCountForTest()
+				if maxPacketCount == 0 {
+					firstRun = run
+				}
+				maxRun = max(maxRun, run)
+				maxPacketCount = max(maxPacketCount, packetCount)
+			}
+		}
+
+		// a source whose kernel drops one segment and prunes what it held
+		// past the hole when the repair fills it, so the whole span behind it
+		// is recovered by the partial acknowledgements
+		harness.source.dropCounts[harness.segmentSeq(firstHoleIndex)] = 1
+		harness.source.renegeOnce = true
+		harness.writeSegments(payload, 0, firstSpanCount)
+		firstRun, maxRun, maxPacketCount := stepRecovery()
+		t.Logf("the first recovery: run from %d to %d, at most %d packets on one acknowledgement", firstRun, maxRun, maxPacketCount)
+		if firstRun != 1 {
+			t.Fatalf("the first recovery began with a run of %d, want the head alone", firstRun)
+		}
+		if maxRun != maxBurstSegmentCount {
+			t.Fatalf("the run reached %d over a span of %d segments, want the ceiling %d", maxRun, firstSpanCount, maxBurstSegmentCount)
+		}
+		if maxBurstSegmentCount < maxPacketCount {
+			t.Fatalf("one acknowledgement drew %d packets, above the ceiling %d", maxPacketCount, maxBurstSegmentCount)
+		}
+
+		// the second span, with the run left at the ceiling by the first
+		harness.source.stateLock.Lock()
+		harness.source.renegeOnce = true
+		harness.source.stateLock.Unlock()
+		harness.source.dropCounts[harness.segmentSeq(secondHoleIndex)] = 1
+		harness.writeSegments(payload, firstSpanCount, secondSpanCount)
+		firstRun, maxRun, maxPacketCount = stepRecovery()
+		t.Logf("the second recovery: run from %d to %d, at most %d packets on one acknowledgement", firstRun, maxRun, maxPacketCount)
+		if firstRun != 1 {
+			t.Fatalf("the second recovery began with a run of %d, want the head alone", firstRun)
+		}
+		// its acknowledgements each cover one retransmission and grow the run
+		// by one, so two segments go on each
+		if 2 < maxPacketCount {
+			t.Fatalf("an acknowledgement of the second recovery drew %d packets, want at most two from a run that starts again", maxPacketCount)
+		}
+
+		harness.stepAcks(4 * tcpReturnTestStepRoundTrip)
+		harness.requireStream(payload)
+		for segmentIndex := 0; segmentIndex < firstSpanCount+secondSpanCount; segmentIndex += 1 {
+			want := 1
+			if firstHoleIndex <= segmentIndex && segmentIndex < firstSpanCount ||
+				secondHoleIndex <= segmentIndex && segmentIndex < firstSpanCount+secondSpanCount {
+				// the hole and the span the source pruned behind it
+				want = 2
+			}
+			harness.requireSeenCount(segmentIndex, want)
+		}
+		_, _, packetCount, reasonCounts := harness.retransmitState()
+		wantPacketCount := int64(firstSpanCount - firstHoleIndex + secondSpanCount - (secondHoleIndex - firstSpanCount))
+		if packetCount != wantPacketCount || reasonCounts[tcpReturnRetransmitReasonDupAck] != 2 {
+			t.Fatalf("retransmissions=%d reasons=%v, want %d, each span once, on two fast retransmits and their partial acknowledgements", packetCount, reasonCounts, wantPacketCount)
+		}
+		if stats := harness.counters.snapshot(); stats.TimeoutCount != 0 {
+			t.Fatalf("stats=%+v, want every repair on duplicate or partial acknowledgements", stats)
+		}
+	})
 }
 
 // The pool roots and ring records the retained set holds, read under the
@@ -2748,6 +3373,69 @@ func TestTcpReturnRetransmitKeepsTheFinUntilItsOwnSequenceByteIsAcknowledged(t *
 // Establishes a flow whose upstream has sent its FIN, unacknowledged and
 // held in retention, with the delivery drain parked waiting for that
 // acknowledgement, on an upstream whose Close takes time.
+// The drain waits for the retained ring at both of its ends. Its loop reads
+// the socket reader's queue from two places — the outer wait for the next
+// packet and the inner drain that fills a batch — and either can be the one
+// that finds the queue closed, depending on where the delivery of the last
+// batch left it. The tests above always end on the inner one, because the
+// reader closes the queue while the drain is still inside that batch. Here
+// the first segment's tunnel write holds the drain long enough for the
+// reader to queue the whole flight, add its FIN and close, so the batch is
+// finished from the queue and the close is found by the outer read. Without
+// the wait there the sequence cancels behind a delivered FIN with a hole
+// still retained, and the source's download ends one segment short.
+func TestTcpReturnRetransmitDrainWaitsForTheRingWhenTheReaderClosesFirst(t *testing.T) {
+	const segmentCount = 3
+	const holeIndex = 1
+	const stall = 10 * time.Millisecond
+	runTcpReturnRetransmitTest(t, func(t *testing.T) {
+		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{})
+		harness.source.stallDurations[harness.segmentSeq(0)] = stall
+		harness.source.dropCounts[harness.segmentSeq(holeIndex)] = 1
+		start := time.Now()
+		payload := harness.payload(segmentCount)
+		harness.write(payload)
+		// the reader queues its FIN and closes while the drain is still in
+		// the first segment's write
+		harness.closeUpstream()
+		synctest.Wait()
+
+		time.Sleep(stall)
+		synctest.Wait()
+		if harness.runIsDone() {
+			t.Fatal("the sequence ended with a hole still retained behind the delivered FIN")
+		}
+		finSeq := harness.segmentSeq(segmentCount)
+		if got := harness.source.seenCount(finSeq); got != 1 {
+			t.Fatalf("the FIN at %d was delivered %d times with the flight, want once", finSeq, got)
+		}
+		harness.requireSeenCount(holeIndex, 1)
+
+		// only two segments came behind the hole, the last of them the FIN,
+		// so the duplicates never reach the threshold and the timer repairs
+		// it (see the file header for the initial timer)
+		harness.waitRunDone(2 * returnRetransmitInitialRto)
+		harness.requireSeenCount(holeIndex, 2)
+		if got, want := harness.requireDelivery(harness.segmentSeq(holeIndex), 1).at.Sub(start), stall+returnRetransmitInitialRto; got != want {
+			t.Fatalf("the hole was repaired at +%s, want +%s, one timer after the batch", got, want)
+		}
+		harness.source.stateLock.Lock()
+		finReceived, rstReceived := harness.source.finReceived, harness.source.rstReceived
+		harness.source.stateLock.Unlock()
+		if !finReceived || rstReceived {
+			t.Fatalf("fin=%t rst=%t, want the FIN accepted behind the repaired hole and no reset", finReceived, rstReceived)
+		}
+		harness.requireStream(payload)
+		retainedByteCount, retainedCount, packetCount, reasonCounts := harness.retransmitState()
+		if retainedByteCount != 0 || retainedCount != 0 {
+			t.Fatalf("retained after the drain: %d bytes in %d segments", retainedByteCount, retainedCount)
+		}
+		if packetCount != 1 || reasonCounts[tcpReturnRetransmitReasonTimeout] != 1 {
+			t.Fatalf("retransmissions=%d reasons=%v, want the hole once on the timer", packetCount, reasonCounts)
+		}
+	})
+}
+
 func newTcpReturnRetransmitTestHarnessWithParkedDrain(t *testing.T, configure func(*TcpBufferSettings)) *tcpReturnRetransmitTestHarness {
 	t.Helper()
 	harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{
