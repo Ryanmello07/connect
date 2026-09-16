@@ -2274,10 +2274,10 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 						// carrying traffic, with nothing left to close it on a
 						// network change.
 						var decision h1PathDecision
-						if err := HandleError(func() {
+						if monitorError := HandleError(func() {
 							decision = pathConnection.tick(time.Now())
-						}); err != nil {
-							pathConnection.monitorStopped(err)
+						}); monitorError != nil {
+							pathConnection.monitorStopped(monitorError)
 							ticker.Stop()
 							tick = nil
 							continue

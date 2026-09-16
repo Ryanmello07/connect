@@ -24,7 +24,9 @@ import (
 // own. Its role -- which selects the provider gates and the provider clamp --
 // is resolved the same way, from SetH1PathRerollRoleOverride,
 // CONNECT_H1_PATH_REROLL_ROLE and the settings, because a provider process is
-// the only thing that knows its websocket to the platform is a provider's. There is no connection, and no per-frame, timer or syscall cost, when:
+// the only thing that knows its websocket to the platform is a provider's.
+//
+// There is no connection, and no per-frame, timer or syscall cost, when:
 //   - the effective mode is Off;
 //   - the transport carries only control (a TransportGenerator is set);
 //   - the dial round trip, a third of the dial duration, is below MinPathRtt.
@@ -73,11 +75,12 @@ import (
 // The connection is owned by the watcher goroutine, which runH1 joins before
 // close. Every method is nil-safe, so runH1 needs no check for an unmonitored
 // connection. The connection counts ConnectionsMonitored, ConnectionsDormant at
-// the dial gate, ConnectionsUnbuffered, KernelUnavailable (once per connection: no kernel socket, or
-// its first read failed), SuppressedObserve and the ledger's refusals,
-// Rerolls, Improved and Unimproved; runH1 counts RerollDials, and a re-roll
-// dial's source port plan counts SourcePortBinds and SourcePortFallbacks, one
-// per socket it plans.
+// the dial gate, ConnectionsUnbuffered, KernelUnavailable (once per connection:
+// no kernel socket, or its first read failed), SourcePortUnmoved,
+// MonitorStopped,
+// SuppressedObserve and the ledger's refusals, Rerolls, Improved and
+// Unimproved; runH1 counts RerollDials, and a re-roll dial's source port plan
+// counts SourcePortBinds and SourcePortFallbacks, one per socket it plans.
 
 // The per-connection counters runH1 keeps for the monitor. The reader and the
 // writer update them; the watcher reads them.
