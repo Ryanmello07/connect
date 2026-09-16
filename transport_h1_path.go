@@ -696,10 +696,11 @@ type h1PathDecision struct {
 //   - tx collapsed: not excluded, a backlogged send queue, acked bytes
 //     advancing below thin;
 //   - clean, which is what resolves a re-roll as improved: demand and a
-//     direction at or above thin, or demand and no direction collapsed on a
-//     tick our own consumer did not pace. The second reading is what makes the
-//     credit reachable at the rates sessions actually run at; neither counts a
-//     tick whose bytes were not counted (the speed test echo, a stand down);
+//     direction at or above thin, or, on a tick our own consumer did not pace,
+//     demand and a direction that could read its queue and did not collapse.
+//     The second reading is what makes the credit reachable at the rates
+//     sessions actually run at; neither counts a tick whose bytes were not
+//     counted (the speed test echo, a stand down);
 //   - excluded from collapsing, for both directions: the receive channel was
 //     full, the speed test echo is active, or the transport is standing down
 //     H1;
@@ -1025,18 +1026,27 @@ func (self *h1PathMonitor) tick(sample h1PathSample) h1PathDecision {
 	// direction at or above thin is the strong one, and it survives our own
 	// back pressure, which only lowers the delivered rate: a tick that cleared
 	// thin cleared it in spite of us. The cheap one is a tick that moved real
-	// bytes and collapsed in neither direction, which is what the ledger is
-	// actually asking -- did the replacement stop doing the thing we convicted
-	// the last one for. Thin is 3.53 MB/s on a 101 ms path, so the strong
-	// reading alone puts the credit, and the unconfirmed budget an improvement
-	// returns, out of reach of every session running under 29 Mb/s: most of
-	// them, and all of the 5-140 Mb/s bad population below its own thin rate,
-	// which is the population the feature exists for. The cheap reading has to
-	// drop the ticks our own consumer paced, unlike the collapse rule, because
-	// a tick we slowed ourselves says nothing about the path either way.
+	// bytes and did not collapse in a direction whose queue it could read,
+	// which is what the ledger is actually asking -- did the replacement stop
+	// doing the thing we convicted the last one for. Thin is 3.53 MB/s on a
+	// 101 ms path, so the strong reading alone puts the credit, and the
+	// unconfirmed budget an improvement returns, out of reach of every session
+	// running under 29 Mb/s: most of them, and all of the 5-140 Mb/s bad
+	// population below its own thin rate, which is the population the feature
+	// exists for.
+	//
+	// The cheap reading takes two guards the collapse rule does not need. It
+	// drops the ticks our own consumer paced, because a tick we slowed
+	// ourselves says nothing about the path either way. And it requires a queue
+	// to have been readable at all: a tick with neither pack samples nor a
+	// fresh ack is not a queue that was absent, and crediting it would resolve
+	// a re-roll as improved from the blind window after the re-roll mark, while
+	// the replacement was sitting on the same bad member.
+	rxReadable := queueDelayKnown || ackQueueKnown
 	clean := rxCleanRate ||
 		txCleanRate ||
-		(!excluded && (rxDemand || txDemand) && !rxCollapsed && !txCollapsed)
+		(!excluded && ((rxDemand && rxReadable && !rxCollapsed) ||
+			(txDemand && !txCollapsed)))
 	// An accepted tick that reached no verdict is not the same reading as a
 	// healthy one, and nothing said which it was: an Observe rollout could not
 	// tell a fleet with no collapse from one that was never able to classify a

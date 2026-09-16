@@ -797,21 +797,27 @@ const pathRerollBlockLossyPort = 40960
 // back for five seconds, so an arm that convicts at 3.5 s has read no ack yet
 // and falls back to the queue delay alone, which is what the other arms do.
 //
-// The full tier (CONNECT_PATHSIM_FULL=1) adds four arms, which read:
+// The full tier (CONNECT_PATHSIM_FULL=1) runs every arm on the long offer, so
+// its numbers are not the table above's, and it adds four arms. The four read:
 //
-//	S9/mode=act/leg=lossy/hash=block64/port=kernel     4.4     4.9    2259     686  282
+//	S9/mode=act/leg=lossy/hash=block64/port=kernel     4.6     5.1    2352     409  207
 //	S9/mode=act/leg=lossy/hash=block64/port=far      281.6   301.8  128923     204    2
 //	S9/mode=act/leg=lossy/ooo=third                  281.6   301.8  128923     204    2
 //	S9/mode=act/leg=lossy/ooo=unknown                  4.6     5.1    2352     409  207
 //
-// The kernel's own re-roll walks 40960 -> 40962 -> 40968, never leaving the bad
-// block of 64, so both re-rolls are unimproved, the latch stops the third, and
-// the arm stays at 4.9 Mb/s. The far-random port leaves the block on its first
-// pick and reads the healthy rate, which is what commit 6 is for. Out-of-order
-// data on one tick in three still confirms the conviction. With no kernel
-// counter at all every conviction is unconfirmed, and the epoch's unconfirmed
-// budget of one allows exactly one re-roll, after which the arm is stuck: the
-// budget is the price of acting on evidence the kernel did not give.
+// None of the four reads an ack, so every conviction in them is unconfirmed and
+// the epoch's budget of one is what bounds each of them -- not the unimproved
+// latch, which these arms no longer reach and which the platform tests pin
+// instead. The kernel's own re-roll walks 40960 -> 40962, stays inside the bad
+// block of 64, is refused a second re-roll by that budget and holds 5.1 Mb/s.
+// The far-random port leaves the block on its first pick and reads the healthy
+// rate, which is what commit 6 is for. Out-of-order data on one tick in three
+// clears the loss bar in every window, so that arm is never denied and its
+// re-roll rescues it, but its conviction is unconfirmed like the rest: the
+// kernel's counter speaks for the path and not for the queue. With no kernel
+// counter at all the arm reads identically to the kernel one, which is the
+// shape of the confidence rule -- with no ack to corroborate them, loss the
+// kernel saw and loss it could not see are the same verdict.
 func TestPathsimS9LossyConnectionReroll(t *testing.T) {
 	// Long enough that the re-roll arm reaches its twenty clean ticks (ten
 	// seconds past a switch at about 3.5 s) with room to spare, and short
@@ -1126,17 +1132,24 @@ func TestPathsimS9LossyConnectionReroll(t *testing.T) {
 		return
 	}
 
-	// The kernel's own re-roll of a few ports stays inside the bad block, so
-	// the second re-roll is unimproved as well and the latch stops the third.
+	// The kernel's own re-roll of a few ports stays inside the bad block, and
+	// the arm reads no ack, so the one re-roll the unconfirmed budget allows is
+	// the whole of what it gets.
 	blockKernelResult := results[blockKernel]
-	if blockKernelResult.reroll.switches != 2 {
+	if blockKernelResult.reroll.switches != 1 {
 		t.Errorf(
-			"S9: %s switched %d times, want the two the unimproved latch allows",
+			"S9: %s switched %d times, want the one the unconfirmed budget allows",
 			blockKernel, blockKernelResult.reroll.switches,
 		)
 	}
-	if blockKernelResult.reroll.suppressedLatched < 1 {
-		t.Errorf("S9: %s never refused a conviction for the latch", blockKernel)
+	if blockKernelResult.reroll.improved != 0 {
+		t.Errorf(
+			"S9: %s credited %d re-rolls as improved while it stayed on the bad block",
+			blockKernel, blockKernelResult.reroll.improved,
+		)
+	}
+	if blockKernelResult.reroll.suppressedUnconfirmedBudget < 1 {
+		t.Errorf("S9: %s never refused a conviction for the unconfirmed budget", blockKernel)
 	}
 	if latched := pathRatio(blockKernelResult, healthyActResult); 0.2 < latched {
 		t.Errorf(
@@ -1157,18 +1170,26 @@ func TestPathsimS9LossyConnectionReroll(t *testing.T) {
 		)
 	}
 
-	// Out-of-order data on one tick in three is still loss evidence.
+	// Out-of-order data on one tick in three is still loss evidence: it clears
+	// the loss bar in every window, so the conviction is never denied. It is
+	// still unconfirmed, because this arm reads no ack and the kernel's counter
+	// speaks for the path and not for the queue.
 	thirdResult := results[thirdTickOoo]
-	if thirdResult.reroll.switches != 1 || thirdResult.reroll.confirmedConvictions < 1 {
+	if thirdResult.reroll.switches != 1 {
+		t.Errorf("S9: %s switched %d times, want exactly one", thirdTickOoo, thirdResult.reroll.switches)
+	}
+	if thirdResult.reroll.confirmedConvictions != 0 ||
+		thirdResult.reroll.unconfirmedConvictions < 1 {
 		t.Errorf(
-			"S9: %s switched %d times with %d confirmed convictions",
-			thirdTickOoo, thirdResult.reroll.switches, thirdResult.reroll.confirmedConvictions,
+			"S9: %s convicted %d confirmed and %d unconfirmed with no ack on the route",
+			thirdTickOoo, thirdResult.reroll.confirmedConvictions,
+			thirdResult.reroll.unconfirmedConvictions,
 		)
 	}
-	if 0 < thirdResult.reroll.unconfirmedConvictions {
+	if rescued := pathRatio(thirdResult, healthyActResult); rescued < 0.6 {
 		t.Errorf(
-			"S9: %s convicted %d times without loss evidence the kernel reported",
-			thirdTickOoo, thirdResult.reroll.unconfirmedConvictions,
+			"S9: %s read %.2f of the healthy rate; one tick in three of loss evidence did not convict it",
+			thirdTickOoo, rescued,
 		)
 	}
 
