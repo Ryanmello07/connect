@@ -920,6 +920,57 @@ func TestH1PathLedgerCleanTicksResolveImprovement(t *testing.T) {
 	}
 }
 
+// The one drop left uncharged: a re-roll whose pending entry is overwritten by
+// a second re-roll on the same route manager.
+//
+// The ledger is keyed by the route manager, which belongs to the client and not
+// to the connection, so two connections of one client can pass allow in the
+// same instant and the second's noteReroll lands on an entry the first is still
+// waiting on. Sequentially it cannot happen -- the conviction that leads to a
+// re-roll takes the entry first, and DeviceRerollSpacing refuses anything
+// inside two seconds of the last one -- but the window between allow and
+// noteReroll is real, and the entry it overwrites spent a break-before-make
+// disconnect that nothing ever judged.
+func TestH1PathLedgerChargesAnOverwrittenReroll(t *testing.T) {
+	settings := DefaultH1PathRerollSettings()
+	ledger, stats := newH1PathTestLedger()
+	key := &RouteManager{}
+	now := h1PathTestOrigin
+
+	convicted := h1PathConvicted{direction: h1PathDirectionRx, ackCarried: true}
+	ledger.noteReroll(key, &settings, now, H1PathRerollRoleClient, h1PathConfidenceConfirmed, convicted, 40004)
+	// the same instant, from the other connection of the same client
+	ledger.noteReroll(key, &settings, now, H1PathRerollRoleClient, h1PathConfidenceConfirmed, convicted, 40012)
+	if unresolved := stats.Unresolved.Load(); unresolved != 1 {
+		t.Fatalf("unresolved = %d, want the overwritten re-roll", unresolved)
+	}
+	if state := testingH1PathLedgerSnapshot(ledger); state.dayCharged != 1 || state.pendingCount != 1 {
+		t.Fatalf("ledger = %+v, want the overwritten re-roll charged and the second one pending", state)
+	}
+	// the second is still judged the ordinary way
+	if !ledger.noteConviction(key, &settings, now.Add(10*time.Second)) {
+		t.Fatal("the surviving entry was not judged")
+	}
+	if state := testingH1PathLedgerSnapshot(ledger); state.dayCharged != 2 || state.epochUnimproved != 1 {
+		t.Fatalf("ledger = %+v, want both disconnects charged", state)
+	}
+	// a credited entry is dropped rather than charged, as everywhere else: it
+	// was resolved as improved before anything replaced it
+	ledger, stats = newH1PathTestLedger()
+	other := &RouteManager{}
+	ledger.noteReroll(other, &settings, now, H1PathRerollRoleClient, h1PathConfidenceConfirmed, convicted, 0)
+	if !ledger.noteClean(other, &settings, now, h1PathCleanTicks{rxAck: settings.CleanTicks}) {
+		t.Fatal("the clean ticks did not credit the re-roll")
+	}
+	ledger.noteReroll(other, &settings, now, H1PathRerollRoleClient, h1PathConfidenceConfirmed, convicted, 0)
+	if state := testingH1PathLedgerSnapshot(ledger); state.dayCharged != 0 ||
+		stats.Unresolved.Load() != 0 {
+		t.Fatalf("ledger = %+v, want the credited entry dropped for free", state)
+	}
+	runtime.KeepAlive(key)
+	runtime.KeepAlive(other)
+}
+
 func TestH1PathLedgerUnconfirmedBudget(t *testing.T) {
 	settings := DefaultH1PathRerollSettings()
 	ledger, _ := newH1PathTestLedger()

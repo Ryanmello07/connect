@@ -1452,8 +1452,9 @@ type h1PathPendingReroll struct {
 // replacement is as bad as what it replaced. The daily budget reads
 // disconnects, so everything that spent one and was not resolved as improved is
 // charged to it -- unimproved (noteConviction), aged out
-// (expirePendingWithLock), evicted at the pending limit (noteReroll), dropped
-// by a network change (networkChanged), or credited and convicted again
+// (expirePendingWithLock), evicted at the pending limit or overwritten by a
+// second re-roll on the same route manager (noteReroll), dropped by a network
+// change (networkChanged), or credited and convicted again
 // (noteConviction) -- and it is what bounds a device whose route cannot
 // produce a verdict inside the window at all, whose network does not stand
 // still long enough to give one, or that recovers for a few seconds at a
@@ -1695,7 +1696,20 @@ func (self *h1PathLedger) noteReroll(
 		self.epochUnconfirmed += 1
 	}
 	pendingKey := weak.Make(key)
-	if _, ok := self.pendingRouteManagerRerolls[pendingKey]; !ok && h1PathPendingLimit <= len(self.pendingRouteManagerRerolls) {
+	if replaced, ok := self.pendingRouteManagerRerolls[pendingKey]; ok {
+		// The route manager is the client's, not the connection's, so two
+		// connections of one client can pass allow in the same instant and the
+		// second arrives here on an entry the first is still waiting on. The
+		// entry it overwrites spent a disconnect and nothing judged it, so it
+		// is charged like any other drop -- sequentially this cannot happen,
+		// since the conviction that led here took the entry first
+		// (noteConviction), and DeviceRerollSpacing closes the window to the
+		// width of these two calls.
+		if !replaced.credited {
+			self.stats.Unresolved.Add(1)
+			self.chargeDayWithLock(now)
+		}
+	} else if h1PathPendingLimit <= len(self.pendingRouteManagerRerolls) {
 		// a credited entry goes first and costs nothing: it is the memory of a
 		// verdict already given, kept only so a re-collapse can take it back.
 		// An uncredited one stops being tracked before anything judged it, and
