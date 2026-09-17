@@ -1464,11 +1464,15 @@ type h1PathPendingReroll struct {
 // kernel loss counter, or a queue that stood on the sender's clock alone.
 // MaxUnconfirmedRerolls of those are allowed per network epoch, and an
 // improvement returns the budget, so a re-roll that keeps working is free and
-// one that changes nothing is spent once.
+// one that changes nothing is spent once. Taking a credit back does not take
+// the returned budget back with it -- the epoch's counts have moved on by then
+// and there is nothing to restore them to -- so a route that recovers and
+// re-collapses can spend the epoch's unconfirmed budget more than once. The
+// day is what bounds that one, as it bounds the rest of that loop.
 //
-// The ledger counts Unresolved; callers count Unimproved and Improved from the
-// returns of noteConviction and noteClean, and the suppression reasons from
-// allow. Safe for concurrent use.
+// The ledger counts Unresolved and Recollapsed; callers count Unimproved and
+// Improved from the returns of noteConviction and noteClean, and the
+// suppression reasons from allow. Safe for concurrent use.
 type h1PathLedger struct {
 	stats *h1PathStats
 
@@ -1485,12 +1489,14 @@ type h1PathLedger struct {
 	dayChargedNext       int
 	// Keyed weakly: the ledger outlives every transport in the process, and an
 	// entry waits out the improvement window whether or not anything still
-	// reads it, so a strong key would pin a route manager -- its match states,
-	// its pending writer snapshots and its alias scopes -- until the next
-	// caller happened to sweep. A weak key keeps the identity (a pointer that
-	// has been collected never equals a live one, whatever the allocator does
-	// with the address) and drops the object. A collected route manager's
-	// re-roll is unresolved, which is what it is: nothing is left to judge it.
+	// reads it -- a credited one waits for a conviction that may never come --
+	// so a strong key would pin a route manager, its match states, its pending
+	// writer snapshots and its alias scopes, for as long as the process runs. A
+	// weak key keeps the identity (a pointer that has been collected never
+	// equals a live one, whatever the allocator does with the address) and
+	// drops the object, which is also what bounds this map. A collected route
+	// manager's re-roll is unresolved, which is what it is: nothing is left to
+	// judge it.
 	pendingRouteManagerRerolls map[weak.Pointer[RouteManager]]h1PathPendingReroll
 	excludedPorts              []int
 }
