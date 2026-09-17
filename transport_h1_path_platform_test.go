@@ -708,11 +708,20 @@ type testingH1PathLedgerState struct {
 	epochUnconfirmed int
 	latchUntil       time.Time
 	excludedPorts    []int
+	// non-zero entries in the daily charge ring; the runs here are shorter
+	// than the rolling 24 hours allow() applies to them
+	dayCharged int
 }
 
 func testingH1PathLedgerSnapshot(ledger *h1PathLedger) testingH1PathLedgerState {
 	ledger.stateLock.Lock()
 	defer ledger.stateLock.Unlock()
+	dayCharged := 0
+	for _, chargedTime := range ledger.dayChargedTimes {
+		if !chargedTime.IsZero() {
+			dayCharged += 1
+		}
+	}
 	return testingH1PathLedgerState{
 		pendingCount:     len(ledger.pendingRouteManagerRerolls),
 		lastReroll:       ledger.lastReroll,
@@ -720,6 +729,7 @@ func testingH1PathLedgerSnapshot(ledger *h1PathLedger) testingH1PathLedgerState 
 		epochUnconfirmed: ledger.epochUnconfirmed,
 		latchUntil:       ledger.latchUntil,
 		excludedPorts:    append([]int{}, ledger.excludedPorts...),
+		dayCharged:       dayCharged,
 	}
 }
 

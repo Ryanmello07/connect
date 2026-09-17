@@ -964,8 +964,11 @@ func TestH1PathLedgerNetworkChangeLatchAge(t *testing.T) {
 	if ok, reason := ledger.allow(&settings, now, H1PathRerollRoleClient, h1PathConfidenceConfirmed, time.Minute); ok || reason != h1PathReasonLatched {
 		t.Fatalf("allow = %t %s, want latched", ok, reason)
 	}
-	// a pending entry is dropped as unresolved by a network change
-	ledger.noteReroll(&RouteManager{}, &settings, now, H1PathRerollRoleClient, h1PathConfidenceConfirmed, h1PathConvicted{direction: h1PathDirectionRx, ackCarried: true}, 0)
+	// a pending entry is dropped as unresolved by a network change, and
+	// charged on the way out: the epoch that ended cannot judge it, and its
+	// disconnect was spent all the same
+	dropped := &RouteManager{}
+	ledger.noteReroll(dropped, &settings, now, H1PathRerollRoleClient, h1PathConfidenceConfirmed, h1PathConvicted{direction: h1PathDirectionRx, ackCarried: true}, 0)
 
 	ledger.networkChanged(latchStart.Add(4 * time.Minute))
 	if ok, reason := ledger.allow(&settings, latchStart.Add(4*time.Minute), H1PathRerollRoleClient, h1PathConfidenceConfirmed, time.Minute); ok || reason != h1PathReasonLatched {
@@ -984,9 +987,13 @@ func TestH1PathLedgerNetworkChangeLatchAge(t *testing.T) {
 			dayCharged += 1
 		}
 	}
-	if dayCharged != 2 {
-		t.Fatalf("the daily count after two network changes = %d, want 2", dayCharged)
+	if dayCharged != 3 {
+		t.Fatalf(
+			"the daily count after two unimproved re-rolls and one dropped by a network change = %d, want 3",
+			dayCharged,
+		)
 	}
+	runtime.KeepAlive(dropped)
 }
 
 // A re-roll nothing could judge is charged when its window closed, not when the
@@ -2636,6 +2643,9 @@ type h1PathRerollProbeShape struct {
 	rxOooEveryTicks int
 	// the source the packs come from; the zero Id keeps the previous one
 	sourceId Id
+	// the device changed network before this tick, which is what the platform
+	// listener does to the ledger (h1PathDefaultLedger)
+	networkChanged bool
 }
 
 // What a probe run cost the device, and what its ticks could have credited.
@@ -2748,6 +2758,9 @@ func runH1PathRerollProbe(
 		sample.ackRtt = observerTick.ackRtt
 		sample.ackRttSamples = observerTick.ackSamples
 
+		if tickShape.networkChanged {
+			ledger.networkChanged(now)
+		}
 		decision := connection.monitor.tick(sample)
 		connection.decide(now, &decision)
 		if decision.convicted {
@@ -3131,6 +3144,79 @@ func TestH1PathRerollIsChargedWhateverTheRouteCanJudge(t *testing.T) {
 			t.Errorf(
 				"ack echo every %s: %s, want the daily budget's %d and then refusals",
 				c.ackEvery, outcome, settings.MaxUnimprovedRerollsPerDay,
+			)
+		}
+	}
+}
+
+// A network change drops every pending re-roll, and charges it on the way out.
+//
+// Dropping is right: a connection on the new network is no evidence about a
+// re-roll on the old one, so nothing there can be judged and the latch never
+// hears about it. Charging is the other half, and it was missing. The daily
+// budget reads disconnects, and one was spent; the change is only what stopped
+// anyone judging it. Uncharged it was the whole rule back, because the change
+// clears the epoch's unimproved and unconfirmed counts too, so on a device
+// that changes network faster than ImprovementWindow the budget was the last
+// bound standing and it never saw a single disconnect.
+//
+// Two hours of the collapse the budget was sized on -- 700 KB/s behind a 6 s
+// queue that only a 150 s ack echo reads, every replacement as bad as the
+// member it left -- at four network-change cadences. At the parent of this
+// commit the last two arms cost 47 re-rolls each and charged none of them.
+func TestH1PathNetworkChangeChargesTheDisconnect(t *testing.T) {
+	const transit = 101 * time.Millisecond
+	const queue = 6 * time.Second
+	const duration = 2 * time.Hour
+	const ackEvery = 150 * time.Second
+
+	for _, changeEvery := range []time.Duration{
+		0,
+		10 * time.Minute,
+		2 * time.Minute,
+		60 * time.Second,
+	} {
+		settings := DefaultH1PathRerollSettings()
+		outcome, stats, ledger := runH1PathRerollProbe(t, &settings, transit, duration,
+			func(elapsed time.Duration, connectionOrdinal int) h1PathRerollProbeShape {
+				shape := h1PathRerollProbeShape{rel: transit + queue, rxByteRate: 700_000}
+				if elapsed%ackEvery == 0 {
+					shape.ackRtt = transit + queue
+				}
+				shape.networkChanged = 0 < changeEvery && elapsed%changeEvery == 0
+				return shape
+			})
+		snapshot := stats.snapshot()
+		state := testingH1PathLedgerSnapshot(ledger)
+		t.Logf(
+			"network change every %s: %s unimproved=%d unresolved=%d charged=%d",
+			changeEvery, outcome, snapshot.Unimproved, snapshot.Unresolved,
+			state.dayCharged,
+		)
+		// the bound the file header claims, now for a device that moves
+		if outcome.rerolls != settings.MaxUnimprovedRerollsPerDay ||
+			outcome.suppressed[h1PathReasonDailyBudget] == 0 {
+			t.Errorf(
+				"network change every %s: %d re-rolls, %d refused by the budget, want the budget's %d disconnects and then refusals",
+				changeEvery, outcome.rerolls,
+				outcome.suppressed[h1PathReasonDailyBudget],
+				settings.MaxUnimprovedRerollsPerDay,
+			)
+		}
+		// every one of them spent a disconnect nothing resolved, and the epoch
+		// that could have latched is cleared by the change, so the budget is
+		// the only reading that can stop this
+		if snapshot.Unresolved != uint64(outcome.rerolls) ||
+			state.dayCharged != outcome.rerolls {
+			t.Errorf(
+				"network change every %s: %d re-rolls left %d unresolved and %d charged, want every re-roll charged",
+				changeEvery, outcome.rerolls, snapshot.Unresolved, state.dayCharged,
+			)
+		}
+		if snapshot.Unimproved != 0 || state.epochUnimproved != 0 {
+			t.Errorf(
+				"network change every %s: ledger = %+v, want no conviction inside the window",
+				changeEvery, state,
 			)
 		}
 	}

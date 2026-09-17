@@ -140,6 +140,19 @@ import (
 // charged too, because nothing here can tell that one from a re-roll that
 // changed nothing.
 //
+// A network change is the other way a route stops being able to answer, and it
+// is charged on the same reading: the epoch that ended cannot judge the
+// re-roll, so it reaches the budget and not the latch, exactly as an age-out
+// does. Left uncharged it handed the whole pre-fix rate back, because the
+// change clears the epoch counters as well and the budget was the only bound
+// still standing: on the same 150 s echo, a change every two minutes cost 47
+// disconnects in two hours and charged none of them, against six and then
+// refusals once they are charged
+// (TestH1PathNetworkChangeChargesTheDisconnect). What that costs is a device
+// that roams faster than the window -- it spends its six a day on re-rolls no
+// network lived long enough to judge -- and the lever is the same
+// MaxUnimprovedRerollsPerDay.
+//
 // This file holds the pure parts, with no call sites of their own:
 //   - the settings and their defaults (library default Observe), the
 //     environment variables and the process mode override, and the precedence
@@ -1370,9 +1383,10 @@ type h1PathPendingReroll struct {
 // replacement is as bad as what it replaced. The daily budget reads
 // disconnects, so everything that spent one and was not resolved as improved is
 // charged to it -- unimproved (noteConviction), aged out
-// (expirePendingWithLock) or evicted at the pending limit (noteReroll) -- and
-// it is what bounds a device whose route cannot produce a verdict inside the
-// window at all.
+// (expirePendingWithLock), evicted at the pending limit (noteReroll) or
+// dropped by a network change (networkChanged) -- and it is what bounds a
+// device whose route cannot produce a verdict inside the window at all, or
+// whose network does not stand still long enough to give one.
 //
 // An unconfirmed conviction is one nothing on this device could check: no
 // kernel loss counter, or a queue that stood on the sender's clock alone.
@@ -1461,9 +1475,9 @@ func (self *h1PathLedger) chargeDayWithLock(chargeTime time.Time) {
 // charged too; the levers are ImprovementWindow and MaxUnimprovedRerollsPerDay.
 //
 // A route manager collected under the weak key is not charged: its transport is
-// gone, so nothing is looping and no disconnect follows. Neither is an epoch
-// that ended (networkChanged), since a re-roll on the old network is no
-// evidence about the new one.
+// gone, so nothing is looping and no disconnect follows. An epoch that ended
+// (networkChanged) is charged, though it is not judged: the new network says
+// nothing about the re-roll, but the disconnect was spent all the same.
 func (self *h1PathLedger) expirePendingWithLock(settings *H1PathRerollSettings, now time.Time) {
 	for key, pending := range self.pendingRouteManagerRerolls {
 		collected := key.Value() == nil
@@ -1657,6 +1671,25 @@ func (self *h1PathLedger) noteClean(
 // excluded ports clear. A latch clears only once it is at least as old as the
 // reset age recorded when it was set. The daily budget and the device spacing
 // span epochs.
+//
+// A pending re-roll is dropped here and charged on the way out. Dropped,
+// because a connection on the new network is no evidence about a re-roll on
+// the old one, and the latch reads evidence. Charged, because the daily budget
+// reads disconnects and that one was spent: the change is what stopped anyone
+// judging it, not proof that nothing was owed. Left uncharged it gave the
+// whole pre-fix rate back to a device that changes network faster than
+// ImprovementWindow, since the change clears the epoch counters too and the
+// budget was the only bound left -- measured over two hours on a route whose
+// ack echo comes every 150 s (TestH1PathNetworkChangeChargesTheDisconnect):
+// with a change every two minutes, 47 re-rolls and nothing charged, against
+// the budget's six and then refusals once they are.
+//
+// What the charge costs is a device that roams faster than the window and
+// convicts on each network: it spends its six a day on re-rolls no network
+// lived long enough to judge, and MaxUnimprovedRerollsPerDay is the lever, the
+// same one an ack cadence slower than the window already leans on. A route
+// manager collected under the weak key is not charged, as everywhere else: its
+// transport is gone, so no disconnect follows.
 func (self *h1PathLedger) networkChanged(now time.Time) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -1668,10 +1701,13 @@ func (self *h1PathLedger) networkChanged(now time.Time) {
 	self.epochUnimproved = 0
 	self.epochUnconfirmed = 0
 	self.excludedPorts = nil
-	// a connection on the new network says nothing about a re-roll on the old one
 	for key := range self.pendingRouteManagerRerolls {
+		collected := key.Value() == nil
 		delete(self.pendingRouteManagerRerolls, key)
 		self.stats.Unresolved.Add(1)
+		if !collected {
+			self.chargeDayWithLock(now)
+		}
 	}
 }
 
