@@ -90,8 +90,9 @@ import (
 // evidence (the rule, and TicksAckBacklogged against Ticks). That is a backlog
 // and not a band of uplink rates -- max(AckBacklogFloorByteCount, rate x
 // threshold), which is 16 KiB up to 0.13 Mb/s and 63 KB at 0.5 Mb/s on a 101
-// ms path, and three times each on a 300 ms one. Neither of the independent
-// floors that
+// ms path. The floor is a constant, so only the rate-proportional half moves
+// with the path: on a 300 ms one the floor still binds at 16 KiB and covers a
+// narrower band, up to about 0.044 Mb/s. Neither of the independent floors that
 // suggest themselves closes it: neither the dial round trip nor the kernel's
 // minimum round trip bounds the offset between the two clocks that every pack
 // tag carries, and neither one times the far socket's send queue, which sits
@@ -1115,14 +1116,15 @@ func (self *h1PathMonitor) tick(sample h1PathSample) h1PathDecision {
 	// at every rate once the backlog reaches max(AckBacklogFloorByteCount, rate
 	// x threshold) -- 16 KiB from 0.05 to 0.13 Mb/s, then 31.6 KB at 0.25 Mb/s,
 	// 63.1 KB at 0.5, 126 KB at 1 and 253 KB at 2, on a 101 ms path. The top of
-	// the band is SendBacklogByteCount over the same threshold, 2.076 Mb/s
-	// here:
+	// the band is SendBacklogByteCount over the same threshold, 2.076 Mb/s here:
 	// above it the same backlog is enough to convict the send direction, so a
 	// client whose uplink also shows retransmits gets a verdict instead of
 	// going invisible, and one whose uplink shows none is invisible as before.
-	// Both bars are divided by the threshold, so the whole band moves with the
-	// path: on a 300 ms path every backlog triples and the top falls to 0.699
-	// Mb/s, which is inside the rates quoted above.
+	// The rate-proportional bar and the top edge are divided by the threshold,
+	// so they move with the path, while AckBacklogFloorByteCount is a constant:
+	// on a 300 ms path the top falls to 0.699 Mb/s, which is inside the rates
+	// quoted above, and the floor still binds at 16 KiB, over a band that
+	// narrows to about 0.044 Mb/s rather than widening.
 	//
 	// The send rule asks a second question of the same bytes -- is there enough
 	// backlog to call the direction collapsed -- and SendBacklogByteCount is
