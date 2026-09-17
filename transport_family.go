@@ -236,8 +236,10 @@ func NewDirectClientStrategy(ctx context.Context, settings *ClientStrategySettin
 	if ipFamily != 0 {
 		base := direct.ConnectSettings
 		base.DialContextSettings = nil
+		// the direct dial, where an H1 re-roll dial binds its planned local
+		// port (h1_source_port.go); an injected dial below keeps its own
 		inner := func(ctx context.Context, network string, addr string) (net.Conn, error) {
-			return base.NetDialer().DialContext(ctx, network, addr)
+			return h1SourcePortDialer(ctx, base.NetDialer()).DialContext(ctx, network, addr)
 		}
 		var packetConnFactory func(context.Context) (net.PacketConn, error)
 		if injected := direct.ConnectSettings.DialContextSettings; injected != nil {

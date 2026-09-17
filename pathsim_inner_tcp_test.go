@@ -761,7 +761,7 @@ func runPathInnerArm(t *testing.T, arm pathInnerArm) pathInnerResult {
 		defer cancel()
 
 		hops := []pathHop{pathRelayHop("tunnel", pathInnerRoundTrip, pathGigabit, pathRelayQueueMessages, 0)}
-		carrier := startPathCarrier(ctx, hops, 9, 16, 1500)
+		carrier := startPathCarrier(ctx, hops, 9, 16, 1500, false)
 
 		newSettings := func() *ClientSettings {
 			settings := DefaultClientSettings()

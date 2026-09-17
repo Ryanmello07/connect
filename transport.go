@@ -518,6 +518,11 @@ type PlatformTransportSettings struct {
 	// drain, but never beyond this bound. A non-positive value uses twice
 	// InactiveDrainTimeout.
 	InactiveDrainMaxTimeout time.Duration
+	// H1PathReroll configures the per-connection H1 path monitor, which
+	// detects a websocket held on a lossy network path and, in Act mode,
+	// re-dials it onto a new 4-tuple. The zero value is Off; the default is
+	// Observe. See transport_h1_path.go.
+	H1PathReroll H1PathRerollSettings
 	// H1MaxMessageByteCount caps each complete WebSocket message before it can
 	// grow a pooled buffer. A non-positive value resolves to the framer limit.
 	H1MaxMessageByteCount int64
@@ -638,6 +643,16 @@ type PlatformTransportSettings struct {
 	// Nil outside package tests. Replaces plain-H3 name resolution so the
 	// family race can be driven against chosen addresses.
 	resolveH3AddrsForTest func(ctx context.Context, address string, ipFamily int) ([]*net.UDPAddr, error)
+
+	// The H1 path queue delay baseline, shared by every transport built from
+	// these settings. An owner that replaces transports across generations
+	// (the window's migration) installs one so a new connection is judged
+	// against the path's history. Nil gives the transport a baseline of its
+	// own.
+	h1PathBaseline *h1QueueDelayBaseline
+	// Nil outside package tests. Scripts the H1 path connections of the
+	// transport; see h1PathTestHooks.
+	h1PathTestHooks *h1PathTestHooks
 }
 
 func DefaultPlatformTransportSettings() *PlatformTransportSettings {
@@ -659,6 +674,7 @@ func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 		TransportBufferSize:       32,
 		InactiveDrainTimeout:      30 * time.Second,
 		InactiveDrainMaxTimeout:   60 * time.Second,
+		H1PathReroll:              DefaultH1PathRerollSettings(),
 		ModeInitialDelay:          2 * time.Second,
 		ModePreferences:           DefaultTransportModePreferences(),
 		PinnedReconnectMaxTimeout: 5 * time.Minute,
@@ -974,6 +990,13 @@ type PlatformTransport struct {
 	// attempt failed because the hostname does not resolve; the group reads
 	// it to release the standby early. See noteDialError.
 	unresolvable atomic.Bool
+
+	// the queue delay baseline of every H1 connection of this transport:
+	// settings.h1PathBaseline, or one of its own. Immutable after construction.
+	h1PathBaseline *h1QueueDelayBaseline
+	// the H1 path mode and source this transport last logged, encoded by
+	// noteH1PathMode; zero before the first connection
+	h1PathModeNoted atomic.Int32
 }
 
 // newPlatformQuicConfig keeps H3's memory and path-MTU behavior explicit and
@@ -1380,6 +1403,12 @@ func NewPlatformTransportWithTargetMode(
 	}
 	if transport.extenderIpsMonitor == nil {
 		transport.extenderIpsMonitor = NewMonitorValue[uint64](0)
+	}
+	transport.h1PathBaseline = settings.h1PathBaseline
+	if transport.h1PathBaseline == nil {
+		// about a kilobyte; kept even when the settings are Off so the
+		// transport needs no nil check
+		transport.h1PathBaseline = newH1QueueDelayBaseline(&settings.H1PathReroll)
 	}
 	transport.ipFamily = normalizeIpFamily(settings.IpFamily)
 	transport.enabled.Store(!settings.StartDisabled)
@@ -1960,6 +1989,12 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 	// (NextReconnectTime); a failed re-dial clears it, so retries fall back to
 	// the serialized NextConnectTime pacing.
 	hadConnection := false
+	// marks the dial that replaces a connection the H1 path monitor closed
+	// (see rerolled below); cleared by that dial's attempt
+	rerollDial := false
+	// numbers the connections of this transport from zero, for the H1 path
+	// monitor's test hooks
+	connectionOrdinal := 0
 
 	for {
 		// stand down while a strictly better mode is active
@@ -1987,6 +2022,11 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 		// Written by the single dial below and read by the connection it
 		// produced, both on this goroutine.
 		var dialExtenderIp netip.Addr
+		// the websocket dial of the connection, without the legacy in-band
+		// auth. A TCP connect, a TLS handshake and the upgrade take at least
+		// three round trips; the H1 path monitor's dormant gate reads a third
+		// of it. Written and read on this goroutine, like dialExtenderIp.
+		var dialDuration time.Duration
 		connect := func() (*websocket.Conn, error) {
 			header := http.Header{}
 			if self.settings.V2H1Auth {
@@ -1997,14 +2037,22 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				self.applyIntentHeader(header)
 			}
 
+			dialCtx := self.dialContext(self.ctx)
+			if rerollDial {
+				self.h1PathStats().RerollDials.Add(1)
+				// a far random local port, away from the convicted ones
+				dialCtx = self.h1PathRerollDialContext(dialCtx)
+			}
+			dialStart := time.Now()
 			ws, _, dialerInfo, err := self.clientStrategy.WsDialContextWithDialer(
-				self.dialContext(self.ctx),
+				dialCtx,
 				self.platformUrl,
 				header,
 			)
 			if err != nil {
 				return nil, err
 			}
+			dialDuration = time.Since(dialStart)
 			if dialerInfo != nil {
 				dialExtenderIp = dialerInfo.ExtenderIp
 			}
@@ -2088,6 +2136,10 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			ws, err = connect()
 		}
 		releaseReconnect()
+		// the connection below reads whether its own dial carried the source
+		// port plan; the flag itself is cleared for the next iteration
+		plannedDial := rerollDial
+		rerollDial = false
 		if err != nil {
 			// a canceled dial is local teardown -- this transport or its owner
 			// shutting down mid-connect -- not a backend signal. Without this
@@ -2131,6 +2183,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 		// auth succeeded: the backend is reachable
 		self.noteDialSuccess()
 
+		// set only by this connection's watcher, when the H1 path monitor
+		// re-rolls the connection; read after c joins the watcher
+		var rerolled atomic.Bool
 		c := func() {
 			defer ws.Close()
 
@@ -2139,6 +2194,33 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 
 			handleCtx, handleCancel := context.WithCancel(self.ctx)
 			defer handleCancel()
+
+			// payload messages delivered by the reader and written by the
+			// writer; the inactive-drain watchdog and the H1 path monitor read
+			// them
+			var readCounter atomic.Uint64
+			var writeCounter atomic.Uint64
+			// read only by the H1 path monitor
+			var readByteCounter atomic.Uint64
+			var receiveFullCounter atomic.Uint64
+			var speedTestActive atomic.Bool
+			// nil, and free, for a short path, a control-only transport or
+			// mode Off (transport_h1_path_connection.go)
+			pathConnection := self.newH1PathConnection(
+				ws,
+				dialExtenderIp,
+				dialDuration,
+				connectionOrdinal,
+				plannedDial,
+				h1PathCounters{
+					readMessageCount:  &readCounter,
+					writeMessageCount: &writeCounter,
+					readByteCount:     &readByteCounter,
+					receiveFullCount:  &receiveFullCounter,
+					speedTestActive:   &speedTestActive,
+				},
+			)
+			defer pathConnection.close()
 
 			// The connection owns every worker it starts. Registration happens
 			// synchronously before cleanup can Wait, and the outer wrapper keeps
@@ -2156,19 +2238,70 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			// re-dials over the new path immediately (see Kick). the ws.Close
 			// is what unblocks a reader/writer parked in a socket call that
 			// handleCancel alone cannot wake.
+			// The same worker ticks the H1 path monitor of a far connection,
+			// and stops its ticker for good once the monitor goes dormant. A
+			// re-roll closes the connection the way a kick does, and only this
+			// H1 connection: Kick would also close H3, reset the pinned backoff
+			// and re-evaluate the family hold.
 			kick := self.kickMonitor.NotifyChannel()
 			startConnectionWorker(func() {
-				select {
-				case <-handleCtx.Done():
-				case <-kick:
-					self.log.Infof("[t]kick: closing connection for re-dial\n")
-					handleCancel()
-					ws.Close()
+				var ticker *time.Ticker
+				var tick <-chan time.Time
+				if pathConnection != nil {
+					ticker = time.NewTicker(pathConnection.tickInterval())
+					defer ticker.Stop()
+					tick = ticker.C
 				}
-			})
+				for {
+					select {
+					case <-handleCtx.Done():
+						return
+					case <-kick:
+						self.log.Infof("[t]kick: closing connection for re-dial\n")
+						handleCancel()
+						ws.Close()
+						return
+					case <-tick:
+						if handleCtx.Err() != nil {
+							return
+						}
+						// This goroutine is also what a kick uses to close the
+						// connection, so the monitor must not be able to take
+						// it with it: an error under tick stops the monitor and
+						// leaves the watcher running. Without this the whole
+						// worker would unwind into HandleError's recovery and
+						// the connection would ride on, registered and
+						// carrying traffic, with nothing left to close it on a
+						// network change.
+						var decision h1PathDecision
+						if monitorError := HandleError(func() {
+							decision = pathConnection.tick(time.Now())
+						}); monitorError != nil {
+							pathConnection.monitorStopped(monitorError)
+							ticker.Stop()
+							tick = nil
+							continue
+						}
+						if decision.action == h1PathActionReroll {
+							rerolled.Store(true)
+							self.log.Infof(
+								"[t]h1 path re-roll: closing connection port=%d dir=%s confidence=%s\n",
+								pathConnection.localPort,
+								decision.direction,
+								decision.confidence,
+							)
+							handleCancel()
+							ws.Close()
+							return
+						}
+						if decision.dormant {
+							ticker.Stop()
+							tick = nil
+						}
+					}
+				}
+			}, handleCancel)
 
-			var readCounter atomic.Uint64
-			var writeCounter atomic.Uint64
 			send := make(chan []byte, self.settings.TransportBufferSize)
 			receive := make(chan []byte, self.settings.TransportBufferSize)
 			controlSend := make(chan []byte, self.settings.TransportBufferSize)
@@ -2256,6 +2389,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				[]Route{receive},
 				TransferCarrierProperties{
 					ReceiveReliability: CarrierReliabilityReliable,
+					receiveObserver:    pathConnection.observerOrNil(),
 				},
 			)
 			self.setRegistered(true)
@@ -2602,12 +2736,14 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 								switch message[0] {
 								case TransportControlSpeedStart:
 									speedTest = true
+									speedTestActive.Store(true)
 									// echo
 									if !self.offerH1Control(handleCtx.Done(), controlSend, message) {
 										return
 									}
 								case TransportControlSpeedStop:
 									speedTest = false
+									speedTestActive.Store(false)
 									// echo
 									if !self.offerH1Control(handleCtx.Done(), controlSend, message) {
 										return
@@ -2632,6 +2768,13 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 							}
 							continue
 						}
+						// the offer takes the message; its length is kept first
+						messageByteCount := len(message)
+						if pathConnection != nil && cap(receive) <= len(receive) {
+							// the consumer is behind, so this tick's delivery
+							// says nothing about the path
+							receiveFullCounter.Add(1)
+						}
 						open, delivered := self.offerReceive(
 							handleCtx.Done(),
 							TransportModeH1,
@@ -2644,6 +2787,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 						}
 						if delivered {
 							readCounter.Add(1)
+							readByteCounter.Add(uint64(messageByteCount))
 						}
 						if delivered && self.log.V(2).Enabled() {
 							self.log.Infof("[tr]%s<-\n", clientId)
@@ -2681,8 +2825,19 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 		} else {
 			c()
 		}
+		connectionOrdinal += 1
 		// the connection ran and died: the next dial is a reconnect
 		hadConnection = true
+		if rerolled.Load() {
+			// this connection was closed on purpose, to leave a lossy 4-tuple.
+			// Re-dial now: reconnect.After would draw uniform(0,
+			// ReconnectTimeout - age), seconds on a young connection. The next
+			// iteration still stands down, waits for dial admission and takes
+			// the reconnect fast path; the ledger's device spacing bounds how
+			// often this can happen.
+			rerollDial = true
+			continue
+		}
 
 		select {
 		case <-self.ctx.Done():

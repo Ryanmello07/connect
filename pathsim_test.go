@@ -101,6 +101,62 @@ type pathHop struct {
 	Reverse pathLink
 }
 
+// A live handle on one hop direction, for a scenario that retires a link while
+// the run continues (the H1 re-roll of S9). A link built without one takes the
+// identical code path, so every other scenario is unaffected.
+type pathLinkControl struct {
+	// closed to stop the link reading its ingress, as a closed socket stops
+	// reading the wire
+	stopIngress chan struct{}
+	// the trim requests the link serves, one at a time
+	trim chan pathTrimRequest
+	// bytes and messages the link handed to its egress, counted whether or not
+	// the run is frozen: this is a socket counter, not a measurement
+	deliveredBytes    atomic.Int64
+	deliveredMessages atomic.Int64
+	// queued plus serialising plus in flight, as of the link's last state change
+	outstanding atomic.Int64
+}
+
+// Drops everything the link holds past keepByteCount of queue head, and with
+// dropInFlight the message in the serialiser and everything propagating too.
+// The link replies with the number of messages it dropped.
+type pathTrimRequest struct {
+	keepByteCount int64
+	dropInFlight  bool
+	dropped       chan int64
+}
+
+func newPathLinkControl() *pathLinkControl {
+	return &pathLinkControl{
+		stopIngress: make(chan struct{}),
+		trim:        make(chan pathTrimRequest),
+	}
+}
+
+// Asks the link to trim and returns what it dropped. The link owns every
+// buffer it drops and returns them to the pool itself. Call it while the link
+// is still able to reach its select: a link blocked writing to a route nobody
+// reads answers only when its context is cancelled.
+func (self *pathLinkControl) trimNow(ctx context.Context, keepByteCount int64, dropInFlight bool) int64 {
+	request := pathTrimRequest{
+		keepByteCount: keepByteCount,
+		dropInFlight:  dropInFlight,
+		dropped:       make(chan int64, 1),
+	}
+	select {
+	case self.trim <- request:
+	case <-ctx.Done():
+		return 0
+	}
+	select {
+	case dropped := <-request.dropped:
+		return dropped
+	case <-ctx.Done():
+		return 0
+	}
+}
+
 // Written only by the link goroutine and read after it has been joined.
 type pathLinkStats struct {
 	offered       int64
@@ -169,6 +225,7 @@ func runPathLink(
 	dataByteCount int,
 	frozen *atomic.Bool,
 	stats *pathLinkStats,
+	control *pathLinkControl,
 ) {
 	queue := [][]byte{}
 	inFlight := &pathInFlightHeap{}
@@ -188,6 +245,25 @@ func runPathLink(
 	scriptedDrops := map[int64]bool{}
 	for _, ordinal := range link.DropOffered {
 		scriptedDrops[ordinal] = true
+	}
+	// nil channels without a control, so the select is the same select
+	var stopIngress chan struct{}
+	var trims chan pathTrimRequest
+	if control != nil {
+		stopIngress = control.stopIngress
+		trims = control.trim
+	}
+	ingressStopped := false
+
+	noteOutstanding := func() {
+		if control == nil {
+			return
+		}
+		outstanding := int64(len(queue)) + int64(inFlight.Len())
+		if serving {
+			outstanding += 1
+		}
+		control.outstanding.Store(outstanding)
 	}
 
 	returnHeld := func() {
@@ -284,6 +360,10 @@ func runPathLink(
 			item := heap.Pop(inFlight).(pathInFlight)
 			select {
 			case out <- item.message:
+				if control != nil {
+					control.deliveredBytes.Add(int64(len(item.message)))
+					control.deliveredMessages.Add(1)
+				}
 				if !frozen.Load() {
 					stats.delivered++
 					if dataByteCount <= len(item.message) {
@@ -299,9 +379,54 @@ func runPathLink(
 		return true
 	}
 
+	// keeps the queue head up to keepByteCount and drops the rest; the
+	// serialiser and everything propagating go too when the caller asks
+	trim := func(request pathTrimRequest) int64 {
+		dropped := int64(0)
+		keptByteCount := int64(0)
+		kept := 0
+		full := false
+		for _, message := range queue {
+			if !full && keptByteCount+int64(len(message)) <= request.keepByteCount {
+				keptByteCount += int64(len(message))
+				queue[kept] = message
+				kept++
+				continue
+			}
+			full = true
+			MessagePoolReturn(message)
+			dropped++
+		}
+		for i := kept; i < len(queue); i++ {
+			queue[i] = nil
+		}
+		queue = queue[:kept]
+		if request.dropInFlight {
+			if serving {
+				serviceTimer.Stop()
+				MessagePoolReturn(servingMessage)
+				servingMessage = nil
+				serving = false
+				dropped++
+			}
+			for _, item := range *inFlight {
+				MessagePoolReturn(item.message)
+				dropped++
+			}
+			*inFlight = (*inFlight)[:0]
+			deliverTimer.Stop()
+		}
+		// the kept head still has to be served
+		startService(time.Now())
+		return dropped
+	}
+
 	for {
 		inCase := in
-		if 0 < link.QueueMessages && !link.DropOnFull && link.QueueMessages <= len(queue) {
+		if ingressStopped {
+			// the socket is closed: nothing more arrives
+			inCase = nil
+		} else if 0 < link.QueueMessages && !link.DropOnFull && link.QueueMessages <= len(queue) {
 			// block the writer by not reading
 			inCase = nil
 		}
@@ -314,30 +439,43 @@ func runPathLink(
 			if link.Trace != nil {
 				link.Trace(stats.offered, message, time.Now())
 			}
-			if counting && scriptedDrops[stats.offered] {
+			switch {
+			case counting && scriptedDrops[stats.offered]:
 				stats.scriptedDrops++
 				MessagePoolReturn(message)
-				continue
-			}
-			if 0 < link.QueueMessages && link.DropOnFull && link.QueueMessages <= len(queue) {
+			case 0 < link.QueueMessages && link.DropOnFull && link.QueueMessages <= len(queue):
 				if counting {
 					stats.queueDrops++
 				}
 				MessagePoolReturn(message)
-				continue
+			default:
+				queue = append(queue, message)
+				if counting {
+					stats.maxQueue = max(stats.maxQueue, len(queue))
+				}
+				startService(time.Now())
 			}
-			queue = append(queue, message)
-			if counting {
-				stats.maxQueue = max(stats.maxQueue, len(queue))
-			}
-			startService(time.Now())
+			noteOutstanding()
 		case <-serviceTimer.C:
 			completeService(serviceDoneAt)
 			startService(serviceDoneAt)
+			noteOutstanding()
 		case <-deliverTimer.C:
 			if !deliverDue(time.Now()) {
 				returnHeld()
 				return
+			}
+			noteOutstanding()
+		case <-stopIngress:
+			ingressStopped = true
+			// a closed channel stays ready; take the case once
+			stopIngress = nil
+		case request := <-trims:
+			dropped := trim(request)
+			noteOutstanding()
+			select {
+			case request.dropped <- dropped:
+			default:
 			}
 		case <-ctx.Done():
 			returnHeld()
@@ -350,6 +488,20 @@ type pathHopStats struct {
 	name    string
 	forward pathLinkStats
 	reverse pathLinkStats
+	// the hop whose forward deliveries reach the receiver: the last hop, and
+	// every replacement leg a re-roll scenario starts in its place
+	terminal bool
+}
+
+// A running hop: its statistics, a control per direction, and a cancel per
+// direction. A scenario that retires a leg cancels its two directions; the
+// carrier joins them in drain().
+type pathHopRuntime struct {
+	stats          *pathHopStats
+	forwardControl *pathLinkControl
+	reverseControl *pathLinkControl
+	forwardCancel  context.CancelFunc
+	reverseCancel  context.CancelFunc
 }
 
 // The hops joined into a carrier between the sender's and the receiver's
@@ -362,6 +514,10 @@ type pathCarrier struct {
 	receiverOut Route
 	channels    []Route
 	stats       []*pathHopStats
+	// one per hop in start order, including the legs a re-roll scenario starts
+	hops []*pathHopRuntime
+	// the routes a re-roll scenario created, drained with the carrier's own
+	extraRoutes []Route
 	// Set when the measurement ends, before the clients close: what the
 	// clients write while closing is carried but not counted, since the
 	// close races the carrier's cancellation and the count would move.
@@ -369,12 +525,16 @@ type pathCarrier struct {
 	done   sync.WaitGroup
 }
 
+// `controlled` gives every hop direction a `pathLinkControl`. Without it the
+// links run with a nil control, which is the code path every scenario but S9
+// takes: the same select over the same channels, so the same digests.
 func startPathCarrier(
 	ctx context.Context,
 	hops []pathHop,
 	seed uint64,
 	routeCapacity int,
 	dataByteCount int,
+	controlled bool,
 ) *pathCarrier {
 	carrier := &pathCarrier{
 		senderOut:   make(Route, routeCapacity),
@@ -385,8 +545,6 @@ func startPathCarrier(
 	forwardIn := carrier.senderOut
 	reverseOut := carrier.senderIn
 	for i, hop := range hops {
-		stats := &pathHopStats{name: hop.Name}
-		carrier.stats = append(carrier.stats, stats)
 		forwardOut := carrier.receiverIn
 		reverseIn := carrier.receiverOut
 		if i+1 < len(hops) {
@@ -394,21 +552,84 @@ func startPathCarrier(
 			reverseIn = make(Route, routeCapacity)
 			carrier.channels = append(carrier.channels, forwardOut, reverseIn)
 		}
-		forwardRandom := rand.New(rand.NewPCG(seed, uint64(2*i)))
-		reverseRandom := rand.New(rand.NewPCG(seed, uint64(2*i+1)))
-		carrier.done.Add(2)
-		go func(link pathLink, random *rand.Rand, in Route, out Route, stats *pathLinkStats) {
-			defer carrier.done.Done()
-			runPathLink(ctx, link, random, in, out, dataByteCount, &carrier.frozen, stats)
-		}(hop.Forward, forwardRandom, forwardIn, forwardOut, &stats.forward)
-		go func(link pathLink, random *rand.Rand, in Route, out Route, stats *pathLinkStats) {
-			defer carrier.done.Done()
-			runPathLink(ctx, link, random, in, out, dataByteCount, &carrier.frozen, stats)
-		}(hop.Reverse, reverseRandom, reverseIn, reverseOut, &stats.reverse)
+		carrier.startHop(
+			ctx, hop, seed, 2*i,
+			forwardIn, forwardOut, reverseIn, reverseOut,
+			dataByteCount, i+1 == len(hops), controlled,
+		)
 		forwardIn = forwardOut
 		reverseOut = reverseIn
 	}
 	return carrier
+}
+
+// Starts one hop's two directions, each under its own cancellable context and
+// with its own control. `randomOrdinal` picks the two loss streams, so a leg
+// started later in a run draws from streams no other hop uses.
+func (self *pathCarrier) startHop(
+	ctx context.Context,
+	hop pathHop,
+	seed uint64,
+	randomOrdinal int,
+	forwardIn Route,
+	forwardOut Route,
+	reverseIn Route,
+	reverseOut Route,
+	dataByteCount int,
+	terminal bool,
+	controlled bool,
+) *pathHopRuntime {
+	stats := &pathHopStats{name: hop.Name, terminal: terminal}
+	self.stats = append(self.stats, stats)
+	forwardCtx, forwardCancel := context.WithCancel(ctx)
+	reverseCtx, reverseCancel := context.WithCancel(ctx)
+	hopRuntime := &pathHopRuntime{
+		stats:         stats,
+		forwardCancel: forwardCancel,
+		reverseCancel: reverseCancel,
+	}
+	if controlled {
+		hopRuntime.forwardControl = newPathLinkControl()
+		hopRuntime.reverseControl = newPathLinkControl()
+	}
+	self.hops = append(self.hops, hopRuntime)
+	forwardRandom := rand.New(rand.NewPCG(seed, uint64(randomOrdinal)))
+	reverseRandom := rand.New(rand.NewPCG(seed, uint64(randomOrdinal+1)))
+	self.done.Add(2)
+	go func() {
+		defer self.done.Done()
+		runPathLink(
+			forwardCtx, hop.Forward, forwardRandom, forwardIn, forwardOut,
+			dataByteCount, &self.frozen, &stats.forward, hopRuntime.forwardControl,
+		)
+	}()
+	go func() {
+		defer self.done.Done()
+		runPathLink(
+			reverseCtx, hop.Reverse, reverseRandom, reverseIn, reverseOut,
+			dataByteCount, &self.frozen, &stats.reverse, hopRuntime.reverseControl,
+		)
+	}()
+	return hopRuntime
+}
+
+// Returns every message a route still holds to the pool, and how many there
+// were. Call it once the links on both ends of the route have stopped.
+func drainPathRoutes(routes ...Route) int64 {
+	drained := int64(0)
+	for _, route := range routes {
+		draining := true
+		for draining {
+			select {
+			case message := <-route:
+				MessagePoolReturn(message)
+				drained++
+			default:
+				draining = false
+			}
+		}
+	}
+	return drained
 }
 
 // Joins the hops and returns every buffer left on a route. Call after the
@@ -417,17 +638,8 @@ func (self *pathCarrier) drain() {
 	self.done.Wait()
 	routes := []Route{self.senderOut, self.senderIn, self.receiverIn, self.receiverOut}
 	routes = append(routes, self.channels...)
-	for _, route := range routes {
-		draining := true
-		for draining {
-			select {
-			case message := <-route:
-				MessagePoolReturn(message)
-			default:
-				draining = false
-			}
-		}
-	}
+	routes = append(routes, self.extraRoutes...)
+	drainPathRoutes(routes...)
 }
 
 // The delivery meter at the receiver's callback. Gaps are measured between
@@ -443,6 +655,9 @@ type pathMeter struct {
 	holThreshold time.Duration
 	// the first delivery instants, capped
 	deliveries []time.Time
+	// the frames of each recorded delivery, for a scenario that measures the
+	// rate over a window of the trace rather than over the whole offer
+	deliveryFrames []int32
 }
 
 const pathMeterTraceCap = 1 << 16
@@ -453,6 +668,7 @@ func (self *pathMeter) deliver(frames []*protocol.Frame, payloadByteCount int) {
 	defer self.stateLock.Unlock()
 	if len(self.deliveries) < pathMeterTraceCap {
 		self.deliveries = append(self.deliveries, now)
+		self.deliveryFrames = append(self.deliveryFrames, int32(len(frames)))
 	}
 	gap := now.Sub(self.lastAt)
 	if self.maxGap < gap {
@@ -511,6 +727,9 @@ type pathArm struct {
 	WindowSizing WindowSizingPolicyKind
 	MemoryBudget ByteCount
 	Configure    func(sender *ClientSettings, receiver *ClientSettings)
+	// when set, the last hop is one H1 connection of S9: the production path
+	// monitor watches it and may re-roll it onto a new leg mid-run
+	Reroll *pathRerollScenario
 }
 
 func pathRoundTrip(hops []pathHop) time.Duration {
@@ -559,6 +778,8 @@ type pathResult struct {
 	drainTime                  time.Duration
 	window                     SendWindowEstimate
 	sequenceCount              int
+	// nil unless the arm carried a re-roll scenario
+	reroll *pathRerollResult
 }
 
 // bytes per second over the whole offer
@@ -599,6 +820,18 @@ func (self pathResult) digest() string {
 		self.maxGap, self.holBlocked, self.drained, self.drainTime, self.window.Window,
 	)
 	fmt.Fprintf(hash, "|%d|%d", self.handoffDrops, self.deadlineDrops)
+	if self.reroll != nil {
+		// only a re-roll arm hashes these, so every other scenario's digest
+		// is the digest it printed before S9 existed
+		fmt.Fprintf(hash, "|%d|%d|%d|%d|%d|%d|%d|%d|%v|%v|%v|%v",
+			self.reroll.convictions, self.reroll.switches, self.reroll.improved,
+			self.reroll.suppressedLatched, self.reroll.suppressedUnconfirmedBudget,
+			self.reroll.monitored, self.reroll.dormant,
+			self.reroll.switchDrops, self.reroll.ports,
+			self.reroll.firstConvictionAfter, self.reroll.firstSwitchAfter,
+			self.reroll.recoveryAfterSwitch,
+		)
+	}
 	for _, hop := range self.hops {
 		fmt.Fprintf(hash, "|%d|%d|%d|%d|%d|%d",
 			hop.forward.offered, hop.forward.drops(), hop.forward.delivered,
@@ -647,6 +880,9 @@ func (self pathResult) row() string {
 	}
 	if 0 < self.reverseDrops() {
 		flags = append(flags, fmt.Sprintf("ackdrop=%d", self.reverseDrops()))
+	}
+	if self.reroll != nil {
+		flags = append(flags, self.reroll.flag())
 	}
 	duplicates := "-"
 	if 0 <= self.duplicates {
@@ -827,7 +1063,8 @@ func runPathArm(t *testing.T, arm pathArm) pathResult {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		carrier := startPathCarrier(ctx, arm.Hops, arm.Seed, arm.RouteCapacity, arm.PayloadByteCount)
+		carrier := startPathCarrier(
+			ctx, arm.Hops, arm.Seed, arm.RouteCapacity, arm.PayloadByteCount, arm.Reroll != nil)
 
 		newSettings := func() *ClientSettings {
 			settings := DefaultClientSettings()
@@ -912,15 +1149,35 @@ func runPathArm(t *testing.T, arm pathArm) pathResult {
 			NewSendGatewayTransportWithType(TransportTypeH1), []Route{carrier.senderOut})
 		sender.RouteManager().UpdateTransportWithProperties(
 			NewReceiveGatewayTransportWithType(TransportTypeH1), []Route{carrier.senderIn}, reliable)
+		// The receiver is the re-roll scenario's client: its receive route is
+		// the one the queue delay observer is published on, and the pair is
+		// retired and replaced when the connection re-rolls.
+		var reroll *pathReroll
+		receiverProperties := reliable
+		if arm.Reroll != nil {
+			reroll = newPathReroll(arm, carrier, sender, receiver)
+			receiverProperties.receiveObserver = reroll.observerOrNil()
+		}
+		receiverReceiveTransport := NewReceiveGatewayTransportWithType(TransportTypeH1)
+		receiverSendTransport := NewSendGatewayTransportWithType(TransportTypeH1)
 		receiver.RouteManager().UpdateTransportWithProperties(
-			NewReceiveGatewayTransportWithType(TransportTypeH1), []Route{carrier.receiverIn}, reliable)
+			receiverReceiveTransport, []Route{carrier.receiverIn}, receiverProperties)
 		receiver.RouteManager().UpdateTransport(
-			NewSendGatewayTransportWithType(TransportTypeH1), []Route{carrier.receiverOut})
+			receiverSendTransport, []Route{carrier.receiverOut})
+		if reroll != nil {
+			reroll.adoptLeg(
+				receiverReceiveTransport, receiverSendTransport,
+				carrier.receiverIn, carrier.receiverOut,
+			)
+		}
 
 		meter := &pathMeter{holThreshold: arm.HolAfter}
 		receiver.AddReceiveCallback(func(_ TransferPath, frames []*protocol.Frame, _ Peer) {
 			meter.deliver(frames, arm.PayloadByteCount)
 		})
+		if reroll != nil {
+			reroll.meter = meter
+		}
 
 		stop := &atomic.Bool{}
 		stopped := make(chan struct{})
@@ -995,6 +1252,34 @@ func runPathArm(t *testing.T, arm pathArm) pathResult {
 				}
 			}(lane, time.Duration(i)*pathLaneStagger)
 		}
+		// The return direction, when the arm has one: a small message upstream
+		// every interval, acked by the sender over the same legs. This is what
+		// a tunnel carrying a download does with its inner flows' acks, and it
+		// is what gives the client's receive rule an ack round trip of its own
+		// -- measured on its own clock -- to read against the pack queue delay.
+		if reroll != nil && 0 < arm.Reroll.ReturnInterval {
+			returnPayload := string(make([]byte, max(1, arm.Reroll.ReturnByteCount)))
+			offers.Add(1)
+			go func() {
+				defer offers.Done()
+				for !stop.Load() {
+					select {
+					case <-time.After(arm.Reroll.ReturnInterval):
+					case <-stopped:
+						return
+					}
+					frame := RequireToFrameWithDefaultProtocolVersion(
+						&protocol.SimpleMessage{Content: returnPayload},
+					)
+					if !receiver.SendWithTimeout(frame, senderId, nil, -1) {
+						MessagePoolReturn(frame.MessageBytes)
+						return
+					}
+					reroll.returned.Add(1)
+				}
+			}()
+		}
+		reroll.start(ctx, started)
 
 		time.Sleep(arm.Offer / 2)
 		midByteCount, _ := meter.snapshot()
@@ -1050,6 +1335,8 @@ func runPathArm(t *testing.T, arm pathArm) pathResult {
 		result.receiverEvictions = receiveStats.ReceiveQueueEvictionCount
 		result.receiverTentativeEvictions = receiveStats.ReceiveQueueTentativeEvictionCount
 
+		result.reroll = reroll.finish()
+
 		// the measurement ends here; what closing writes is not counted
 		carrier.frozen.Store(true)
 		closeCtx, closeCancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -1068,8 +1355,12 @@ func runPathArm(t *testing.T, arm pathArm) pathResult {
 		for _, stats := range carrier.stats {
 			result.hops = append(result.hops, *stats)
 		}
-		if 0 < len(result.hops) {
-			result.forwardArrivals = result.hops[len(result.hops)-1].forward.dataDelivered
+		for _, hop := range result.hops {
+			// one terminal hop unless a re-roll replaced it, when every leg
+			// that carried traffic to the receiver counts
+			if hop.terminal {
+				result.forwardArrivals += hop.forward.dataDelivered
+			}
 		}
 		if result.drained {
 			result.duplicates = result.forwardArrivals - result.admitted
