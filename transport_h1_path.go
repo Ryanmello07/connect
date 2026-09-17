@@ -84,10 +84,14 @@ import (
 // that starts bad and stays bad. The ack echo is the only evidence that needs
 // no floor of the sender's, so where one rides the route the collapse is
 // convicted in 3 s and where none does the connection is invisible, in Observe
-// and in Act alike. A client uploading over a 0.25-0.5 Mb/s uplink joins that
-// invisible population for as long as it uploads, because the ack guard reads
-// its own send queue's drain time and withdraws the evidence (the rule, and
-// TicksAckBacklogged against Ticks). Neither of the independent floors that
+// and in Act alike. An uploading client joins that invisible population for as
+// long as its own send queue holds the queue delay threshold's worth of data,
+// because the ack guard reads that queue's drain time and withdraws the
+// evidence (the rule, and TicksAckBacklogged against Ticks). That is a backlog
+// and not a band of uplink rates -- max(AckBacklogFloorByteCount, rate x
+// threshold), which is 16 KiB up to 0.13 Mb/s and 63 KB at 0.5 Mb/s on a 101
+// ms path, and three times each on a 300 ms one. Neither of the independent
+// floors that
 // suggest themselves closes it: neither the dial round trip nor the kernel's
 // minimum round trip bounds the offset between the two clocks that every pack
 // tag carries, and neither one times the far socket's send queue, which sits
@@ -139,6 +143,22 @@ import (
 // the charge costs is a re-roll that did work and could not be read, which is
 // charged too, because nothing here can tell that one from a re-roll that
 // changed nothing.
+//
+// That cost starts at half the window and not at it, because a credit needs
+// two echoes where an age-out needs one. CleanTicks clean ticks at
+// AckEvidenceWindow of freshness per echo is two echoes, and the re-roll lands
+// a tick or two after the echo that convicted, so the twentieth fresh tick
+// arrives about 2C + AckEvidenceWindow after it against the window's 120 s.
+// Measured a second at a time on a replacement that is healthy from its first
+// tick, at 16 Mb/s, which is under the thin bar and is most of the population
+// (TestH1PathImprovementCreditNeedsTwoEchoesInsideTheWindow): an echo every 58
+// s is credited, every 59 s is charged, and every cadence above that is
+// charged as well. So from about a minute up, a re-roll that worked costs a
+// day's charge, and it is only past 120 s that nothing can be judged at all.
+// The same reading in the counter a rollout has is TicksAckUnknown against
+// Ticks, which is about 1 - AckEvidenceWindow / C: measured 0.911 at a 60 s
+// echo and 0.967 at 150 s, so above about 0.91 a fleet's successful re-rolls
+// are being charged, and above about 0.96 its re-rolls are not being judged.
 //
 // A network change is the other way a route stops being able to answer, and it
 // is charged on the same reading: the epoch that ended cannot judge the
@@ -493,9 +513,9 @@ type H1PathRerollSettings struct {
 	// our own uplink have put a threshold-sized queue into the ack round trip
 	// -- and AckBacklogFloorByteCount is only the floor that keeps a socket
 	// with a few bytes pending and nothing acked in the tick from answering
-	// yes for ever. It cannot keep the ordinary queue of a client uploading over
-	// a 0.25-0.5 Mb/s uplink out of the guard, and what that costs is at the
-	// rule. A send conviction asks a second question, whether there is
+	// yes for ever. It cannot keep an ordinary uploading client's queue out of
+	// the guard at any rate, and what that costs is at the rule. A send
+	// conviction asks a second question, whether there is
 	// enough backlog to call the direction collapsed, and
 	// SendBacklogByteCount is that bar. Every platform reports the same
 	// quantity here (transport_h1_path_socket_darwin.go)
@@ -1088,6 +1108,21 @@ func (self *h1PathMonitor) tick(sample h1PathSample) h1PathDecision {
 	// TicksAckUnknown: this population is an uplink to be read against, not a
 	// peer that answers elsewhere.
 	//
+	// Which uplinks that is, measured rather than assumed, is two byte bars
+	// over one drain time and not a band of rates
+	// (TestH1PathAckGuardBandIsTwoByteBarsOverTheThreshold). The evidence goes
+	// at every rate once the backlog reaches max(AckBacklogFloorByteCount, rate
+	// x threshold) -- 16 KiB from 0.05 to 0.13 Mb/s, then 31.6 KB at 0.25 Mb/s,
+	// 63.1 KB at 0.5, 126 KB at 1 and 253 KB at 2, on a 101 ms path. The top of
+	// the band is SendBacklogByteCount over the same threshold, 2.076 Mb/s
+	// here:
+	// above it the same backlog is enough to convict the send direction, so a
+	// client whose uplink also shows retransmits gets a verdict instead of
+	// going invisible, and one whose uplink shows none is invisible as before.
+	// Both bars are divided by the threshold, so the whole band moves with the
+	// path: on a 300 ms path every backlog triples and the top falls to 0.699
+	// Mb/s, which is inside the rates quoted above.
+	//
 	// The send rule asks a second question of the same bytes -- is there enough
 	// backlog to call the direction collapsed -- and SendBacklogByteCount is
 	// that bar, which is why one reading cannot serve both: a conjunction can
@@ -1507,7 +1542,11 @@ func (self *h1PathLedger) chargeDayWithLock(chargeTime time.Time) {
 // reading: a conviction inside the window says the replacement is as bad as
 // what it replaced, and an age-out says only that a disconnect was spent. The
 // cost of the charge is that a re-roll that did work and could not be read is
-// charged too; the levers are ImprovementWindow and MaxUnimprovedRerollsPerDay.
+// charged too, and that starts at half the window rather than at it, since the
+// credit needs two ack echoes where the age-out needs one: an echo every 59 s
+// already charges a re-roll that worked
+// (TestH1PathImprovementCreditNeedsTwoEchoesInsideTheWindow). The levers are
+// ImprovementWindow and MaxUnimprovedRerollsPerDay.
 //
 // A route manager collected under the weak key is not charged: its transport is
 // gone, so nothing is looping and no disconnect follows. An epoch that ended

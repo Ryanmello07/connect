@@ -2,6 +2,7 @@ package connect
 
 import (
 	"fmt"
+	"math"
 	"runtime"
 	"testing"
 	"time"
@@ -2825,7 +2826,10 @@ func runH1PathRerollProbe(
 // residual, the one the floor leaves open underneath, is an arm here too: below
 // about 0.13 Mb/s up the drain time is not allowed to answer alone, so a socket
 // with no receive queue at all is convicted for the seconds its own uplink put
-// into the round trip.
+// into the round trip. Which uplinks the guard covers, and where the band ends
+// at each edge, is measured in
+// TestH1PathAckGuardBandIsTwoByteBarsOverTheThreshold: the rates here are two
+// points inside it and not its limits.
 func TestH1PathAckGuardCostsASlowUplinkItsEvidence(t *testing.T) {
 	const pathRtt = 101 * time.Millisecond
 	const queue = 7 * time.Second
@@ -3159,6 +3163,195 @@ func TestH1PathRerollIsChargedWhateverTheRouteCanJudge(t *testing.T) {
 				"ack echo every %s: %s, want the daily budget's %d and then refusals",
 				c.ackEvery, outcome, settings.MaxUnimprovedRerollsPerDay,
 			)
+		}
+	}
+}
+
+// Where the charge starts costing a re-roll that worked: an ack cadence of
+// about a minute, which is half the improvement window and not the window.
+//
+// The two verdicts need different amounts of the same evidence. An age-out
+// needs one echo -- the replacement collapses, one ack carries the queue, it is
+// convicted -- so it stops arriving when the cadence passes ImprovementWindow.
+// A credit needs CleanTicks fresh-ack ticks, and an ack is evidence for
+// AckEvidenceWindow, so it needs two echoes, and the re-roll lands a tick or
+// two after the echo that convicted it: the twentieth fresh tick arrives about
+// 2C + AckEvidenceWindow later, against a window of 120 s.
+//
+// The replacement here is genuinely healthy from its first tick at 16 Mb/s,
+// which is under the thin bar and is where most sessions run, so only the ack
+// can credit it. What is measured is the cadence at which the credit stops
+// arriving and the day starts being charged for a re-roll that worked.
+func TestH1PathImprovementCreditNeedsTwoEchoesInsideTheWindow(t *testing.T) {
+	const transit = 101 * time.Millisecond
+	const queue = 6 * time.Second
+	const duration = 20 * time.Minute
+
+	for _, c := range []struct {
+		ackEvery time.Duration
+		credited bool
+	}{
+		{ackEvery: 30 * time.Second, credited: true},
+		{ackEvery: 58 * time.Second, credited: true},
+		{ackEvery: 59 * time.Second, credited: false},
+		{ackEvery: 100 * time.Second, credited: false},
+		{ackEvery: 150 * time.Second, credited: false},
+	} {
+		settings := DefaultH1PathRerollSettings()
+		outcome, stats, ledger := runH1PathRerollProbe(t, &settings, transit, duration,
+			func(elapsed time.Duration, connectionOrdinal int) h1PathRerollProbeShape {
+				shape := h1PathRerollProbeShape{rel: transit + queue, rxByteRate: 700_000}
+				if 0 < connectionOrdinal {
+					// the replacement is healthy, and under the thin rate, so
+					// the ack echo is the only thing that can credit it
+					shape = h1PathRerollProbeShape{rel: transit, rxByteRate: 2_000_000}
+				}
+				if elapsed%c.ackEvery == 0 {
+					shape.ackRtt = shape.rel
+				}
+				return shape
+			})
+		snapshot := stats.snapshot()
+		state := testingH1PathLedgerSnapshot(ledger)
+		t.Logf(
+			"ack echo every %s, replacement healthy: rerolls=%d improved=%d unresolved=%d charged=%d cleanRxAck=%d",
+			c.ackEvery, outcome.rerolls, outcome.improved, snapshot.Unresolved,
+			state.dayCharged, outcome.cleanTicks.rxAck,
+		)
+		if outcome.rerolls != 1 {
+			t.Fatalf(
+				"ack echo every %s: %d re-rolls, want the one the collapse earned",
+				c.ackEvery, outcome.rerolls,
+			)
+		}
+		if c.credited {
+			if outcome.improved != 1 || state.dayCharged != 0 {
+				t.Errorf(
+					"ack echo every %s: improved=%d charged=%d, want the working replacement credited for free",
+					c.ackEvery, outcome.improved, state.dayCharged,
+				)
+			}
+			continue
+		}
+		// the replacement worked and nothing could read it twice inside the
+		// window, so the re-roll ages out and the day is charged for it
+		if outcome.improved != 0 || snapshot.Unresolved != 1 || state.dayCharged != 1 {
+			t.Errorf(
+				"ack echo every %s: improved=%d unresolved=%d charged=%d, want the re-roll that worked charged",
+				c.ackEvery, outcome.improved, snapshot.Unresolved, state.dayCharged,
+			)
+		}
+	}
+}
+
+// The scope of the ack guard: two byte bars over one drain time, not a band of
+// uplink rates.
+//
+// The guard withdraws the ack evidence when our own send backlog takes at least
+// the queue delay threshold to drain, over AckBacklogFloorByteCount, so the
+// backlog it takes is max(AckBacklogFloorByteCount, rate x threshold) at every
+// rate -- there is no rate that is too fast for it. What bounds the band above
+// is the other rule reading the same bytes: at SendBacklogByteCount the backlog
+// is enough to convict the send direction, so a client whose uplink also shows
+// retransmits gets a verdict instead of going invisible. Both bars are divided
+// by the threshold, and the threshold is max(QueueDelayFloor,
+// QueueDelayRttMultiple x path rtt), so the whole band moves with the path: the
+// arms run on a 101 ms and a 300 ms one, where the top edge is 2.076 Mb/s and
+// 0.699 Mb/s.
+func TestH1PathAckGuardBandIsTwoByteBarsOverTheThreshold(t *testing.T) {
+	const queue = 7 * time.Second
+
+	for _, pathRtt := range []time.Duration{101 * time.Millisecond, 300 * time.Millisecond} {
+		settings := DefaultH1PathRerollSettings()
+		threshold := max(
+			settings.QueueDelayFloor,
+			time.Duration(settings.QueueDelayRttMultiple)*pathRtt,
+		)
+		// the same collapse as everywhere else -- 0.5 MB/s behind a 7 s queue
+		// that only the ack echo reads -- behind an uplink of our choosing
+		read := func(upByteRate float64, notSent uint64, txRetrans bool) (int, uint64, uint64, uint64) {
+			armSettings := DefaultH1PathRerollSettings()
+			monitor, stats := newH1PathTestMonitor(t, &armSettings, pathRtt)
+			decisions := runH1PathMonitorShape(monitor, 60, func(k int) h1PathTickShape {
+				return h1PathTickShape{
+					rxByteRate:        500_000,
+					queueDelaySamples: 4,
+					rxOooAdvance:      true,
+					ackRtt:            pathRtt + queue,
+					minRtt:            pathRtt,
+					txKnown:           true,
+					txAckedByteRate:   upByteRate,
+					txNotSent:         notSent,
+					txRetrans:         txRetrans,
+				}
+			})
+			snapshot := stats.snapshot()
+			return len(h1PathConvictionTicks(decisions)), snapshot.RxConvictions,
+				snapshot.TxConvictions, snapshot.TicksAckBacklogged
+		}
+		// the backlog that withdraws the evidence, at each rate: the floor
+		// below about AckBacklogFloorByteCount / threshold and the drain time
+		// above it, with no upper rate at all
+		for _, upBitRate := range []float64{0.05, 0.25, 0.5, 1, 2} {
+			upByteRate := upBitRate * 1000 * 1000 / 8
+			boundary := uint64(math.Ceil(max(
+				float64(settings.AckBacklogFloorByteCount),
+				upByteRate*threshold.Seconds(),
+			)))
+			at, _, atTx, atBacklogged := read(upByteRate, boundary, false)
+			under, _, _, underBacklogged := read(upByteRate, boundary-1, false)
+			t.Logf(
+				"path %s, %.2f Mb/s up: evidence withdrawn at %d bytes -- %d convictions, %d ticks backlogged, %d send convictions; one byte under: %d convictions, %d backlogged",
+				pathRtt, upBitRate, boundary, at, atBacklogged, atTx, under, underBacklogged,
+			)
+			if at != 0 || atTx != 0 || atBacklogged == 0 {
+				t.Errorf(
+					"path %s, %.2f Mb/s up, %d unsent: %d convictions (%d send), %d backlogged, want the evidence withdrawn and no verdict",
+					pathRtt, upBitRate, boundary, at, atTx, atBacklogged,
+				)
+			}
+			if under == 0 || underBacklogged != 0 {
+				t.Errorf(
+					"path %s, %.2f Mb/s up, %d unsent: %d convictions, %d backlogged, want one byte under the boundary to keep the evidence",
+					pathRtt, upBitRate, boundary-1, under, underBacklogged,
+				)
+			}
+		}
+		// the top of the band, where the same bytes are enough for a send
+		// conviction: the client is read instead of blinded, if its uplink has
+		// loss evidence to convict on
+		for _, notSent := range []uint64{
+			uint64(settings.SendBacklogByteCount) - 1,
+			uint64(settings.SendBacklogByteCount),
+		} {
+			// a shade under the rate whose threshold-sized backlog is this
+			// many bytes, so the drain time is met with room for the float
+			upByteRate := 0.999 * float64(notSent) / threshold.Seconds()
+			_, rx, tx, backlogged := read(upByteRate, notSent, true)
+			_, quietRx, quietTx, _ := read(upByteRate, notSent, false)
+			t.Logf(
+				"path %s, top edge at %.3f Mb/s up (%d unsent): with uplink loss rx=%d tx=%d backlogged=%d; without uplink loss rx=%d tx=%d",
+				pathRtt, upByteRate*8/1000/1000, notSent, rx, tx, backlogged, quietRx, quietTx,
+			)
+			if rx != 0 || quietRx != 0 || backlogged == 0 {
+				t.Errorf(
+					"path %s, %d unsent: rx=%d quiet rx=%d backlogged=%d, want the receive evidence withdrawn on both sides of the send bar",
+					pathRtt, notSent, rx, quietRx, backlogged,
+				)
+			}
+			if quietTx != 0 {
+				t.Errorf(
+					"path %s, %d unsent: %d send convictions with no uplink loss, want none",
+					pathRtt, notSent, quietTx,
+				)
+			}
+			wantTx := uint64(settings.SendBacklogByteCount) <= notSent
+			if (0 < tx) != wantTx {
+				t.Errorf(
+					"path %s, %d unsent: %d send convictions, want the send bar at %d to decide it",
+					pathRtt, notSent, tx, settings.SendBacklogByteCount,
+				)
+			}
 		}
 	}
 }
