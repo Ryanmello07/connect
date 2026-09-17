@@ -102,8 +102,8 @@ import (
 //
 // That last shape is not a corner, and treating it as unconfirmed is a choice
 // about most clients, not about a few. A route carries an ack to read only
-// while the peer answers over it, so the platform rig and six of the eight S9
-// arms read none: a pack queue and the kernel's out-of-order counter, and
+// while the peer answers over it, so the platform rig and seven of the eight
+// S9 arms read none: a pack queue and the kernel's out-of-order counter, and
 // nothing measured on a clock this device owns. The reading kept here is that
 // such a client re-rolls once per network epoch instead of twice, and the trade
 // is cheap for the shape the rollout is sized against. The ground truth is 11
@@ -119,8 +119,9 @@ import (
 // the budget together and let one bad member cost a disconnect every time the
 // acks went quiet. What the other reading would buy is the ten points between
 // 89 and 99, and what it would cost is every sender clock step two disconnects
-// and a 30 minute latch, on evidence no clock here can check. A rollout that wants to re-price this reads
-// TicksAckUnknown against Ticks for the size of the population it applies to.
+// and a 30 minute latch, on evidence no clock here can check. A rollout that
+// wants to re-price this reads TicksAckUnknown against Ticks for the size of
+// the population it applies to.
 //
 // The same cadence decides what the ledger is able to bound, and that is why
 // its two budgets read different things. A re-roll is judged by the connection
