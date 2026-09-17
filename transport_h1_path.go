@@ -153,6 +153,25 @@ import (
 // network lived long enough to judge -- and the lever is the same
 // MaxUnimprovedRerollsPerDay.
 //
+// The last disconnect loop neither budget bounded was a route that recovers
+// and collapses again, because the improvement credit used to be permanent.
+// CleanTicks is twenty ticks, ten seconds at the defaults: evidence that a
+// replacement started well and none that it lasts. A replacement clean for ten
+// seconds and collapsed a minute later was credited, its entry dropped, its
+// epoch counts returned and the day charged nothing, so the device paid one
+// disconnect per cycle for ever -- 109 in two hours on a route good for a
+// minute at a time, 39 at three minutes, 12 at ten. The credit is now taken
+// back by the next conviction on the same route manager, counted Recollapsed
+// and charged to the day, and each of those arms costs the budget's six and
+// then refusals
+// (TestH1PathImprovementCreditIsTakenBackWhenTheRouteRecollapses). What stops
+// such a loop is the day and not the latch: a re-collapse is not the latch's
+// reading, and the credit returned the epoch's counts before it anyway, so the
+// budget is what bounds it -- the budget reading disconnects, which is what it
+// is for. What stays free is a re-roll whose route is never convicted again,
+// which is the population the credit was written for: one re-roll off a slow
+// member onto a good one, on a connection that then runs for hours.
+//
 // This file holds the pure parts, with no call sites of their own:
 //   - the settings and their defaults (library default Observe), the
 //     environment variables and the process mode override, and the precedence
@@ -1366,6 +1385,11 @@ func (self h1PathConvicted) cleanTicks(cleanTicks h1PathCleanTicks) int {
 type h1PathPendingReroll struct {
 	rerollTime time.Time
 	convicted  h1PathConvicted
+	// clean ticks of the convicted measure credited this re-roll as improved
+	// (noteClean). The entry stays after that, so a route that re-collapses
+	// can take the credit back; it no longer ages out, since an improvement
+	// is a verdict and the window is only how long one is waited for
+	credited bool
 }
 
 // The process-wide budget for re-rolls. Every method takes the current time so
@@ -1378,15 +1402,26 @@ type h1PathPendingReroll struct {
 // MaxUnimprovedRerolls unimproved re-rolls in one network epoch set the latch
 // for LatchDuration.
 //
+// The improvement is a credit and not a discharge, so the entry stays for as
+// long as its route manager lives. CleanTicks ticks is ten seconds at the
+// defaults: evidence that the replacement started well, and none at all that
+// it kept working. A conviction on a credited route manager takes the credit
+// back as a re-collapse, which reaches the budget and not the latch: the latch
+// reads a replacement that was never better, and this one was, for as long as
+// CleanTicks ticks can see. What stays free is a re-roll whose route is never
+// convicted again, which is what "a re-roll that keeps working is free" says.
+//
 // The two budgets read different things. The latch reads verdicts, so only a
 // conviction inside the window sets it: that is the reading that says the
 // replacement is as bad as what it replaced. The daily budget reads
 // disconnects, so everything that spent one and was not resolved as improved is
 // charged to it -- unimproved (noteConviction), aged out
-// (expirePendingWithLock), evicted at the pending limit (noteReroll) or
-// dropped by a network change (networkChanged) -- and it is what bounds a
-// device whose route cannot produce a verdict inside the window at all, or
-// whose network does not stand still long enough to give one.
+// (expirePendingWithLock), evicted at the pending limit (noteReroll), dropped
+// by a network change (networkChanged), or credited and convicted again
+// (noteConviction) -- and it is what bounds a device whose route cannot
+// produce a verdict inside the window at all, whose network does not stand
+// still long enough to give one, or that recovers for a few seconds at a
+// time.
 //
 // An unconfirmed conviction is one nothing on this device could check: no
 // kernel loss counter, or a queue that stood on the sender's clock alone.
@@ -1478,13 +1513,23 @@ func (self *h1PathLedger) chargeDayWithLock(chargeTime time.Time) {
 // gone, so nothing is looping and no disconnect follows. An epoch that ended
 // (networkChanged) is charged, though it is not judged: the new network says
 // nothing about the re-roll, but the disconnect was spent all the same.
+//
+// A credited entry does not age out. The window is how long a verdict is
+// waited for, and that one arrived; what it waits for now is a conviction that
+// would take the credit back, which can come at any age (noteConviction).
 func (self *h1PathLedger) expirePendingWithLock(settings *H1PathRerollSettings, now time.Time) {
 	for key, pending := range self.pendingRouteManagerRerolls {
 		collected := key.Value() == nil
-		if !collected && now.Sub(pending.rerollTime) <= settings.ImprovementWindow {
+		if !collected &&
+			(pending.credited || now.Sub(pending.rerollTime) <= settings.ImprovementWindow) {
 			continue
 		}
 		delete(self.pendingRouteManagerRerolls, key)
+		if pending.credited {
+			// already resolved as improved, and its route manager is gone, so
+			// there is nothing left to take the credit back
+			continue
+		}
 		self.stats.Unresolved.Add(1)
 		if !collected {
 			// charged when the window closed and not when the ledger was next
@@ -1499,6 +1544,16 @@ func (self *h1PathLedger) expirePendingWithLock(settings *H1PathRerollSettings, 
 // Returns true when the conviction lands inside the improvement window of a
 // re-roll on the same route manager. That re-roll is unimproved: it counts
 // toward the epoch latch and the daily budget.
+//
+// A conviction on a credited entry takes the credit back instead: the re-roll
+// is charged to the daily budget, counted Recollapsed and dropped, and the
+// latch is left alone, since a replacement that was read as working is not the
+// reading the latch is for -- that one says the replacement was as bad as what
+// it replaced, and this one says it stopped being better. Without the
+// revocation a replacement clean for CleanTicks ticks and collapsed again
+// bought its own next re-roll for ever: measured on a route that clears for a
+// minute at a time, 109 disconnects in two hours against six here
+// (TestH1PathImprovementCreditIsTakenBackWhenTheRouteRecollapses).
 func (self *h1PathLedger) noteConviction(
 	key *RouteManager,
 	settings *H1PathRerollSettings,
@@ -1509,12 +1564,17 @@ func (self *h1PathLedger) noteConviction(
 
 	self.expirePendingWithLock(settings, now)
 	pendingKey := weak.Make(key)
-	if _, ok := self.pendingRouteManagerRerolls[pendingKey]; !ok {
+	pending, ok := self.pendingRouteManagerRerolls[pendingKey]
+	if !ok {
 		return false
 	}
 	delete(self.pendingRouteManagerRerolls, pendingKey)
-	self.epochUnimproved += 1
 	self.chargeDayWithLock(now)
+	if pending.credited {
+		self.stats.Recollapsed.Add(1)
+		return false
+	}
+	self.epochUnimproved += 1
 	if settings.MaxUnimprovedRerolls <= self.epochUnimproved {
 		self.latchStart = now
 		self.latchUntil = now.Add(settings.LatchDuration)
@@ -1596,22 +1656,32 @@ func (self *h1PathLedger) noteReroll(
 	}
 	pendingKey := weak.Make(key)
 	if _, ok := self.pendingRouteManagerRerolls[pendingKey]; !ok && h1PathPendingLimit <= len(self.pendingRouteManagerRerolls) {
+		// a credited entry goes first and costs nothing: it is the memory of a
+		// verdict already given, kept only so a re-collapse can take it back.
+		// An uncredited one stops being tracked before anything judged it, and
+		// it spent a disconnect like any other, so it is charged here rather
+		// than dropped for free
 		var oldestKey weak.Pointer[RouteManager]
 		var oldestTime time.Time
+		oldestCredited := false
 		oldestSet := false
 		for candidateKey, pending := range self.pendingRouteManagerRerolls {
-			if !oldestSet || pending.rerollTime.Before(oldestTime) {
-				oldestKey = candidateKey
-				oldestTime = pending.rerollTime
-				oldestSet = true
+			replaces := !oldestSet ||
+				(pending.credited && !oldestCredited) ||
+				(pending.credited == oldestCredited && pending.rerollTime.Before(oldestTime))
+			if !replaces {
+				continue
 			}
+			oldestKey = candidateKey
+			oldestTime = pending.rerollTime
+			oldestCredited = pending.credited
+			oldestSet = true
 		}
-		// the oldest re-roll stops being tracked before anything judged it,
-		// and it spent a disconnect like any other, so it is charged here
-		// rather than dropped for free
 		delete(self.pendingRouteManagerRerolls, oldestKey)
-		self.stats.Unresolved.Add(1)
-		self.chargeDayWithLock(now)
+		if !oldestCredited {
+			self.stats.Unresolved.Add(1)
+			self.chargeDayWithLock(now)
+		}
 	}
 	self.pendingRouteManagerRerolls[pendingKey] = h1PathPendingReroll{
 		rerollTime: now,
@@ -1629,12 +1699,19 @@ func (self *h1PathLedger) noteReroll(
 	}
 }
 
-// Returns true when a pending re-roll on the route manager has reached
+// Returns true, once, when a pending re-roll on the route manager has reached
 // CleanTicks clean ticks of the measure that convicted. The re-roll is
 // improved, and the epoch's unimproved and unconfirmed counts are both reset: a
 // re-roll that demonstrably fixed the connection is the evidence its conviction
 // lacked, so it costs the epoch nothing and the next unconfirmed conviction is
 // judged on its own.
+//
+// The entry is kept and marked rather than dropped, so the credit can be taken
+// back by any later conviction on the same route manager (noteConviction). Ten
+// seconds of clean ticks say the replacement started well and nothing about
+// whether it lasts, and the caller reads clean ticks on every tick once the
+// bar is reached, so the mark is also what keeps Improved counting one per
+// re-roll.
 //
 // Only the convicted measure counts, because these two counters are the only
 // bound on a client that keeps re-rolling, and every other reading a
@@ -1655,13 +1732,14 @@ func (self *h1PathLedger) noteClean(
 	self.expirePendingWithLock(settings, now)
 	pendingKey := weak.Make(key)
 	pending, ok := self.pendingRouteManagerRerolls[pendingKey]
-	if !ok {
+	if !ok || pending.credited {
 		return false
 	}
 	if pending.convicted.cleanTicks(cleanTicks) < settings.CleanTicks {
 		return false
 	}
-	delete(self.pendingRouteManagerRerolls, pendingKey)
+	pending.credited = true
+	self.pendingRouteManagerRerolls[pendingKey] = pending
 	self.epochUnimproved = 0
 	self.epochUnconfirmed = 0
 	return true
@@ -1689,7 +1767,9 @@ func (self *h1PathLedger) noteClean(
 // lived long enough to judge, and MaxUnimprovedRerollsPerDay is the lever, the
 // same one an ack cadence slower than the window already leans on. A route
 // manager collected under the weak key is not charged, as everywhere else: its
-// transport is gone, so no disconnect follows.
+// transport is gone, so no disconnect follows. Neither is a credited entry:
+// that re-roll was resolved as improved before the change, and the credit ends
+// with the epoch rather than being charged to it.
 func (self *h1PathLedger) networkChanged(now time.Time) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -1701,9 +1781,15 @@ func (self *h1PathLedger) networkChanged(now time.Time) {
 	self.epochUnimproved = 0
 	self.epochUnconfirmed = 0
 	self.excludedPorts = nil
-	for key := range self.pendingRouteManagerRerolls {
+	for key, pending := range self.pendingRouteManagerRerolls {
 		collected := key.Value() == nil
 		delete(self.pendingRouteManagerRerolls, key)
+		if pending.credited {
+			// resolved as improved before the change: the disconnect it spent
+			// bought a connection that worked, and the credit ends with the
+			// epoch rather than being charged to it
+			continue
+		}
 		self.stats.Unresolved.Add(1)
 		if !collected {
 			self.chargeDayWithLock(now)
@@ -1829,10 +1915,17 @@ type h1PathStats struct {
 	// how often nothing could tell either way. Unimproved and Unresolved are
 	// both charged to the daily budget, since both spent a disconnect; only
 	// Unimproved reaches the latch, and SuppressedDailyBudget against these two
-	// is where a route that cannot be judged inside the window shows up
+	// is where a route that cannot be judged inside the window shows up.
+	//
+	// Recollapsed counts the credits taken back: a re-roll counted Improved
+	// whose route was convicted again afterwards, charged to the budget and
+	// not to the latch. Improved less Recollapsed is how often a
+	// re-roll was seen to work and was never seen to stop, and Recollapsed
+	// against Improved is how much of the credit a fleet's routes hand back
 	Improved            atomic.Uint64
 	Unimproved          atomic.Uint64
 	Unresolved          atomic.Uint64
+	Recollapsed         atomic.Uint64
 	SourcePortBinds     atomic.Uint64
 	SourcePortFallbacks atomic.Uint64
 	// connections whose local port is inside the window the ledger excluded,
@@ -1912,6 +2005,7 @@ type H1PathRerollStatsSnapshot struct {
 	Improved                    uint64
 	Unimproved                  uint64
 	Unresolved                  uint64
+	Recollapsed                 uint64
 	SourcePortBinds             uint64
 	SourcePortFallbacks         uint64
 	SourcePortUnmoved           uint64
@@ -1953,6 +2047,7 @@ func (self *h1PathStats) snapshot() H1PathRerollStatsSnapshot {
 		Improved:                    self.Improved.Load(),
 		Unimproved:                  self.Unimproved.Load(),
 		Unresolved:                  self.Unresolved.Load(),
+		Recollapsed:                 self.Recollapsed.Load(),
 		SourcePortBinds:             self.SourcePortBinds.Load(),
 		SourcePortFallbacks:         self.SourcePortFallbacks.Load(),
 		SourcePortUnmoved:           self.SourcePortUnmoved.Load(),

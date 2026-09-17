@@ -890,8 +890,22 @@ func TestH1PathLedgerCleanTicksResolveImprovement(t *testing.T) {
 	if ledger.epochUnimproved != 0 {
 		t.Fatalf("improvement left the epoch's unimproved count at %d", ledger.epochUnimproved)
 	}
+	if ledger.noteClean(key, &settings, now, h1PathCleanTicks{rxAck: 40}) {
+		t.Fatal("the same clean run was credited twice")
+	}
+	// the credit is provisional: the next conviction on this route manager
+	// takes it back. It is not unimproved -- the replacement was read as
+	// working, which is not what the latch reads -- and the disconnect it
+	// spent is charged to the day, so a route that clears for CleanTicks ticks
+	// and collapses again cannot re-roll without bound
 	if ledger.noteConviction(key, &settings, now.Add(time.Second)) {
 		t.Fatal("a conviction after an improvement was unimproved")
+	}
+	if recollapsed := stats.Recollapsed.Load(); recollapsed != 1 {
+		t.Fatalf("recollapsed = %d, want the credit taken back", recollapsed)
+	}
+	if state := testingH1PathLedgerSnapshot(ledger); state.dayCharged != 2 || state.pendingCount != 0 {
+		t.Fatalf("ledger = %+v, want the unimproved re-roll and the re-collapse charged", state)
 	}
 
 	// a conviction after the improvement window is not unimproved, and the
@@ -3144,6 +3158,87 @@ func TestH1PathRerollIsChargedWhateverTheRouteCanJudge(t *testing.T) {
 			t.Errorf(
 				"ack echo every %s: %s, want the daily budget's %d and then refusals",
 				c.ackEvery, outcome, settings.MaxUnimprovedRerollsPerDay,
+			)
+		}
+	}
+}
+
+// The improvement credit is provisional, and a route that re-collapses gives it
+// back.
+//
+// CleanTicks is twenty ticks, ten seconds at the defaults: evidence that a
+// replacement started well and none at all that it keeps working. While the
+// credit was permanent it dropped the pending entry and returned the epoch's
+// counts, so a route that recovers and collapses again was never charged and
+// never latched, and the device paid one break-before-make disconnect per
+// cycle for ever -- the only re-roll loop left with no bound on it.
+//
+// Three cycle lengths, two hours each. Every replacement is genuinely healthy
+// for the whole of `good` -- full rate, no queue in the pack tags, an ack echo
+// every tick carrying none -- and then as bad as the member it left, read by a
+// 30 s echo alone. At the parent of this commit the three arms cost 109, 39 and
+// 12 disconnects with nothing charged and nothing refused.
+func TestH1PathImprovementCreditIsTakenBackWhenTheRouteRecollapses(t *testing.T) {
+	const transit = 101 * time.Millisecond
+	const queue = 6 * time.Second
+	const duration = 2 * time.Hour
+
+	for _, good := range []time.Duration{
+		60 * time.Second,
+		3 * time.Minute,
+		10 * time.Minute,
+	} {
+		settings := DefaultH1PathRerollSettings()
+		// the elapsed time each connection was dialled at, so a replacement's
+		// own age decides its shape
+		bornAt := map[int]time.Duration{0: 0}
+		outcome, stats, ledger := runH1PathRerollProbe(t, &settings, transit, duration,
+			func(elapsed time.Duration, connectionOrdinal int) h1PathRerollProbeShape {
+				if _, ok := bornAt[connectionOrdinal]; !ok {
+					bornAt[connectionOrdinal] = elapsed
+				}
+				if age := elapsed - bornAt[connectionOrdinal]; 0 < connectionOrdinal && age < good {
+					return h1PathRerollProbeShape{
+						rel:        transit,
+						rxByteRate: 4_000_000,
+						ackRtt:     transit,
+					}
+				}
+				shape := h1PathRerollProbeShape{rel: transit + queue, rxByteRate: 700_000}
+				if elapsed%(30*time.Second) == 0 {
+					shape.ackRtt = transit + queue
+				}
+				return shape
+			})
+		snapshot := stats.snapshot()
+		state := testingH1PathLedgerSnapshot(ledger)
+		t.Logf(
+			"each replacement good for %s: %s unimproved=%d recollapsed=%d unresolved=%d charged=%d",
+			good, outcome, snapshot.Unimproved, snapshot.Recollapsed,
+			snapshot.Unresolved, state.dayCharged,
+		)
+		if outcome.rerolls != settings.MaxUnimprovedRerollsPerDay ||
+			outcome.suppressed[h1PathReasonDailyBudget] == 0 {
+			t.Errorf(
+				"each replacement good for %s: %d re-rolls, %d refused by the budget, want the budget's %d disconnects and then refusals",
+				good, outcome.rerolls,
+				outcome.suppressed[h1PathReasonDailyBudget],
+				settings.MaxUnimprovedRerollsPerDay,
+			)
+		}
+		// every replacement was credited, once each, and every credit was
+		// taken back by the conviction that followed it -- inside the window
+		// as unimproved, after it as a re-collapse
+		if outcome.improved != uint64(outcome.rerolls) {
+			t.Errorf(
+				"each replacement good for %s: %d re-rolls credited %d improvements, want one each",
+				good, outcome.rerolls, outcome.improved,
+			)
+		}
+		if snapshot.Unimproved+snapshot.Recollapsed != uint64(outcome.rerolls) {
+			t.Errorf(
+				"each replacement good for %s: %d re-rolls left %d unimproved and %d recollapsed, want every credit taken back",
+				good, outcome.rerolls, snapshot.Unimproved, snapshot.Recollapsed,
 			)
 		}
 	}

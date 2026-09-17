@@ -711,6 +711,9 @@ type testingH1PathLedgerState struct {
 	// non-zero entries in the daily charge ring; the runs here are shorter
 	// than the rolling 24 hours allow() applies to them
 	dayCharged int
+	// pending entries a clean run credited as improved, which stay until a
+	// conviction takes the credit back
+	pendingCredited int
 }
 
 func testingH1PathLedgerSnapshot(ledger *h1PathLedger) testingH1PathLedgerState {
@@ -722,6 +725,12 @@ func testingH1PathLedgerSnapshot(ledger *h1PathLedger) testingH1PathLedgerState 
 			dayCharged += 1
 		}
 	}
+	pendingCredited := 0
+	for _, pending := range ledger.pendingRouteManagerRerolls {
+		if pending.credited {
+			pendingCredited += 1
+		}
+	}
 	return testingH1PathLedgerState{
 		pendingCount:     len(ledger.pendingRouteManagerRerolls),
 		lastReroll:       ledger.lastReroll,
@@ -730,6 +739,7 @@ func testingH1PathLedgerSnapshot(ledger *h1PathLedger) testingH1PathLedgerState 
 		latchUntil:       ledger.latchUntil,
 		excludedPorts:    append([]int{}, ledger.excludedPorts...),
 		dayCharged:       dayCharged,
+		pendingCredited:  pendingCredited,
 	}
 }
 
@@ -1441,8 +1451,10 @@ func TestPlatformTransportH1PathRerollDoesNotTouchH3Carrier(t *testing.T) {
 }
 
 // A replacement that runs clean for CleanTicks resolves its re-roll as
-// improved and clears the pending entry.
-func TestPlatformTransportH1PathImprovementClearsPending(t *testing.T) {
+// improved. The entry stays, credited: ten seconds of clean ticks say the
+// replacement started well, and the credit is given back if the route is ever
+// convicted again (h1PathLedger.noteConviction).
+func TestPlatformTransportH1PathImprovementCreditsThePendingEntry(t *testing.T) {
 	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
@@ -1475,8 +1487,9 @@ func TestPlatformTransportH1PathImprovementClearsPending(t *testing.T) {
 		if stats := rig.stats.snapshot(); stats.Rerolls != 1 || stats.Unimproved != 0 || stats.Unresolved != 0 {
 			t.Fatalf("stats = %+v, want one re-roll resolved as improved", stats)
 		}
-		if state := testingH1PathLedgerSnapshot(rig.ledger); state.pendingCount != 0 || state.epochUnimproved != 0 {
-			t.Fatalf("ledger = %+v, want no pending re-roll", state)
+		if state := testingH1PathLedgerSnapshot(rig.ledger); state.pendingCredited != 1 ||
+			state.pendingCount != 1 || state.epochUnimproved != 0 || state.dayCharged != 0 {
+			t.Fatalf("ledger = %+v, want the re-roll credited and nothing charged", state)
 		}
 		if !transport.IsConnected() {
 			t.Fatal("the improved replacement is not connected")
@@ -1518,8 +1531,9 @@ func TestPlatformTransportH1PathImprovementAtARealUserRate(t *testing.T) {
 				t.Fatalf("the replacement cleared the thin rate, so this test proves nothing: %+v", decision)
 			}
 		}
-		if state := testingH1PathLedgerSnapshot(rig.ledger); state.pendingCount != 0 || state.epochUnimproved != 0 {
-			t.Fatalf("ledger = %+v, want no pending re-roll", state)
+		if state := testingH1PathLedgerSnapshot(rig.ledger); state.pendingCredited != 1 ||
+			state.pendingCount != 1 || state.epochUnimproved != 0 || state.dayCharged != 0 {
+			t.Fatalf("ledger = %+v, want the re-roll credited and nothing charged", state)
 		}
 	})
 }

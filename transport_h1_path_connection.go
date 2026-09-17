@@ -68,7 +68,9 @@ import (
 //     the loop re-dials without the reconnect backoff.
 // Clean ticks of the direction and the measure that convicted resolve the
 // re-roll as improved (noteClean); a clean reading from anywhere else resolves
-// nothing, so the connection counts one clean run per reading.
+// nothing, so the connection counts one clean run per reading. The credit is
+// provisional: the next conviction on the same route manager takes it back,
+// here through the same noteConviction call.
 //
 // A transport whose receive channel is unbuffered (TransportBufferSize 0) is
 // not monitored either: our own consumer paces every delivery there, so no tick
