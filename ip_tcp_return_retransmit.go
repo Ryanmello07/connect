@@ -319,10 +319,10 @@ func (self *returnRetransmitCounters) snapshot() ReturnRetransmitStats {
 // the cap it is a rate ceiling where it binds, but for the NAT's flows
 // together: 64 MiB over the inner round trip unbudgeted, which no path
 // reaches, and 4 MiB at the phone profile below, which is a few hundred
-// megabits a second across every flow that phone is serving. This is the accounting the NAT's
-// steady-state invariant rests on: a full data budget must still admit the
-// acknowledgement that releases it, which holds only while the return
-// producer is throttled by that same budget (MEMSTEADY, and
+// megabits a second across every flow that phone is serving. This is the
+// accounting the NAT's steady-state invariant rests on: a full data budget
+// must still admit the acknowledgement that releases it, which holds only
+// while the return producer is throttled by that same budget (MEMSTEADY, and
 // TestNatProviderMemoryTcpAckProgressAtFullDataBudget, which fails without
 // this charge).
 //
