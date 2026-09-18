@@ -314,7 +314,12 @@ func (self *returnRetransmitCounters) snapshot() ReturnRetransmitStats {
 // filled is freed by that sibling's acknowledgements, or by its no-progress
 // bound, so nothing can hold it for ever; the wait is woken by the pool's own
 // capacity edge, since this flow's acknowledgements, which are all that
-// signal the window, cannot free it. This is the accounting the NAT's
+// signal the window, cannot free it. What the pool holds is what is in flight
+// between Transfer's delivery and the source's own acknowledgement, so like
+// the cap it is a rate ceiling where it binds, but for the NAT's flows
+// together: 64 MiB over the inner round trip unbudgeted, which no path
+// reaches, and 4 MiB at the phone profile below, which is a few hundred
+// megabits a second across every flow that phone is serving. This is the accounting the NAT's
 // steady-state invariant rests on: a full data budget must still admit the
 // acknowledgement that releases it, which holds only while the return
 // producer is throttled by that same budget (MEMSTEADY, and
