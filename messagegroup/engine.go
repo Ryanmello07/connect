@@ -42,8 +42,9 @@ import (
 // GroupEngine is the factory half of section 6: everything a caller needs in order to obtain a
 // GroupHandle, and nothing about a group it already holds.
 //
-// Four methods, transcribed from section 6's block. JoinFromWelcome is HERE and not on
-// GroupHandle, which is worth stating because the other three of the four are obviously
+// Five methods. Four are transcribed from section 6's block and the fifth is LoadGroup, which is a
+// section 6 AMENDMENT and is documented as one at its declaration below. JoinFromWelcome is HERE
+// and not on GroupHandle, which is worth stating because the other factories are obviously
 // factories and this one reads like a group operation: a member joining from a Welcome has no
 // handle yet, and putting it on the handle would require one to exist before the join that
 // creates it.
@@ -77,6 +78,31 @@ type GroupEngine interface {
 	Suite() uint16
 	NewKeyPackage() (keyPackage []byte, err error)
 	CreateGroup(groupId []byte, policy []byte, leafKeys []byte) (GroupHandle, error)
+
+	// LoadGroup reopens a group this device already belongs to, out of the epoch state a previous
+	// run persisted. IT IS THE FIFTH METHOD AND SECTION 6'S BLOCK HAS FOUR: it is an amendment,
+	// and the paragraph a reader needs is why an amendment was the only honest answer.
+	//
+	// WITHOUT IT A DURABLE STORE IS WRITE-ONLY. CreateGroup founds, JoinFromWelcome joins, and
+	// neither of them opens something already on the disk -- so a device that restarts has rows it
+	// wrote and no door back into them. sdk carried its own GroupHandle over mls.LoadGroup for
+	// exactly that reason and it was not free: connectMlsHandle is unexported, so the copy was a
+	// SECOND implementation of twenty six methods by construction of the visibility rules, and
+	// two of them -- Process and ApplyCommit -- could not be written at all. EngineProcessed's
+	// staged half is unexported, so a foreign implementation can only build a value ApplyCommit
+	// refuses; sdk's copy therefore REFUSED the pair by name, and a restored group could not
+	// ingest a commit. That was open item J1-8 and this method is what closes it.
+	//
+	// THE EPOCH IS A PARAMETER AND THERE IS NO DEFAULT. mls.StateStore holds one blob per (group,
+	// epoch) and nothing on it enumerates, so this layer cannot answer "the latest" without a
+	// scan it has no method for. Whoever persisted the group is the one that knows which epoch it
+	// was at, so the epoch travels with that caller's own record rather than being guessed here --
+	// and an implementation that guessed would reopen a group at an epoch its peers have left,
+	// which is a member that cannot read the next message and has nothing to say why.
+	//
+	// AND THE EPOCH IT ANSWERS AT IS CHECKED AGAINST THE EPOCH IT WAS ASKED FOR. See the adapter.
+	LoadGroup(groupId []byte, epoch uint64) (GroupHandle, error)
+
 	JoinFromWelcome(welcome []byte, ratchetTree []byte) (GroupHandle, error)
 }
 
@@ -265,7 +291,7 @@ func NewConnectMlsEngine(crypto mls.CryptoProvider, store mls.StateStore,
 // Zeroize erases the identity signing key this engine holds a copy of.
 //
 // NOTHING IN THIS PACKAGE CALLS IT, and that is a gap in section 6 rather than an oversight here:
-// GroupEngine has four methods and none of them is a lifecycle method, so an engine has no
+// GroupEngine has five methods and none of them is a lifecycle method, so an engine has no
 // documented end. mls.Group clones the same signer into every group this device founds and erases
 // its own copy at Close; this copy has no Close to be erased at. The erase is declared so the
 // obligation sits on the type that holds the octets -- which is where connect/mls's erase reading
@@ -374,6 +400,58 @@ func (self *connectMlsEngine) CreateGroup(groupId []byte, policy []byte, leafKey
 		return nil, err
 	}
 	return &connectMlsHandle{group: group}, nil
+}
+
+// LoadGroup reopens the group this device persisted at that epoch, and answers a handle no caller
+// can tell from a founded or a joined one.
+//
+// THAT INDISTINGUISHABILITY IS THE WHOLE POINT AND IT IS WHY THE RETURN IS connectMlsHandle. The
+// type this answers is the SAME type CreateGroup and JoinFromWelcome answer, so a restored group
+// reaches every one of GroupHandle's methods through the same bodies a live group does -- Process
+// and ApplyCommit included, which is the pair a foreign implementation of this interface cannot
+// write: EngineProcessed.stagedRef is unexported, so only a member of this package can put a staged
+// commit in one. A restored group can therefore INGEST A COMMIT and follow its group into the next
+// epoch, which is the thing open item J1-8 named and which no adapter outside this package could
+// have provided.
+//
+// THE CONFIG CARRIES ONLY WHAT THE LOAD READS, which is the discipline joinWithTakenKeyPackage
+// states one method down and is checked the same way. mls.LoadGroup reads Crypto, Store and
+// GroupId; Suite, Extensions, RequiredCaps and LeafKeys are CreateGroup's four and are unread here,
+// because a restore rebuilds the group context out of the persisted blob rather than out of a
+// caller's intent. A field set here that nothing reads is a field a later reader believes is load
+// bearing.
+//
+// THE GROUP ID IS CLONED ON THE WAY IN for CreateGroup's reason inverted: this hands a caller's
+// array to an object mls goes on holding, and a group id that moved underneath a restored group is
+// every secret of that group derived over something else.
+//
+// AND THE EPOCH IT CAME BACK AT IS REFUSED BY NAME WHEN IT IS NOT THE EPOCH THAT WAS ASKED FOR.
+// mls.LoadGroup does not make that comparison and says so -- it reads the blob the store answers at
+// the key it was given and rebuilds whatever is in it -- so a store that answers the wrong epoch's
+// state produces a group that is internally consistent, exports real secrets, and is at an epoch
+// the caller never asked for. Nothing downstream can see the difference: the session built over it
+// derives a perfectly good storage root at the WRONG epoch, seals records under it, and every peer
+// refuses them for a reason this device cannot name. sdk's own restore made this comparison before
+// this method existed and it is kept HERE so that every caller of the interface gets it rather than
+// the one caller that remembered.
+func (self *connectMlsEngine) LoadGroup(groupId []byte, epoch uint64) (GroupHandle, error) {
+	group, err := mls.LoadGroup(&mls.GroupConfig{
+		Crypto:  self.crypto,
+		Store:   self.store,
+		GroupId: append([]byte(nil), groupId...),
+	}, epoch, self.signer)
+	if err != nil {
+		return nil, err
+	}
+	handle := &connectMlsHandle{group: group}
+	if loaded := handle.Epoch(); loaded != epoch {
+		// closed rather than leaked: the restored group holds a live epoch schedule and a leaf
+		// private state, and a handle nobody is answered is a handle nobody can Close.
+		handle.Close()
+		return nil, fmt.Errorf("%w: group %x was asked for at epoch %d and the state that came back stands at epoch %d",
+			ErrEngineLoadedEpoch, groupId, epoch, loaded)
+	}
+	return handle, nil
 }
 
 // JoinFromWelcome builds this device's group state out of a Welcome addressed to a key package it

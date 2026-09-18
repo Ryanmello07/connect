@@ -43,6 +43,13 @@ var sectionSixGroupEngine = map[string]string{
 	"NewKeyPackage":   "func() (keyPackage []byte, err error)",
 	"CreateGroup":     "func(groupId []byte, policy []byte, leafKeys []byte) (GroupHandle, error)",
 	"JoinFromWelcome": "func(welcome []byte, ratchetTree []byte) (GroupHandle, error)",
+	// THE FIFTH, AND IT IS AN AMENDMENT RATHER THAN A TRANSCRIPTION. Section 6's block has four
+	// and none of them opens a persisted group, so a durable store was write-only: sdk carried its
+	// own twenty-six-method GroupHandle over mls.LoadGroup, and two of those methods -- Process and
+	// ApplyCommit -- could not be written at all, because EngineProcessed's staged half is
+	// unexported. A restored group therefore could not ingest a commit. That was open item J1-8 and
+	// LoadGroup is the change it named.
+	"LoadGroup": "func(groupId []byte, epoch uint64) (GroupHandle, error)",
 }
 
 var sectionSixGroupHandle = map[string]string{
@@ -194,8 +201,14 @@ func TestTheEngineInterfacesAreExactlySectionSixsBlock(t *testing.T) {
 	// AND IT IS 4 AND 26 FROM LEDGER ITEM 228's read-receipt tag ruling: PairwiseExport is the
 	// one method that ruling adds, and it is one method rather than an accessor for a leaf
 	// private key precisely so that no leaf scalar crosses this seam.
-	if len(sectionSixGroupEngine) != 4 || len(sectionSixGroupHandle) != 26 {
-		t.Errorf("section 6's block is transcribed as %d and %d methods; it was measured at 4 and 26, and a change to either is a change to the seam",
+	//
+	// AND IT IS 5 AND 26 FROM 2026-09-18's LoadGroup, which closes open item J1-8: the ENGINE half
+	// gains its first method since section 6 was written, and the HANDLE half gains none -- which
+	// is the shape the amendment was chosen for. A restored group is the same connectMlsHandle a
+	// founded one is, so it reaches Process and ApplyCommit through the same bodies rather than
+	// through a second implementation that cannot write EngineProcessed's unexported staged half.
+	if len(sectionSixGroupEngine) != 5 || len(sectionSixGroupHandle) != 26 {
+		t.Errorf("section 6's block is transcribed as %d and %d methods; it was measured at 5 and 26, and a change to either is a change to the seam",
 			len(sectionSixGroupEngine), len(sectionSixGroupHandle))
 	}
 }
@@ -213,7 +226,7 @@ func TestTheEngineInterfacesAreExactlySectionSixsBlock(t *testing.T) {
 // a type change rather than a factory change.
 //
 // The scope question (R3a) is answered separately from the class question: the CLASS is the
-// method set of both interfaces read off the syntax tree, which is 27 members at this commit and
+// method set of both interfaces read off the syntax tree, which is 31 members at this commit and
 // is never a list; the SCOPE is engine.go, because that is the file section 2.2's tree puts the
 // interface in and an interface declared anywhere else would fail
 // TestThisPackageIsBuiltFromExactlyTheseImports before it reached here.

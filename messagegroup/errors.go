@@ -130,6 +130,14 @@ var (
 	// surface, which is the whole difference from the sentinel it replaces: a join is now
 	// possible, and what is left to refuse is a message.
 	ErrEngineWelcomeShape = errors.New("messagegroup: these octets are not an MLSMessage carrying a welcome")
+	// Fires when LoadGroup is answered an epoch state that stands at a DIFFERENT epoch from the
+	// one it was asked for. mls.LoadGroup makes no such comparison -- it reads the blob the store
+	// answers at the key it was handed and rebuilds whatever is in it -- so without this refusal a
+	// store that answered the wrong row produces a group that is internally consistent in every
+	// way: real tree, real schedule, real exporter, at an epoch nobody asked for. Every key the
+	// record layer derives over it is then a well formed key at the wrong epoch, the records seal,
+	// and every peer refuses them for a reason this device cannot name.
+	ErrEngineLoadedEpoch = errors.New("messagegroup: the epoch state this store answered stands at a different epoch from the one that was asked for")
 	// Fires when no key package ref the Welcome names is one this device's store holds. It
 	// carries the ref count, the refusal count and the last store error VERBATIM, because
 	// StateStore.TakeKeyPackage answers a bare error with no declared not-found value: a broken
