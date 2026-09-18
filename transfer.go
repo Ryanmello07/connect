@@ -1069,7 +1069,8 @@ func DefaultReceiveBufferSettingsWithBufferSize(bufferSize int) *ReceiveBufferSe
 		// or when a head ack advances past selectively acked items (a hole
 		// filled). Written in sequence order, a partial batch can no longer
 		// "prove" the neighbours of one hole lost. The in-order ack rate is
-		// unchanged: a wake costs at most one extra write per interval.
+		// nearly unchanged: the budget is per reason, and there are two of
+		// them, so the wakes cost at most two extra writes per interval.
 		AckGapWakeSelectiveCount: 3,
 		MinMessageByteCount:      ByteCount(1),
 		// ResendAbuseThreshold: 4,

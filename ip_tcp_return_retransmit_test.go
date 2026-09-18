@@ -2583,6 +2583,38 @@ func (self *tcpReturnRetransmitTestHarness) requireTimerRetransmissionAt(segment
 	}
 }
 
+// The 200 ms floor holds before the first sample too. A host that sets
+// ReturnResendTimeout below it would otherwise send the head again inside
+// the shortest round trip TCP admits, once per that timer, against a source
+// that has the original in flight; every later timer is already floored by
+// baseRtoNanos. A settings value above the floor is the timer it asks for.
+func TestTcpReturnRetransmitInitialTimerHoldsTheFloor(t *testing.T) {
+	for _, c := range []struct {
+		resendTimeout time.Duration
+		wantRto       time.Duration
+	}{
+		{resendTimeout: 50 * time.Millisecond, wantRto: returnRetransmitMinRto},
+		{resendTimeout: returnRetransmitMinRto, wantRto: returnRetransmitMinRto},
+		{resendTimeout: 500 * time.Millisecond, wantRto: 500 * time.Millisecond},
+		{resendTimeout: 0, wantRto: returnRetransmitInitialRto},
+	} {
+		runTcpReturnRetransmitTest(t, func(t *testing.T) {
+			harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{
+				configure: func(settings *TcpBufferSettings) {
+					settings.ReturnResendTimeout = c.resendTimeout
+				},
+			})
+			harness.source.holdAcks = true
+			harness.write(harness.payload(1))
+			synctest.Wait()
+			if rto, baseRto := harness.retransmitTimer(); rto != c.wantRto || baseRto != c.wantRto {
+				t.Fatalf("ReturnResendTimeout %s gave a timer of %s and a base of %s, want %s",
+					c.resendTimeout, rto, baseRto, c.wantRto)
+			}
+		})
+	}
+}
+
 // The first round-trip sample brings the timer's deadline in from the initial
 // second to the sampled timer, and a lost tail that only the timer repairs is
 // sent again at that deadline. The worker computed its wait from the initial

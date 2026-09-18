@@ -715,6 +715,27 @@ func TestSequenceAckWindowGapWakeOpeningHole(t *testing.T) {
 	}
 }
 
+// A selective ack at sequence number zero is a selective ack. Sequence
+// numbers start at zero (ReceiveSequence's nextSequenceNumber), so the
+// highest selectively acked number cannot double as "there was one": reading
+// zero as none loses the opening hole of a sequence whose first item was
+// held above a missing one, which is the shape TestGapWakeRepairsTheFirstCumulativeHead
+// covers at every other sequence number.
+func TestSequenceAckWindowGapWakeSelectiveAckAtSequenceZeroIsSeen(t *testing.T) {
+	window := newSequenceAckWindowWithGapWake(3)
+	window.Update(sequenceAck{sequenceNumber: 0, messageId: NewId(), selective: true})
+	if gapWakePending(window) {
+		t.Fatal("one selective ack proved a hole three are supposed to prove")
+	}
+	window.Update(sequenceAck{sequenceNumber: 1, messageId: NewId()})
+	if !gapWakePending(window) {
+		t.Fatal("the first head ack under a selective ack at sequence zero did not signal the hole fill")
+	}
+	if reasons := window.GapWakeReasons(); reasons != gapWakeHoleFilled {
+		t.Fatalf("gap wake reasons = %b, want filled hole", reasons)
+	}
+}
+
 // The proof counts only selective acks still above the current head. A head
 // retires the evidence it absorbed, and leaves the evidence above it standing,
 // because an already-written selective ack above the hole is still evidence at

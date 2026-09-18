@@ -146,7 +146,12 @@ func TestTcpReturnRecoveryCrossesSequenceWrap(t *testing.T) {
 // FIN above it. That ACK takes no round-trip sample from a retransmission
 // (Karn), so the timer stays backed off and the FIN goes one doubled
 // interval later. The deadline is this mechanism's, not the one-second
-// fixed resend the row was written against.
+// fixed resend the row was written against: bisected, the row fails at
+// 2100, 2500 and 2900 ms and passes at 3000, so a tail hole followed by a
+// FIN is repaired about a second later than the fixed resend repaired it.
+// That second is the price of a timer that answers the path instead of a
+// constant, and it is paid only by a tail hole under a FIN; ordinary holes
+// are repaired on the duplicate acknowledgements, a round trip.
 func TestTcpReturnKeepsRecoveryAfterOriginEof(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) { checkTcpReturnHole(t, 100, 4, 8, 3100*time.Millisecond, true, 4) })
@@ -166,5 +171,7 @@ func TestTcpReturnRecoveryIpv6(t *testing.T) {
 // `TcpSequence.retainReturnChunk` and the shared `ReturnQueueBudget`
 // admission, which `tcpReturnRetransmitState` supersedes (see
 // ip_tcp_return_retransmit.go). The rows above are black-box over
-// NewTcpSequence and still hold; charging the shared budget on the surviving
-// mechanism is tracked separately.
+// NewTcpSequence and still hold. The surviving mechanism does charge that
+// shared pool, pinned by
+// TestTcpReturnRetransmitChargesRetainedRootsToTheSharedPool and
+// TestTcpReturnRetentionWakesAFlowParkedOnASiblingsPool.

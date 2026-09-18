@@ -3950,7 +3950,8 @@ type TcpBufferSettings struct {
 	ReturnQueueMaxByteCount ByteCount
 	// How long the return replay waits before resending an unacknowledged
 	// segment before it has a round-trip sample of its own; after that the
-	// flow's own estimator sets the timer (see tcpReturnRetransmitState).
+	// flow's own estimator sets the timer, and either way never below its
+	// 200 ms floor (see tcpReturnRetransmitState).
 	ReturnResendTimeout time.Duration
 
 	// nil resolves to the local user nat `Log`

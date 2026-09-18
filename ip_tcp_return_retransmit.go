@@ -19,7 +19,8 @@ const (
 	// the timer floor, which is TCP's own minimum, and the timer before the
 	// first round-trip sample exists (RFC 6298 §2.1). The initial timer is
 	// what TcpBufferSettings.ReturnResendTimeout names; this is the value
-	// used when the settings leave it zero.
+	// used when the settings leave it zero, and the floor the settings
+	// cannot set it below.
 	returnRetransmitMinRto     = 200 * time.Millisecond
 	returnRetransmitInitialRto = 1 * time.Second
 	// the backoff ceiling. With the no-progress bound this fixes how many
@@ -581,6 +582,10 @@ func newTcpReturnRetransmitState(tcpBufferSettings *TcpBufferSettings) tcpReturn
 	if state.initialRtoNanos <= 0 {
 		state.initialRtoNanos = int64(returnRetransmitInitialRto)
 	}
+	// The floor holds before the first sample as well as after it. A settings
+	// value below it would send the head again inside the shortest round trip
+	// TCP admits, which is a retransmission of a segment still in flight.
+	state.initialRtoNanos = max(state.initialRtoNanos, int64(returnRetransmitMinRto))
 	state.rtoNanos = state.initialRtoNanos
 	if state.retainByteCount <= 0 {
 		// the flow's maximum window, so the cap never binds below it

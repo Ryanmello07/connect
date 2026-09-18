@@ -38,9 +38,16 @@ type sequenceAckWindow struct {
 	// separate from both cumulative and selective acknowledgement windows.
 	contractMissingAcks map[Id]sequenceAck
 	// A gap is proved once per reason per cumulative head, independently of
-	// snapshots. Retain a bounded set of distinct evidence across compression
-	// intervals; repeating the same proof must not disable compression under
-	// sustained loss. Zero disables early wakes.
+	// snapshots. The evidence is the distinct selective acks still above the
+	// head, carried across compression intervals so that repeating one proof
+	// cannot disable compression under sustained loss, and retired by the
+	// head that absorbs it rather than cleared: an already written selective
+	// ack above the hole is still evidence at the sender. So the set is
+	// bounded by what the receive queue holds out of order, not by
+	// gapWakeSelectiveCount, and the scan and the retirement below are linear
+	// in it. Measured on a 5,000-round repair burst, which grows it to 5,000
+	// entries, that is about a tenth of the ack bookkeeping (22.4 ms against
+	// 20.2 ms at 2,000 items). Zero disables early wakes.
 	gapNotify             chan struct{}
 	gapWakeSelectiveCount int
 	gapWakeSignaled       gapWakeReason
