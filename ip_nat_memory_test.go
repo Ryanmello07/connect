@@ -233,8 +233,13 @@ func TestNatMemoryControlPartitionIsPrechargedAndBounded(t *testing.T) {
 // The replay-metadata row that stood here was white-box over
 // `TcpSequence.retainReturnChunk` and its shared-budget wake, which
 // `tcpReturnRetransmitState` supersedes (see ip_tcp_return_retransmit.go).
-// That mechanism bounds its retention per flow and does not yet draw on the
-// NAT budget, so there is nothing here to charge.
+// Its two subjects are pinned on the superseding mechanism instead: what the
+// retention charges this budget by
+// TestTcpReturnRetransmitChargesRetainedRootsToTheSharedPool, and the wake a
+// flow parked on a sibling's share needs by
+// TestTcpReturnRetentionWakesAFlowParkedOnASiblingsPool. The ring's own
+// records are not charged there, as the replay slices were here: they stay
+// under the per-flow memory bound.
 
 func TestNatMemoryPacketizationBoundsTinyMss(t *testing.T) {
 	state := ConnectionState{ipVersion: 4, peerMss: 1}
@@ -400,20 +405,6 @@ func testNatMemoryTcpAckProgressAtFullDataBudget(t *testing.T, providerProtocolV
 	var handshakeOnce sync.Once
 	var dataStarted atomic.Bool
 	var received atomic.Int64
-	// Refusals of a releasing ACK. Upstream's own return cache charged its
-	// retained origin bytes to this NAT budget, which throttled the return
-	// producer and kept at most a few inner ACKs outstanding at once. The
-	// return replay this tree ships instead (tcpReturnRetransmitState) bounds
-	// itself per flow and does not draw on the budget yet, so when the data
-	// budget is pinned full and the host gives the socket reader a whole
-	// scheduling quantum (GOMAXPROCS=1, or a loaded CI host) the burst can
-	// present more simultaneous ACKs than the 16 KiB prepaid control
-	// partition admits. A refused ACK is regenerable and the source sends it
-	// again, so the flow below still completes and the budget is still never
-	// overdrawn - those are asserted. The refusals are counted rather than
-	// failed until the budget participation is ported onto the replay, which
-	// is the open item this row is the evidence for.
-	var ackRefusedCount atomic.Int64
 	const total = 32 * 1024
 	nat.AddReceivePacketCallback(func(_ TransferPath, _ protocol.ProvideMode, _ *IpPath, packet []byte) {
 		if ctx.Err() != nil {
@@ -442,7 +433,7 @@ func testNatMemoryTcpAckProgressAtFullDataBudget(t *testing.T, providerProtocolV
 		if !sendPacket(ack) {
 			MessagePoolReturn(ack)
 			if ctx.Err() == nil {
-				ackRefusedCount.Add(1)
+				t.Error("full data budget refused a releasing TCP ACK")
 			}
 		}
 		if tcp.syn {
@@ -500,8 +491,5 @@ func testNatMemoryTcpAckProgressAtFullDataBudget(t *testing.T, providerProtocolV
 	}
 	if budget.UsedByteCount() > budget.TotalByteCount() {
 		t.Fatal("TCP progress overdrew its budget")
-	}
-	if refused := ackRefusedCount.Load(); 0 < refused {
-		t.Logf("the full data budget refused %d releasing TCP ACKs; the source resent them and the flow completed", refused)
 	}
 }

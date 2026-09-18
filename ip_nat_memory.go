@@ -130,12 +130,18 @@ func natControlPackets(packets [][]byte) bool {
 
 // The pool the return retention of this NAT's flows draws on. The NAT's own
 // budget owns the retained origin bytes when it has one; otherwise the
-// separate return queue pool does.
-func (self *TcpSequence) returnMemoryBudget() *TransferMemoryBudget {
-	if self.tcpBufferSettings.MemoryBudget != nil {
-		return self.tcpBufferSettings.MemoryBudget
+// separate return queue pool does. Every flow of one NAT resolves the same
+// pool, which is what bounds the retention of all of them together (see
+// tcpReturnRetransmitState).
+func returnMemoryBudget(tcpBufferSettings *TcpBufferSettings) *TransferMemoryBudget {
+	if tcpBufferSettings.MemoryBudget != nil {
+		return tcpBufferSettings.MemoryBudget
 	}
-	return self.tcpBufferSettings.ReturnQueueBudget
+	return tcpBufferSettings.ReturnQueueBudget
+}
+
+func (self *TcpSequence) returnMemoryBudget() *TransferMemoryBudget {
+	return returnMemoryBudget(self.tcpBufferSettings)
 }
 
 func (self *ConnectionState) natPacketizationByteLimit(mtu int) int {

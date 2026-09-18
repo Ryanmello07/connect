@@ -3936,9 +3936,16 @@ func (self *StreamState) udpPacket(payload []byte) []byte {
 
 type TcpBufferSettings struct {
 	MemoryBudget *TransferMemoryBudget
-	// Shared retained origin bytes awaiting inner TCP acknowledgement. Defaults
-	// share one pool across this NAT's flows. Zero per-flow maximum borrows up
-	// to the shared pool; nil budget uses the configured TCP window per flow.
+	// The pool this NAT's flows charge their retained return segments to, one
+	// pool root per segment the packetizer builds, held until the source's
+	// inner TCP acknowledges it. It bounds the sum of the retention across
+	// flows, which the per-flow cap cannot, and a full pool parks a flow's
+	// packetizer exactly as a closed window does (see
+	// tcpReturnRetransmitState). The NAT's own MemoryBudget takes its place
+	// where it has one, so a budgeted NAT accounts this retention with the
+	// rest of its memory (returnMemoryBudget). Either pool also sizes the
+	// chunk the socket reader packetizes at once, so that a large read splits
+	// to fit a small one. Nil leaves the per-flow cap to bound retention alone.
 	ReturnQueueBudget       *TransferMemoryBudget
 	ReturnQueueMaxByteCount ByteCount
 	// How long the return replay waits before resending an unacknowledged
@@ -5067,6 +5074,28 @@ func (self *TcpSequence) signalReturnRetransmit() {
 	}
 }
 
+// Broadcasts `cond` when the shared return pool next has capacity, so that a
+// packetizer parked on a pool the NAT's other flows filled is not left to this
+// flow's own acknowledgements, which are the only thing that signals the
+// window and cannot free what a sibling holds; without it such a flow would
+// sleep to its idle timeout. `capacity` is the pool's edge taken before the
+// admission that refused, so a release in between is not lost. One waiter runs
+// per park and ends at the first edge or with the sequence.
+func (self *TcpSequence) wakeOnReturnPoolCapacity(capacity <-chan struct{}, cond *sync.Cond) {
+	if capacity == nil {
+		return
+	}
+	go func() {
+		select {
+		case <-self.ctx.Done():
+		case <-capacity:
+		}
+		self.mutex.Lock()
+		defer self.mutex.Unlock()
+		cond.Broadcast()
+	}()
+}
+
 // Retains the segments the packetizer just built, in sequence order from the
 // current receiveSeq. The sequence mutex must be held.
 func (self *TcpSequence) retainReturnPacketsWithLock(packets [][]byte) {
@@ -6059,6 +6088,12 @@ func (self *TcpSequence) Run() {
 							default:
 							}
 
+							// taken before the pool admission below, so a
+							// sibling's release between a refusal and the wait
+							// is not lost (see CapacityNotify)
+							returnPoolCapacity := self.returnRetransmit.capacityNotifyWithLock()
+							returnPoolFull := false
+
 							windowByteCount := int(int64(self.receiveWindowSize) - int64(self.receiveSeq-self.receiveSeqAck))
 							// the retention cap binds beside the window, and
 							// acknowledgements open both (see
@@ -6078,22 +6113,44 @@ func (self *TcpSequence) Run() {
 									chunkLimit = min(chunkLimit, max(1, (budget.TotalByteCount()-128)/2))
 								}
 								j := min(i+windowByteCount, i+int(chunkLimit), n)
-								var err error
-								chunkPackets, err = self.DataPackets(buffer[i:j], j-i, self.tcpBufferSettings.Mtu)
-								if err != nil {
-									self.log.Infof("[f%d]tcp receive packets error = %s\n", forwardIter, err)
-									stop = true
+								// The shared pool holds what the chunk will
+								// retain before it is built, so a pool the
+								// NAT's flows have filled throttles this
+								// producer the way a closed window does; the
+								// chunk is cut to what the pool admits.
+								j = i + self.returnRetransmit.reserveBudgetWithLock(
+									j-i,
+									self.dataPayloadByteCount(self.tcpBufferSettings.Mtu),
+								)
+								if i < j {
+									// gives back whatever the chunk did not
+									// take, on this path and the error path
+									// below
+									defer self.returnRetransmit.settleBudgetWithLock()
+									var err error
+									chunkPackets, err = self.DataPackets(buffer[i:j], j-i, self.tcpBufferSettings.Mtu)
+									if err != nil {
+										self.log.Infof("[f%d]tcp receive packets error = %s\n", forwardIter, err)
+										stop = true
+										return
+									}
+									self.retainReturnPacketsWithLock(chunkPackets)
+									self.receiveSeq += uint32(j - i)
+									ackedSendSeq = self.sendSeq
+									i = j
 									return
 								}
-								self.retainReturnPacketsWithLock(chunkPackets)
-								self.receiveSeq += uint32(j - i)
-								ackedSendSeq = self.sendSeq
-								i = j
-								return
+								returnPoolFull = true
 							}
 
 							if self.log.V(2).Enabled() {
-								self.log.Infof("[f%d]tcp receive window wait\n", forwardIter)
+								self.log.Infof("[f%d]tcp receive window wait pool=%t\n", forwardIter, returnPoolFull)
+							}
+							if returnPoolFull {
+								// this flow's own acknowledgements, which are
+								// all that signal the window, cannot free a
+								// pool a sibling filled
+								self.wakeOnReturnPoolCapacity(returnPoolCapacity, receiveAckCond)
 							}
 							receiveAckCond.Wait()
 						}

@@ -4060,6 +4060,178 @@ func TestTcpReturnRetransmitRetainedBytesStayWithinTheCap(t *testing.T) {
 	})
 }
 
+// What the shared pool holds and the roots the ring holds that it is charged
+// for, read under the sequence mutex: the pool's account and the ring's own
+// account of the same bytes.
+func (self *tcpReturnRetransmitTestHarness) retainedPool() (
+	poolByteCount ByteCount,
+	rootByteCount int64,
+	memoryByteCount int64,
+) {
+	self.sequence.mutex.Lock()
+	defer self.sequence.mutex.Unlock()
+	state := &self.sequence.returnRetransmit
+	return state.budget.UsedByteCount(), state.retainedRootByteCountWithLock(), state.retainedMemoryByteCount
+}
+
+// (e) The retained pool roots are charged to the pool this NAT's flows share,
+// TcpBufferSettings.ReturnQueueBudget. A pool smaller than the flow's own cap
+// binds first: packetizing stops at the pool exactly as it stops at a closed
+// window, the upstream write waits, and the pool holds exactly the roots the
+// ring holds - not the ring's records, which are per flow. Acknowledgements
+// return both, and the pool's reserve and release counts balance, so no
+// chunk's reservation is left behind. Uncharged, the pool stands at zero
+// however much is retained and nothing throttles the return producer, which
+// is what lets a full NAT budget refuse the acknowledgement that would
+// release it (TestNatProviderMemoryTcpAckProgressAtFullDataBudget).
+func TestTcpReturnRetransmitChargesRetainedRootsToTheSharedPool(t *testing.T) {
+	runTcpReturnRetransmitTest(t, func(t *testing.T) {
+		const poolSegmentCount = 4
+		var pool *TransferMemoryBudget
+		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{
+			configure: func(settings *TcpBufferSettings) {
+				// whole segment roots, well below this flow's own cap
+				pool = NewTransferMemoryBudget(
+					ByteCount(poolSegmentCount) * retainedMessageCapacity(ByteCount(settings.Mtu)))
+				settings.ReturnQueueBudget = pool
+			},
+		})
+		harness.source.holdAcks = true
+
+		payload := harness.payload(16)
+		writeDone := make(chan struct{})
+		go func() {
+			defer close(writeDone)
+			harness.write(payload)
+		}()
+		synctest.Wait()
+
+		select {
+		case <-writeDone:
+			t.Fatal("the burst was consumed past the shared pool with nothing acknowledged")
+		default:
+		}
+		poolByteCount, rootByteCount, memoryByteCount := harness.retainedPool()
+		_, retainedCount, _, _ := harness.retransmitState()
+		t.Logf("%d segments retained, %d bytes of roots and ring, pool %d of %d",
+			retainedCount, memoryByteCount, poolByteCount, pool.TotalByteCount())
+		if retainedCount != poolSegmentCount {
+			t.Fatalf("retained %d segments, want the %d the pool has room for", retainedCount, poolSegmentCount)
+		}
+		if poolByteCount != ByteCount(rootByteCount) || poolByteCount != pool.TotalByteCount() {
+			t.Fatalf("the pool holds %d for %d bytes of roots, want the whole pool of %d",
+				poolByteCount, rootByteCount, pool.TotalByteCount())
+		}
+		if memoryByteCount <= rootByteCount {
+			t.Fatalf("the ring's records are %d bytes beside its roots, want the per-flow bound to carry them",
+				memoryByteCount-rootByteCount)
+		}
+
+		harness.source.ackNow()
+		select {
+		case <-writeDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("the burst did not complete after acknowledgements freed the pool")
+		}
+		synctest.Wait()
+		harness.requireStream(payload)
+		poolByteCount, rootByteCount, _ = harness.retainedPool()
+		if poolByteCount != 0 || rootByteCount != 0 {
+			t.Fatalf("the pool holds %d for %d bytes of roots after full acknowledgement", poolByteCount, rootByteCount)
+		}
+		if stats := pool.Stats(); stats.ReservedByteCount != stats.ReleasedByteCount {
+			t.Fatalf("the pool's claims do not balance: %+v", stats)
+		}
+	})
+}
+
+// (f) The pool is shared, so one flow's retention can park another's
+// packetizer - and the parked flow's own acknowledgements, which are the only
+// thing that signals its window, cannot free what a sibling holds. The
+// sibling's acknowledgement does, through the pool's capacity edge. Without
+// that wake the parked flow sends nothing until its idle timeout, which is
+// why upstream's own return cache waited on this pool's notification. The
+// sibling's no-progress bound is the other end of it: nothing can hold the
+// pool for ever.
+func TestTcpReturnRetentionWakesAFlowParkedOnASiblingsPool(t *testing.T) {
+	runTcpReturnRetransmitTest(t, func(t *testing.T) {
+		const poolSegmentCount = 4
+		var pool *TransferMemoryBudget
+		configure := func(settings *TcpBufferSettings) {
+			if pool == nil {
+				pool = NewTransferMemoryBudget(
+					ByteCount(poolSegmentCount) * retainedMessageCapacity(ByteCount(settings.Mtu)))
+			}
+			settings.ReturnQueueBudget = pool
+		}
+		sibling := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{configure: configure})
+		parked := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{configure: configure})
+		sibling.source.holdAcks = true
+		parked.source.holdAcks = true
+
+		siblingPayload := sibling.payload(16)
+		siblingWriteDone := make(chan struct{})
+		go func() {
+			defer close(siblingWriteDone)
+			sibling.write(siblingPayload)
+		}()
+		synctest.Wait()
+		if poolByteCount, _, _ := sibling.retainedPool(); poolByteCount != pool.TotalByteCount() {
+			t.Fatalf("the sibling holds %d of the pool, want the whole %d", poolByteCount, pool.TotalByteCount())
+		}
+
+		// more than one socket read, so the write itself cannot complete
+		// while the packetizer is parked
+		parkedPayload := parked.payload(16)
+		parkedWriteDone := make(chan struct{})
+		go func() {
+			defer close(parkedWriteDone)
+			parked.write(parkedPayload)
+		}()
+		synctest.Wait()
+		requireParked := func(when string) {
+			t.Helper()
+			select {
+			case <-parkedWriteDone:
+				t.Fatalf("a flow packetized on a pool a sibling had filled: %s", when)
+			default:
+			}
+			if _, retainedCount, _, _ := parked.retransmitState(); retainedCount != 0 {
+				t.Fatalf("the parked flow retained %d segments the pool never admitted: %s", retainedCount, when)
+			}
+			if got := len(parked.source.streamCopy()); got != 0 {
+				t.Fatalf("the parked flow's source received %d bytes the pool never admitted: %s", got, when)
+			}
+		}
+		requireParked("with the sibling holding the pool")
+
+		// its own source acknowledges everything it can, which is nothing it
+		// retained, so its own acknowledgements cannot free this pool
+		parked.source.ackNow()
+		synctest.Wait()
+		requireParked("after its own acknowledgements")
+
+		sibling.source.ackNow()
+		select {
+		case <-parkedWriteDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("a flow parked on a sibling's pool was not woken when the sibling released it")
+		}
+		synctest.Wait()
+		parked.requireStream(parkedPayload)
+		select {
+		case <-siblingWriteDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("the sibling's burst did not complete")
+		}
+		synctest.Wait()
+		sibling.requireStream(siblingPayload)
+		if poolByteCount := pool.UsedByteCount(); poolByteCount != 0 {
+			t.Fatalf("the pool holds %d after both flows were acknowledged", poolByteCount)
+		}
+	})
+}
+
 // The cap a flow gets when the settings leave it zero is its own maximum
 // window. With the source advertising more than that window and acknowledging
 // nothing, packetizing stops at exactly MaxWindowSize, below the earlier fixed

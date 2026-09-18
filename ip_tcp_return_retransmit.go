@@ -299,8 +299,26 @@ func (self *returnRetransmitCounters) snapshot() ReturnRetransmitStats {
 // socket read and the ring's last doubling; a flow whose path mtu has been
 // cut far below the packet pool's class binds on memory before the cap. The
 // ring gives its records back when the retained set empties, rather than
-// keeping the peak for the life of the flow. Across flows nothing but the
-// flow count bounds the sum.
+// keeping the peak for the life of the flow.
+//
+// Across flows the sum is bounded by the pool the NAT's flows share,
+// TcpBufferSettings.ReturnQueueBudget, or the NAT's own budget where it has
+// one (returnMemoryBudget). Every retained root is reserved there before the
+// chunk that fills it is packetized and released as the source's
+// acknowledgements retire it, so a full pool parks the packetizer exactly as
+// a closed window does, and the producer is throttled by what the NAT can
+// hold rather than by this flow's cap alone. Only the roots are charged, not
+// the ring's records: the pool's account is then the origin bytes retained,
+// and the records stay under the per-flow bound above. A pool a sibling
+// filled is freed by that sibling's acknowledgements, or by its no-progress
+// bound, so nothing can hold it for ever; the wait is woken by the pool's own
+// capacity edge, since this flow's acknowledgements, which are all that
+// signal the window, cannot free it. This is the accounting the NAT's
+// steady-state invariant rests on: a full data budget must still admit the
+// acknowledgement that releases it, which holds only while the return
+// producer is throttled by that same budget (MEMSTEADY, and
+// TestNatProviderMemoryTcpAckProgressAtFullDataBudget, which fails without
+// this charge).
 //
 // Constrained providers. MaxWindowSize scales with the process memory budget
 // (DefaultTcpBufferSettingsWithBufferSize): 16 MiB unbudgeted, 8 MiB at the
@@ -444,7 +462,12 @@ type tcpReturnRetransmitState struct {
 	sackPermitted         bool
 	retainByteCount       int64
 	retainMemoryByteCount int64
-	timeout               time.Duration
+	// the pool shared with the NAT's other flows that the retained roots are
+	// charged to, and what one retained segment costs in it: a whole pool
+	// root of this flow's mtu class. Nil where nothing accounts them.
+	budget        *TransferMemoryBudget
+	rootByteCount int64
+	timeout       time.Duration
 	// shared with the owning NAT, nil when nothing counts
 	counters *returnRetransmitCounters
 
@@ -457,12 +480,15 @@ type tcpReturnRetransmitState struct {
 	// hold them, each against its own bound
 	retainedByteCount       int64
 	retainedMemoryByteCount int64
-	sackedCount             int
-	highestSackedEnd        uint32
-	appliedSackBlocks       [tcpMaxSackBlockCount]tcpSackBlock
-	appliedSackBlockCount   int
-	finRetained             bool
-	dueCount                int
+	// what is reserved in the shared pool: the roots the ring holds, plus the
+	// unused remainder of a chunk's reservation while it is being packetized
+	budgetedByteCount     int64
+	sackedCount           int
+	highestSackedEnd      uint32
+	appliedSackBlocks     [tcpMaxSackBlockCount]tcpSackBlock
+	appliedSackBlockCount int
+	finRetained           bool
+	dueCount              int
 	// the selective holes newly marked in the current hole interval, and
 	// when that interval ends; the ceiling is carried over the interval
 	// rather than over one acknowledgement (see markSackHolesWithLock)
@@ -523,6 +549,8 @@ func newTcpReturnRetransmitState(tcpBufferSettings *TcpBufferSettings) tcpReturn
 	state := tcpReturnRetransmitState{
 		enabled:         tcpBufferSettings.EnableReturnRetransmit,
 		retainByteCount: int64(tcpBufferSettings.ReturnRetransmitRetainByteCount),
+		budget:          returnMemoryBudget(tcpBufferSettings),
+		rootByteCount:   int64(retainedMessageCapacity(ByteCount(tcpBufferSettings.Mtu))),
 		timeout:         tcpBufferSettings.ReturnRetransmitTimeout,
 		initialRtoNanos: int64(tcpBufferSettings.ReturnResendTimeout),
 	}
@@ -591,6 +619,7 @@ func (self *tcpReturnRetransmitState) popWithLock() (segment tcpReturnRetainedSe
 	}
 	self.retainedByteCount -= int64(segment.byteCount)
 	self.retainedMemoryByteCount -= int64(cap(segment.packet))
+	self.releaseBudgetWithLock(int64(cap(segment.packet)))
 	if segment.delivered {
 		self.deliveredCount -= 1
 	}
@@ -609,7 +638,8 @@ func (self *tcpReturnRetransmitState) popWithLock() (segment tcpReturnRetainedSe
 // sequence bytes, in memory bytes read as a ceiling on the next chunk's
 // sequence bytes: one chunk is at most one socket read, so retention passes
 // its memory bound by at most that read's segments and the ring's last
-// doubling.
+// doubling. This is the flow's own bound; the shared pool bounds the sum
+// across flows and is taken by reserveBudgetWithLock.
 func (self *tcpReturnRetransmitState) roomWithLock() int64 {
 	if !self.enabled || self.retainByteCount <= 0 {
 		return int64(1) << 62
@@ -618,6 +648,80 @@ func (self *tcpReturnRetransmitState) roomWithLock() int64 {
 		self.retainByteCount-self.retainedByteCount,
 		self.retainMemoryByteCount-self.retainedMemoryByteCount,
 	)
+}
+
+// The capacity edge of the shared pool, taken before an admission so that a
+// release between a refusal and the wait that follows it is not lost. Nil
+// where nothing accounts the retained bytes, and where nothing is retained at
+// all, since only what is retained can park on the pool.
+func (self *tcpReturnRetransmitState) capacityNotifyWithLock() <-chan struct{} {
+	if !self.enabled || self.budget == nil {
+		return nil
+	}
+	return self.budget.CapacityNotify()
+}
+
+// The pool roots the ring holds, which is what the shared pool is charged.
+// The memory bound's other term, the ring's own records, is per flow.
+func (self *tcpReturnRetransmitState) retainedRootByteCountWithLock() int64 {
+	return self.retainedMemoryByteCount -
+		int64(len(self.segments))*tcpReturnRetainedSegmentByteCount
+}
+
+// Reserves the shared pool for the retention of a chunk of `byteCount`
+// sequence bytes, which the packetizer will cut into segments of
+// `payloadByteCount`, and returns how many of those bytes the pool admitted:
+// zero when it is full, which parks the packetizer exactly as a closed window
+// does. Retention holds one whole pool root per packetized segment whatever
+// the segment's size, so the pool is charged per segment rather than per
+// sequence byte, and a chunk the pool cannot hold whole is cut to the segments
+// it has room for. The charge is the root of a full-size segment, an upper
+// bound on what the chunk takes; settleBudgetWithLock gives back the rest.
+func (self *tcpReturnRetransmitState) reserveBudgetWithLock(
+	byteCount int,
+	payloadByteCount int,
+) int {
+	if !self.enabled || self.budget == nil || byteCount <= 0 {
+		return byteCount
+	}
+	segmentCount := (byteCount + payloadByteCount - 1) / payloadByteCount
+	// Available is a transient, so it only sizes the request; the reservation
+	// below is what admits it.
+	availableByteCount := int64(self.budget.Available())
+	for 0 < segmentCount && availableByteCount < int64(segmentCount)*self.rootByteCount {
+		segmentCount /= 2
+	}
+	if segmentCount <= 0 {
+		return 0
+	}
+	chargeByteCount := int64(segmentCount) * self.rootByteCount
+	if !self.budget.TryReserve(ByteCount(chargeByteCount)) {
+		// a sibling took the room between the two reads
+		return 0
+	}
+	self.budgetedByteCount += chargeByteCount
+	return min(byteCount, segmentCount*payloadByteCount)
+}
+
+// Gives back the part of a chunk's reservation the retained set did not take,
+// so that between chunks the pool holds exactly the roots the ring holds.
+func (self *tcpReturnRetransmitState) settleBudgetWithLock() {
+	if self.budget == nil {
+		return
+	}
+	if surplusByteCount := self.budgetedByteCount - self.retainedRootByteCountWithLock(); 0 < surplusByteCount {
+		self.budgetedByteCount -= surplusByteCount
+		self.budget.Release(ByteCount(surplusByteCount))
+	}
+}
+
+// Gives back the pool bytes of a root the ring no longer holds.
+func (self *tcpReturnRetransmitState) releaseBudgetWithLock(byteCount int64) {
+	if self.budget == nil || byteCount <= 0 {
+		return
+	}
+	self.budgetedByteCount -= byteCount
+	self.budget.Release(ByteCount(byteCount))
 }
 
 // The end of the newest delivered segment, which is the highest sequence the
