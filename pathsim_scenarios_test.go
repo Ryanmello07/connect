@@ -148,16 +148,19 @@ func TestPathsimS1LossCostOnAShortPath(t *testing.T) {
 // only path that writes SELECTIVE acks early - takeQuietHead publishes the
 // head alone and only when the head is moving, so it is inert while a hole
 // is open - and the only early-write path at all on non-H1 carriers. What
-// this row can still prove is asserted below: the wake costs no throughput,
-// never lengthens a head-of-line wait, and adds no duplicate or spurious
-// resend. Whether the gain clause comes back, or the wake is retired in
-// favour of takeQuietHead, is a rig question (wake=3 against wake=0 on top
-// of the merge), not a simulator one.
+// this row can still prove is asserted below: the wake is still running and
+// still writes acknowledgements earlier than the arm without it, and it
+// costs no throughput, never lengthens a head-of-line wait, and adds no
+// duplicate or spurious resend. Whether the gain clause comes back, or the
+// wake is retired in favour of takeQuietHead, is a rig question (wake=3
+// against wake=0 on top of the merge), not a simulator one.
 func TestPathsimS2ReceiverGapWake(t *testing.T) {
 	offer := pathOffer(2*time.Second, 8*time.Second)
 	results := []pathResult{}
+	laneCounts := []int{}
 	for _, lanes := range []int{1, 8} {
 		for _, wake := range []int{3, 0} {
+			laneCounts = append(laneCounts, lanes)
 			results = append(results, runPathArm(t, pathScenarioArm(
 				fmt.Sprintf("S2/short/lanes=%d/wake=%d", lanes, wake),
 				[]pathHop{pathRelayHop("relay", pathShortRoundTrip, pathGigabit, pathRelayQueueMessages, 0.005)},
@@ -172,6 +175,28 @@ func TestPathsimS2ReceiverGapWake(t *testing.T) {
 
 	for i := 0; i < len(results); i += 2 {
 		wake, noWake := results[i], results[i+1]
+		t.Logf("S2: %s wrote %d acknowledgements against %s at %d",
+			wake.arm, wake.receiverAckWrites, noWake.arm, noWake.receiverAckWrites)
+		// The wake has to change the run at all. The instrument is
+		// deterministic to the byte -- three runs print these digests -- so
+		// two arms that differ only by a receiver setting can read the same
+		// only if that setting does nothing, which is what a deleted wake
+		// looks like.
+		if wake.digest() == noWake.digest() {
+			t.Errorf("S2: %s and %s produced the same run, digest %s; the gap wake changed nothing",
+				wake.arm, noWake.arm, wake.digest())
+		}
+		// What it changes is the acknowledgement clock. At one lane a hole
+		// blocks the whole flow, and the wake ends a compression wait that
+		// the arm without it rides out, so the receiver writes more
+		// acknowledgements over the same offer: 4484 against 3953 here. At
+		// eight lanes a hole holds only its own share, the wakes are rare and
+		// the two counts sit within a per cent of each other in either
+		// direction (2931 against 2954), so this asserts nothing there.
+		if laneCounts[i] == 1 && wake.receiverAckWrites <= noWake.receiverAckWrites {
+			t.Errorf("S2: %s wrote %d acknowledgements against %s at %d; the wake exists to write them early",
+				wake.arm, wake.receiverAckWrites, noWake.arm, noWake.receiverAckWrites)
+		}
 		// not lower, to within the 1% the eight-lane pair moves either way
 		if wake.steadyGoodput() < 0.99*noWake.steadyGoodput() {
 			t.Errorf("S2: %s read %.1f Mb/s below %s at %.1f; the wake is not supposed to cost throughput",

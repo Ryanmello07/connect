@@ -770,14 +770,18 @@ type pathResult struct {
 	receiverDrops              uint64
 	receiverEvictions          uint64
 	receiverTentativeEvictions uint64
-	hops                       []pathHopStats
-	maxGap                     time.Duration
-	holBlocked                 time.Duration
-	stalled                    bool
-	drained                    bool
-	drainTime                  time.Duration
-	window                     SendWindowEstimate
-	sequenceCount              int
+	// the acknowledgements the receiver wrote to the route: the ordinary
+	// compressed writes, plus the early ones a gap wake ended a compression
+	// wait for
+	receiverAckWrites uint64
+	hops              []pathHopStats
+	maxGap            time.Duration
+	holBlocked        time.Duration
+	stalled           bool
+	drained           bool
+	drainTime         time.Duration
+	window            SendWindowEstimate
+	sequenceCount     int
 	// nil unless the arm carried a re-roll scenario
 	reroll *pathRerollResult
 }
@@ -1334,6 +1338,7 @@ func runPathArm(t *testing.T, arm pathArm) pathResult {
 		result.receiverDrops = receiveStats.ReceiveQueueDropCount
 		result.receiverEvictions = receiveStats.ReceiveQueueEvictionCount
 		result.receiverTentativeEvictions = receiveStats.ReceiveQueueTentativeEvictionCount
+		result.receiverAckWrites = receiveStats.AckRouteWriteCount
 
 		result.reroll = reroll.finish()
 
