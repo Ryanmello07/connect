@@ -328,10 +328,34 @@ func (self *returnRetransmitCounters) snapshot() ReturnRetransmitStats {
 // treats every window as a demand-driven ceiling, and changes neither the
 // window nor the cap, so no constructor lowers the cap. A per-flow value small
 // enough for a phone's provider share would impose the rate ceiling above on
-// every flow and still not bound the sum across flows, which only an
-// aggregate bound charged to that share could. A host that must keep less per
-// flow sets the cap, or MaxWindowSize with it; both the sequence bytes and the
+// every flow; the sum across flows is bounded instead by the shared pool
+// above, which is that aggregate bound. A host that must keep less per flow
+// sets the cap, or MaxWindowSize with it; both the sequence bytes and the
 // memory follow it.
+//
+// What it costs on a phone, measured 2026-09-18 rather than reasoned about.
+// The sdk provider load test (TestDeviceLocalProviderMemoryUnderLoad: the ios
+// packet tunnel's 32 MiB budget, six peers each churning four rounds of two
+// 96 KiB tcp flows, then thirty-two udp flows), darwin/arm64, six interleaved
+// runs an arm. Peak runtime total: 30.8 MiB mean (30.4-31.2) with this
+// retention, 31.3 (30.9-31.8) on upstream/main, whose own return cache this
+// supersedes, and 30.6 (30.3-31.3) with the retention off. Peak process RSS:
+// 65.2, 65.7 and 65.2 MiB, the same within the spread, and mostly the test
+// binary's own mappings. Pool roots created over a run: 1,905, 1,727 and
+// 1,850 - the merge creates about a tenth more than upstream/main, and the
+// retention-off arm sits with the merge, so that difference is not this
+// retention. So on that profile the retention costs nothing measurable.
+//
+// What it can cost is the ceiling, and the ceiling is now the pool. At the
+// 32 MiB phone budget the flow's cap is 8 MiB of sequence bytes and 24 MiB of
+// memory, but every flow of the NAT draws on one 4 MiB return pool, 2,036
+// segment roots, against the provider profile's 256 tcp flows; unbudgeted it
+// is 16 MiB and 48 MiB a flow against a 64 MiB pool. Before the pool was
+// charged, the bound was the per-flow memory alone times however many flows
+// the host allowed. The load test moves short flows over loopback, so it
+// measures the steady state and not that ceiling: what reaches it is a source
+// that stops acknowledging while a fast origin streams, and nothing measures
+// that shape yet.
 //
 // Time is bounded by ReturnRetransmitTimeout: when the cumulative
 // acknowledgement has not advanced for that long with delivered segments
