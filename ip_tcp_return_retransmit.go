@@ -39,6 +39,12 @@ const (
 	// share this ceiling and not that period: they go once per hole interval,
 	// which at that round trip is the 200 ms floor (markSackHolesWithLock).
 	returnRetransmitMaxBurstSegmentCount = 128
+	// what one flow may hold of the NAT's shared return pool before it has to
+	// leave the rest for its siblings, and the part of the pool a flow beyond
+	// its share must leave free. Both are the same fraction, so a flow that
+	// arrives later can always take its own share at once: the pool never
+	// runs below it while anyone is over.
+	returnRetransmitPoolShareDivisor = 4
 	// the most duplicate acknowledgements the storm guard credits to this
 	// flow's own guesses (see fastRetransmitWithLock). A burst goes only on an
 	// acknowledgement that advances, so a run of duplicates at a standing one
@@ -317,9 +323,13 @@ func (self *returnRetransmitCounters) snapshot() ReturnRetransmitStats {
 // signal the window, cannot free it. What the pool holds is what is in flight
 // between Transfer's delivery and the source's own acknowledgement, so like
 // the cap it is a rate ceiling where it binds, but for the NAT's flows
-// together: 64 MiB over the inner round trip unbudgeted, which no path
-// reaches, and 4 MiB at the phone profile below, which is a few hundred
-// megabits a second across every flow that phone is serving. This is the
+// together. The pool is charged a whole root per segment whatever the segment
+// carries, so its bytes are about 1.94 times the origin bytes they hold at
+// full-size segments and far more than that for small ones: the 64 MiB pool
+// unbudgeted holds about 33 MiB of origin bytes over the inner round trip,
+// which no path reaches, and the 4 MiB pool at the phone profile below about
+// 2.1 MiB, which is on the order of a hundred megabits a second shared across
+// every flow that phone is serving. This is the
 // accounting the NAT's steady-state invariant rests on: a full data budget
 // must still admit the acknowledgement that releases it, which holds only
 // while the return producer is throttled by that same budget (MEMSTEADY, and
@@ -355,7 +365,8 @@ func (self *returnRetransmitCounters) snapshot() ReturnRetransmitStats {
 // What it can cost is the ceiling, and the ceiling is now the pool. At the
 // 32 MiB phone budget the flow's cap is 8 MiB of sequence bytes and 24 MiB of
 // memory, but every flow of the NAT draws on one 4 MiB return pool, 2,036
-// segment roots, against the provider profile's 256 tcp flows; unbudgeted it
+// segment roots, against the 819 tcp flows that profile allows (the floor is
+// 512; 256 is the per-user limit, not a flow count); unbudgeted it
 // is 16 MiB and 48 MiB a flow against a 64 MiB pool. Before the pool was
 // charged, the bound was the per-flow memory alone times however many flows
 // the host allowed. The load test moves short flows over loopback, so it
@@ -722,7 +733,22 @@ func (self *tcpReturnRetransmitState) reserveBudgetWithLock(
 	// Available is a transient, so it only sizes the request; the reservation
 	// below is what admits it.
 	availableByteCount := int64(self.budget.Available())
-	for 0 < segmentCount && availableByteCount < int64(segmentCount)*self.rootByteCount {
+	// A flow takes its share of the pool whenever the pool can carry it, and
+	// more only out of the part that would still leave a share free. Without
+	// this a single source that stops acknowledging holds every root the pool
+	// has, and its siblings park in their packetizers until its no-progress
+	// bound fires, since only its own acknowledgements can free what it took.
+	poolByteCount := int64(self.budget.TotalByteCount())
+	shareByteCount := max(
+		self.rootByteCount,
+		poolByteCount/returnRetransmitPoolShareDivisor,
+	)
+	limitByteCount := max(
+		shareByteCount-self.budgetedByteCount,
+		availableByteCount-poolByteCount/returnRetransmitPoolShareDivisor,
+	)
+	headroomByteCount := min(availableByteCount, limitByteCount)
+	for 0 < segmentCount && headroomByteCount < int64(segmentCount)*self.rootByteCount {
 		segmentCount /= 2
 	}
 	if segmentCount <= 0 {

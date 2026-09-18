@@ -4110,7 +4110,9 @@ func (self *tcpReturnRetransmitTestHarness) retainedPool() (
 // TcpBufferSettings.ReturnQueueBudget. A pool smaller than the flow's own cap
 // binds first: packetizing stops at the pool exactly as it stops at a closed
 // window, the upstream write waits, and the pool holds exactly the roots the
-// ring holds - not the ring's records, which are per flow. Acknowledgements
+// ring holds - not the ring's records, which are per flow. One flow stops at
+// its share of the pool rather than at the pool, so a sibling arriving later
+// still finds a share free (returnRetransmitPoolShareDivisor). Acknowledgements
 // return both, and the pool's reserve and release counts balance, so no
 // chunk's reservation is left behind. Uncharged, the pool stands at zero
 // however much is retained and nothing throttles the return producer, which
@@ -4147,12 +4149,20 @@ func TestTcpReturnRetransmitChargesRetainedRootsToTheSharedPool(t *testing.T) {
 		_, retainedCount, _, _ := harness.retransmitState()
 		t.Logf("%d segments retained, %d bytes of roots and ring, pool %d of %d",
 			retainedCount, memoryByteCount, poolByteCount, pool.TotalByteCount())
-		if retainedCount != poolSegmentCount {
-			t.Fatalf("retained %d segments, want the %d the pool has room for", retainedCount, poolSegmentCount)
+		// the share rule keeps one quarter of the pool for the siblings this
+		// flow has not met yet, so a lone flow stops one root short of it
+		shareSegmentCount := poolSegmentCount - poolSegmentCount/returnRetransmitPoolShareDivisor
+		if retainedCount != shareSegmentCount {
+			t.Fatalf("retained %d segments, want the %d this flow may take of the pool's %d",
+				retainedCount, shareSegmentCount, poolSegmentCount)
 		}
-		if poolByteCount != ByteCount(rootByteCount) || poolByteCount != pool.TotalByteCount() {
-			t.Fatalf("the pool holds %d for %d bytes of roots, want the whole pool of %d",
-				poolByteCount, rootByteCount, pool.TotalByteCount())
+		if poolByteCount != ByteCount(rootByteCount) {
+			t.Fatalf("the pool holds %d for %d bytes of roots, want them equal",
+				poolByteCount, rootByteCount)
+		}
+		if want := pool.TotalByteCount() - pool.TotalByteCount()/returnRetransmitPoolShareDivisor; poolByteCount != want {
+			t.Fatalf("the pool holds %d of %d, want %d left for a sibling's share",
+				poolByteCount, pool.TotalByteCount(), want)
 		}
 		if memoryByteCount <= rootByteCount {
 			t.Fatalf("the ring's records are %d bytes beside its roots, want the per-flow bound to carry them",
@@ -4177,9 +4187,63 @@ func TestTcpReturnRetransmitChargesRetainedRootsToTheSharedPool(t *testing.T) {
 	})
 }
 
+// (g) A flow takes its share of the shared pool and no more while anything is
+// left for a sibling, so one source that stops acknowledging cannot hold every
+// root the NAT has. Without the share a single flow fills the pool and every
+// later flow parks in its packetizer until that source's no-progress bound
+// fires, seconds or minutes later, because only its own acknowledgements free
+// what it took.
+func TestTcpReturnRetransmitLeavesASiblingsShareOfThePool(t *testing.T) {
+	runTcpReturnRetransmitTest(t, func(t *testing.T) {
+		const poolSegmentCount = 8
+		var pool *TransferMemoryBudget
+		harness := newTcpReturnRetransmitTestHarness(t, tcpReturnTestOptions{
+			configure: func(settings *TcpBufferSettings) {
+				pool = NewTransferMemoryBudget(
+					ByteCount(poolSegmentCount) * retainedMessageCapacity(ByteCount(settings.Mtu)))
+				settings.ReturnQueueBudget = pool
+			},
+		})
+		harness.source.holdAcks = true
+
+		payload := harness.payload(32)
+		writeDone := make(chan struct{})
+		go func() {
+			defer close(writeDone)
+			harness.write(payload)
+		}()
+		synctest.Wait()
+
+		poolByteCount, _, _ := harness.retainedPool()
+		_, retainedCount, _, _ := harness.retransmitState()
+		shareSegmentCount := poolSegmentCount - poolSegmentCount/returnRetransmitPoolShareDivisor
+		freeByteCount := pool.TotalByteCount() - poolByteCount
+		t.Logf("one flow holds %d of the pool's %d in %d segments, %d free",
+			poolByteCount, pool.TotalByteCount(), retainedCount, freeByteCount)
+		if retainedCount != shareSegmentCount {
+			t.Fatalf("one flow retained %d segments of the pool's %d, want the %d its share allows",
+				retainedCount, poolSegmentCount, shareSegmentCount)
+		}
+		if want := pool.TotalByteCount() / returnRetransmitPoolShareDivisor; freeByteCount != want {
+			t.Fatalf("the pool has %d free, want the %d a sibling arriving now can still take",
+				freeByteCount, want)
+		}
+
+		harness.source.ackNow()
+		select {
+		case <-writeDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("the burst did not complete once its own acknowledgements freed the share")
+		}
+		synctest.Wait()
+		harness.requireStream(payload)
+	})
+}
+
 // (f) The pool is shared, so one flow's retention can park another's
-// packetizer - and the parked flow's own acknowledgements, which are the only
-// thing that signals its window, cannot free what a sibling holds. The
+// packetizer once that flow has taken its own share - and the parked flow's
+// own acknowledgements, which are the only thing that signals its window,
+// cannot free what a sibling holds. The
 // sibling's acknowledgement does, through the pool's capacity edge. Without
 // that wake the parked flow sends nothing until its idle timeout, which is
 // why upstream's own return cache waited on this pool's notification. The
@@ -4187,7 +4251,12 @@ func TestTcpReturnRetransmitChargesRetainedRootsToTheSharedPool(t *testing.T) {
 // pool for ever.
 func TestTcpReturnRetentionWakesAFlowParkedOnASiblingsPool(t *testing.T) {
 	runTcpReturnRetransmitTest(t, func(t *testing.T) {
-		const poolSegmentCount = 4
+		// one root, so the share rule leaves a flow that arrives second
+		// nothing at all: the share is a whole root either way, and the
+		// sibling is holding it. Above one root a later flow takes its own
+		// share and makes progress on it, which is the point of the share;
+		// here there is none to take and only the sibling's release will do.
+		const poolSegmentCount = 1
 		var pool *TransferMemoryBudget
 		configure := func(settings *TcpBufferSettings) {
 			if pool == nil {
