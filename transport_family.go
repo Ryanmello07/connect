@@ -479,6 +479,7 @@ func (self *PlatformTransport) runFamilyHoldWatcher() {
 // helper narrows the network before resolution, and with the attempt observer
 // that classifies each dialer attempt's typed error (see noteDialError).
 func (self *PlatformTransport) dialContext(ctx context.Context) context.Context {
+	ctx = context.WithValue(ctx, extenderTransportSettingsContextKey{}, self.settings)
 	if !self.pinned() {
 		return ctx
 	}
@@ -738,6 +739,10 @@ type h3DialAttempt struct {
 	quicTransport *quic.Transport
 	conn          *quic.Conn
 	egressPinned  bool
+	// API alt dials own a separate carrier claim. Ordinary platform attempts
+	// use their long-lived transport's claim instead.
+	budgetReservation      *platformTransportBudgetReservation
+	translationReservation *platformTransportBudgetReservation
 }
 
 func (self *h3DialAttempt) close() {
@@ -753,22 +758,67 @@ func (self *h3DialAttempt) close() {
 	if self.packetConn != nil {
 		self.packetConn.Close()
 	}
+	self.budgetReservation.Release()
+	self.translationReservation.Release()
 }
 
-// openH3PacketConn is the socket for one H3 dial: the injected endpoint for a
-// plain H3 dial when a factory is set, else a host UDP socket bound to the
+// openH3PacketConn is the socket for one H3 dial: the injected endpoint for
+// any H3 mode when a factory is set, else a host UDP socket bound to the
 // wildcard of the destination's family and pinned to the physical egress
 // interface. The returned endpoint is owned by the caller on every non-nil
 // return, including one returned alongside an error.
-func (self *PlatformTransport) openH3PacketConn(ctx context.Context, ptMode TransportMode, udpAddr *net.UDPAddr) (net.PacketConn, bool, error) {
-	if ptMode == TransportModeH3 && self.settings.H3PacketConnFactory != nil {
+func (self *PlatformTransport) openH3PacketConn(
+	ctx context.Context,
+	ptMode TransportMode,
+	serverName string,
+	udpAddr *net.UDPAddr,
+) (net.PacketConn, net.Addr, bool, error) {
+	if self.settings.H3PacketConnFactory != nil {
 		packetConn, err := self.settings.H3PacketConnFactory(ctx)
-		return packetConn, false, err
+		return packetConn, nil, false, err
+	}
+	// An extender-only strategy has no direct path, so reach the destination
+	// through the extender instead of binding a local socket. The extender
+	// carrier is a reliable stream and quic needs datagrams, so the datagrams
+	// are framed on it and become real udp at the far end
+	// (net_extender_datagram.go). Without this an h3-pinned client had no
+	// extender path at all.
+	//
+	// The destination is a NAME, not the address the direct path would have
+	// resolved. The extender resolves it from its own egress, which is the
+	// point: a client that cannot resolve the alt host is exactly the client
+	// that needs an extender, and an extender's destination whitelist is a
+	// list of operator name patterns that no ip literal matches.
+	//
+	// Nothing is egress pinned: the socket that leaves this host belongs to
+	// the extender dial, and pinning is that dial's business rather than ours.
+	extenderConfig, extenderDestination, err := self.h3ExtenderDestination(ptMode, serverName)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	if extenderConfig != nil {
+		udpNetwork, _ := udpWildcardForFamily(udpAddrFamily(udpAddr))
+		// Naming is delegated to the extender, but memory ownership stays
+		// with this transport's device child, not the standalone API root.
+		packetConn, err := NewExtenderPacketDialContext(
+			self.clientStrategy.ConnectSettings(), extenderConfig,
+		)(self.dialContext(ctx), udpNetwork, extenderDestination)
+		if err != nil {
+			if packetConn != nil {
+				packetConn.Close()
+			}
+			return nil, nil, false, err
+		}
+		// Quic must dial the same peer the connection reports on read, or it
+		// discards every arriving packet as coming from somewhere else. The
+		// relayed connection is point to point, so that peer is whatever it
+		// says it is.
+		return packetConn, ExtenderPacketConnRemoteAddr(packetConn), false, nil
 	}
 	udpNetwork, wildcard := udpWildcardForFamily(udpAddrFamily(udpAddr))
 	udpConn, err := net.ListenUDP(udpNetwork, wildcard)
 	if err != nil {
-		return nil, false, err
+		return nil, nil, false, err
 	}
 	// bind to the physical egress interface so the platform QUIC connection
 	// never loops into the tunnel this process provides (R1); a no-op off
@@ -782,7 +832,7 @@ func (self *PlatformTransport) openH3PacketConn(ctx context.Context, ptMode Tran
 		egressPinned = false
 		self.log.Infof("[tr]egress bind failed, the platform connection may loop into the tunnel: %s\n", bindErr)
 	}
-	return udpConn, egressPinned, nil
+	return udpConn, nil, egressPinned, nil
 }
 
 // raceH3Dial is Happy Eyeballs for QUIC: candidates launch in order, each
@@ -1302,6 +1352,100 @@ func (self *PlatformTransport) resolveSingleControlUDPAddr(ctx context.Context, 
 // plain mode uses the socket as is.
 type h3PacketConnWrapper func(ctx context.Context, packetConn net.PacketConn) (net.PacketConn, error)
 
+// h3CarrierDestination is the unresolved host and ports one H3 carrier sends
+// to, before any name resolution.
+//
+// It is the naming half of h3DialCandidates, split out because the extender
+// path needs the NAME and the direct path needs the addresses. Sharing it is
+// the point: the alt substitution (L4) and the dns port order (L2) are decided
+// once, so a client that reaches the operator through an extender targets
+// exactly the service a direct client would.
+func (self *PlatformTransport) h3CarrierDestination(
+	ptMode TransportMode,
+	serverName string,
+) (string, []int, error) {
+	altHost, altPort := altUrlHostPort(self.settings.AltUrl)
+	switch ptMode {
+	case TransportModeH3Dns:
+		dnsHost := serverName
+		dnsPorts := []int{self.settings.DnsPort}
+		if altHost != "" {
+			// the dns carrier is alt's whodis listener, on 53 through the
+			// router and on 4053 directly (L2)
+			dnsHost = altHost
+			dnsPorts = altDnsPorts(altPort, self.settings.DnsPort)
+		}
+		return dnsHost, dnsPorts, nil
+	case TransportModeH3DnsPump:
+		pumpServerName := strings.TrimSpace(self.settings.DnsPumpHost)
+		dnsPorts := []int{self.settings.DnsPort}
+		if pumpServerName == "" {
+			// the pump host is only where this client's own pump packets go,
+			// so it derives from the alt url rather than from a published
+			// name of its own (L3)
+			pumpServerName = altHost
+			dnsPorts = altDnsPorts(altPort, self.settings.DnsPort)
+		}
+		if pumpServerName == "" {
+			return "", nil, fmt.Errorf("H3 DNS pump host is empty")
+		}
+		return pumpServerName, dnsPorts, nil
+	default:
+		h3Host := serverName
+		h3Port := self.settings.H3Port
+		if altHost != "" {
+			h3Host = altHost
+			if 0 < altPort {
+				h3Port = altPort
+			}
+		}
+		return h3Host, []int{h3Port}, nil
+	}
+}
+
+// h3ExtenderDestination is where an extender should be asked to relay an H3
+// carrier's datagrams, as a host and port the extender resolves itself.
+//
+// Unresolved on purpose. Resolving here would need working dns for the alt
+// host on a client that may have none, which is half of what an extender is
+// for, and it would hand the extender an ip literal -- which its destination
+// whitelist, a list of operator name patterns, refuses outright.
+//
+// Empty when this strategy has a direct path, which leaves every ordinary
+// client dialing exactly as before.
+func (self *PlatformTransport) h3ExtenderDestination(
+	ptMode TransportMode,
+	serverName string,
+) (*ExtenderConfig, string, error) {
+	extenderConfig := self.clientStrategy.H3ExtenderConfig()
+	if extenderConfig == nil {
+		return nil, "", nil
+	}
+	host, ports, err := self.h3CarrierDestination(ptMode, serverName)
+	if err != nil {
+		return nil, "", err
+	}
+	if len(ports) == 0 {
+		return nil, "", fmt.Errorf("H3 carrier has no destination port")
+	}
+	// One port, not the race: the extender reaches the destination from its
+	// own egress, so the port the client would have had to try second is not
+	// a censorship question any more. Ascending order puts 53 first, which is
+	// what alt serves through the router.
+	return extenderConfig, net.JoinHostPort(host, strconv.Itoa(ports[0])), nil
+}
+
+type h3TranslationReservationContextKey struct{}
+
+func (self *PlatformTransport) acquireH3TranslationMemory(ctx context.Context) (*platformTransportBudgetReservation, error) {
+	_, byteCount := boundedQuicPacketTranslationSettings()
+	budget := self.settings.PlatformTransportBudget
+	if budget == nil {
+		budget = DefaultPlatformTransportBudget()
+	}
+	return (extenderQuicMemoryPolicy{budget: budget, byteCount: byteCount}).acquire(ctx)
+}
+
 // h3DialCandidates resolves the addresses one H3 connect attempt may dial, in
 // dial order, and how their sockets are wrapped. The dns modes translate one
 // socket and so dial one address. The plain mode dials one address when a
@@ -1314,66 +1458,83 @@ func (self *PlatformTransport) h3DialCandidates(ctx context.Context, ptMode Tran
 	}
 	translated := func(mode PacketTranslationMode, tld []byte) h3PacketConnWrapper {
 		return func(attemptCtx context.Context, packetConn net.PacketConn) (net.PacketConn, error) {
-			ptSettings := DefaultPacketTranslationSettings()
+			if err := attemptCtx.Err(); err != nil {
+				return nil, err
+			}
+			ptSettings, _ := boundedQuicPacketTranslationSettings()
 			ptSettings.DnsTlds = [][]byte{tld}
+			claim, preadmitted := attemptCtx.Value(h3TranslationReservationContextKey{}).(*platformTransportBudgetReservation)
+			if !preadmitted {
+				var err error
+				claim, err = self.acquireH3TranslationMemory(attemptCtx)
+				if err != nil {
+					return nil, err
+				}
+			}
 			// The connection cleanup owns the translated PacketConn. Keep its
 			// encoder alive while cancellation closes QUIC gracefully; otherwise
 			// the parent cancellation can discard the CONNECTION_CLOSE before
 			// CloseWithError reaches the wire and leave a stale server route.
-			return NewPacketTranslation(
+			translation, err := NewPacketTranslation(
 				context.WithoutCancel(attemptCtx),
 				mode,
 				packetConn,
 				ptSettings,
 			)
+			if err != nil {
+				if !preadmitted {
+					claim.Release()
+				}
+				return nil, err
+			}
+			if preadmitted {
+				return translation, nil
+			}
+			return &extenderBudgetPacketConn{PacketConn: translation, reservation: claim}, nil
 		}
 	}
-	altHost, altPort := altUrlHostPort(self.settings.AltUrl)
+	host, ports, err := self.h3CarrierDestination(ptMode, serverName)
+	if err != nil {
+		return nil, nil, err
+	}
+	// Through an extender the client does not resolve at all: it names the
+	// destination and the extender resolves it from its own egress. One
+	// candidate, because there is nothing to race -- the extender reaches
+	// whichever address the name has.
+	//
+	// The wrapper still applies. A dns carrier's packets are dns-encoded by
+	// this client and decoded by alt's whodis listener; the extender only
+	// moves them, so the translation belongs on this side exactly as it does
+	// on a direct dial.
+	if _, extenderDestination, err := self.h3ExtenderDestination(ptMode, serverName); err != nil {
+		return nil, nil, err
+	} else if extenderDestination != "" {
+		var wrap h3PacketConnWrapper = plain
+		switch ptMode {
+		case TransportModeH3Dns:
+			wrap = translated(PacketTranslationModeDns, self.randomDnsTld())
+		case TransportModeH3DnsPump:
+			wrap = translated(PacketTranslationModeDnsPump, self.randomDnsTld())
+		}
+		return []*net.UDPAddr{extenderPlaceholderUDPAddr(ports[0])}, wrap, nil
+	}
 	switch ptMode {
 	case TransportModeH3Dns:
-		tld := self.settings.DnsTlds[mathrand.Intn(len(self.settings.DnsTlds))]
-		dnsHost := serverName
-		dnsPorts := []int{self.settings.DnsPort}
-		if altHost != "" {
-			// the dns carrier is alt's whodis listener, on 53 through the
-			// router and on 4053 directly (L2)
-			dnsHost = altHost
-			dnsPorts = altDnsPorts(altPort, self.settings.DnsPort)
-		}
-		udpAddrs, err := self.resolveDnsCarrierAddrs(ctx, dnsHost, dnsPorts)
+		tld := self.randomDnsTld()
+		udpAddrs, err := self.resolveDnsCarrierAddrs(ctx, host, ports)
 		if err != nil {
 			return nil, nil, err
 		}
 		return udpAddrs, translated(PacketTranslationModeDns, tld), nil
 	case TransportModeH3DnsPump:
-		tld := self.settings.DnsTlds[mathrand.Intn(len(self.settings.DnsTlds))]
-		pumpServerName := strings.TrimSpace(self.settings.DnsPumpHost)
-		dnsPorts := []int{self.settings.DnsPort}
-		if pumpServerName == "" {
-			// the pump host is only where this client's own pump packets go,
-			// so it derives from the alt url rather than from a published
-			// name of its own (L3)
-			pumpServerName = altHost
-			dnsPorts = altDnsPorts(altPort, self.settings.DnsPort)
-		}
-		if pumpServerName == "" {
-			return nil, nil, fmt.Errorf("H3 DNS pump host is empty")
-		}
-		udpAddrs, err := self.resolveDnsCarrierAddrs(ctx, pumpServerName, dnsPorts)
+		tld := self.randomDnsTld()
+		udpAddrs, err := self.resolveDnsCarrierAddrs(ctx, host, ports)
 		if err != nil {
 			return nil, nil, err
 		}
 		return udpAddrs, translated(PacketTranslationModeDnsPump, tld), nil
 	default:
-		h3Host := serverName
-		h3Port := self.settings.H3Port
-		if altHost != "" {
-			h3Host = altHost
-			if 0 < altPort {
-				h3Port = altPort
-			}
-		}
-		address := net.JoinHostPort(h3Host, strconv.Itoa(h3Port))
+		address := net.JoinHostPort(host, strconv.Itoa(ports[0]))
 		if self.settings.resolveH3AddrsForTest != nil {
 			udpAddrs, err := self.settings.resolveH3AddrsForTest(ctx, address, self.ipFamily)
 			return udpAddrs, plain, err
@@ -1436,6 +1597,7 @@ func (self *PlatformTransport) resolveDnsCarrierAddrs(
 func (self *PlatformTransport) dialH3(
 	ctx context.Context,
 	ptMode TransportMode,
+	serverName string,
 	udpAddr *net.UDPAddr,
 	wrap h3PacketConnWrapper,
 	tlsConfig *tls.Config,
@@ -1443,7 +1605,22 @@ func (self *PlatformTransport) dialH3(
 	slowMultiple int,
 	confirm bool,
 ) (*h3DialAttempt, error) {
-	packetConn, egressPinned, err := self.openH3PacketConn(ctx, ptMode, udpAddr)
+	var translationClaim *platformTransportBudgetReservation
+	if ptMode == TransportModeH3Dns || ptMode == TransportModeH3DnsPump {
+		var err error
+		translationClaim, err = self.acquireH3TranslationMemory(ctx)
+		if err != nil {
+			return nil, err
+		}
+		ctx = context.WithValue(ctx, h3TranslationReservationContextKey{}, translationClaim)
+	}
+	claimTransferred := false
+	defer func() {
+		if !claimTransferred {
+			translationClaim.Release()
+		}
+	}()
+	packetConn, peerAddr, egressPinned, err := self.openH3PacketConn(ctx, ptMode, serverName, udpAddr)
 	if err != nil {
 		// A factory can return a usable endpoint together with an error.
 		// Ownership transfers on every non-nil return, including this
@@ -1456,8 +1633,15 @@ func (self *PlatformTransport) dialH3(
 	if packetConn == nil {
 		return nil, fmt.Errorf("H3 packet connection factory returned nil")
 	}
+	// An extender dial has no local address for the peer: the name is resolved
+	// at the extender. Its connection reports the peer it actually relays to,
+	// and quic has to agree with that.
+	if peerAddr == nil {
+		peerAddr = udpAddr
+	}
 	attempt := &h3DialAttempt{
-		udpAddr: udpAddr,
+		udpAddr:                udpAddr,
+		translationReservation: translationClaim,
 		packetConn: capPlatformPacketConn(
 			packetConn,
 			self.h3SocketReadBufferByteCount(),
@@ -1465,6 +1649,7 @@ func (self *PlatformTransport) dialH3(
 		),
 		egressPinned: egressPinned,
 	}
+	claimTransferred = true
 	success := false
 	defer func() {
 		if !success {
@@ -1479,7 +1664,7 @@ func (self *PlatformTransport) dialH3(
 
 	// packetConn, not the host socket: an injected endpoint has no host
 	// socket, and a packet translation reports the address of the one it wraps.
-	self.log.Infof("[c]h3 connect to %v (%s) local=%v bound=%t\n", udpAddr, tlsConfig.ServerName, attempt.packetConn.LocalAddr(), egressPinned)
+	self.log.Infof("[c]h3 connect to %v (%s) local=%v bound=%t\n", peerAddr, tlsConfig.ServerName, attempt.packetConn.LocalAddr(), egressPinned)
 
 	attempt.quicTransport = &quic.Transport{
 		Conn: attempt.packetConn,
@@ -1491,7 +1676,19 @@ func (self *PlatformTransport) dialH3(
 	if handshakeAttempt != nil {
 		attemptQuicConfig.Tracer = self.settings.H3QuicPacketStats.tracerForAttempt(handshakeAttempt)
 	}
-	conn, err := attempt.quicTransport.DialEarly(ctx, udpAddr, attemptTlsConfig, attemptQuicConfig)
+	if self.settings.h3RetainedByteAccounting {
+		installQuicSendFlight(attemptQuicConfig)
+	}
+	var conn *quic.Conn
+	if self.settings.h3RetainedByteAccounting {
+		// Allow0RTT is a server acceptance option, not a client-send switch.
+		// The retained-flight controller intentionally tracks only confirmed
+		// 1-RTT ownership; Dial (not DialEarly) also avoids Retry requeueing
+		// application roots outside that tracker on resumed connections.
+		conn, err = attempt.quicTransport.Dial(ctx, peerAddr, attemptTlsConfig, attemptQuicConfig)
+	} else {
+		conn, err = attempt.quicTransport.DialEarly(ctx, peerAddr, attemptTlsConfig, attemptQuicConfig)
+	}
 	if err != nil {
 		handshakeAttempt.finish(false)
 		if handshakeAttempt.sentWithoutResponse() {
@@ -1550,4 +1747,18 @@ func (self *PlatformTransport) dialH3(
 	}
 	success = true
 	return attempt, nil
+}
+
+// randomDnsTld picks the tld one dns carrier attempt encodes with.
+func (self *PlatformTransport) randomDnsTld() []byte {
+	return self.settings.DnsTlds[mathrand.Intn(len(self.settings.DnsTlds))]
+}
+
+// extenderPlaceholderUDPAddr stands in for the address an extender dial does
+// not have, because the name is resolved at the extender rather than here.
+//
+// It is never dialed. dialH3 replaces it with the address the extender packet
+// connection reports, so quic's notion of the peer matches what arrives.
+func extenderPlaceholderUDPAddr(port int) *net.UDPAddr {
+	return &net.UDPAddr{IP: net.IPv4zero, Port: port}
 }

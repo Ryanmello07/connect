@@ -396,6 +396,10 @@ func TestSubprotocolRegistrationRules(t *testing.T) {
 	if len(ids) != 4 || ids[0] != 1 || ids[1] != 2 || ids[2] != 1024 || ids[3] != 65535 {
 		t.Fatalf("ids %v", ids)
 	}
+	applicationIds := client.subprotocols.table.Load().applicationIds()
+	if len(applicationIds) != 2 || applicationIds[0] != 1024 || applicationIds[1] != 65535 {
+		t.Fatalf("application ids exposed reserved protocols: %v", applicationIds)
+	}
 }
 
 func TestSubprotocolSendRules(t *testing.T) {
@@ -433,13 +437,20 @@ func TestSubprotocolSendRules(t *testing.T) {
 }
 
 func TestSubprotocolSendFailureReturnsBuffer(t *testing.T) {
+	if messagePoolSnapshotInFreshProcess(t) {
+		return
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	client := NewClientWithDefaults(ctx, NewId(), NewNoContractClientOob())
 	client.Cancel()
 	cancel()
-	// the client's own teardown returns its buffers asynchronously; let it
-	// settle so the packet-class outstanding count reflects only the sends
-	time.Sleep(100 * time.Millisecond)
+	// The process is exclusive, and this test also joins its own client before
+	// measuring failed-send ownership. A timer cannot establish that boundary.
+	closeCtx, closeCancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer closeCancel()
+	if err := client.CloseAndWait(closeCtx); err != nil {
+		t.Fatalf("join canceled subprotocol client: %v", err)
+	}
 	codec := &fixedCodec{}
 	m := &fixedMessage{}
 	m.set([]byte("after cancel"))
@@ -454,7 +465,7 @@ func TestSubprotocolSendFailureReturnsBuffer(t *testing.T) {
 	if SendSubprotocolMulti[*fixedMessage](client, 2000, []*fixedMessage{m, m}, NewId(), nil, WithSubprotocolCodec[*fixedMessage](codec)) {
 		t.Fatal("a multi send on a cancelled client must fail")
 	}
-	if outstandingAfter := MessagePoolPacketOutstandingCount(); outstandingBefore < outstandingAfter {
+	if outstandingAfter := MessagePoolPacketOutstandingCount(); outstandingBefore != outstandingAfter {
 		t.Fatalf("pool buffers leaked on failed sends: outstanding %d -> %d", outstandingBefore, outstandingAfter)
 	}
 }
@@ -529,7 +540,7 @@ func TestSubprotocolQueryCompletion(t *testing.T) {
 	client.subprotocols.stateLock.Lock()
 	client.subprotocols.pendingQueries[queryId] = resultChan
 	client.subprotocols.stateLock.Unlock()
-	result := &protocol.SubprotocolsQueryResult{QueryId: queryId.Bytes(), SubprotocolIds: []uint32{9000, 2000, 2000, 0, 70000, 1500}}
+	result := &protocol.SubprotocolsQueryResult{QueryId: queryId.Bytes(), SubprotocolIds: []uint32{9000, 2000, 2000, 0, 1, 1023, 70000, 1500}}
 	frame, err := ToFrame(result, DefaultProtocolVersion)
 	if err != nil {
 		t.Fatal(err)

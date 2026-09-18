@@ -43,8 +43,8 @@ func TestTheReceiveHoldAndThePeerWindowCrossAtFourFifthsOfTheSendersBudget(t *te
 	// Captured before the row moves it: a cleanup that reads the default at
 	// cleanup time restores whatever the row left, which leaked the rule into
 	// every later row the day the default went back to the constant
-	restoreSizing := DefaultWindowSizing()
-	t.Cleanup(func() { SetWindowSizing(restoreSizing) })
+	windowSizing := DefaultWindowSizing()
+	t.Cleanup(func() { SetWindowSizing(windowSizing) })
 	SetWindowSizing(WindowSizingConstant)
 
 	// a provider runs unbudgeted, so the sender's window is the unscaled

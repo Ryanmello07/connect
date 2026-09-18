@@ -252,12 +252,12 @@ func runCampaign(args []string) error {
 	return report([]string{*out})
 }
 
-func writeJson(path string, value any) {
+func writeJson(path string, value any) error {
 	b, err := json.MarshalIndent(value, "", "  ")
 	if err != nil {
-		return
+		return err
 	}
-	_ = os.WriteFile(path, b, 0o644)
+	return os.WriteFile(path, b, 0o644)
 }
 
 // glogRecordStart matches the prefix of a fresh glog record (severity,
@@ -269,6 +269,7 @@ var glogRecordStart = regexp.MustCompile(`^[IWEF][0-9]{4} `)
 type diagSample struct {
 	Millis  int64
 	Payload map[string]any
+	Parts   map[string]bool
 }
 
 // parseDiag reads every [flightgate] part line and rejoins the parts that
@@ -284,26 +285,45 @@ func parseDiag(path string) ([]diagSample, error) {
 	}
 	defer file.Close()
 	byMillis := map[int64]map[string]any{}
+	partsByMillis := map[int64]map[string]bool{}
 	windowsByMillis := map[int64]map[string]map[string]any{}
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 1024*1024), 8*1024*1024)
 	// gomobile's stdout bridge splits one glog record into 1,024-byte logcat
 	// entries; a record's continuation is the next GoLog entry that does not
-	// itself start a glog record. Join until the JSON parses.
+	// itself start a glog record. Other Android tags can occur between those
+	// entries, even inside a JSON field name, so only join the same GoLog
+	// process stream. Join until the JSON parses.
 	pending := ""
+	pendingSource := ""
 	for scanner.Scan() {
 		line := scanner.Text()
 		message := line
+		source := ""
 		if i := strings.Index(line, "GoLog   : "); i >= 0 {
 			message = line[i+len("GoLog   : "):]
+			source = "GoLog"
+			// Both epoch and threadtime logcat prefixes end in PID TID
+			// severity. The bridge can move threads between chunks, but
+			// another process's GoLog output is never our continuation.
+			fields := strings.Fields(line[:i])
+			if len(fields) >= 3 {
+				if _, err := strconv.Atoi(fields[len(fields)-3]); err == nil {
+					source += ":" + fields[len(fields)-3]
+				}
+			}
 		}
 		var body string
 		if i := strings.Index(message, "[flightgate] "); i >= 0 {
 			body = message[i+len("[flightgate] "):]
 			pending = ""
-		} else if pending != "" && !glogRecordStart.MatchString(message) {
+			pendingSource = source
+		} else if pending != "" && source != "" && source == pendingSource && !glogRecordStart.MatchString(message) {
 			body = pending + message
 		} else {
+			if source == pendingSource && glogRecordStart.MatchString(message) {
+				pending = ""
+			}
 			continue
 		}
 		var part map[string]any
@@ -312,16 +332,22 @@ func parseDiag(path string) ([]diagSample, error) {
 			continue
 		}
 		pending = ""
-		millisValue, _ := part["unix_millis"].(float64)
-		millis := int64(millisValue)
+		millis, err := exactDiagInt(part, "unix_millis")
+		if err != nil {
+			return nil, fmt.Errorf("invalid diagnostic timestamp: %w", err)
+		}
 		payload := byMillis[millis]
 		if payload == nil {
 			payload = map[string]any{"windows": []any{}}
 			byMillis[millis] = payload
 		}
 		kind, _ := part["part"].(string)
+		if partsByMillis[millis] == nil {
+			partsByMillis[millis] = map[string]bool{}
+		}
+		partsByMillis[millis][kind] = true
 		switch kind {
-		case "state", "memory":
+		case "state", "memory", "memory_device_transport", "memory_device_transfer":
 			for k, v := range part {
 				if k != "part" {
 					payload[k] = v
@@ -364,7 +390,7 @@ func parseDiag(path string) ([]diagSample, error) {
 			windows = append(windows, window)
 		}
 		payload["windows"] = windows
-		samples = append(samples, diagSample{Millis: millis, Payload: payload})
+		samples = append(samples, diagSample{Millis: millis, Payload: payload, Parts: partsByMillis[millis]})
 	}
 	sort.Slice(samples, func(a, b int) bool { return samples[a].Millis < samples[b].Millis })
 	return samples, scanner.Err()
@@ -915,16 +941,27 @@ func seriesReport(args []string) error {
 
 // loadLogTotalBytes reads the helper's final "done total_bytes=N" line.
 func loadLogTotalBytes(path string) int64 {
+	bytes, _, _ := loadLogSummary(path)
+	return bytes
+}
+
+func loadLogSummary(path string) (int64, int64, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return 0
+		return 0, 0, err
 	}
+	var bytes, errorsCount int64
+	completed := 0
 	for _, line := range strings.Split(string(b), "\n") {
-		if _, rest, ok := strings.Cut(line, "done total_bytes="); ok {
-			value, _, _ := strings.Cut(rest, " ")
-			n, _ := strconv.ParseInt(value, 10, 64)
-			return n
+		if strings.HasPrefix(line, "done ") {
+			if n, err := fmt.Sscanf(line, "done total_bytes=%d errors=%d", &bytes, &errorsCount); n != 2 || err != nil || bytes < 0 || errorsCount < 0 {
+				return 0, 0, errors.New("malformed load completion record")
+			}
+			completed++
 		}
 	}
-	return 0
+	if completed != 1 {
+		return 0, 0, errors.New("expected one load completion record")
+	}
+	return bytes, errorsCount, nil
 }

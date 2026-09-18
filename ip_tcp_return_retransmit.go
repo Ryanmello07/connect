@@ -17,7 +17,9 @@ const (
 	// than reordering (RFC 5681)
 	returnRetransmitDupAckThreshold = 3
 	// the timer floor, which is TCP's own minimum, and the timer before the
-	// first round-trip sample exists (RFC 6298 §2.1)
+	// first round-trip sample exists (RFC 6298 §2.1). The initial timer is
+	// what TcpBufferSettings.ReturnResendTimeout names; this is the value
+	// used when the settings leave it zero.
 	returnRetransmitMinRto     = 200 * time.Millisecond
 	returnRetransmitInitialRto = 1 * time.Second
 	// the backoff ceiling. With the no-progress bound this fixes how many
@@ -492,6 +494,10 @@ type tcpReturnRetransmitState struct {
 	// retransmission an acknowledgement covers
 	burstSegmentCount int
 
+	// the timer before the first round-trip sample exists, from
+	// TcpBufferSettings.ReturnResendTimeout or the constant below
+	initialRtoNanos int64
+
 	rttKnown  bool
 	srttNanos int64
 	// the shortest round trip this flow ever measured, which bounds how soon
@@ -518,8 +524,12 @@ func newTcpReturnRetransmitState(tcpBufferSettings *TcpBufferSettings) tcpReturn
 		enabled:         tcpBufferSettings.EnableReturnRetransmit,
 		retainByteCount: int64(tcpBufferSettings.ReturnRetransmitRetainByteCount),
 		timeout:         tcpBufferSettings.ReturnRetransmitTimeout,
-		rtoNanos:        int64(returnRetransmitInitialRto),
+		initialRtoNanos: int64(tcpBufferSettings.ReturnResendTimeout),
 	}
+	if state.initialRtoNanos <= 0 {
+		state.initialRtoNanos = int64(returnRetransmitInitialRto)
+	}
+	state.rtoNanos = state.initialRtoNanos
 	if state.retainByteCount <= 0 {
 		// the flow's maximum window, so the cap never binds below it
 		state.retainByteCount = int64(tcpBufferSettings.MaxWindowSize)
@@ -736,6 +746,9 @@ func (self *tcpReturnRetransmitState) releaseAllWithLock() {
 // The timer before backoff (RFC 6298 §2, with the 2 x srtt floor).
 func (self *tcpReturnRetransmitState) baseRtoNanos() int64 {
 	if !self.rttKnown {
+		if 0 < self.initialRtoNanos {
+			return self.initialRtoNanos
+		}
 		return int64(returnRetransmitInitialRto)
 	}
 	return max(

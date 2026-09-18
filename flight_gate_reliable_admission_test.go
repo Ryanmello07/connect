@@ -42,6 +42,13 @@ func TestDeliveredBytesRingIsNotRetainedWhenOff(t *testing.T) {
 // one window rather than lagging it.
 func TestDeliveredBytesMeasuresTheDrain(t *testing.T) {
 	sequence := admissionSequence(t)
+	// The numbers below are the measure at its fine checkpoint interval,
+	// which is what the delivery-sized window rule asks for. That rule is not
+	// the shipping default on this branch (see the `init` in transfer.go), and
+	// with it off the interval is RttMinResendInterval/4 - three times as
+	// coarse, so the same trace reads one checkpoint further back. The row is
+	// about the measure, not about the default, so the interval is set here.
+	sequence.sendBufferSettings.DeliverySizedWindowScale = deliverySizedWindowScale
 	now := time.Now()
 	// one second at about 1.86 MB/s
 	for index := range 40 {

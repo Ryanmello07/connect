@@ -131,10 +131,28 @@ func TestPathsimS1LossCostOnAShortPath(t *testing.T) {
 // to unsort it, so its half of the finding is pinned by the receiver's own
 // unit tests (transfer_receive_ack_gap_test.go) and not simulated.
 //
-// Produced (fast tier, 0.5% loss, 1 ms, 1 Gb/s): 1 lane, wake 3 against 0:
-// 971.0 against 875.4 Mb/s steady (1.11x), head-of-line time 0 against
-// 48.9 ms, exactly one resend per loss and no duplicate on either arm. At 8
-// lanes 992.9 against 991.6: a lane's hole holds only its own share.
+// Produced on beta (fast tier, 0.5% loss, 1 ms, 1 Gb/s): 1 lane, wake 3
+// against 0: 971.0 against 875.4 Mb/s steady (1.11x), head-of-line time 0
+// against 48.9 ms, exactly one resend per loss and no duplicate on either
+// arm. At 8 lanes 992.9 against 991.6: a lane's hole holds only its own
+// share.
+//
+// The single-lane GAIN no longer reproduces here and this row no longer
+// asserts it. The 2026-09-18 merge took upstream's `takeQuietHead`, which
+// publishes the cumulative head one tenth of an AckCompressTimeout after a
+// delivered H1 burst goes quiet, and that ends the same head-of-line wait
+// the gap wake was built to end. Isolated, not guessed: with takeQuietHead
+// put out of reach (ackBurstTailByteCount raised) this row reproduces beta
+// exactly, 963.9 against 871.1 Mb/s and 0 against 48.9 ms; with it, both
+// arms head-block 0 s and the wake reads 1.00-1.01x. The wake is still the
+// only path that writes SELECTIVE acks early - takeQuietHead publishes the
+// head alone and only when the head is moving, so it is inert while a hole
+// is open - and the only early-write path at all on non-H1 carriers. What
+// this row can still prove is asserted below: the wake costs no throughput,
+// never lengthens a head-of-line wait, and adds no duplicate or spurious
+// resend. Whether the gain clause comes back, or the wake is retired in
+// favour of takeQuietHead, is a rig question (wake=3 against wake=0 on top
+// of the merge), not a simulator one.
 func TestPathsimS2ReceiverGapWake(t *testing.T) {
 	offer := pathOffer(2*time.Second, 8*time.Second)
 	results := []pathResult{}
@@ -170,13 +188,14 @@ func TestPathsimS2ReceiverGapWake(t *testing.T) {
 			}
 		}
 	}
-	// the single-flow gain, where a hole holds the whole link
-	if ratio := pathRatio(results[0], results[1]); ratio < 1.05 {
-		t.Errorf("S2: the wake bought %.2fx at one lane, under 1.05; produced 1.11", ratio)
-	}
-	if results[1].holBlocked <= results[0].holBlocked {
-		t.Errorf("S2: without the wake one lane was head-blocked %s, not above the %s with it",
-			results[1].holBlocked, results[0].holBlocked)
+	// A hole costs one resend and nothing else, on either arm: the early
+	// write must not prove a hole's neighbours lost. This is the half of the
+	// finding that survives takeQuietHead unchanged (see the note above).
+	for _, result := range results {
+		if losses := result.forwardDrops(); losses <= 0 || float64(result.resendCount) > 1.1*float64(losses) {
+			t.Errorf("S2: %s resent %d items for %d losses; more than 1.1 per loss is a hole proving its neighbours lost",
+				result.arm, result.resendCount, losses)
+		}
 	}
 }
 
@@ -197,20 +216,27 @@ func TestPathsimS2ReceiverGapWake(t *testing.T) {
 //	long 100 ms, 8 lanes: off 143.7, on 592.4 steady (4.12x), window 6.0 MiB
 //
 // The long-path gain for one flow reproduces. The short-path cost for one
-// flow reproduces over the offer but not at steady state: the rule climbs
-// from its 320 KiB initial bet slowly on a short path, and at the full
-// tier's 8 s offer the second half reads the link rate (993.5 against
-// 993.5, 0.87x over the offer), at the rig's own 0.3 ms as much as at 1 ms.
-// The rig lost 59-67% at steady state over 30 s runs, so that cell
-// disagrees on mechanism — here the cost is a ramp — and the assertion is
-// on the whole-offer goodput, which holds at both tiers. Two more cells
-// disagree with the rig and are asserted as the simulation has them: the
-// rule does not lose at eight lanes on the short path here, and it gains
-// rather than loses at eight lanes on the long path. Every disagreeing
-// rig cell involves what this simulator does not contain — the client's
-// kernel TCP and its memory-budgeted receive side, and a relay doing
-// per-message work — and the eight-lane cells here run eight equal shares
-// of one pool rather than eight kernel flows.
+// flow NO LONGER reproduces at all, and this row no longer asserts it. It
+// did on beta, as a ramp: 474.0 against 993.3 Mb/s over a 2 s offer (0.48x)
+// with the window collapsed to 1.4 MiB, converging to the constant's rate
+// over 8 s. After the 2026-09-18 merge took upstream's receiver ACK-timing
+// and window rework the same arm reads 992.3 against 993.3 over the offer
+// and 993.5 against 993.5 steady, at a 2.8 MiB window: the §8.3 short-path
+// collapse is repaired in the simulator. So three of the four cells now
+// disagree with the rig and are asserted as the simulation has them — the
+// rule costs nothing at one or at eight lanes on the short path here, and
+// it gains rather than loses at eight lanes on the long path. Every
+// disagreeing rig cell involves what this simulator does not contain — the
+// client's kernel TCP and its memory-budgeted receive side, and a relay
+// doing per-message work — and the eight-lane cells here run eight equal
+// shares of one pool rather than eight kernel flows.
+//
+// This does NOT move the shipping default. The default is the constant
+// because of the rig (§1 above), not because of this row, and a simulator
+// is not the rig. What it does do is make the `init` comment in transfer.go
+// stale on its short-path cell until the rule is A/B'd on the physical
+// rig on top of this merge; until that runs, the default stands where the
+// rig left it.
 func TestPathsimS3WindowRuleRegimes(t *testing.T) {
 	offer := pathOffer(2*time.Second, 8*time.Second)
 	type cell struct {
@@ -241,11 +267,10 @@ func TestPathsimS3WindowRuleRegimes(t *testing.T) {
 			t.Errorf("S3: %s ran with the rule off (%s); the arm measures nothing", on.arm, on.window.Reason)
 		}
 	}
-	// short path, one flow: the rule costs its ramp over the offer (rig:
-	// -67% at steady state; produced 0.48x over 2 s and 0.87x over 8 s,
-	// with the steady state converging to the constant's)
-	if off, on := results[0], results[1]; 0.95*off.goodput() < on.goodput() {
-		t.Errorf("S3: on the short path for one lane the rule read %.2fx the constant over the offer, not under 0.95; the report's §8.3 short-path defect, as a ramp here",
+	// short path, one flow: no difference here since the merge repaired the
+	// ramp (rig: -67% at steady state; beta produced 0.48x over 2 s)
+	if off, on := results[0], results[1]; on.goodput() < 0.97*off.goodput() || 1.03*off.goodput() < on.goodput() {
+		t.Errorf("S3: on the short path for one lane the rule read %.2fx the constant over the offer; the simulation has them equal since the receiver rework, and the rig had the rule at 0.33x",
 			on.goodput()/off.goodput())
 	}
 	t.Logf("S3: short path one lane, the rule against the constant: %.2fx over the offer, %.2fx steady", results[1].goodput()/results[0].goodput(), ratio(0))

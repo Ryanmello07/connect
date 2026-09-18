@@ -583,15 +583,14 @@ type Tun struct {
 }
 
 const (
-	// Reconcile each producer burst well below gVisor's 100-segment processing
-	// quantum. A processor that meets a syscall-owned endpoint relies on the
-	// subsequent user unlock to requeue it; the transfer shim has no return-path
-	// retransmission with which to recover from a missed handoff.
+	// Yield each producer burst below gVisor's 100-segment processing quantum.
+	// The dispatcher owns endpoint wakeups after injection; no endpoint lock
+	// may be acquired from the reliable receive callback.
 	tunTcpInboundBurstPacketCount = 16
 	tunTcpInboundShardCount       = 32
 )
 
-// tunTcpInboundShard bounds one set of TCP flow handoffs without serializing
+// tunTcpInboundShard bounds one set of TCP producer bursts without serializing
 // unrelated flows. Its fixed arrays make memory independent of flow churn.
 type tunTcpInboundShard struct {
 	writeLock     sync.Mutex
@@ -603,7 +602,7 @@ type tunTcpInboundShard struct {
 // tcpInboundFlow parses the endpoint identity and stable shard of a complete,
 // unfragmented IPv4 or IPv6 TCP packet. A v6 packet whose next header is an
 // extension header is not a flow here: the in-process NAT writes plain
-// headers, so such a packet is not one whose finite-burst handoff this shard
+// headers, so such a packet is not one whose finite-burst ordering this shard
 // machinery exists to protect.
 func tcpInboundFlow(packet []byte) (stack.TransportEndpointID, int, bool) {
 	if len(packet) < header.IPv4MinimumSize {
@@ -659,6 +658,20 @@ func tcpInboundNetworkProtocol(endpointId stack.TransportEndpointID) tcpip.Netwo
 	return ipv4.ProtocolNumber
 }
 
+// Called only for a packet validated by tcpInboundFlow. Pure ACKs skip
+// producer-burst accounting and its scheduler yield; injection still publishes
+// them to gVisor through the same ordered path as data-bearing packets.
+func tcpInboundAcknowledgementOnly(packet []byte) bool {
+	offset := Ipv6HeaderSize
+	if packet[0]>>4 == 4 {
+		offset = int(packet[0]&15) * 4
+	}
+	transport := packet[offset:]
+	headerSize := int(transport[12]>>4) * 4
+	return headerSize >= TcpHeaderSizeWithoutExtensions && headerSize == len(transport) &&
+		transport[13]&tcpFlagAck != 0 && transport[13]&(tcpFlagSyn|tcpFlagFin|tcpFlagRst) == 0
+}
+
 // addTcpInboundEndpointWithLock records an endpoint once in the current
 // bounded burst. The shard write lock must be held.
 func (self *Tun) addTcpInboundEndpointWithLock(shard *tunTcpInboundShard, endpointId stack.TransportEndpointID) {
@@ -672,7 +685,7 @@ func (self *Tun) addTcpInboundEndpointWithLock(shard *tunTcpInboundShard, endpoi
 }
 
 // advanceTcpInboundShardWithLock records one injection and reports when its
-// shard needs an endpoint handoff. The shard write lock must be held.
+// producer burst should yield. The shard write lock must be held.
 func (self *Tun) advanceTcpInboundShardWithLock(shard *tunTcpInboundShard, endpointId stack.TransportEndpointID) bool {
 	self.addTcpInboundEndpointWithLock(shard, endpointId)
 	shard.packetCount += 1
@@ -683,32 +696,19 @@ func (self *Tun) advanceTcpInboundShardWithLock(shard *tunTcpInboundShard, endpo
 	return true
 }
 
-// synchronizeTcpInboundProcessorsWithLock performs gVisor's documented user
-// unlock handoff for every endpoint touched in the burst. The shard write lock
-// remains held so the next burst cannot overtake the handoff. Endpoint state
-// is cleared independently from packetCount: individual finite callbacks must
-// retain their shared cadence until one of them performs the scheduler yield.
-func (self *Tun) synchronizeTcpInboundProcessorsWithLock(shard *tunTcpInboundShard) {
-	for endpointIndex := 0; endpointIndex < shard.endpointCount; endpointIndex += 1 {
-		endpointId := shard.endpointIds[endpointIndex]
-		stackEndpoint := self.stack.FindTransportEndpoint(
-			tcpInboundNetworkProtocol(endpointId),
-			tcp.ProtocolNumber,
-			endpointId,
-			self.nicId,
-		)
-		if endpoint, ok := stackEndpoint.(*tcp.Endpoint); ok {
-			endpoint.LockUser()
-			endpoint.UnlockUser()
-		}
-	}
+// Injection/Flush has already transferred each segment to gVisor. Its TCP
+// dispatcher queues processor-owned endpoints, requeues unfinished work, and
+// the syscall owner's UnlockUser wakes segments queued during that syscall.
+// Taking the endpoint lock here would join an unrelated outbound write while
+// holding receive/GRO ownership, closing the duplex admission/ACK cycle.
+func (self *Tun) finishTcpInboundBurstWithLock(shard *tunTcpInboundShard) {
 	shard.endpointCount = 0
 }
 
 // tunLinkEndpoint converts channel.Endpoint's silent bounded-queue drop into
-// bounded backpressure. The user-NAT TCP bridge is intentionally lossless and
-// does not retransmit its return path, so dropping one ACK here can otherwise
-// strand a flow forever at its advertised receive window.
+// bounded backpressure. Inner TCP and provider return replay can recover
+// losses, but dropping feedback still delays progress. The timeout remains
+// the bounded NIC-loss escape, not a receive-callback synchronization step.
 type tunLinkEndpoint struct {
 	*channel.Endpoint
 	ctx   context.Context
@@ -1185,28 +1185,23 @@ func (self *Tun) WriteBatch(packets [][]byte) (int, error) {
 		pkb.DecRef()
 		total += len(packet)
 
-		if tcpInbound && self.advanceTcpInboundShardWithLock(shard, endpointId) {
-			// the shard's burst is full: deliver everything queued so far so
-			// the user-unlock handoff runs against enqueued segments
-			// (write()'s inject-then-synchronize order), and so the shard's
-			// bounded endpoint array cannot overflow mid-batch
+		if tcpInbound && !tcpInboundAcknowledgementOnly(packet) && self.advanceTcpInboundShardWithLock(shard, endpointId) {
+			// Publish the full producer burst before yielding, keeping the
+			// bounded per-shard metadata and same-flow ordering intact.
 			self.gro.Flush()
-			self.synchronizeTcpInboundProcessorsWithLock(shard)
-			// UnlockUser requeues protocol work but does not run it
-			// synchronously. Yield while the shard remains gated so a new
-			// producer cannot immediately overtake the awakened worker.
+			self.finishTcpInboundBurstWithLock(shard)
+			// Give the dispatcher a turn while the same-flow shard remains
+			// gated. This yield never acquires its TCP endpoint lock.
 			runtime.Gosched()
 		}
 	}
 	self.gro.Flush()
 
-	// A finite response commonly ends with fewer than the 16 packets that
-	// trigger the mid-batch cadence above. gVisor can have queued one of those
-	// packets while a syscall owned the endpoint; without this final
-	// LockUser/UnlockUser handoff there may be no later packet to wake its TCP
-	// processor. The provider NAT has already consumed the upstream bytes, so
-	// that missed tail is permanent rather than recoverable by retransmission.
-	finalHandoff := false
+	// Flush publishes a finite tail even below the normal producer quantum.
+	// gVisor's dispatcher and user-unlock path retain responsibility for every
+	// queued segment, so no subsequent packet or synthetic endpoint lock is
+	// needed to schedule that tail.
+	finalYield := false
 	for shardIndex, locked := range lockedShards {
 		if !locked {
 			continue
@@ -1216,14 +1211,13 @@ func (self *Tun) WriteBatch(packets [][]byte) (int, error) {
 			shard.packetCount = 0
 			continue
 		}
-		self.synchronizeTcpInboundProcessorsWithLock(shard)
+		self.finishTcpInboundBurstWithLock(shard)
 		shard.packetCount = 0
-		finalHandoff = true
+		finalYield = true
 	}
-	if finalHandoff {
-		// UnlockUser queues processors asynchronously. Yield once for the whole
-		// finite batch while every touched shard remains gated so the awakened
-		// workers cannot be overtaken by the next producer callback.
+	if finalYield {
+		// Yield once after the finite batch while touched shards remain
+		// gated, retaining the existing producer scheduling cadence.
 		runtime.Gosched()
 	}
 
@@ -1246,7 +1240,9 @@ func (self *Tun) write(packet []byte, onRelease func()) (int, error) {
 	if tcpInbound {
 		tcpInboundShard = &self.tcpInboundShards[shardIndex]
 		tcpInboundShard.writeLock.Lock()
-		yieldProcessor = self.advanceTcpInboundShardWithLock(tcpInboundShard, endpointId)
+		if !tcpInboundAcknowledgementOnly(packet) {
+			yieldProcessor = self.advanceTcpInboundShardWithLock(tcpInboundShard, endpointId)
+		}
 	}
 
 	// copy the packet
@@ -1270,11 +1266,9 @@ func (self *Tun) write(packet []byte, onRelease func()) (int, error) {
 	self.ep.InjectInbound(networkProtocol, pkb)
 	pkb.DecRef()
 	if tcpInbound {
-		// A one-packet callback is itself a complete finite burst. Complete
-		// gVisor's user-unlock handoff before returning: deferred execution
-		// can strand a short H1/TLS response behind an unrelated shard or a
-		// worker scheduling delay, and the provider NAT cannot retransmit it.
-		self.synchronizeTcpInboundProcessorsWithLock(tcpInboundShard)
+		// Injection has already published this finite burst to gVisor.
+		// Clear producer metadata without waiting on the endpoint owner.
+		self.finishTcpInboundBurstWithLock(tcpInboundShard)
 		if yieldProcessor {
 			runtime.Gosched()
 		}

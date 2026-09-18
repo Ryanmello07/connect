@@ -1,10 +1,8 @@
 package connect
 
-// FLIGHTGATEFIX §20.3. The landing's memory against merged's. Everything
-// this program added to the ack path is gone, so the two acknowledgement
-// structs are merged's to the byte. sendItem carries §13.5's per-item
-// deferral state and §34.3's per-item lane position, which are the two
-// mechanisms the landing keeps, and that state is what the extra bytes are.
+// FLIGHTGATEFIX §20.3. Account for each retained mechanism against merged's
+// exact struct sizes. Later receiver advertisements, ACK arrival timestamps
+// and pacing state have explicit byte costs; unaccounted growth still fails.
 
 import (
 	"testing"
@@ -38,31 +36,45 @@ const (
 	// the items a receiver removed from its hold after acknowledging them
 	// (THROUGHPUTFIX §37.16)
 	evictionNoticeStateByteCount = 8
+	// Optional receiver compression duration plus its presence bit/padding.
+	// Actual receiver ACK delay fits the same layout by grouping presence bits;
+	// the compact ACK still has no additional retained word for that field.
+	ackCompressionStateByteCount = 8
+	// Local arrival survives ACK handoff without retaining the wire message.
+	ackArrivalStateByteCount = 8
+	pacingWireStateByteCount = 16
+	// The actual first-release burst id survives until acknowledgement, so
+	// older in-flight bursts cannot reset the newer RTT measurement ring.
+	// This uint64 follows the two pacing words and adds no alignment padding.
+	pacingBurstStateByteCount = 8
+	// Mobile retained admission follows an item through retries and teardown.
+	retainedBudgetOwnerByteCount = 8
 )
 
 func TestLandingStructsMatchMergedLessTheDeferState(t *testing.T) {
-	if got, want := unsafe.Sizeof(sequenceAck{}), uintptr(mergedSequenceAckByteCount); got != want {
-		t.Errorf("sequenceAck is %d bytes, want merged's %d: the ack path carries nothing of this program's",
+	if got, want := unsafe.Sizeof(sequenceAck{}), uintptr(mergedSequenceAckByteCount+ackArrivalStateByteCount); got != want {
+		t.Errorf("sequenceAck is %d bytes, want baseline plus one arrival timestamp, %d",
 			got, want)
 	}
 	if got, want := unsafe.Sizeof(receiveAckMessage{}),
 		uintptr(mergedReceiveAckMessageByteCount+
 			receiveAdvertisementStateByteCount+
-			evictionNoticeStateByteCount); got != want {
+			evictionNoticeStateByteCount+ackCompressionStateByteCount+ackArrivalStateByteCount); got != want {
 		t.Errorf(
-			"receiveAckMessage is %d bytes, want merged's %d plus %d for the receiver's advertised capacity and %d for the eviction notice",
+			"receiveAckMessage is %d bytes, want merged's %d plus %d for capacity, %d for evictions, %d for compression and 8 for arrival",
 			got, mergedReceiveAckMessageByteCount,
-			receiveAdvertisementStateByteCount, evictionNoticeStateByteCount,
+			receiveAdvertisementStateByteCount, evictionNoticeStateByteCount, ackCompressionStateByteCount,
 		)
 	}
 	want := uintptr(
-		mergedSendItemByteCount + deferStateByteCount + lanePositionStateByteCount)
+		mergedSendItemByteCount + deferStateByteCount + lanePositionStateByteCount + pacingWireStateByteCount + pacingBurstStateByteCount + retainedBudgetOwnerByteCount)
 	if got := unsafe.Sizeof(sendItem{}); got != want {
 		t.Errorf(
 			"sendItem is %d bytes, want merged's %d plus %d for the deferred retransmit's own state "+
-				"and %d for the lane position it last looked at; "+
+				"and %d for the lane position it last looked at, plus %d for paced wire bytes and actual write time "+
+				"and %d for the actual burst epoch plus %d for the lifetime budget owner; "+
 				"anything else means a removed mechanism left a field behind",
-			got, mergedSendItemByteCount, deferStateByteCount, lanePositionStateByteCount,
+			got, mergedSendItemByteCount, deferStateByteCount, lanePositionStateByteCount, pacingWireStateByteCount, pacingBurstStateByteCount, retainedBudgetOwnerByteCount,
 		)
 	}
 }

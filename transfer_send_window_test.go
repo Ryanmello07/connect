@@ -6,6 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/urnetwork/connect/protocol"
@@ -44,8 +45,8 @@ import (
 //     permission lifts it to the next binder at no measured cost.
 //   - Mechanism. The window is computed from the measured minimum round trip
 //     and the measured delivery rate rather than from a floored resend timer;
-//     it shrinks when the path shrinks; and it converges to what the path
-//     delivers rather than to whatever ceiling is configured.
+//     its candidate follows a slower path while learned capacity is
+//     retained; and byte permission remains independently bounded.
 //
 // The receive advertisement rows are step two, which §37.15 holds behind a
 // multi-route failover cell. They run with the setting turned on explicitly,
@@ -60,18 +61,6 @@ type sendWindowHarness struct {
 	sender     *Client
 	receiver   *Client
 	receiverId Id
-	// when set, the data half drops the next frame it carries, once
-	dropNext *atomic.Bool
-	drops    *atomic.Int64
-	// When set to a positive number of nanoseconds, the data half holds the
-	// next frame it carries for that long, once. A deterministic reordering:
-	// everything behind it arrives first, so a cell that needs a full hold and
-	// then an earlier arrival gets exactly that, rather than depending on a
-	// retransmit racing the hold filling.
-	delayNextNanos *atomic.Int64
-	// when set, the acknowledgement half discards everything it carries, so a
-	// sequence's resend queue fills and stays full
-	holdAcks *atomic.Bool
 	// the carrier's drain in bytes per second, settable mid-flight so one
 	// cell can measure a path that changes
 	bytesPerSecond *atomic.Int64
@@ -81,8 +70,8 @@ type sendWindowHarness struct {
 	wireFrameCapacity int
 }
 
-// Sets the receiver's hold, which is what it advertises less what it holds,
-// and turns the advertisement on.
+// Sets and advertises the receiver's full hold capacity, independent of its
+// current occupancy.
 //
 // The advertisement follows the window rule: off under the constant policy,
 // which is the shipping default, and on under `WindowSizingFromDelivery`
@@ -203,10 +192,6 @@ func newPacedSendWindowHarnessWithClient(
 	// per frame, concurrently: a pump that sleeps in its own loop is a serial
 	// line and would bound the measurement rather than the window
 	pumpsDone := []chan struct{}{}
-	dropNext := &atomic.Bool{}
-	drops := &atomic.Int64{}
-	delayNextNanos := &atomic.Int64{}
-	holdAcks := &atomic.Bool{}
 	rate := &atomic.Int64{}
 	rate.Store(int64(bytesPerSecond))
 	ratePump := func(from Route, to Route) {
@@ -254,28 +239,11 @@ func newPacedSendWindowHarnessWithClient(
 			for {
 				select {
 				case transferFrameBytes := <-from:
-					// the acknowledgement half, withheld
-					if 0 < delay && holdAcks.Load() {
-						MessagePoolReturn(transferFrameBytes)
-						continue
-					}
-					// one induced loss on the data half, for the loss cell
-					if delay == 0 && dropNext.CompareAndSwap(true, false) {
-						drops.Add(1)
-						MessagePoolReturn(transferFrameBytes)
-						continue
-					}
-					frameDelay := delay
-					if delay == 0 {
-						if held := delayNextNanos.Swap(0); 0 < held {
-							frameDelay = time.Duration(held)
-						}
-					}
 					framesInFlight.Add(1)
 					go func(transferFrameBytes []byte) {
 						defer framesInFlight.Done()
-						if 0 < frameDelay {
-							time.Sleep(frameDelay)
+						if 0 < delay {
+							time.Sleep(delay)
 						}
 						select {
 						case to <- transferFrameBytes:
@@ -324,35 +292,59 @@ func newPacedSendWindowHarnessWithClient(
 		sender:            sender,
 		receiver:          receiver,
 		receiverId:        receiverId,
-		dropNext:          dropNext,
-		drops:             drops,
-		delayNextNanos:    delayNextNanos,
-		holdAcks:          holdAcks,
 		bytesPerSecond:    rate,
 		wireFrameCapacity: cap(senderOut),
 	}
 }
 
-// offers packs as fast as they are admitted, for the given window
-func (self *sendWindowHarness) offer(t *testing.T, payloadByteCount int, window time.Duration) {
+// Offers sustained traffic until the context stops the producer. Zero-timeout
+// admission gives accepted Packs the carrier's normal write budget; refusal
+// retains the same frame for a rate-limited retry. Passing the offer context to
+// Send would instead retire the sequence when that context expires.
+func (self *sendWindowHarness) offerWithCtx(t *testing.T, ctx context.Context, payloadByteCount int) {
 	t.Helper()
 	payload := string(make([]byte, payloadByteCount))
-	deadline := time.Now().Add(window)
-	for time.Now().Before(deadline) {
+	for ctx.Err() == nil {
 		frame := RequireToFrameWithDefaultProtocolVersion(
 			&protocol.SimpleMessage{Content: payload},
 		)
-		admitted, _ := self.sender.SendWithTimeoutDetailed(
-			frame,
-			self.receiverId,
-			nil,
-			50*time.Millisecond,
-			sendPackRecoveryOption{upstreamRecoverable: true, retainAfterAckTimeout: true},
-		)
-		if !admitted {
-			MessagePoolReturn(frame.MessageBytes)
+		for {
+			admitted, err := self.sender.SendWithTimeoutDetailed(
+				frame,
+				self.receiverId,
+				nil,
+				0,
+				sendPackRecoveryOption{upstreamRecoverable: true, retainAfterAckTimeout: true},
+			)
+			if admitted && err == nil {
+				break
+			}
+			if err != nil {
+				MessagePoolReturn(frame.MessageBytes)
+				if self.sender.ctx.Err() == nil {
+					t.Errorf("fixture could not offer a Pack: %v", err)
+				}
+				return
+			}
+			select {
+			case <-ctx.Done():
+				MessagePoolReturn(frame.MessageBytes)
+				return
+			case <-self.sender.ctx.Done():
+				MessagePoolReturn(frame.MessageBytes)
+				return
+			case <-time.After(resendCapacityPollInterval):
+			}
 		}
 	}
+}
+
+// Bounds the offered workload, independently of accepted messages' write time.
+func (self *sendWindowHarness) offer(t *testing.T, payloadByteCount int, window time.Duration) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(self.sender.ctx, window)
+	defer cancel()
+	self.offerWithCtx(t, ctx, payloadByteCount)
 }
 
 // THROUGHPUTFIX §32.5 row W4. The send window is a constant today, so a flow
@@ -632,28 +624,12 @@ func TestDeliverySizedWindowRateFormHoldsAtAShortRoundTrip(t *testing.T) {
 
 	// let the rule reach its fixed point, then read it repeatedly while the
 	// path is steady
-	offering := make(chan struct{})
+	offeringCtx, stopOffering := context.WithCancel(ctx)
+	defer stopOffering()
 	offerDone := make(chan struct{})
 	go func() {
 		defer close(offerDone)
-		payload := string(make([]byte, 4*1024))
-		for {
-			select {
-			case <-offering:
-				return
-			default:
-			}
-			frame := RequireToFrameWithDefaultProtocolVersion(
-				&protocol.SimpleMessage{Content: payload},
-			)
-			admitted, _ := harness.sender.SendWithTimeoutDetailed(
-				frame, harness.receiverId, nil, 50*time.Millisecond,
-				sendPackRecoveryOption{upstreamRecoverable: true, retainAfterAckTimeout: true},
-			)
-			if !admitted {
-				MessagePoolReturn(frame.MessageBytes)
-			}
-		}
+		harness.offerWithCtx(t, offeringCtx, 4*1024)
 	}()
 	time.Sleep(time.Second)
 
@@ -665,7 +641,7 @@ func TestDeliverySizedWindowRateFormHoldsAtAShortRoundTrip(t *testing.T) {
 		}
 		time.Sleep(40 * time.Millisecond)
 	}
-	close(offering)
+	stopOffering()
 	<-offerDone
 
 	if len(windows) < 8 {
@@ -702,104 +678,70 @@ func TestDeliverySizedWindowRateFormHoldsAtAShortRoundTrip(t *testing.T) {
 // retransmission is the lost item rather than the window behind it.
 func TestReceiveAdvertisementStopsTheLossRetransmitStorm(t *testing.T) {
 	assertMessagePoolOwnership(t)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	const ceiling = ByteCount(16 * 1024 * 1024)
-	const hold = ByteCount(512 * 1024)
-	const payloadByteCount = 4 * 1024
-
-	harness := newSendWindowHarness(t, ctx, 25*time.Millisecond, func(settings *SendBufferSettings) {
-		settings.ResendQueueMaxByteCount = ByteCount(128 * 1024)
-		settings.DeliverySizedWindowScale = 2
-		settings.DeliverySizedWindowCeilingByteCount = ceiling
-		settings.ResendQueueBudget = NewTransferMemoryBudget(ceiling)
+	synctest.Test(t, func(t *testing.T) {
+		const ceiling = ByteCount(16 * 1024 * 1024)
+		const hold = ByteCount(512 * 1024)
+		const payloadByteCount = 4 * 1024
+		const propagation = 25 * time.Millisecond
+		fixture := newWindowRoundFixture(t, func(settings *SendBufferSettings) {
+			settings.ResendQueueMaxByteCount = 128 * 1024
+			settings.DeliverySizedWindowScale = deliverySizedWindowScale
+			settings.DeliverySizedWindowCeilingByteCount = ceiling
+			settings.ResendQueueBudget = NewTransferMemoryBudget(ceiling)
+		}, func(settings *ReceiveBufferSettings) {
+			settings.ReceiveQueueMaxByteCount = hold
+			settings.AdvertiseReceiveWindow = true
+		})
+		// Eight actual flights produce delivery and round-trip samples before
+		// the loss. Ack release follows each completed flight by exactly 25 ms.
+		for range 8 {
+			var lastAck *windowRoundFrame
+			for range 32 {
+				lastAck = fixture.receive(fixture.write(payloadByteCount))
+			}
+			time.Sleep(propagation)
+			fixture.forward(lastAck, fixture.senderIn)
+		}
+		before := fixture.sender.DestinationSendStats(fixture.receiver.ClientId())
+		window := before.SendWindow
+		if !window.Sized || hold < window.Window {
+			t.Fatalf("loss begins without a sampled advertised bound: %+v", window)
+		}
+		head := fixture.write(payloadByteCount)
+		heldCount := int(window.Window/ByteCount(len(head.bytes))) - 2
+		fixture.drop(head)
+		for range heldCount {
+			fixture.forward(fixture.receive(fixture.write(payloadByteCount)), fixture.senderIn)
+		}
+		receiveSequence := fixture.receiveSequence()
+		if count, queued := receiveSequence.receiveQueue.QueueSize(); count != heldCount || count <= 0 ||
+			queued != ByteCount(heldCount)*MessageByteCount(head.pack.Frames) ||
+			receiveSequence.nextSequenceNumber != head.pack.SequenceNumber {
+			t.Fatalf("loss left hold=%d/%d bytes in %d Packs at head %d, want %d Packs beyond dropped Pack %d", queued, hold, count, receiveSequence.nextSequenceNumber, heldCount, head.pack.SequenceNumber)
+		}
+		fixture.forward(fixture.receive(fixture.recovery(head)), fixture.senderIn)
+		after := fixture.sender.DestinationSendStats(fixture.receiver.ClientId())
+		resentByteCount := ByteCount(after.ResendWriteByteCount - before.ResendWriteByteCount)
+		if resentByteCount <= 0 || window.Window <= resentByteCount {
+			t.Fatalf("exact Pack %d loss cost %d resend bytes, want positive recovery below the %d byte window", head.pack.SequenceNumber, resentByteCount, window.Window)
+		}
+		stats := fixture.receiver.ReceiveStats()
+		if stats.ReceiveQueueDropCount != 0 || stats.ReceiveQueueEvictionCount != 0 {
+			t.Fatalf("advertised loss recovery refused=%d evicted=%d", stats.ReceiveQueueDropCount, stats.ReceiveQueueEvictionCount)
+		}
+		if fixture.deliveredCount != int(fixture.nextNumber) || fixture.ackedCount != int(fixture.nextNumber) {
+			t.Fatalf("loss recovery delivered/acknowledged %d/%d of %d", fixture.deliveredCount, fixture.ackedCount, fixture.nextNumber)
+		}
+		t.Logf("sampled window %d under hold %d: Pack %d loss held %d later Packs and cost %d resend bytes with zero receiver loss", window.Window, hold, head.pack.SequenceNumber, heldCount, resentByteCount)
 	})
-	harness.receiveHold(hold)
-
-	// reach the fixed point, then lose one Pack
-	harness.offer(t, payloadByteCount, time.Second)
-	window := harness.sender.DestinationSendStats(harness.receiverId).SendWindow
-	before := harness.sender.DestinationSendStats(harness.receiverId)
-	beforeDrops := harness.receiver.receiveQueueDropCount.Load()
-
-	harness.dropNext.Store(true)
-	harness.offer(t, payloadByteCount, time.Second)
-
-	after := harness.sender.DestinationSendStats(harness.receiverId)
-	afterDrops := harness.receiver.receiveQueueDropCount.Load()
-	resentByteCount := ByteCount(after.ResendWriteByteCount - before.ResendWriteByteCount)
-
-	if harness.drops.Load() != 1 {
-		t.Fatalf("the cell induced %d losses, want exactly one", harness.drops.Load())
-	}
-	if !window.Sized {
-		t.Fatalf("the window rule did not engage, so this cell does not test the advertisement: %+v", window)
-	}
-	if hold < window.Window {
-		t.Errorf("the window is %d above the %d byte hold, so the advertisement did not bind", window.Window, hold)
-	}
-	// the receiver never has to refuse an arrival, because the sender never
-	// sent more than it said it could hold
-	if beforeDrops != afterDrops {
-		t.Errorf(
-			"the receiver dropped %d arrivals through one induced loss; with the sender clamped to the advertised hold there is nothing above the hold to drop",
-			afterDrops-beforeDrops,
-		)
-	}
-	// And the retransmission is the item rather than the window behind it.
-	// The failure mode this replaces is a window or more: every arrival above
-	// the hold is refused and sent again. Measured here at 8 KB to 118 KB
-	// against a 512 KiB window, two to twenty-nine items, so the assertion is
-	// against the window rather than against a tighter band the noise of a
-	// shared runner would cross.
-	if window.Window <= resentByteCount {
-		t.Errorf(
-			"one induced loss cost %d bytes of retransmission against a %d byte window; the advertisement exists so that a loss costs the item rather than the window behind it",
-			resentByteCount,
-			window.Window,
-		)
-	}
-	t.Logf(
-		"window %d, hold %d: one loss cost %d bytes of retransmission (%d items of %d) and %d receiver drops",
-		window.Window, hold, resentByteCount, resentByteCount/payloadByteCount, payloadByteCount, afterDrops-beforeDrops,
-	)
 }
 
-// THROUGHPUTFIX §37.15's mechanism claim, the first of two: the window is
-// computed from the round trip the path actually has, rather than from a resend
-// timer that has a floor.
-//
-// The defect from source. The rule as first built multiplied the delivery term
-// by `ScaledRtt`, which is the retransmit pacing estimate and is floored at
-// `RttMinResendInterval`, 300 ms. On a 25 ms path it therefore multiplied by
-// twelve times the round trip, and on a 6.7 ms path by forty-five. Measured on
-// three paths before the correction: 300 ms flat against real round trips of
-// 6.7, 27 and 102 ms, an overshoot of 2.9 to 44.8 times.
-//
-// This row does not claim a consequence for that overshoot. Both cells that
-// tried to measure one — TCP on a slow drain, UDP at 97 Mb/s into 20 — found
-// about 2 ms rather than the hundreds predicted, for the reasons in the file
-// header. A rule that multiplies a delivery rate by a resend timer is wrong on
-// its own terms, and that is what this asserts: the window equals the scale
-// times the measured delivery rate over the measured minimum round trip, from
-// the estimate's own evidence fields, to the byte.
-//
-// Prediction, recorded before the run: on a 25 ms path the reported window
-// equals scale x delivered x roundTrip / interval exactly, and the round trip
-// the rule used is close to the path's rather than at the 300 ms floor.
-//
-// Two corrections after earlier runs, kept on the record. At a 5 ms
-// propagation the computed value was 204,800 bytes, below the 262,144 floor, so
-// the row passed with the window clamped and would have gone on passing had the
-// rule read the resend timer. The path is 25 ms here and the row now fails if
-// the window lands on either clamp, because a cell that measures a clamp
-// measures nothing. And the receiver has to advertise a hold with room in it:
-// without an advertisement a sender takes its own constant as its ceiling and
-// can never exceed it, so the delivery term never binds and this row would be
-// measuring that clamp instead.
-func TestSizedWindowIsComputedFromTheMeasuredRoundTrip(t *testing.T) {
+// The fresh sizing candidate uses measured path residence, not the resend
+// timer's 300 ms floor. Recompute cumulative and, when qualified, service
+// candidates from their published evidence exactly. The effective window may
+// retain an earlier larger candidate, so its separate hard bounds are checked.
+// The original path, two-second offer and interior-clamp controls are retained.
+func TestWindowRetainedCandidateUsesMeasuredRoundTrip(t *testing.T) {
 	assertMessagePoolOwnership(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -820,8 +762,8 @@ func TestSizedWindowIsComputedFromTheMeasuredRoundTrip(t *testing.T) {
 	estimate := harness.sender.DestinationSendStats(harness.receiverId).SendWindow
 
 	t.Logf(
-		"window %d from %d bytes over %s at a %s round trip, floor %d ceiling %d, reason %q",
-		estimate.Window, estimate.DeliveredByteCount, estimate.Interval,
+		"window %d candidate %d from %d bytes over %s at a %s round trip, floor %d ceiling %d, reason %q",
+		estimate.Window, estimate.CandidateWindow, estimate.DeliveredByteCount, estimate.Interval,
 		estimate.RoundTrip, estimate.Floor, estimate.Ceiling, estimate.Reason,
 	)
 
@@ -830,14 +772,21 @@ func TestSizedWindowIsComputedFromTheMeasuredRoundTrip(t *testing.T) {
 	}
 	// the rule's own arithmetic, recomputed from the evidence it published
 	want := ByteCount(int64(estimate.DeliveredByteCount) *
-		estimate.RoundTrip.Nanoseconds() / estimate.Interval.Nanoseconds())
+		estimate.WindowRoundTrip.Nanoseconds() / estimate.Interval.Nanoseconds())
 	want = min(max(ByteCount(2)*want, estimate.Floor), estimate.Ceiling)
-	if estimate.Window != want {
+	if estimate.ServiceSized {
+		service := ByteCount(2 * float64(estimate.ServiceByteRate) * estimate.WindowRoundTrip.Seconds())
+		want = max(want, min(max(service, estimate.Floor), estimate.Ceiling))
+	}
+	if estimate.CandidateWindow != want {
 		t.Errorf(
-			"the window is %d but the evidence it reports gives %d; the rule and the number it publishes have to be the same rule",
-			estimate.Window,
+			"the current candidate is %d but its reported evidence gives %d",
+			estimate.CandidateWindow,
 			want,
 		)
+	}
+	if estimate.LearnedWindow < estimate.Initial || estimate.Window != min(max(estimate.LearnedWindow, estimate.Floor), estimate.Ceiling) {
+		t.Errorf("the effective window lost retained capacity or its hard bounds: %+v", estimate)
 	}
 	// the floored resend timer is 300 ms; a rule reading it would be here
 	if floor := DefaultSendBufferSettings().RttMinResendInterval; estimate.RoundTrip >= floor {
@@ -848,13 +797,13 @@ func TestSizedWindowIsComputedFromTheMeasuredRoundTrip(t *testing.T) {
 			floor,
 		)
 	}
-	if estimate.Window >= estimate.Ceiling {
+	if estimate.CandidateWindow >= estimate.Ceiling || estimate.Window >= estimate.Ceiling {
 		t.Errorf(
 			"the window reached its %d byte ceiling, so this cell measured the ceiling rather than the path; the rule is supposed to converge to what the path delivers",
 			estimate.Ceiling,
 		)
 	}
-	if estimate.Window <= estimate.Floor {
+	if estimate.CandidateWindow <= estimate.Floor {
 		t.Errorf(
 			"the window sits on its %d byte floor, so this cell measured a clamp and would pass with the rule reading a resend timer",
 			estimate.Floor,
@@ -862,89 +811,92 @@ func TestSizedWindowIsComputedFromTheMeasuredRoundTrip(t *testing.T) {
 	}
 }
 
-// THROUGHPUTFIX §37.15's mechanism claim, the second: a window sized from the
-// path follows the path down as well as up.
-//
-// This is the property a constant cannot have and the one the rule exists for.
-// A flow whose path slows — a carrier handover, a congested hop, a provider
-// taking on more clients — holds a window sized for the old path under any
-// constant, and the excess permission is exactly the ramp §36.7 describes.
-//
-// Which carrier this runs against, and why it decides the answer. The rule
-// multiplies the measured delivery rate by the measured minimum round trip.
-// Behind a deep buffer the minimum is inflated by the queue the permission
-// itself creates, and the two move against each other: measured on the deep
-// carrier, cutting the drain by eight cut the delivery rate by 5.7 and raised
-// the minimum round trip from 200 ms to 888 ms, so the window fell by only
-// 1.29 — 680,406 to 527,516 — and the prediction of a factor of two was wrong.
-// That is recorded rather than loosened away. Against a carrier that accepts at
-// its drain rate, which is the only shape either carrier in this tree has, the
-// queue does not form, the minimum stays at the path's, and the window tracks
-// the rate. So this row runs on the shallow carrier and the deep-carrier figure
-// above is the trade: behind a relay the response is damped by the queue the
-// permission creates.
-//
-// Prediction, recorded before the second run: on the shallow carrier, cutting
-// the drain by eight lowers the reported window by at least a factor of four,
-// with the minimum round trip staying within a round trip or so of the path.
-//
-// Measured, four runs: 3.57, 3.73, 3.64 and 4.07 times, so the prediction of
-// four was a little high and the bar here is three. The damping that remains is
-// not the fixture: the layers below the sequence — the carrier's own frames and
-// the 32-item packs channel — hold a roughly fixed number of bytes, tens of
-// kilobytes, and a fixed number of bytes costs proportionally more time at a
-// slower drain. The minimum round trip rose from 225 ms to 342 ms across the
-// cut for that reason, against 200 ms of propagation. This is the same 20 KiB
-// the UDP and TCP cells both measured, seen from the other side.
-func TestSizedWindowShrinksWhenThePathShrinks(t *testing.T) {
+// An eightfold reduction in physical drain must lower the fresh candidate
+// while retaining learned bytes. The original threefold
+// response, measured-delivery tolerance, hard ceiling and interior floor
+// controls still distinguish path tracking from a clamp or expired offer.
+// Virtual time drives the same shallow carrier and sustained offer durations.
+// This harness publishes an unknown carrier; H1 pacing has separate controls.
+func TestWindowRetainedSlowPathLowersCandidateWithoutShrinking(t *testing.T) {
 	assertMessagePoolOwnership(t)
+	// This row measures the delivery-sized window rule, which is not the
+	// shipping default on this branch (see the `init` in transfer.go), so it
+	// is set here explicitly rather than taken from the default. Outside the
+	// bubble: SetWindowSizing is process-wide.
+	windowSizing := DefaultWindowSizing()
+	t.Cleanup(func() { SetWindowSizing(windowSizing) })
+	SetWindowSizing(WindowSizingFromDelivery)
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		const fastBytesPerSecond = ByteCount(20 * 1000 * 1000 / 8)
+		const slowBytesPerSecond = fastBytesPerSecond / 8
+		// the long round trip is where the window binds throughput at all, and it
+		// is the only regime in which both arms clear the floor
+		const propagation = 200 * time.Millisecond
+		const ceiling = ByteCount(16 * 1024 * 1024)
+		const floor = ByteCount(64 * 1024)
+		harness := newPacedSendWindowHarness(t, ctx, propagation, fastBytesPerSecond,
+			shallowCarrierFrameCapacity,
+			func(settings *SendBufferSettings) {
+				settings.DeliverySizedWindowScale = 2
+				settings.DeliverySizedWindowCeilingByteCount = ceiling
+				settings.ResendQueueMinByteCount = floor
+				settings.ResendQueueBudget = NewTransferMemoryBudget(ceiling)
+			})
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	const fastBytesPerSecond = ByteCount(20 * 1000 * 1000 / 8)
-	const slowBytesPerSecond = fastBytesPerSecond / 8
-	// the long round trip is where the window binds throughput at all, and it
-	// is the only regime in which both arms clear the floor
-	const propagation = 200 * time.Millisecond
-	const ceiling = ByteCount(16 * 1024 * 1024)
-	const floor = ByteCount(64 * 1024)
-	harness := newPacedSendWindowHarness(t, ctx, propagation, fastBytesPerSecond,
-		shallowCarrierFrameCapacity,
-		func(settings *SendBufferSettings) {
-			settings.DeliverySizedWindowScale = 2
-			settings.DeliverySizedWindowCeilingByteCount = ceiling
-			settings.ResendQueueMinByteCount = floor
-			settings.ResendQueueBudget = NewTransferMemoryBudget(ceiling)
-		})
+		harness.offer(t, 4*1024, 4*time.Second)
+		synctest.Wait()
+		fast := harness.sender.DestinationSendStats(harness.receiverId).SendWindow
+		harness.bytesPerSecond.Store(int64(slowBytesPerSecond))
+		harness.offer(t, 4*1024, 6*time.Second)
+		synctest.Wait()
+		slow := harness.sender.DestinationSendStats(harness.receiverId).SendWindow
 
-	harness.offer(t, 4*1024, 4*time.Second)
-	fast := harness.sender.DestinationSendStats(harness.receiverId).SendWindow
-	harness.bytesPerSecond.Store(int64(slowBytesPerSecond))
-	harness.offer(t, 4*1024, 6*time.Second)
-	slow := harness.sender.DestinationSendStats(harness.receiverId).SendWindow
-
-	t.Logf(
-		"at %d B/s window %d (%d bytes over %s, round trip %s); at %d B/s window %d (%d bytes over %s, round trip %s)",
-		fastBytesPerSecond, fast.Window, fast.DeliveredByteCount, fast.Interval, fast.RoundTrip,
-		slowBytesPerSecond, slow.Window, slow.DeliveredByteCount, slow.Interval, slow.RoundTrip,
-	)
-
-	if !fast.Sized || !slow.Sized {
-		t.Fatalf("the window rule did not engage on both arms: fast %+v slow %+v", fast, slow)
-	}
-	if 3*slow.Window > fast.Window {
-		t.Errorf(
-			"the drain fell by eight and the window went from %d to %d; a window sized from the path has to follow the path down, which is the whole of what a constant cannot do",
-			fast.Window,
-			slow.Window,
+		t.Logf(
+			"at %d B/s window %d candidate %d pacing %d (%d bytes over %s, round trip %s); at %d B/s window %d candidate %d pacing %d (%d bytes over %s, round trip %s)",
+			fastBytesPerSecond, fast.Window, fast.CandidateWindow, fast.PacingByteRate, fast.DeliveredByteCount, fast.Interval, fast.RoundTrip,
+			slowBytesPerSecond, slow.Window, slow.CandidateWindow, slow.PacingByteRate, slow.DeliveredByteCount, slow.Interval, slow.RoundTrip,
 		)
-	}
-	if slow.Window <= slow.Floor {
-		t.Errorf(
-			"the window fell to its %d byte floor, so this cell cannot tell a rule that tracks the path from one that collapsed",
-			slow.Floor,
-		)
-	}
+
+		if !fast.Sized || !slow.Sized {
+			t.Fatalf("the window rule did not engage on both arms: fast %+v slow %+v", fast, slow)
+		}
+		if drops := harness.sender.ReceiveStats().SendPackDeadlineDropCount; drops != 0 {
+			t.Fatalf("fixture expired %d accepted Packs; this cell must measure the carrier's drain", drops)
+		}
+		for _, sample := range []struct {
+			rate     ByteCount
+			estimate SendWindowEstimate
+		}{
+			{rate: fastBytesPerSecond, estimate: fast},
+			{rate: slowBytesPerSecond, estimate: slow},
+		} {
+			rate := float64(sample.estimate.DeliveredByteCount) / sample.estimate.Interval.Seconds()
+			if rate < 0.9*float64(sample.rate) || 1.1*float64(sample.rate) < rate {
+				t.Errorf("configured drain %d B/s produced %.0f B/s of sampled delivery; the path must be the rate limit", sample.rate, rate)
+			}
+			if sample.estimate.Window >= sample.estimate.Ceiling {
+				t.Errorf("window %d reached ceiling %d on the %d B/s path", sample.estimate.Window, sample.estimate.Ceiling, sample.rate)
+			}
+		}
+		if 3*slow.CandidateWindow > fast.CandidateWindow {
+			t.Errorf(
+				"the drain fell by eight but the fresh candidate went from %d to %d",
+				fast.CandidateWindow,
+				slow.CandidateWindow,
+			)
+		}
+		if slow.Window < fast.Window || slow.LearnedWindow < fast.LearnedWindow {
+			t.Errorf("ordinary slower feedback shrank retained capacity: fast=%+v slow=%+v", fast, slow)
+		}
+		if slow.CandidateWindow <= slow.Floor {
+			t.Errorf(
+				"the candidate fell to its %d byte floor, so this cell cannot distinguish measured slowdown from a collapsed estimate",
+				slow.Floor,
+			)
+		}
+	})
 }
 
 // The window rule reads sequence-local state — the delivered-bytes ring — and

@@ -2,44 +2,17 @@ package connect
 
 import (
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/urnetwork/connect/protocol"
 )
 
-// THROUGHPUTFIX §37.21. The window consumer has THREE branches on what the
-// sender knows about its peer, not two, and the third exists because a sender
-// that has heard nothing and a sender whose peer does not advertise are
-// different facts:
-//
-//   - the peer advertised a capacity: the window steps to it;
-//   - the peer has acknowledged but never advertised - a legacy peer: the
-//     window is this sender's own constant, the shipping receive hold;
-//   - nothing has been heard at all: the window is the more conservative of
-//     two constants, this sender's own and the receive hold floor every
-//     receiver ships.
-//
-// `TestTheWindowStepsToTheAdvertisedCapacity` pins the first, and pins it as a
-// step rather than as a value: it reads the blind window first and then asserts
-// the advertised capacity on the very next estimate with no intermediate. This
-// row does not restate it. What is unpinned is the second branch entirely - the
-// case a modern client talking to an older client takes - and the separation
-// that keeps the second and third apart.
-//
-// Why the separation is the thing to assert rather than the values. `ackSeen`
-// is stored separately from `receiveWindowSet` (`observeReceiveWindowAdvertisement`
-// sets the first on EVERY acknowledgement and the second only on one carrying
-// the field), so the two facts survive independently. Collapse them - read
-// `receiveWindowSet` alone, or set `ackSeen` where the field arrives - and
-// branch three silently becomes branch two: a sender that has heard nothing at
-// all takes the 2 MiB constant instead of the 320 KiB floor. That is a licence
-// rather than a reduction, and it is invisible in the estimate's own fields
-// because both branches report the same Reason.
-//
-// Deterministic with no clock at all: the estimate returns at the ceiling with
-// "no round trip samples", which is the branch under test and nothing beyond
-// it.
-func TestTheThreePeerBranchesAreThreeDifferentWindows(t *testing.T) {
+// Peer knowledge determines permission independently of delivery learning:
+// silence limits the opening to the receive floor, a legacy reply permits the
+// configured opening, and an advertisement states the peer's actual capacity.
+// Without delivery samples, neither reply grows the learned opening.
+func TestTheThreePeerBranchesHaveDifferentPermissionCeilings(t *testing.T) {
 	restore := MemoryBudget()
 	t.Cleanup(func() { SetMemoryBudget(restore) })
 	// scale 1, so the shipping constants read at their written values and a
@@ -57,10 +30,11 @@ func TestTheThreePeerBranchesAreThreeDifferentWindows(t *testing.T) {
 	}
 	initial := DefaultSendBufferSettings().ResendQueueMaxByteCount
 	blindBet := min(defaultInitialWindowByteCount(), initial)
+	now := time.Unix(1700000000, 0)
 
 	// branch three: nothing heard
 	silent := newSequence()
-	silentEstimate := silent.sendWindowEstimate(time.Now())
+	silentEstimate := silent.sendWindowEstimate(now)
 
 	// branch two: acknowledged, never advertised. This is the legacy peer, and
 	// the acknowledgement is delivered through the production observer rather
@@ -68,7 +42,7 @@ func TestTheThreePeerBranchesAreThreeDifferentWindows(t *testing.T) {
 	// two facts and not a fixture's idea of it.
 	legacy := newSequence()
 	legacy.observeReceiveWindowAdvertisement(receiveAckMessage{receiveWindowSet: false})
-	legacyEstimate := legacy.sendWindowEstimate(time.Now())
+	legacyEstimate := legacy.sendWindowEstimate(now)
 
 	// branch one: advertised
 	modern := newSequence()
@@ -76,18 +50,17 @@ func TestTheThreePeerBranchesAreThreeDifferentWindows(t *testing.T) {
 		receiveWindowSet:       true,
 		receiveWindowByteCount: uint32(advertised),
 	})
-	modernEstimate := modern.sendWindowEstimate(time.Now())
+	modernEstimate := modern.sendWindowEstimate(now)
 
 	t.Logf(
-		"silent %d, legacy %d, advertised %d; this sender's constant is %d and the blind bet is %d",
-		silentEstimate.Window,
-		legacyEstimate.Window,
-		modernEstimate.Window,
+		"windows silent=%d legacy=%d advertised=%d; ceilings=%d/%d/%d; initial=%d blind=%d",
+		silentEstimate.Window, legacyEstimate.Window, modernEstimate.Window,
+		silentEstimate.Ceiling, legacyEstimate.Ceiling, modernEstimate.Ceiling,
 		initial,
 		blindBet,
 	)
 
-	if silentEstimate.Window != blindBet {
+	if silentEstimate.Window != blindBet || silentEstimate.Ceiling != blindBet {
 		t.Errorf(
 			"a sender that has heard nothing takes a window of %d rather than %d, the more conservative of this sender's own constant %d and the receive hold floor %d every receiver ships. A blind sender may assume only what every receiver already has",
 			silentEstimate.Window,
@@ -96,19 +69,26 @@ func TestTheThreePeerBranchesAreThreeDifferentWindows(t *testing.T) {
 			defaultInitialWindowByteCount(),
 		)
 	}
-	if legacyEstimate.Window != initial {
+	if legacyEstimate.Window != initial || legacyEstimate.Ceiling != initial {
 		t.Errorf(
 			"a peer that acknowledges without the field gets a window of %d rather than this sender's own constant %d. Not the blind floor, which would be a regression for every peer not yet updated, and not a raise on no evidence: the status quo is what a legacy peer gets",
 			legacyEstimate.Window,
 			initial,
 		)
 	}
-	if modernEstimate.Window != advertised {
+	if modernEstimate.Window != initial || modernEstimate.Ceiling != advertised {
 		t.Errorf(
-			"a peer advertising %d gets a window of %d",
-			advertised,
-			modernEstimate.Window,
+			"advertisement must change permission without growing the configured opening: initial=%d advertised=%d estimate=%+v",
+			initial, advertised, modernEstimate,
 		)
+	}
+	for _, estimate := range []SendWindowEstimate{silentEstimate, legacyEstimate, modernEstimate} {
+		if estimate.Sized || estimate.LearnedWindow != initial || estimate.CandidateWindow != estimate.Window {
+			t.Errorf("peer knowledge without delivery changed learned capacity: %+v", estimate)
+		}
+	}
+	if modernEstimate.Ceiling <= legacyEstimate.Ceiling {
+		t.Errorf("advertised permission=%d did not exceed legacy permission=%d", modernEstimate.Ceiling, legacyEstimate.Ceiling)
 	}
 
 	// The separation, asserted as a relationship rather than as three values,
@@ -210,79 +190,102 @@ func TestTheBlindBetIsTheSmallerOfTheTwoConstants(t *testing.T) {
 // and collapses the window to its floor for the life of the sequence. The
 // arrangement that prevents it is one `return` and nothing asserted it.
 //
-// The step timestamp is asserted alongside, because it is the other thing that
-// must not move: `receiveWindowSetAtNanos` is written only on the FIRST
-// advertisement, and the delivery term refuses any delivery measured before it.
-// Rewriting it on a later acknowledgement would re-lag the delivery term and
-// discard evidence the sender had already earned.
+// Missing, unchanged and smaller advertisements preserve the delivery epoch.
+// A larger capacity requires fresh delivery without granting learned growth.
+// Distinct virtual times expose incorrect timestamp transitions.
 func TestALegacyAcknowledgementCannotOverwriteAnAdvertisement(t *testing.T) {
+	// Outside the bubble: SetMemoryBudget replaces the process-wide platform
+	// transport budget, whose capacity channel would then belong to this
+	// bubble and be fatal for the next test that registers a transport.
 	restore := MemoryBudget()
 	t.Cleanup(func() { SetMemoryBudget(restore) })
 	SetMemoryBudget(0)
+	synctest.Test(t, func(t *testing.T) {
+		const advertised = ByteCount(4 * 1024 * 1024)
+		sequence := newEstimatorFixture(t, func(settings *SendBufferSettings) {
+			settings.DeliverySizedWindowScale = deliverySizedWindowScale
+			settings.ResendQueueBudget = NewTransferMemoryBudget(mib(64))
+		})
 
-	const advertised = ByteCount(4 * 1024 * 1024)
-	sequence := newEstimatorFixture(t, func(settings *SendBufferSettings) {
-		settings.DeliverySizedWindowScale = deliverySizedWindowScale
-		settings.ResendQueueBudget = NewTransferMemoryBudget(mib(64))
+		sequence.observeReceiveWindowAdvertisement(receiveAckMessage{
+			receiveWindowSet:       true,
+			receiveWindowByteCount: uint32(advertised),
+		})
+		steppedAtNanos := sequence.receiveWindowSetAtNanos.Load()
+		if steppedAtNanos == 0 {
+			t.Fatal("the first advertisement did not mark the step, so the delivery term's lag has no anchor")
+		}
+
+		// an ordinary acknowledgement carrying no capacity, of the kind every
+		// acknowledgement from a peer that does not advertise is
+		sequence.observeReceiveWindowAdvertisement(receiveAckMessage{receiveWindowSet: false})
+
+		held, ok := sequence.receivedWindowAdvertisement()
+		if !ok {
+			t.Fatal("an acknowledgement without the field cleared the peer's advertisement, so a single legacy-shaped ack retires a capacity the peer really stated")
+		}
+		if held != advertised {
+			t.Errorf(
+				"the peer's advertised capacity reads %d after an acknowledgement carrying no field, against the %d it advertised. Absent is not zero: an acknowledgement that does not carry the field says nothing about the receiver's capacity and must leave it exactly as it was",
+				held,
+				advertised,
+			)
+		}
+		estimate := sequence.sendWindowEstimate(time.Now())
+		if estimate.Window != estimate.Initial || estimate.LearnedWindow != estimate.Initial || estimate.Ceiling != advertised || estimate.Sized {
+			t.Errorf(
+				"a fieldless acknowledgement changed retained opening or advertised permission: advertised=%d estimate=%+v",
+				advertised, estimate,
+			)
+		}
+		if now := sequence.receiveWindowSetAtNanos.Load(); now != steppedAtNanos {
+			t.Errorf(
+				"the step timestamp moved from %d to %d on a later acknowledgement. It marks the first advertisement, and the delivery term refuses delivery measured before it, so rewriting it discards evidence the sender had already earned and re-lags a window that had already stepped",
+				steppedAtNanos,
+				now,
+			)
+		}
+
+		for _, capacity := range []ByteCount{advertised, advertised / 2, 0} {
+			time.Sleep(time.Millisecond)
+			sequence.observeReceiveWindowAdvertisement(receiveAckMessage{
+				receiveWindowSet: true, receiveWindowByteCount: uint32(capacity),
+			})
+			if held, _ := sequence.receivedWindowAdvertisement(); held != capacity {
+				t.Errorf("capacity=%d stored=%d", capacity, held)
+			}
+			if got := sequence.receiveWindowSetAtNanos.Load(); got != steppedAtNanos {
+				t.Errorf("unchanged or smaller capacity=%d moved delivery epoch from %d to %d", capacity, steppedAtNanos, got)
+			}
+			if current := sequence.sendWindowEstimate(time.Now()); current.Window != min(current.Initial, capacity) || current.Ceiling != capacity || current.LearnedWindow != estimate.LearnedWindow {
+				t.Errorf("capacity=%d changed learned capacity or failed to limit admission: %+v", capacity, current)
+			}
+		}
+
+		// A capacity increase deliberately restarts delivery's settling interval.
+		time.Sleep(time.Millisecond)
+		const raised = ByteCount(8 * 1024 * 1024)
+		raisedAtNanos := time.Now().UnixNano()
+		sequence.observeReceiveWindowAdvertisement(receiveAckMessage{
+			receiveWindowSet:       true,
+			receiveWindowByteCount: uint32(raised),
+		})
+		if held, _ := sequence.receivedWindowAdvertisement(); held != raised {
+			t.Errorf("a later advertisement of %d did not update the capacity, which reads %d", raised, held)
+		}
+		if got := sequence.receiveWindowSetAtNanos.Load(); got != raisedAtNanos {
+			t.Errorf("larger capacity retained delivery measured under the old bound: epoch=%d want=%d", got, raisedAtNanos)
+		}
+		if current := sequence.sendWindowEstimate(time.Now()); current.Window != estimate.Window || current.LearnedWindow != estimate.LearnedWindow || current.Ceiling != raised || current.Sized {
+			t.Errorf("larger capacity taught an unmeasured window: %+v", current)
+		}
+		time.Sleep(time.Millisecond)
+		sequence.observeReceiveWindowAdvertisement(receiveAckMessage{})
+		sequence.observeReceiveWindowAdvertisement(receiveAckMessage{receiveWindowSet: true, receiveWindowByteCount: uint32(raised)})
+		if got := sequence.receiveWindowSetAtNanos.Load(); got != raisedAtNanos {
+			t.Errorf("repeat or missing advertisement moved delivery epoch: got=%d want=%d", got, raisedAtNanos)
+		}
 	})
-
-	sequence.observeReceiveWindowAdvertisement(receiveAckMessage{
-		receiveWindowSet:       true,
-		receiveWindowByteCount: uint32(advertised),
-	})
-	steppedAtNanos := sequence.receiveWindowSetAtNanos.Load()
-	if steppedAtNanos == 0 {
-		t.Fatal("the first advertisement did not mark the step, so the delivery term's lag has no anchor")
-	}
-
-	// an ordinary acknowledgement carrying no capacity, of the kind every
-	// acknowledgement from a peer that does not advertise is
-	sequence.observeReceiveWindowAdvertisement(receiveAckMessage{receiveWindowSet: false})
-
-	held, ok := sequence.receivedWindowAdvertisement()
-	if !ok {
-		t.Fatal("an acknowledgement without the field cleared the peer's advertisement, so a single legacy-shaped ack retires a capacity the peer really stated")
-	}
-	if held != advertised {
-		t.Errorf(
-			"the peer's advertised capacity reads %d after an acknowledgement carrying no field, against the %d it advertised. Absent is not zero: an acknowledgement that does not carry the field says nothing about the receiver's capacity and must leave it exactly as it was",
-			held,
-			advertised,
-		)
-	}
-	estimate := sequence.sendWindowEstimate(time.Now())
-	if estimate.Window != advertised {
-		t.Errorf(
-			"the window is %d after a fieldless acknowledgement followed a %d byte advertisement; a zero written over a good capacity reads as a receiver with no room and pins the window at its floor for the life of the sequence",
-			estimate.Window,
-			advertised,
-		)
-	}
-	if now := sequence.receiveWindowSetAtNanos.Load(); now != steppedAtNanos {
-		t.Errorf(
-			"the step timestamp moved from %d to %d on a later acknowledgement. It marks the first advertisement, and the delivery term refuses delivery measured before it, so rewriting it discards evidence the sender had already earned and re-lags a window that had already stepped",
-			steppedAtNanos,
-			now,
-		)
-	}
-
-	// a SECOND real advertisement updates the capacity and still does not move
-	// the step
-	const raised = ByteCount(8 * 1024 * 1024)
-	sequence.observeReceiveWindowAdvertisement(receiveAckMessage{
-		receiveWindowSet:       true,
-		receiveWindowByteCount: uint32(raised),
-	})
-	if held, _ := sequence.receivedWindowAdvertisement(); held != raised {
-		t.Errorf("a later advertisement of %d did not update the capacity, which reads %d", raised, held)
-	}
-	if now := sequence.receiveWindowSetAtNanos.Load(); now != steppedAtNanos {
-		t.Errorf(
-			"the step timestamp moved from %d to %d on a second advertisement; the step happened once, when the sender stopped being blind",
-			steppedAtNanos,
-			now,
-		)
-	}
 }
 
 // Guard two: the wire field is optional, so ABSENT and ZERO are different
@@ -353,10 +356,9 @@ func TestAnAbsentCapacityAndAZeroCapacityTakeDifferentBranches(t *testing.T) {
 
 	settings := DefaultSendBufferSettings()
 	initial := settings.ResendQueueMaxByteCount
-	floor := settings.ResendQueueMinByteCount
 	t.Logf(
-		"absent gives window %d (this sender's constant %d), zero gives window %d (the working floor %d)",
-		absentEstimate.Window, initial, zeroEstimate.Window, floor,
+		"absent gives window %d (this sender's constant %d), zero gives window %d",
+		absentEstimate.Window, initial, zeroEstimate.Window,
 	)
 
 	if absentEstimate.Window != initial {
@@ -366,11 +368,10 @@ func TestAnAbsentCapacityAndAZeroCapacityTakeDifferentBranches(t *testing.T) {
 			initial,
 		)
 	}
-	if zeroEstimate.Window != floor {
+	if zeroEstimate.Window != 0 || zeroEstimate.Floor != 0 {
 		t.Errorf(
-			"a zero capacity gives a window of %d rather than the working floor %d; a receiver stating no room is clamped to nothing and held up only by the floor reliable admission already needs",
+			"a zero capacity gives a window of %d; the peer limit must apply before the queue's separate one-item progress allowance",
 			zeroEstimate.Window,
-			floor,
 		)
 	}
 	if absentEstimate.Window == zeroEstimate.Window {

@@ -164,27 +164,35 @@ type ExtenderDial struct {
 	Challenge []byte
 	// 0 forward, 1 gossip, 2 feed. DestinationHost is ignored when set.
 	Service uint32
+	// Datagram asks the extender to relay udp datagrams to the destination
+	// rather than a stream. The carrier is still one reliable byte stream; the
+	// datagrams are framed on it (net_extender_datagram.go).
+	Datagram bool
 }
 
-// create a tls connect to (destinationHost, destinationPort) on the connection
-// returned by this
-// the returned connection is not a tls connection
-func NewExtenderDialTlsContext(
+// NewExtenderDialContext returns a PLAIN dial through the extender: the raw
+// stream the extender relays to (destinationHost, destinationPort), with no
+// inner TLS on top.
+//
+// The extender passes the inner stream through verbatim, so a caller that does
+// not want TLS to the destination -- plain http:// or ws://, which have no tls
+// dialer to reach this layer through -- gets an ordinary net.Conn here and
+// speaks whatever it likes over it. Without this, those schemes silently
+// bypassed every extender and dialed the destination directly.
+func NewExtenderDialContext(
 	connectSettings *ConnectSettings,
 	extenderConfig *ExtenderConfig,
-) DialTlsContextFunction {
-	return newExtenderDialTlsContext(connectSettings, extenderConfig, nil)
+) DialContextFunction {
+	return newExtenderDialContext(connectSettings, extenderConfig)
 }
 
-func newExtenderDialTlsContext(
+func newExtenderDialContext(
 	connectSettings *ConnectSettings,
 	extenderConfig *ExtenderConfig,
-	nextProtos []string,
-) DialTlsContextFunction {
+) DialContextFunction {
 	// one outer config per dialer, so its session cache is not shared with
 	// any other egress path
 	extenderTlsConfig := newExtenderTlsConfig(extenderConfig)
-	innerBaseTlsConfig := newClientTlsConfig(connectSettings.TlsConfig, nextProtos)
 	return func(
 		ctx context.Context,
 		network string,
@@ -217,6 +225,44 @@ func newExtenderDialTlsContext(
 			},
 			extenderTlsConfig,
 		)
+		if err != nil {
+			return nil, err
+		}
+		return serverConn, nil
+	}
+}
+
+// create a tls connect to (destinationHost, destinationPort) on the connection
+// returned by this
+// the returned connection is not a tls connection
+func NewExtenderDialTlsContext(
+	connectSettings *ConnectSettings,
+	extenderConfig *ExtenderConfig,
+) DialTlsContextFunction {
+	return newExtenderDialTlsContext(connectSettings, extenderConfig, nil)
+}
+
+// The tls dial is the plain dial with the inner handshake on top: the extender
+// relays the inner stream verbatim, so there is nothing tls-specific about
+// reaching the destination, only about what is spoken once it is reached.
+func newExtenderDialTlsContext(
+	connectSettings *ConnectSettings,
+	extenderConfig *ExtenderConfig,
+	nextProtos []string,
+) DialTlsContextFunction {
+	dialContext := newExtenderDialContext(connectSettings, extenderConfig)
+	innerBaseTlsConfig := newClientTlsConfig(connectSettings.TlsConfig, nextProtos)
+	return func(
+		ctx context.Context,
+		network string,
+		address string,
+	) (net.Conn, error) {
+		host, _, err := net.SplitHostPort(address)
+		if err != nil {
+			panic(err)
+		}
+
+		serverConn, err := dialContext(ctx, network, address)
 		if err != nil {
 			return nil, err
 		}
@@ -350,6 +396,7 @@ func extenderRequestHeaderBytes(
 		Timestamp:       uint64(time.Now().UnixMilli()),
 		Challenge:       extenderDial.Challenge,
 		Service:         extenderDial.Service,
+		Datagram:        extenderDial.Datagram,
 	}
 	if extenderConfig.Secret != "" {
 		nonce := NewId()
@@ -419,6 +466,16 @@ func dialExtenderTcp(
 	extenderTlsConfig *tls.Config,
 	headerBytes []byte,
 ) (net.Conn, *protocol.ExtenderResponse, error) {
+	reservation, err := acquireExtenderTcpMemory(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	owned := false
+	defer func() {
+		if !owned {
+			reservation.Release()
+		}
+	}()
 	authority := net.JoinHostPort(
 		extenderConfig.Ip.String(),
 		strconv.Itoa(extenderConfig.Profile.Port),
@@ -493,17 +550,25 @@ func dialExtenderTcp(
 
 	// the reader may buffer past the response; it becomes the read side of
 	// the returned connection
-	reader := bufio.NewReader(serverConn)
+	headerReader := &extenderResponseHeaderReader{reader: serverConn, remaining: ExtenderMaxHeaderByteCount}
+	reader := bufio.NewReader(headerReader)
 	var response *protocol.ExtenderResponse
 	if err := withConnReadPhaseDeadline(ctx, serverConn, connectSettings.ConnectTimeout, func() error {
 		httpResponse, err := http.ReadResponse(reader, request)
 		if err != nil {
 			return err
 		}
-		defer httpResponse.Body.Close()
+		headerReader.remaining = -1
 		if httpResponse.StatusCode != http.StatusOK {
 			return fmt.Errorf("extender refused the request with status %d", httpResponse.StatusCode)
 		}
+		// A TCP extender sends exactly one bounded, length-delimited frame
+		// before handing the connection over. Reject chunked bodies/trailers:
+		// Body.Close would otherwise parse unbounded trailer MIME headers.
+		if len(httpResponse.TransferEncoding) != 0 || httpResponse.ContentLength < 4 || httpResponse.ContentLength > 4+ExtenderMaxHeaderByteCount {
+			return fmt.Errorf("extender response must have a bounded content length")
+		}
+		defer httpResponse.Body.Close()
 		response, err = ReadExtenderResponseFrame(httpResponse.Body)
 		return err
 	}); err != nil {
@@ -511,7 +576,11 @@ func dialExtenderTcp(
 	}
 
 	success = true
-	return newBufferedConn(serverConn, reader), response, nil
+	owned = true
+	return &extenderBudgetConn{
+		Conn:        newBufferedConn(serverConn, reader),
+		reservation: reservation,
+	}, response, nil
 }
 
 // The udp carriers: one QUIC connection with ALPN h3 straight to the extender
@@ -532,7 +601,18 @@ func dialExtenderQuic(
 		uint16(extenderConfig.Profile.Port),
 	))
 
-	closers := []func(){}
+	policy := newExtenderQuicMemoryPolicy(ctx, connectSettings)
+	var ptSettings *PacketTranslationSettings
+	if extenderConfig.Profile.ConnectMode == ExtenderConnectModeDns {
+		ptSettings = policy.packetTranslationSettings()
+	}
+	reservation, err := policy.acquire(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	// Reverse-order cleanup releases the claim only after the connection,
+	// QUIC transport, translation and raw socket have all stopped owning bytes.
+	closers := []func(){reservation.Release}
 	success := false
 	defer func() {
 		if !success {
@@ -554,6 +634,7 @@ func dialExtenderQuic(
 	if packetConn == nil {
 		return nil, nil, fmt.Errorf("extender packet connection factory returned nil")
 	}
+	packetConn = capPlatformPacketConn(packetConn, policy.readBufferByteCount, policy.writeBufferByteCount)
 	closers = append(closers, func() { packetConn.Close() })
 
 	if extenderConfig.Profile.ConnectMode == ExtenderConnectModeDns {
@@ -561,7 +642,6 @@ func dialExtenderQuic(
 		if tld == "" {
 			tld = DefaultExtenderDnsTld
 		}
-		ptSettings := DefaultPacketTranslationSettings()
 		ptSettings.Log = connectSettings.Log
 		ptSettings.DnsTlds = [][]byte{[]byte(tld)}
 		// The connection cleanup owns the translated PacketConn. Keep its
@@ -591,21 +671,22 @@ func dialExtenderQuic(
 	// name -- the same shape the tcp carrier sends
 	quicTlsConfig := extenderTlsConfig.Clone()
 	quicTlsConfig.NextProtos = []string{http3.NextProtoH3}
-	quicConfig := &quic.Config{
-		HandshakeIdleTimeout: connectSettings.ConnectTimeout + connectSettings.TlsTimeout + connectSettings.HandshakeTimeout,
-	}
-	quicConn, err := quicTransport.Dial(ctx, udpAddr, quicTlsConfig, quicConfig)
+	installQuicSendFlight(policy.quicConfig)
+	quicConn, err := quicTransport.Dial(ctx, udpAddr, quicTlsConfig, policy.quicConfig)
 	if err != nil {
 		return nil, nil, err
 	}
 	closers = append(closers, func() { quicConn.CloseWithError(0, "") })
+	flight := quicSendFlightForConn(quicConn)
+	flight.bind(quicConn)
 
-	h3Transport := &http3.Transport{}
+	h3Transport := &http3.Transport{MaxResponseHeaderBytes: ExtenderMaxHeaderByteCount}
 	clientConn := h3Transport.NewClientConn(quicConn)
 	stream, err := clientConn.OpenRequestStream(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
+	writer := flight.newWriter(stream)
 
 	// http3 rejects a request stream header that carries a body, so the body
 	// is written as DATA frames after it; the content length still describes
@@ -618,10 +699,13 @@ func dialExtenderQuic(
 	if err := stream.SetDeadline(deadline); err != nil {
 		return nil, nil, err
 	}
+	if err := writer.SetWriteDeadline(deadline); err != nil {
+		return nil, nil, err
+	}
 	if err := stream.SendRequestHeader(request); err != nil {
 		return nil, nil, err
 	}
-	if _, err := stream.Write(headerBytes); err != nil {
+	if _, err := writer.Write(headerBytes); err != nil {
 		return nil, nil, err
 	}
 	httpResponse, err := stream.ReadResponse()
@@ -638,14 +722,42 @@ func dialExtenderQuic(
 	if err := stream.SetDeadline(time.Time{}); err != nil {
 		return nil, nil, err
 	}
+	if err := writer.SetWriteDeadline(time.Time{}); err != nil {
+		return nil, nil, err
+	}
 
 	success = true
 	return newStreamConn(
 		stream,
+		writer,
 		packetConn.LocalAddr(),
 		udpAddr,
 		closers,
 	), response, nil
+}
+
+// Limit bytes supplied to http.ReadResponse, not just its bufio read-ahead:
+// net/http's MIME parser can otherwise grow a single line or header map
+// without bound. Once headers are parsed, -1 allows the buffered reader to
+// continue as the inner tunnel's read side. All parser roots fit the outer
+// H1 claim; at most the 1-KiB wire header plus the fixed bufio buffer is read.
+type extenderResponseHeaderReader struct {
+	reader    io.Reader
+	remaining int
+}
+
+func (self *extenderResponseHeaderReader) Read(b []byte) (int, error) {
+	if self.remaining == 0 {
+		return 0, fmt.Errorf("extender HTTP response headers exceed %d bytes", ExtenderMaxHeaderByteCount)
+	}
+	if self.remaining > 0 {
+		b = b[:min(len(b), self.remaining)]
+	}
+	n, err := self.reader.Read(b)
+	if self.remaining > 0 {
+		self.remaining -= n
+	}
+	return n, err
 }
 
 // One unconnected udp endpoint for a carrier dial, narrowed to the family of
@@ -763,6 +875,7 @@ func (self *bufferedConn) Read(b []byte) (int, error) {
 // the whole carrier.
 type streamConn struct {
 	stream     *http3.RequestStream
+	writer     *quicSendFlightWriter
 	localAddr  net.Addr
 	remoteAddr net.Addr
 	closers    []func()
@@ -771,12 +884,14 @@ type streamConn struct {
 
 func newStreamConn(
 	stream *http3.RequestStream,
+	writer *quicSendFlightWriter,
 	localAddr net.Addr,
 	remoteAddr net.Addr,
 	closers []func(),
 ) *streamConn {
 	return &streamConn{
 		stream:     stream,
+		writer:     writer,
 		localAddr:  localAddr,
 		remoteAddr: remoteAddr,
 		closers:    closers,
@@ -788,7 +903,7 @@ func (self *streamConn) Read(b []byte) (int, error) {
 }
 
 func (self *streamConn) Write(b []byte) (int, error) {
-	return self.stream.Write(b)
+	return self.writer.Write(b)
 }
 
 func (self *streamConn) Close() error {
@@ -811,7 +926,10 @@ func (self *streamConn) RemoteAddr() net.Addr {
 }
 
 func (self *streamConn) SetDeadline(t time.Time) error {
-	return self.stream.SetDeadline(t)
+	if err := self.writer.SetWriteDeadline(t); err != nil {
+		return err
+	}
+	return self.stream.SetReadDeadline(t)
 }
 
 func (self *streamConn) SetReadDeadline(t time.Time) error {
@@ -819,5 +937,62 @@ func (self *streamConn) SetReadDeadline(t time.Time) error {
 }
 
 func (self *streamConn) SetWriteDeadline(t time.Time) error {
-	return self.stream.SetWriteDeadline(t)
+	return self.writer.SetWriteDeadline(t)
+}
+
+// NewExtenderPacketDialContext returns a dial that yields a net.PacketConn
+// reaching (destinationHost, destinationPort) through the extender.
+//
+// This is the h3 path. An extender relays one reliable byte stream and cannot
+// see inside the inner tls, so it cannot reframe a quic stream into anything;
+// the datagrams are framed explicitly instead and the extender turns them back
+// into udp at the far end. See net_extender_datagram.go for what that
+// preserves and what it costs.
+func NewExtenderPacketDialContext(
+	connectSettings *ConnectSettings,
+	extenderConfig *ExtenderConfig,
+) DialPacketContextFunction {
+	extenderTlsConfig := newExtenderTlsConfig(extenderConfig)
+	return func(
+		ctx context.Context,
+		network string,
+		address string,
+	) (net.PacketConn, error) {
+		switch network {
+		case "udp", "udp4", "udp6":
+		default:
+			return nil, fmt.Errorf("extender packet dial supports udp, not %s", network)
+		}
+
+		host, portStr, err := net.SplitHostPort(address)
+		if err != nil {
+			return nil, err
+		}
+		port, err := strconv.Atoi(portStr)
+		if err != nil {
+			return nil, err
+		}
+
+		serverConn, _, err := dialExtenderStream(
+			ctx,
+			connectSettings,
+			extenderConfig,
+			&ExtenderDial{
+				DestinationHost: host,
+				DestinationPort: port,
+				Datagram:        true,
+			},
+			extenderTlsConfig,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		// ReadFrom's address is informational: the extender already owns the
+		// destination from the accepted header. Construct it without resolving
+		// the hostname here; an unbound resolver would bypass the egress path
+		// and can recurse into the tunnel on Windows.
+		remote := newExtenderDatagramAddr(network, address)
+		return newExtenderPacketConn(serverConn, remote), nil
+	}
 }
