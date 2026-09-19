@@ -167,6 +167,17 @@ func TestTcpReturnRecoveryIpv6(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) { checkTcpReturnHole(t, 100, 4, 32, 100*time.Millisecond, false, 6) })
 }
 
+// Upstream's ip_tcp_return_burst_recovery_test.go, which arrived with
+// "Recover TCP return tail bursts promptly", stood beside these rows and is
+// gone with the same mechanism: it drives `retainReturnChunk`,
+// `returnChunks`, `returnHead` and `runReturnRecovery` directly. What it
+// asserted, our own mechanism holds and pins black-box: a lost burst repairs
+// on the acknowledgements it earns rather than one segment per timer
+// (TestTcpReturnRetransmitPrunedSpanRecoversInBursts and
+// ...LostFlightRecoversInBurstsAfterTheProbe), recovery stops at the flight
+// it began in (...RecoveryCoversTheBatchItBeganInside), and a silent peer
+// keeps its backoff to the abandon bound (...TimesOutWithBackoffThenResets).
+//
 // The three upstream cache rows that stood here were white-box over
 // `TcpSequence.retainReturnChunk` and the shared `ReturnQueueBudget`
 // admission, which `tcpReturnRetransmitState` supersedes (see

@@ -131,6 +131,11 @@ type ExtenderDirectorySettings struct {
 	// kept and reported over (K4). The app panel shows the count over the
 	// last minute, which is the default.
 	EventWindowTimeout time.Duration
+	// A latency sample older than this counts as never measured
+	// (DESIGNNOTES4.md §4): the ordering stops trusting it and a probe pass
+	// measures the address again. <= 0 keeps a sample for the life of the
+	// process.
+	LatencyMaxAge time.Duration
 
 	// The only clock the policy reads. Tests install a fake one.
 	Now func() time.Time
@@ -148,6 +153,7 @@ func DefaultExtenderDirectorySettings() *ExtenderDirectorySettings {
 		MaxAddressCount:                512,
 		SaveTimeout:                    1 * time.Second,
 		EventWindowTimeout:             60 * time.Second,
+		LatencyMaxAge:                  24 * time.Hour,
 		Now:                            time.Now,
 	}
 }
@@ -182,6 +188,14 @@ type extenderDirectoryAddress struct {
 	holdUntilTime           time.Time
 	lastUseTime             time.Time
 	inUseCount              int
+
+	// the latest latency sample (DESIGNNOTES4.md): the lowest rtt of one
+	// probe pass, when it was taken and whether that pass attested it to
+	// the operator. Per process; never stored.
+	latency         time.Duration
+	latencyTime     time.Time
+	latencyAttested bool
+	probeCount      int
 }
 
 // One dialable endpoint handed to the strategy and to the network client. The
@@ -205,8 +219,17 @@ type ExtenderCandidate struct {
 	DnsPorts    []int
 	DnsTld      string
 	CountryCode string
-	Source      string
-	Verified    bool
+	// The continent the operator stamped on the record, upper case; empty
+	// for a record that predates it and for an unverified address
+	// (DESIGNNOTES4.md §2).
+	ContinentCode string
+	// The current latency sample, zero when there is none (DESIGNNOTES4.md).
+	Latency time.Duration
+	// Whether the sample was attested to the operator, which a provider's
+	// probe pass reads to find what it has not attested yet.
+	LatencyAttested bool
+	Source          string
+	Verified        bool
 }
 
 // The dns carrier ports of one candidate in dial order (L2). DnsPorts when it
@@ -229,6 +252,8 @@ type ExtenderDirectoryEntry struct {
 	PublicKey       []byte
 	Carriers        []string
 	CountryCode     string
+	ContinentCode   string
+	Latency         time.Duration
 	State           string
 	Source          string
 	LastSuccessTime time.Time
@@ -275,6 +300,9 @@ type ExtenderDirectory struct {
 	// those two sources count: a stored record loaded at start and an address
 	// added by hand are not network events.
 	eventTimes []time.Time
+	// the continent the candidate order prefers, upper case, empty until the
+	// network client learns one (DESIGNNOTES4.md §4)
+	continentHint string
 	// verified identities by hex public key
 	keyHexRecords map[string]*extenderDirectoryRecord
 	// every known address
@@ -649,6 +677,7 @@ func (self *ExtenderDirectory) SampleRecords(
 
 	var ownRecord *protocol.ExtenderRecord
 	records := []*protocol.ExtenderRecord{}
+	recordBodies := map[*protocol.ExtenderRecord]*protocol.ExtenderRecordBody{}
 	for keyHex, keyRecord := range self.keyHexRecords {
 		if keyRecord.record == nil || keyRecord.recordBody == nil {
 			continue
@@ -661,10 +690,9 @@ func (self *ExtenderDirectory) SampleRecords(
 			continue
 		}
 		records = append(records, keyRecord.record)
+		recordBodies[keyRecord.record] = keyRecord.recordBody
 	}
-	mathrand.Shuffle(len(records), func(i int, j int) {
-		records[i], records[j] = records[j], records[i]
-	})
+	records = balanceRecordsByIpFamily(records, recordBodies)
 	if ownRecord != nil {
 		records = append([]*protocol.ExtenderRecord{ownRecord}, records...)
 	}
@@ -679,6 +707,102 @@ func (self *ExtenderDirectory) SampleRecords(
 		})
 	}
 	return messages
+}
+
+// balanceRecordsByIpFamily orders records so that taking a prefix of any length
+// yields as close to an equal number of v4-reachable and v6-reachable extenders
+// as the directory can supply.
+//
+// A plain shuffle does not do this. A directory that is mostly v4 -- which is
+// the normal case, since v4 addresses are easier to come by -- hands a v6-only
+// client a sample it cannot dial, and the client has no way to ask for more.
+//
+// Reachability, not exclusivity: a dual-stack extender is in both buckets and
+// can satisfy either side of the interleave. That is deliberate. The point of
+// the balance is that a client of either family finds something it can reach,
+// and a dual-stack extender serves both, so it should never be held back in
+// favour of a single-family one.
+//
+// The interleave starts with v6 because it is the scarcer family: when the
+// count is odd, the extra slot goes to the side more likely to be short.
+func balanceRecordsByIpFamily(
+	records []*protocol.ExtenderRecord,
+	recordBodies map[*protocol.ExtenderRecord]*protocol.ExtenderRecordBody,
+) []*protocol.ExtenderRecord {
+	if len(records) <= 1 {
+		return records
+	}
+
+	ipv4Capable := []*protocol.ExtenderRecord{}
+	ipv6Capable := []*protocol.ExtenderRecord{}
+	unreachable := []*protocol.ExtenderRecord{}
+	for _, record := range records {
+		hasIpv4, hasIpv6 := recordIpFamilies(recordBodies[record])
+		if hasIpv4 {
+			ipv4Capable = append(ipv4Capable, record)
+		}
+		if hasIpv6 {
+			ipv6Capable = append(ipv6Capable, record)
+		}
+		if !hasIpv4 && !hasIpv6 {
+			// No usable address. Kept rather than dropped, so what the caller
+			// reports as available does not change -- but held in its own list
+			// so it cannot displace a record a client could actually dial.
+			unreachable = append(unreachable, record)
+		}
+	}
+	shuffle := func(pool []*protocol.ExtenderRecord) {
+		mathrand.Shuffle(len(pool), func(i int, j int) {
+			pool[i], pool[j] = pool[j], pool[i]
+		})
+	}
+	shuffle(ipv4Capable)
+	shuffle(ipv6Capable)
+
+	balanced := make([]*protocol.ExtenderRecord, 0, len(records))
+	taken := map[*protocol.ExtenderRecord]bool{}
+	take := func(pool []*protocol.ExtenderRecord, from int) int {
+		for i := from; i < len(pool); i += 1 {
+			if taken[pool[i]] {
+				continue
+			}
+			taken[pool[i]] = true
+			balanced = append(balanced, pool[i])
+			return i + 1
+		}
+		return len(pool)
+	}
+	ipv4Next, ipv6Next := 0, 0
+	for len(balanced) < len(records) {
+		before := len(balanced)
+		ipv6Next = take(ipv6Capable, ipv6Next)
+		ipv4Next = take(ipv4Capable, ipv4Next)
+		if len(balanced) == before {
+			// both pools are exhausted of un-taken records
+			break
+		}
+	}
+	return append(balanced, unreachable...)
+}
+
+// recordIpFamilies reports which families a record lists an address for. A
+// record that fails to name any parseable address is reachable over neither.
+func recordIpFamilies(body *protocol.ExtenderRecordBody) (hasIpv4 bool, hasIpv6 bool) {
+	if body == nil {
+		return false, false
+	}
+	for _, recordAddress := range body.Addresses {
+		ip, err := netip.ParseAddr(recordAddress.Ip)
+		if err != nil {
+			continue
+		}
+		if ip.Unmap().Is4() {
+			hasIpv4 = true
+		} else {
+			hasIpv6 = true
+		}
+	}
+	return hasIpv4, hasIpv6
 }
 
 // Adds an address learned outside the signed path: a dns bootstrap answer or a
@@ -827,6 +951,58 @@ func (self *ExtenderDirectory) SetInUse(ip netip.Addr, delta int) {
 	self.changedWithLock()
 }
 
+// SetContinentHint sets the continent the candidate order prefers
+// (DESIGNNOTES4.md §4): the operator's hint, or the one inferred from the dns
+// bootstrap. Upper case; empty clears it. Reports whether it changed.
+func (self *ExtenderDirectory) SetContinentHint(continentCode string) (changed bool) {
+	continentCode = strings.ToUpper(strings.TrimSpace(continentCode))
+
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	if self.continentHint == continentCode {
+		return false
+	}
+	self.continentHint = continentCode
+	self.changedWithLock()
+	return true
+}
+
+// The continent the candidate order prefers, empty when nothing has said.
+func (self *ExtenderDirectory) ContinentHint() string {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return self.continentHint
+}
+
+// RecordLatency stores the outcome of one probe pass over an address: the
+// lowest rtt it measured and whether that pass attested it to the operator
+// (DESIGNNOTES4.md). The sample is per process and ages out after
+// LatencyMaxAge; it is never stored, because yesterday's path is not today's.
+func (self *ExtenderDirectory) RecordLatency(ip netip.Addr, rtt time.Duration, attested bool) {
+	if !ip.IsValid() || rtt <= 0 {
+		return
+	}
+	ip = ip.Unmap()
+	now := self.settings.Now()
+
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	address := self.ipAddresses[ip]
+	if address == nil {
+		return
+	}
+	address.latency = rtt
+	address.latencyTime = now
+	address.latencyAttested = attested
+	address.probeCount += 1
+	if self.log.V(2).Enabled() {
+		self.log.Infof("[extender]latency %s %s attested=%t\n", ip, rtt, attested)
+	}
+	self.changedWithLock()
+}
+
 // The hold after `consecutiveFailureCount` failures: the base doubling per
 // failure, capped. The shift is bounded before it is taken, so a long run
 // cannot overflow into a negative duration.
@@ -870,9 +1046,12 @@ func (self *ExtenderDirectory) Expire(now time.Time) (changed bool) {
 
 // Up to `count` dialable endpoints of `ipVersion` (0 for any family), active
 // and not held, verified first. The order is deterministic -- verified, then
-// fewest consecutive failures, then the most recent success, then the address
-// -- because the strategy does its own weighting on top and a stable order
-// makes the policy testable.
+// the proximity order of DESIGNNOTES4.md §4 (the hinted continent first, then
+// measured latency ascending with unmeasured addresses last), then fewest
+// consecutive failures, then the most recent success, then the address --
+// because the strategy does its own weighting on top and a stable order makes
+// the policy testable. With no hint and no samples it is the order it always
+// was.
 func (self *ExtenderDirectory) Candidates(
 	ipVersion int,
 	count int,
@@ -890,33 +1069,13 @@ func (self *ExtenderDirectory) Candidates(
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
-	addresses := []*extenderDirectoryAddress{}
-	for ip, address := range self.ipAddresses {
-		if excludeIps[ip] {
-			continue
-		}
-		if ipVersion != 0 && addressIpVersion(ip) != ipVersion {
-			continue
-		}
-		if now.Before(address.holdUntilTime) {
-			continue
-		}
-		if !self.addressDialableWithLock(address) {
-			continue
-		}
-		if !self.addressActiveWithLock(address, now) {
-			continue
-		}
-		addresses = append(addresses, address)
-	}
+	addresses := self.usableAddressesWithLock(ipVersion, now, excludeIps)
 	slices.SortFunc(addresses, func(a *extenderDirectoryAddress, b *extenderDirectoryAddress) int {
-		aVerified := a.publicKeyHex != ""
-		bVerified := b.publicKeyHex != ""
-		if aVerified != bVerified {
-			if aVerified {
-				return -1
-			}
-			return 1
+		if c := compareExtenderVerified(a, b); c != 0 {
+			return c
+		}
+		if c := self.compareProximityWithLock(a, b, now, false, false); c != 0 {
+			return c
 		}
 		if a.consecutiveFailureCount != b.consecutiveFailureCount {
 			return a.consecutiveFailureCount - b.consecutiveFailureCount
@@ -936,13 +1095,193 @@ func (self *ExtenderDirectory) Candidates(
 		if count <= len(candidates) {
 			break
 		}
-		candidates = append(candidates, self.candidateWithLock(address))
+		candidates = append(candidates, self.candidateWithLock(address, now))
 	}
 	return candidates
 }
 
+// The usable addresses of one family: not held, dialable, key active. The
+// filter every candidate order shares. `excludeIps` may be nil.
+func (self *ExtenderDirectory) usableAddressesWithLock(
+	ipVersion int,
+	now time.Time,
+	excludeIps map[netip.Addr]bool,
+) []*extenderDirectoryAddress {
+	addresses := []*extenderDirectoryAddress{}
+	for ip, address := range self.ipAddresses {
+		if excludeIps[ip] {
+			continue
+		}
+		if ipVersion != 0 && addressIpVersion(ip) != ipVersion {
+			continue
+		}
+		if now.Before(address.holdUntilTime) {
+			continue
+		}
+		if !self.addressDialableWithLock(address) {
+			continue
+		}
+		if !self.addressActiveWithLock(address, now) {
+			continue
+		}
+		addresses = append(addresses, address)
+	}
+	return addresses
+}
+
+// The verified-first rule every candidate order starts with.
+func compareExtenderVerified(a *extenderDirectoryAddress, b *extenderDirectoryAddress) int {
+	aVerified := a.publicKeyHex != ""
+	bVerified := b.publicKeyHex != ""
+	if aVerified == bVerified {
+		return 0
+	}
+	if aVerified {
+		return -1
+	}
+	return 1
+}
+
+// The proximity order of DESIGNNOTES4.md §4: the hinted continent before the
+// others before unknown, then within a tier a measured address before an
+// unmeasured one and ascending by rtt. `explore` puts the unmeasured first
+// instead, which is the probe pass asking for what it has not measured yet;
+// `attesting` counts only an attested sample as a measurement.
+func (self *ExtenderDirectory) compareProximityWithLock(
+	a *extenderDirectoryAddress,
+	b *extenderDirectoryAddress,
+	now time.Time,
+	explore bool,
+	attesting bool,
+) int {
+	aTier := self.continentTierWithLock(a)
+	bTier := self.continentTierWithLock(b)
+	if aTier != bTier {
+		return aTier - bTier
+	}
+	aLatency, aMeasured := self.latencyWithLock(a, now, attesting)
+	bLatency, bMeasured := self.latencyWithLock(b, now, attesting)
+	if aMeasured != bMeasured {
+		if aMeasured != explore {
+			return -1
+		}
+		return 1
+	}
+	if aMeasured && aLatency != bLatency {
+		if aLatency < bLatency {
+			return -1
+		}
+		return 1
+	}
+	return 0
+}
+
+// The continent tier of an address under the current hint (DESIGNNOTES4.md
+// §4): 0 on the hinted continent, 1 on another, 2 unknown -- an unverified
+// address, or a record that predates the continent field. With no hint every
+// address is tier 0, which leaves the order what it was.
+func (self *ExtenderDirectory) continentTierWithLock(address *extenderDirectoryAddress) int {
+	if self.continentHint == "" {
+		return 0
+	}
+	keyRecord := self.keyHexRecords[address.publicKeyHex]
+	if keyRecord == nil || keyRecord.recordBody == nil {
+		return 2
+	}
+	switch continentCode := strings.ToUpper(strings.TrimSpace(keyRecord.recordBody.ContinentCode)); continentCode {
+	case "":
+		return 2
+	case self.continentHint:
+		return 0
+	default:
+		return 1
+	}
+}
+
+// The current latency sample of an address, and whether there is one: a sample
+// exists, is younger than LatencyMaxAge and, when `attesting`, was attested.
+func (self *ExtenderDirectory) latencyWithLock(
+	address *extenderDirectoryAddress,
+	now time.Time,
+	attesting bool,
+) (time.Duration, bool) {
+	if address.latencyTime.IsZero() || address.latency <= 0 {
+		return 0, false
+	}
+	if attesting && !address.latencyAttested {
+		return 0, false
+	}
+	if 0 < self.settings.LatencyMaxAge && self.settings.LatencyMaxAge <= now.Sub(address.latencyTime) {
+		return 0, false
+	}
+	return address.latency, true
+}
+
+// ProbeCandidates is what a probe pass measures, in the order it should
+// (DESIGNNOTES4.md §4): the hinted continent first, and within a tier the
+// addresses with no current sample before those with one, so the prior saves
+// probes rather than merely reordering them. `attesting` treats an unattested
+// sample as none, which is what a provider's pass has yet to do.
+func (self *ExtenderDirectory) ProbeCandidates(
+	ipVersion int,
+	count int,
+	attesting bool,
+) []*ExtenderCandidate {
+	if count <= 0 {
+		return []*ExtenderCandidate{}
+	}
+	now := self.settings.Now()
+
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	addresses := self.usableAddressesWithLock(ipVersion, now, nil)
+	slices.SortFunc(addresses, func(a *extenderDirectoryAddress, b *extenderDirectoryAddress) int {
+		if c := compareExtenderVerified(a, b); c != 0 {
+			return c
+		}
+		if c := self.compareProximityWithLock(a, b, now, true, attesting); c != 0 {
+			return c
+		}
+		if a.consecutiveFailureCount != b.consecutiveFailureCount {
+			return a.consecutiveFailureCount - b.consecutiveFailureCount
+		}
+		return strings.Compare(a.ip.String(), b.ip.String())
+	})
+
+	candidates := []*ExtenderCandidate{}
+	for _, address := range addresses {
+		if count <= len(candidates) {
+			break
+		}
+		candidates = append(candidates, self.candidateWithLock(address, now))
+	}
+	return candidates
+}
+
+// MeasuredLatencies is every current latency sample of a usable address of
+// one family (0 for any), which is what the probe pass counts its window
+// over. With `attesting` only attested samples count.
+func (self *ExtenderDirectory) MeasuredLatencies(ipVersion int, attesting bool) []time.Duration {
+	now := self.settings.Now()
+
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	latencies := []time.Duration{}
+	for _, address := range self.usableAddressesWithLock(ipVersion, now, nil) {
+		if latency, measured := self.latencyWithLock(address, now, attesting); measured {
+			latencies = append(latencies, latency)
+		}
+	}
+	return latencies
+}
+
 // The dialable form of one address, filled from its record when it has one.
-func (self *ExtenderDirectory) candidateWithLock(address *extenderDirectoryAddress) *ExtenderCandidate {
+func (self *ExtenderDirectory) candidateWithLock(
+	address *extenderDirectoryAddress,
+	now time.Time,
+) *ExtenderCandidate {
 	candidate := &ExtenderCandidate{
 		Ip:        address.ip,
 		IpVersion: addressIpVersion(address.ip),
@@ -954,6 +1293,10 @@ func (self *ExtenderDirectory) candidateWithLock(address *extenderDirectoryAddre
 		DnsTld:    DefaultExtenderDnsTld,
 		Source:    address.source,
 	}
+	if latency, measured := self.latencyWithLock(address, now, false); measured {
+		candidate.Latency = latency
+		candidate.LatencyAttested = address.latencyAttested
+	}
 	keyRecord := self.keyHexRecords[address.publicKeyHex]
 	if keyRecord == nil || keyRecord.recordBody == nil {
 		return candidate
@@ -962,6 +1305,7 @@ func (self *ExtenderDirectory) candidateWithLock(address *extenderDirectoryAddre
 	candidate.Verified = true
 	candidate.PublicKey = slices.Clone(keyRecord.publicKey)
 	candidate.CountryCode = body.CountryCode
+	candidate.ContinentCode = strings.ToUpper(strings.TrimSpace(body.ContinentCode))
 	if 0 < body.TcpPort {
 		candidate.TcpPort = int(body.TcpPort)
 	}
@@ -1195,7 +1539,7 @@ func (self *ExtenderDirectory) Snapshot() *ExtenderDirectorySnapshot {
 		Entries: []*ExtenderDirectoryEntry{},
 	}
 	for _, address := range self.ipAddresses {
-		candidate := self.candidateWithLock(address)
+		candidate := self.candidateWithLock(address, now)
 		state := self.addressStateWithLock(address, now)
 		entry := &ExtenderDirectoryEntry{
 			Ip:              address.ip,
@@ -1203,6 +1547,8 @@ func (self *ExtenderDirectory) Snapshot() *ExtenderDirectorySnapshot {
 			PublicKey:       candidate.PublicKey,
 			Carriers:        candidate.Carriers,
 			CountryCode:     candidate.CountryCode,
+			ContinentCode:   candidate.ContinentCode,
+			Latency:         candidate.Latency,
 			State:           state,
 			Source:          address.source,
 			LastSuccessTime: address.lastSuccessTime,

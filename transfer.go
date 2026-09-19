@@ -1171,6 +1171,9 @@ type SendPack struct {
 	// the peer may not have completed its half of the handshake even after our
 	// local cipher is established.
 	ForceUnwrapped bool
+	// Written only by synchronous admission before an unsuccessful return.
+	// Successful ownership transfer forbids the caller from inspecting it.
+	admissionFailure sendAdmissionBoundary
 	// EncryptionRole selects which per-peer session this pack uses, keying the
 	// SendSequence so the roles run as distinct sequences: client (the default —
 	// the client's own outbound data, whose handshake it initiates/restarts) or
@@ -2850,7 +2853,7 @@ func (self *SendSequence) laneOldestOutstanding(route Route) *sendItem {
 // item is acknowledged and gone before its promoted firing arrives, so the
 // drain writes nothing.
 //
-// Only an acknowledgement of a retransmit promotes. That is what separates a
+// An acknowledgement promotes only after a retransmit. That separates a
 // batch being dragged forward one write at a time from a lane making its own
 // forward progress: in the first the acknowledgement exists because the
 // sender wrote the position again, and the next position needs the same
@@ -2861,6 +2864,11 @@ func (self *SendSequence) laneOldestOutstanding(route Route) *sendItem {
 // writes; a position the scoreboard recovered instead is not promoted, and
 // does not need to be, since the scoreboard writes every position it proves
 // in one round.
+// A head rewritten onto a different carrier also leaves this lane's
+// outstanding set. Promote its successor at that transition: the changed
+// carrier makes the head's eventual acknowledgement ambiguous, so it can no
+// longer promote through lane acknowledgement evidence. This schedules one
+// probe without crediting either lane with delivery.
 //
 // The firing is set to the round trip in both directions, never only pulled
 // in. A new lane head has usually been riding the old one and carries that
@@ -3507,6 +3515,8 @@ func (self *Client) sendGroupToWithTimeoutDetailed(
 	return self.enqueueSendPack(sendPack, timeout)
 }
 
+// Preserves the public send result while the internal path retains its refusal
+// gate. Takes the frame's pool buffer on success only.
 func (self *Client) sendWithTimeoutDetailed(
 	frame *protocol.Frame,
 	destinationId Id,
@@ -3515,9 +3525,25 @@ func (self *Client) sendWithTimeoutDetailed(
 	timeout time.Duration,
 	opts ...any,
 ) (bool, error) {
+	success, err, _ := self.sendWithTimeoutAdmissionDetailed(
+		frame, destinationId, intermediaryIds, ackCallback, timeout, opts...,
+	)
+	return success, err
+}
+
+// Takes the frame's pool buffer on success only. The extra local diagnostic
+// identifies a synchronous false/nil refusal without changing the public result.
+func (self *Client) sendWithTimeoutAdmissionDetailed(
+	frame *protocol.Frame,
+	destinationId Id,
+	intermediaryIds MultiHopId,
+	ackCallback AckFunction,
+	timeout time.Duration,
+	opts ...any,
+) (bool, error, sendAdmissionBoundary) {
 	select {
 	case <-self.ctx.Done():
-		return false, errors.New("Done")
+		return false, errors.New("Done"), sendAdmissionUnknown
 	default:
 	}
 
@@ -3555,7 +3581,11 @@ func (self *Client) sendWithTimeoutDetailed(
 	if noAck && !(success && err == nil) {
 		self.sendNoAckRefusedCount.Add(1)
 	}
-	return success, err
+	if !success && err == nil {
+		return false, nil, sendPack.admissionFailure
+	}
+	// A successful consumer may already have returned or reused the Pack.
+	return success, err, sendAdmissionUnknown
 }
 
 // The fully resolved values shared by single, batch, and raw sends.
@@ -3748,6 +3778,7 @@ func (self *Client) sendRawToWithTimeoutDetailed(
 }
 
 func (self *Client) enqueueSendPack(sendPack *SendPack, timeout time.Duration) (bool, error) {
+	sendPack.admissionFailure = sendAdmissionUnknown
 	ctx := sendPack.Ctx
 	if sendPack.Destination == self.clientId {
 		// loopback
@@ -3776,6 +3807,7 @@ func (self *Client) enqueueSendPack(sendPack *SendPack, timeout time.Duration) (
 			case self.loopback <- sendPack:
 				return true, nil
 			default:
+				sendPack.admissionFailure = sendAdmissionLoopback
 				return false, nil
 			}
 		} else {
@@ -3787,6 +3819,7 @@ func (self *Client) enqueueSendPack(sendPack *SendPack, timeout time.Duration) (
 			case self.loopback <- sendPack:
 				return true, nil
 			case <-time.After(timeout):
+				sendPack.admissionFailure = sendAdmissionLoopback
 				return false, nil
 			}
 		}
@@ -5128,6 +5161,9 @@ type SendBufferSettings struct {
 	beforeEncryptedControlPackForTest    func([]byte)
 	beforeContractFailureClassifyForTest func(sendSequenceId)
 	beforeTakeContractForTest            func(sendSequenceId)
+	// Nil observers pin admission across an idle check without scheduler timing.
+	beforeRequiredEncryptionWaitForTest func(sendSequenceId)
+	afterIdleCloseForTest               func(sendSequenceId, bool)
 	// Runs after the caller-side no-acknowledgement stage decided, with
 	// whether an immediate write was attempted, whether it succeeded, and the
 	// timeout the pack then carries into admission (THROUGHPUTFIX §38.12).
@@ -6253,11 +6289,10 @@ type SendSequence struct {
 	// where it switches today. Owned by the sequence goroutine.
 	sendContractFrameDue bool
 
-	// packMutex protects packs from Close and coordinates the idle-close
-	// checkpoint. Pack only needs a read lock: multiple callers must be able
-	// to wait on the bounded queue independently. With an exclusive lock, one
-	// application send using an infinite timeout could hold the mutex while
-	// the queue was full, preventing a finite-time liveness probe behind it
+	// packMutex protects packs from Close. Pack only needs a read lock so
+	// multiple callers can wait on the bounded queue independently. An
+	// application send using an infinite timeout could hold an exclusive lock
+	// while the queue was full, preventing a finite-time liveness probe behind it
 	// from observing its own timeout. That hid a route-full condition
 	// indefinitely. Close takes the write lock after canceling the sequence,
 	// which wakes every blocked Pack before the channel is closed.
@@ -6320,6 +6355,11 @@ type SendSequence struct {
 	// Set only after three-later-ACK evidence proves this sequence has holes.
 	// Tail probing stays off for reliable ordered carriers that show no gap.
 	selectiveGapRecoveryActive bool
+	// Owned by the send worker. Once applied, selective evidence stays known
+	// for the sequence lifetime even after cumulative progress clears it.
+	selectiveAckObserved bool
+	// Nil in production; deterministically observes full-flight recovery work.
+	beforeSelectiveAckRecoveryForTest func()
 
 	// contract acquisition blocks this sequence, so track how much of its life
 	// goes into waiting for one. atomics so stats can be read without taking
@@ -6800,6 +6840,7 @@ func (self *SendSequence) acquirePackAdmission(
 func (self *SendSequence) Pack(sendPack *SendPack, timeout time.Duration) (bool, error) {
 	self.packMutex.RLock()
 	defer self.packMutex.RUnlock()
+	sendPack.admissionFailure = sendAdmissionUnknown
 
 	select {
 	case <-sendPack.Ctx.Done():
@@ -6835,6 +6876,9 @@ func (self *SendSequence) Pack(sendPack *SendPack, timeout time.Duration) (bool,
 	// waiting keeps the sequence (and the session it references) alive through
 	// the establishment it is waiting on.
 	if !sendPack.ForceUnwrapped && self.session != nil && self.session.RequireEncryption() {
+		if self.sendBufferSettings.beforeRequiredEncryptionWaitForTest != nil {
+			self.sendBufferSettings.beforeRequiredEncryptionWaitForTest(self.id())
+		}
 		enterTime := time.Now()
 		blockedNotified := false
 		for self.session.Cipher() == nil {
@@ -6947,12 +6991,18 @@ func (self *SendSequence) Pack(sendPack *SendPack, timeout time.Duration) (bool,
 	if sendPack.Ack {
 		admitted, err, capacityTimeout := self.awaitResendCapacity(sendPack, timeout)
 		if err != nil || !admitted {
+			if err == nil {
+				sendPack.admissionFailure = sendAdmissionResendCapacity
+			}
 			return false, err
 		}
 		timeout = capacityTimeout
 	}
 	admitted, err, timeout := self.acquirePackAdmission(sendPack, timeout)
 	if err != nil || !admitted {
+		if err == nil {
+			sendPack.admissionFailure = sendAdmissionPack
+		}
 		return false, err
 	}
 	queued := false
@@ -6990,6 +7040,7 @@ func (self *SendSequence) Pack(sendPack *SendPack, timeout time.Duration) (bool,
 			queued = true
 			return true, nil
 		default:
+			sendPack.admissionFailure = sendAdmissionHandoff
 			return false, nil
 		}
 	} else {
@@ -7002,6 +7053,7 @@ func (self *SendSequence) Pack(sendPack *SendPack, timeout time.Duration) (bool,
 			queued = true
 			return true, nil
 		case <-time.After(timeout):
+			sendPack.admissionFailure = sendAdmissionHandoff
 			return false, nil
 		}
 	}
@@ -7361,6 +7413,9 @@ func (self *SendSequence) processLogicalGroupChunk(
 // acknowledged, one RTT-paced duplicate solicits the cumulative ACK that may
 // have been lost.
 func (self *SendSequence) scheduleSelectiveAckRecovery(currentTime time.Time) bool {
+	if self.beforeSelectiveAckRecoveryForTest != nil {
+		self.beforeSelectiveAckRecoveryForTest()
+	}
 	reschedule := func(item *sendItem, resendTime time.Time, recoveryKind sendRecoveryKind) {
 		removed := self.resendQueue.RemoveByMessageId(item.messageId)
 		if removed != item {
@@ -8277,7 +8332,7 @@ sendSequenceLoop:
 		if flightPolicyChanged {
 			self.scheduleRetiredReliableCarrierRecovery(sendTime)
 		}
-		if ackUpdated && self.scheduleSelectiveAckRecovery(sendTime) {
+		if ackUpdated && self.scheduleSelectiveAckRecoveryAfterFeedback(sendTime) {
 			self.client.unreliableFlightGapCount.Add(1)
 			if self.flightController.reduceForLoss() {
 				self.client.unreliableFlightReductionCount.Add(1)
@@ -9049,14 +9104,13 @@ sendSequenceLoop:
 			}
 		case <-idleTimer.C:
 			if self.resendQueue.Len() == 0 && scheduler.Len() == 0 {
-				done := false
-				func() {
-					self.packMutex.Lock()
-					defer self.packMutex.Unlock()
-					if self.idleCondition.Close(checkpointId) {
-						done = true
-					}
-				}()
+				// IdleCondition atomically rejects retirement while Pack is open.
+				// Waiting for packMutex here would strand Required application
+				// admission and exclude the controls needed to finish its handshake.
+				done := self.idleCondition.Close(checkpointId)
+				if self.sendBufferSettings.afterIdleCloseForTest != nil {
+					self.sendBufferSettings.afterIdleCloseForTest(self.id(), done)
+				}
 				if done {
 					if self.log.V(1).Enabled() {
 						self.log.Infof("[s]%s->%s...%s s(%s) exit idle timeout\n", self.client.ClientTag(), self.contractIntermediaryIds(), self.destination, self.contractMultiRouteWriterAlias.StreamId)
@@ -10364,11 +10418,22 @@ func (self *SendSequence) observeCarrierWrite(
 	item *sendItem,
 	disposition transferWriteDisposition,
 ) {
+	departedLane := uint32(0)
 	if item.carrierRoute != nil && item.carrierRoute != disposition.route {
+		// A changed-carrier item no longer owns its old lane's probe. Read
+		// that ownership before changing the route or setting the exclusion.
+		if self.laneProvenRecovery(item) && self.laneOldestOutstanding(item.carrierRoute) == item {
+			if slot := self.laneSlotFor(item.carrierRoute); 0 <= slot {
+				departedLane = uint32(1) << uint(slot)
+			}
+		}
 		item.carrierChanged = true
 	}
 	item.carrierRoute = disposition.route
 	self.observeLaneSend(item)
+	if departedLane != 0 {
+		self.promoteLaneHeads(departedLane, time.Now())
+	}
 	if !disposition.unreliable {
 		if disposition.reliable && !item.unreliableCarrierObserved {
 			item.reliableCarrierObserved = true
@@ -11539,6 +11604,7 @@ func (self *SendSequence) receiveAckFeedbackAt(
 	}
 
 	if selective {
+		self.selectiveAckObserved = true
 		if !item.deliveryObserved {
 			bytes := item.MessageByteCount()
 			if self.windowPacer.service != nil {
@@ -11599,7 +11665,6 @@ func (self *SendSequence) receiveAckFeedbackAt(
 	// had its oldest unacknowledged item acknowledged. Collect those lanes
 	// and promote their new heads once the acknowledged prefix is gone.
 	promoteLanes := uint32(0)
-	var promoteRoute Route
 	// acks are cumulative
 	// implicitly ack all earlier items in the sequence
 	i := 0
@@ -11638,15 +11703,10 @@ func (self *SendSequence) receiveAckFeedbackAt(
 		}
 		self.observeLaneAck(implicitItem, self.lastCumulativeAckTime)
 		self.observeReliableLaneAck(implicitItem, self.lastCumulativeAckTime)
-		if implicitItem.carrierRoute != nil && !implicitItem.carrierChanged &&
-			implicitItem.carrierRoute != promoteRoute {
-			promoteRoute = implicitItem.carrierRoute
-			// this is the lane's oldest unacknowledged item, since the
-			// acknowledged items are a prefix of the sequence. Its send
-			// count is above one exactly when the sender had to write it
-			// again to get this acknowledgement.
-			if slot := self.laneSlotFor(promoteRoute); 0 <= slot &&
-				1 < implicitItem.sendCount {
+		if 1 < implicitItem.sendCount && implicitItem.carrierRoute != nil && !implicitItem.carrierChanged {
+			// Any recovered item in the prefix advances its lane. An earlier
+			// original write must not hide it; the mask deduplicates promotion.
+			if slot := self.laneSlotFor(implicitItem.carrierRoute); 0 <= slot {
 				promoteLanes |= uint32(1) << uint(slot)
 			}
 		}
@@ -12675,6 +12735,8 @@ type ReceiveBufferSettings struct {
 	beforeAckWorkerStopForTest         func(receiveSequenceId)
 	afterAckWriterOpenForTest          func(receiveSequenceId, MultiRouteWriter)
 	afterAckWritesCanceledForTest      func(receiveSequenceId)
+	// Nil observer exposes an idle check while producer admission is held.
+	afterIdleCloseForTest func(receiveSequenceId, bool)
 }
 
 func (self *ReceiveBufferSettings) packHandoffTimeout(
@@ -14556,16 +14618,12 @@ func (self *ReceiveSequence) Run() {
 			}
 		case <-idleTimer.C:
 			if 0 == self.receiveQueue.Len() {
-				done := false
-				func() {
-					self.packMutex.Lock()
-					defer self.packMutex.Unlock()
-					// idle timeout
-					if self.idleCondition.Close(checkpointId) {
-						done = true
-					}
-					// else there are pending updates
-				}()
+				// An open Pack can be waiting for this worker to receive; its idle
+				// reservation, not its producer mutex, serializes retirement.
+				done := self.idleCondition.Close(checkpointId)
+				if self.receiveBufferSettings.afterIdleCloseForTest != nil {
+					self.receiveBufferSettings.afterIdleCloseForTest(self.id(), done)
+				}
 				if done {
 					// close the sequence
 					if self.log.V(1).Enabled() {
@@ -15937,6 +15995,8 @@ type ForwardBufferSettings struct {
 	beforeRunForwardSequenceForTest    func(TransferPath)
 	beforeCloseWaitForTest             func(TransferPath)
 	afterRunForwardSequenceForTest     func(TransferPath)
+	// Nil observer exposes an idle check while producer admission is held.
+	afterIdleCloseForTest func(TransferPath, bool)
 }
 
 type ForwardBuffer struct {
@@ -16304,16 +16364,12 @@ func (self *ForwardSequence) Run() {
 				return
 			}
 		case <-idleTimer.C:
-			done := false
-			func() {
-				self.packMutex.Lock()
-				defer self.packMutex.Unlock()
-				// idle timeout
-				if self.idleCondition.Close(checkpointId) {
-					done = true
-				}
-				// else there are pending updates
-			}()
+			// An open Pack can be waiting for this worker to receive; its idle
+			// reservation, not its producer mutex, serializes retirement.
+			done := self.idleCondition.Close(checkpointId)
+			if self.forwardBufferSettings.afterIdleCloseForTest != nil {
+				self.forwardBufferSettings.afterIdleCloseForTest(self.destination, done)
+			}
 			if done {
 				// close the sequence
 				if self.log.V(1).Enabled() {
