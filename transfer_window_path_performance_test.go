@@ -448,6 +448,16 @@ func measureWindowPathCell(t *testing.T, cell windowPathCell, duration time.Dura
 			s.SendBufferSettings.WindowSizing = WindowSizingFromDelivery
 		}
 		s.SendBufferSettings.ApplyWindowSizing()
+		// The receive side is asked for the same policy as the send side
+		// rather than inheriting the process default, which decides the
+		// advertisement and the hold: an arm that names a policy should
+		// measure it on both ends whatever the tree's default is, and this
+		// tree's default is the constant window where upstream's is the rule.
+		// This is not what makes TestWindowPathServiceRoundTripGrowthBeyondOldRing
+		// flaky: measured on the VPS it fails about one run in ten with this
+		// line and without it, and on upstream's own tree as well.
+		s.ReceiveBufferSettings.WindowSizing = s.SendBufferSettings.WindowSizing
+		s.ReceiveBufferSettings.ApplyWindowSizing()
 		s.SendBufferSettings.disableWindowPacingForTest = cell.Arm == "unpaced"
 		if cell.KnownPathRoundTrip {
 			s.SendBufferSettings.windowRoundTripOverrideForTest = &cell.RoundTrip
