@@ -243,6 +243,34 @@ type EngineProcessed struct {
 	SenderLeaf uint32
 	Aad        []byte
 	Plaintext  []byte
+
+	// ── what a COMMIT does, read off the staged commit at Process time ─────────────────────
+	//
+	// These are populated ONLY on the commit arm (Kind == EngineProcessedCommit) and are the zero
+	// value on the application and proposal arms. They are here because MASTER section 11 makes a
+	// bad commit one that "is refused by the committing client, and is rejected by every receiving
+	// client ON VALIDATION" -- and a receiving client's validation is an authorization decision it
+	// must take BEFORE ApplyCommit, on what the commit DOES and who authored it, without reaching
+	// the opaque staged half. So the storage layer needs the commit's shape out of Process's own
+	// result rather than out of a membership diff it could only take AFTER applying.
+	//
+	// Committer is AUTHENTICATED and the three vectors are NOT A CLAIM: the commit's signature has
+	// been verified against Committer's own leaf by the time Process answers, and the leaves are
+	// where its proposals were RESOLVED and APPLIED against this member's own tree, not where a
+	// header said they would be. They are LEAF INDICES and not sender_handles because that is what
+	// the staged commit names and what the interface's uint32 rule already carries; a caller that
+	// wants a role reads it off the membership at that leaf.
+	//
+	// They are on the struct rather than behind a new interface method because a method would be a
+	// twenty-eighth entry on section 6's block, and these are facts Process already holds -- the
+	// same reasoning SenderLeaf, Aad and Plaintext are fields for. A foreign engine leaves them
+	// zero, which is the zero value a keyed literal already produces and which ApplyCommit's
+	// foreign-refusal makes moot.
+	CommitterLeaf uint32
+	AddedLeaves   []uint32
+	RemovedLeaves []uint32
+	UpdatedLeaves []uint32
+
 	// opaque to this package and handed back to ApplyCommit. It is the message these values
 	// were read out of and nothing else; the staged commit is never here.
 	Raw []byte
@@ -898,7 +926,34 @@ func (self *connectMlsHandle) Process(message []byte) (*EngineProcessed, error) 
 		answer.Aad = processed.Application.AuthenticatedData
 		answer.Plaintext = processed.Application.Plaintext
 	}
+	if processed.Kind == mls.ProcessedCommit {
+		if processed.Commit == nil {
+			return nil, fmt.Errorf("%w: a commit message with no commit arm", ErrEngineProcessedArm)
+		}
+		// what the commit DOES, off the staged commit its signature has already been verified
+		// against. The accessors each hand back a fresh slice, so nothing here aliases the staged
+		// value ApplyCommit is about to enter -- and these leave no key material to erase.
+		answer.CommitterLeaf = uint32(processed.Commit.Committer())
+		answer.AddedLeaves = leafIndexValues(processed.Commit.AddedLeaves())
+		answer.RemovedLeaves = leafIndexValues(processed.Commit.RemovedLeaves())
+		answer.UpdatedLeaves = leafIndexValues(processed.Commit.UpdatedLeaves())
+	}
 	return answer, nil
+}
+
+// leafIndexValues projects the staged commit's leaf vectors onto the interface's own type, in
+// the one direction the boundary allows -- an mls.LeafIndex becomes a uint32 here and nowhere else.
+// A nil input answers nil rather than an empty non-nil slice, so a commit that adds nobody and one
+// this package could not read are not told apart by the shape of the answer.
+func leafIndexValues(leaves []mls.LeafIndex) []uint32 {
+	if leaves == nil {
+		return nil
+	}
+	out := make([]uint32, len(leaves))
+	for at, leaf := range leaves {
+		out[at] = uint32(leaf)
+	}
+	return out
 }
 
 // ApplyCommit enters the epoch a staged commit opens, and refuses anything this handle did not
