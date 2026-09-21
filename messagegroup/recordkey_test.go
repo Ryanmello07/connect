@@ -691,6 +691,41 @@ var recordKeyOneWayProbes = map[string]func(secret []byte) [][]byte{
 		}
 		return [][]byte{handle[:]}
 	},
+	// TrackSender for a PRIOR epoch, ledger item 241. The rung arrives as pq_secret, the probe
+	// session is moved to epoch one so that epoch zero is a prior epoch it can rebuild out of the
+	// store, and the ladder is installed there; what the session produces from that pq_secret is
+	// its sender handle, which is TrackSender's own answer one row up.
+	"TrackSenderAt": func(secret []byte) [][]byte {
+		fixture, err := buildProbeSession(secret)
+		if err != nil {
+			return nil
+		}
+		defer fixture.session.Close()
+		if _, _, _, err := fixture.handle.Commit(nil); err != nil {
+			return nil
+		}
+		if err := fixture.handle.MergePendingCommit(); err != nil {
+			return nil
+		}
+		if err := fixture.session.AdvanceEpoch(secret); err != nil {
+			return nil
+		}
+		groupId := fixture.handle.GroupId()
+		engine := fixture.engine.engine
+		if err := fixture.session.InstallPastEpochLoader(func(epoch uint64) (GroupHandle, error) {
+			return engine.LoadGroup(groupId, epoch)
+		}); err != nil {
+			return nil
+		}
+		if err := fixture.session.TrackSenderAt(0, fixture.handle.OwnLeafIndex(), message.RetentionDurable, 0, 0, 0); err != nil {
+			return nil
+		}
+		handle, err := fixture.session.SenderHandle()
+		if err != nil {
+			return nil
+		}
+		return [][]byte{handle[:]}
+	},
 	"SealRecord": func(secret []byte) [][]byte {
 		fixture, err := buildProbeSession(secret)
 		if err != nil {

@@ -944,9 +944,13 @@ func TestTheEpochKeysDoorJoinsTheDerivedClassOfGroupSessionMethods(t *testing.T)
 	if !slices.Contains(all, "EpochKeys") {
 		t.Fatal("no method named EpochKeys is declared on *GroupSession, so the door this file tests is not in the class the loop gate holds")
 	}
-	if len(all) != 30 {
-		t.Errorf("%d methods are declared on *GroupSession and MASTER section 8.4's second pass makes it 30 -- 24 after the 2026-09-13 seal lift, plus frameBodyOnLoop and unframeBodyOnLoop for the inner frame, plus refuseFrameBindingsOnLoop, OpenCeremonyRecord, openRecordThroughDoor and MessageIdOf for the arm split and the id door; the number moves by one per method, and a method that arrived without moving it arrived without a thought about which file it belongs in",
+	if len(all) != 35 {
+		t.Errorf("%d methods are declared on *GroupSession and ledger item 241's multi-epoch open makes it 35 -- 30 after MASTER section 8.4's second pass (24 after the 2026-09-13 seal lift, plus frameBodyOnLoop and unframeBodyOnLoop for the inner frame, plus refuseFrameBindingsOnLoop, OpenCeremonyRecord, openRecordThroughDoor and MessageIdOf for the arm split and the id door), plus the five of pastepoch.go: InstallPastEpochLoader, TrackSenderAt and trackSenderAtOnLoop, scheduleForOnLoop and pastEpochOnLoop; the number moves by one per method, and a method that arrived without moving it arrived without a thought about which file it belongs in",
 			len(all))
+	}
+	if got := len(perFile["pastepoch.go"]); got != 5 {
+		t.Errorf("pastepoch.go declares %d methods on *GroupSession and item 241 makes it 5: a prior epoch's schedule is neither epoch state of the session's own epoch nor a record method, so the door that installs its loader, the track for it, the lookup an open routes through and the build belong in the file that says what one holds; the DROP is not a method, because connect/mls reads an erase field by field and follows no delegation, so it is spelled in installEpochOnLoop and zeroizeOnLoop",
+			got)
 	}
 	if got := len(perFile["session.go"]); got != 15 {
 		t.Errorf("session.go declares %d methods on *GroupSession and the seal lift makes it 15, which is the per-file half of the same count: the door belongs beside Epoch and AdvanceEpoch and not in seal.go, and so does InstallEphRoot",

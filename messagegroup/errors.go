@@ -432,6 +432,22 @@ var (
 	// and the two sentinels are what sdk matches on until it does. Wave 2's fan out is what
 	// returns it; nothing in wave 1 does.
 	ErrNoWrap = errors.New("messagegroup: no device wrap for this target at this epoch")
+	// Fires when a record names an epoch further behind this session's than PastEpochWindow,
+	// which is the line connect/mls's MergePendingCommit deletes state below: no device holds a
+	// schedule for it and no re-fetch will change that. It is its own sentinel and not
+	// ErrRecordNotForThisSession because sdk renders the two differently -- one is a visible gap
+	// the walk moves past, the other a record a later fetch may still open. Ledger item 241.
+	ErrEpochOutOfWindow = errors.New("messagegroup: this record's epoch is behind the past epoch window")
+	// Fires when a prior epoch inside the window could not be rebuilt: the loader answered an
+	// error, no handle, a handle at another epoch or over another group, or a handle whose
+	// exporter refused. The loader's own error is wrapped beneath it, so a caller that knows its
+	// store can tell "this device held no state at that epoch" -- a member admitted later, for
+	// whom item 241 says the epoch is not theirs -- from a store that would not read.
+	ErrPastEpochUnobtainable = errors.New("messagegroup: this record's epoch is inside the window and its schedule could not be obtained")
+	// Fires when InstallPastEpochLoader is handed nil. A nil is refused rather than read as an
+	// uninstall because a session that silently went back to single-epoch would produce gaps a
+	// caller has no way to trace to the line that caused them.
+	ErrNilPastEpochLoader = errors.New("messagegroup: a past epoch loader is required and none was given")
 )
 
 // ---------------------------------------------------------------------------

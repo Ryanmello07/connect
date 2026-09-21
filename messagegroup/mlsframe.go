@@ -368,9 +368,15 @@ func (self *GroupSession) refuseFrameBindingsOnLoop(header *message.RecordHeader
 // premise -- one SenderData open feeding both the pre-reading and the key derivation -- is a
 // property of mls's implementation rather than of any document.
 //
+// THE HANDLE IS AN ARGUMENT AND NOT self.handle SINCE LEDGER ITEM 241, because the frame inside a
+// record sealed at a prior epoch opens under THAT epoch's secret tree and no other: mls refuses a
+// frame naming any epoch but the group's own. openRecordOnLoop chooses the handle by the record's
+// epoch and hands it down; the sealing half one function up still reads self.handle, because a
+// record is only ever sealed at the epoch the session is at.
+//
 // The caller is the loop goroutine.
-func (self *GroupSession) unframeBodyOnLoop(header *message.RecordHeader, recordKey []byte,
-	headPlain []byte, bodyPlain []byte) ([]byte, error) {
+func (self *GroupSession) unframeBodyOnLoop(handle GroupHandle, header *message.RecordHeader,
+	recordKey []byte, headPlain []byte, bodyPlain []byte) ([]byte, error) {
 
 	if !isApplicationRecord(header.IsCommit, header.ServerAttachment) {
 		return bodyPlain, nil
@@ -380,7 +386,7 @@ func (self *GroupSession) unframeBodyOnLoop(header *message.RecordHeader, record
 	// which is the non-circularity headCommit's header states from the opening side.
 	head := headCommit(recordKey, headPlain)
 	binding := header.BodyBinding()
-	peekLeaf, peekAad, peekGeneration, err := peekInnerFrameSender(self.handle, bodyPlain)
+	peekLeaf, peekAad, peekGeneration, err := peekInnerFrameSender(handle, bodyPlain)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrRecordInnerFrame, err)
 	}
@@ -394,7 +400,7 @@ func (self *GroupSession) unframeBodyOnLoop(header *message.RecordHeader, record
 	if err := self.refuseFrameBindingsOnLoop(header, peekPosition, peekLeaf, peekAad); err != nil {
 		return nil, err
 	}
-	aad, plaintext, senderLeaf, generation, err := self.handle.Unprotect(bodyPlain)
+	aad, plaintext, senderLeaf, generation, err := handle.Unprotect(bodyPlain)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrRecordInnerFrame, err)
 	}

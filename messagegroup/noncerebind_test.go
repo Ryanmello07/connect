@@ -300,7 +300,13 @@ func noncerebindWhere(fileSet *token.FileSet, path string, declaration string, a
 // had none of: the derivation was exported and had no caller anywhere. Neither reaches
 // self.serverNonce, so the banned subset is still empty and the complement this gate prints is
 // still what it narrowed away.
-const noncerebindExportedSessionMethods = 13
+//
+// Ledger item 241's multi-epoch open adds the fourteenth and fifteenth, and NEITHER answers octets:
+// InstallPastEpochLoader takes the door a prior epoch's schedule is rebuilt through, and
+// TrackSenderAt is TrackSender for a prior epoch. Neither reaches self.serverNonce -- a prior
+// epoch's schedule is a read schedule and holds no write key for the nonce to be mac'd under --
+// so the banned subset stays empty and the complement is unchanged.
+const noncerebindExportedSessionMethods = 15
 
 // Property 4 -- THE NARROWING, AND IT IS THE ONE PLACE IN THIS FILE WHERE AN EMPTINESS IS THE
 // PROPERTY RATHER THAN A DEFECT IN IT.

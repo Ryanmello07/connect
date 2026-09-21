@@ -137,6 +137,13 @@ type GroupSession struct {
 	// receivers'.
 	senders   map[senderLadderKey]*SenderRatchet
 	receivers *ReceiverRatchets
+
+	// the PRIOR epochs' read schedules this session holds, by epoch, and the door they are
+	// rebuilt through. Ledger item 241; pastepoch.go is the whole account of what one holds,
+	// how long, and what erases it. The table is dropped and erased at every epoch install and
+	// at Close, so every entry is at most PastEpochWindow behind the epoch above.
+	pastEpochLoader PastEpochLoader
+	pastEpochs      map[uint64]*pastEpoch
 }
 
 // senderLadderKey is what one of this session's own sender ladders is held under.
@@ -232,6 +239,7 @@ func NewGroupSession(handle GroupHandle, pqSecret []byte, groupHandleKeyEpoch0 [
 		windowSize:    DefaultRecordWindowSize,
 		retainedBound: DefaultRetainedRecordKeys,
 		senders:       map[senderLadderKey]*SenderRatchet{},
+		pastEpochs:    map[uint64]*pastEpoch{},
 	}
 	self.groupId = [32]byte(groupId)
 	self.ownLeaf = handle.OwnLeafIndex()
@@ -719,6 +727,17 @@ func (self *GroupSession) installEpochOnLoop(groupHandleKeyEpoch0 []byte) error 
 	// other member, and alive past the epoch that promised to destroy it.
 	zeroize(self.ephRoot)
 	self.ephRoot = nil
+	// AND EVERY PRIOR EPOCH'S SCHEDULE GOES WITH THEM, erased entry by entry. They were built
+	// against the epoch this session is leaving -- the window they sit inside is measured from
+	// it -- and a schedule a later record needs is rebuilt on demand out of the store, which is
+	// what pastepoch.go's header prices. What this costs is one load per prior epoch per epoch
+	// change; what it buys is that nothing here has to decide which of them is now past the
+	// window, because none of them survives to be past it. The loop is spelled here and not
+	// delegated, for the reason the paragraph above gives about every other field.
+	for _, past := range self.pastEpochs {
+		past.Zeroize()
+	}
+	self.pastEpochs = map[uint64]*pastEpoch{}
 	self.groupHandleKey = handleKey
 	self.storageRoot = root
 	self.classKeys = DeriveClassKeys(root)
@@ -746,32 +765,15 @@ func (self *GroupSession) installEpochOnLoop(groupHandleKeyEpoch0 []byte) error 
 // than anything this method reads.
 //
 // The caller is the loop goroutine.
+//
+// THE FOUR ARMS LIVE IN classKeyOf SINCE LEDGER ITEM 241, and this body is the current epoch's
+// call into them: a prior epoch's schedule holds class keys and no eph_root, and one switch
+// over the four classes that both callers reach cannot come to answer a class differently for
+// the two. What stays here is the reading of the session's own two fields.
 func (self *GroupSession) classKeyOnLoop(class message.RetentionClass, ephBucket uint8,
 	ephWindow uint64) ([]byte, error) {
 
-	if self.classKeys == nil {
-		return nil, ErrSessionClosed
-	}
-	switch class {
-	case message.RetentionPermanent:
-		return self.classKeys.Perm, nil
-	case message.RetentionDurable:
-		return self.classKeys.Durable, nil
-	case message.RetentionMedia:
-		return self.classKeys.Media, nil
-	case message.RetentionEph:
-		// the ONE branch that derives rather than looks up, and the one that can fail on
-		// state rather than on its argument. eph_root is not in ClassKeys and never will
-		// be -- master invariant I4, and spec A section 5.3 says a field for it "would make
-		// the wrong thing the easy thing" -- so the absence of a fourth field is what sends
-		// this branch to a value that had to arrive from outside.
-		if len(self.ephRoot) == 0 {
-			return nil, fmt.Errorf("%w: this record is EPH bucket %d window %d",
-				ErrNoEphRoot, ephBucket, ephWindow)
-		}
-		return EphKey(self.ephRoot, ephBucket, ephWindow), nil
-	}
-	return nil, fmt.Errorf("%w: retention class %d", ErrRetentionClassUnknown, class)
+	return classKeyOf(self.classKeys, self.ephRoot, class, ephBucket, ephWindow)
 }
 
 // senderRatchetOnLoop is this session's own ladder for one retention class, built on first use.
@@ -838,6 +840,9 @@ func (self *GroupSession) zeroizeOnLoop() {
 	zeroize(self.groupHandleKey)
 	zeroize(self.pqSecret)
 	zeroize(self.ephRoot)
+	for _, past := range self.pastEpochs {
+		past.Zeroize()
+	}
 	self.classKeys = nil
 	self.storageRoot = nil
 	self.writeKey = nil
@@ -846,6 +851,7 @@ func (self *GroupSession) zeroizeOnLoop() {
 	self.pqSecret = nil
 	self.ephRoot = nil
 	self.senders = map[senderLadderKey]*SenderRatchet{}
+	self.pastEpochs = map[uint64]*pastEpoch{}
 }
 
 // The exporter label and length MASTER section 7 derives mls_secret at.

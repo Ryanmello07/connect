@@ -765,13 +765,28 @@ func (self *GroupSession) openRecordOnLoop(record *message.Record,
 		return nil, nil, fmt.Errorf("%w: is_commit=%v, %d octets of server attachment, and this door opens application=%v",
 			ErrRecordNotAnApplicationRecord, header.IsCommit, len(header.ServerAttachment), wantApplication)
 	}
-	// the group id through subtle and the epoch with ==. Guardrail G8 is a rule about the
+	// the group id through subtle and the epoch by arithmetic. Guardrail G8 is a rule about the
 	// SPELLING and its class is derived off this tree's own imports, so every comparison of
 	// OCTETS goes one way whether or not the octets are secret -- a group id is public and is
 	// compared this way because a ban with one exemption in it is a ban with a judgement call in
 	// front of it. An epoch is a u64 and not octets, and it is compared as one.
-	if subtle.ConstantTimeCompare(header.GroupId[:], self.groupId[:]) != 1 || header.Epoch != self.epoch {
+	if subtle.ConstantTimeCompare(header.GroupId[:], self.groupId[:]) != 1 {
 		return nil, nil, fmt.Errorf("%w: group %x epoch %d", ErrRecordNotForThisSession, header.GroupId, header.Epoch)
+	}
+	// THE EPOCH CHECK IS A LOOKUP AND NOT AN EQUALITY SINCE LEDGER ITEM 241. This line used to
+	// read `header.Epoch != self.epoch`, and what it refused was every record a member had not
+	// yet opened when a commit moved the group on: a committer's own unfetched backlog, a
+	// restarted device re-walking its history at a later epoch, a second device. Item 241 rules
+	// that a member who WAS THERE keeps that history, and scheduleForOnLoop is the relaxation:
+	// the session's own handle and ladders for its own epoch, a prior epoch's rebuilt schedule
+	// for one inside [current - PastEpochWindow, current], and a refusal -- three of them, told
+	// apart by sentinel -- for a future epoch, an epoch below the window, and an epoch this
+	// device holds no state for. Everything below this line reads the handle and the ladders it
+	// answered and never self.handle or self.receivers, which is what "a record opens under the
+	// schedule of the epoch it was sealed at" means once it reaches code.
+	handle, receivers, err := self.scheduleForOnLoop(header.Epoch)
+	if err != nil {
+		return nil, nil, err
 	}
 	if err := self.refuseAheadEphWindowOnLoop(&header); err != nil {
 		return nil, nil, err
@@ -820,7 +835,7 @@ func (self *GroupSession) openRecordOnLoop(record *message.Record,
 		RetentionWire: retentionWire,
 		EphWindow:     ephLadderWindow(header.RetentionClass, header.EphWindow),
 	}
-	recordKey, err := self.receivers.PeekFor(ratchetKey, header.StreamIndex)
+	recordKey, err := receivers.PeekFor(ratchetKey, header.StreamIndex)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -857,7 +872,7 @@ func (self *GroupSession) openRecordOnLoop(record *message.Record,
 	// of what this ruling bought. It runs BEFORE the commit below for the reason
 	// unframeBodyOnLoop's comment gives: a forged envelope that moved the receiver's ladder
 	// would deny the true sender its own next index.
-	bodyPlain, err = self.unframeBodyOnLoop(&header, recordKey, headPlain, bodyPlain)
+	bodyPlain, err = self.unframeBodyOnLoop(handle, &header, recordKey, headPlain, bodyPlain)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -898,7 +913,7 @@ func (self *GroupSession) openRecordOnLoop(record *message.Record,
 	// prose say judges them -- a wrap by whether it decrypts to this device, a commit by whether
 	// mls accepts it, and mls has a replay guard of its own.
 	if wantApplication {
-		if err := self.receivers.Commit(ratchetKey, header.StreamIndex); err != nil {
+		if err := receivers.Commit(ratchetKey, header.StreamIndex); err != nil {
 			return nil, nil, err
 		}
 	}
