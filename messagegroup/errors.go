@@ -138,6 +138,16 @@ var (
 	// record layer derives over it is then a well formed key at the wrong epoch, the records seal,
 	// and every peer refuses them for a reason this device cannot name.
 	ErrEngineLoadedEpoch = errors.New("messagegroup: the epoch state this store answered stands at a different epoch from the one that was asked for")
+	// Fires when CommitAdd is handed no key packages at all. A commit carrying no proposal and
+	// no path is ValSem201's refusal one layer down, and a commit carrying no proposal WITH a
+	// path is a legitimate MLS commit that adds nobody -- so an empty vector is refused here,
+	// by name, rather than becoming whichever of the two mls answers.
+	ErrEngineCommitAddEmpty = errors.New("messagegroup: CommitAdd was handed no key packages")
+	// Fires when one of the key packages handed to CommitAdd does not decode, or decodes to a
+	// leaf that carries no urmessage_leaf_keys extension. The message names WHICH one. It
+	// carries the index because a caller batching several is otherwise told only that one of
+	// them is wrong.
+	ErrEngineCommitAddKeyPackage = errors.New("messagegroup: a key package handed to CommitAdd is not one this profile can admit")
 	// Fires when no key package ref the Welcome names is one this device's store holds. It
 	// carries the ref count, the refusal count and the last store error VERBATIM, because
 	// StateStore.TakeKeyPackage answers a bare error with no declared not-found value: a broken

@@ -73,6 +73,7 @@ var sectionSixGroupHandle = map[string]string{
 	"ProposeGroupPolicy": "func(policy []byte) ([]byte, error)",
 
 	"Commit":             "func(byReference [][]byte) (commit []byte, welcome []byte, ratchetTree []byte, err error)",
+	"CommitAdd":          "func(keyPackages [][]byte) (commit []byte, welcome []byte, ratchetTree []byte, err error)",
 	"MergePendingCommit": "func() error",
 	"ClearPendingCommit": "func()",
 
@@ -207,8 +208,15 @@ func TestTheEngineInterfacesAreExactlySectionSixsBlock(t *testing.T) {
 	// is the shape the amendment was chosen for. A restored group is the same connectMlsHandle a
 	// founded one is, so it reaches Process and ApplyCommit through the same bodies rather than
 	// through a second implementation that cannot write EngineProcessed's unexported staged half.
-	if len(sectionSixGroupEngine) != 5 || len(sectionSixGroupHandle) != 26 {
-		t.Errorf("section 6's block is transcribed as %d and %d methods; it was measured at 5 and 26, and a change to either is a change to the seam",
+	//
+	// AND IT IS 5 AND 27 FROM 2026-09-18's CommitAdd, ledger item 239's group chats: the HANDLE
+	// half gains the by-value commit arm. It is one method taking octets rather than a widening
+	// of Commit, because Commit's one parameter is the by-reference vector and a second
+	// parameter naming mls.Proposal would be the re-export Property 3 refuses; and it is on the
+	// seam at all because the property it buys -- a member that never saw a proposal processes
+	// the commit -- is one no caller of Commit can reach through Commit.
+	if len(sectionSixGroupEngine) != 5 || len(sectionSixGroupHandle) != 27 {
+		t.Errorf("section 6's block is transcribed as %d and %d methods; it was measured at 5 and 27, and a change to either is a change to the seam",
 			len(sectionSixGroupEngine), len(sectionSixGroupHandle))
 	}
 }

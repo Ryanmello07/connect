@@ -155,6 +155,32 @@ type GroupHandle interface {
 	ProposeGroupPolicy(policy []byte) ([]byte, error)
 
 	Commit(byReference [][]byte) (commit []byte, welcome []byte, ratchetTree []byte, err error)
+
+	// CommitAdd builds a commit that carries one Add proposal PER KEY PACKAGE, BY VALUE, and
+	// nothing by reference. IT IS THE TWENTY SEVENTH METHOD AND SECTION 6'S BLOCK HAS TWENTY SIX:
+	// it is an amendment, made 2026-09-18 for ledger item 239's group chats, and the paragraph a
+	// reader needs is what the by-reference arm cannot do.
+	//
+	// Commit names proposals by REFERENCE, and a reference resolves against the receiver's own
+	// proposal cache for the epoch that is closing. A member that never received the proposal
+	// refuses the commit -- (*mls.ProposalCache).Resolve answers errProposalNotCached, "proposal
+	// reference is not cached for this epoch" -- so the ProposeAdd-then-Commit pair only works
+	// while every member sees every proposal before the commit, which is one record per proposal
+	// per member on top of the commit. RFC 9420 section 12.4 lets a commit carry a proposal
+	// INLINE instead, attributed to the committer, and (*mls.Group).CreateCommit has carried that
+	// arm since it was written; this method is that arm brought to the seam. A receiver needs
+	// nothing cached, and N adds are one commit rather than N proposals and a commit.
+	//
+	// EXACTLY THESE ADDS AND NOTHING ELSE, which is the one contract decision. Passing a nil
+	// by-reference vector to CreateCommit would fold in every proposal this member has cached,
+	// and that would make "a member that never saw a proposal can process this" a fact about
+	// the cache's state at the moment of the call rather than about the method. A caller that
+	// wants cached proposals committed has Commit for them.
+	//
+	// THE KEY PACKAGES ARE OCTETS AND NOT mls.KeyPackage, for the same reason every other
+	// signature on this interface names go types only; the decode happens behind the seam.
+	CommitAdd(keyPackages [][]byte) (commit []byte, welcome []byte, ratchetTree []byte, err error)
+
 	MergePendingCommit() error
 	ClearPendingCommit()
 
@@ -775,6 +801,60 @@ func (self *connectMlsHandle) ProposeGroupPolicy(policy []byte) ([]byte, error) 
 // merged optimistically would fork itself off the group.
 func (self *connectMlsHandle) Commit(byReference [][]byte) ([]byte, []byte, []byte, error) {
 	result, err := self.group.CreateCommit(byReference, nil, nil)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return result.Commit, result.Welcome, result.RatchetTree, nil
+}
+
+// CommitAdd builds a commit carrying one by-value Add per key package. See the interface for why
+// the arm exists; what is decided here is what the adapter checks before mls is reached.
+//
+// THE KEY PACKAGE IS DECODED HERE, from the caller's octets, because mls.Add carries a structure
+// and section 6's signature carries octets. syntax.Unmarshal copies every opaque field it reads,
+// so the proposal shares no array with the caller's buffer -- the same property ProposeAdd states
+// for its own decode, and the reason a caller's later write through keyPackages[i] reaches nothing
+// this commit signed.
+//
+// urmessage_leaf_keys IS REQUIRED HERE, AND IT IS THE ONE CHECK mls's LIST RULES DO NOT MAKE.
+// ValidateProposalList runs inside CreateCommit over every by-value Add -- ValSem105 is
+// (*KeyPackage).Validate, so an expired, wrong-suite or wrongly signed package is refused by mls
+// without this adapter restating section 10.1 -- but the v1 wrap target is this profile's and not
+// RFC 9420's. ProposeAdd asks LeafKeysOf at generation for the reason its header gives: a joiner
+// whose leaf carries none is a member no epoch wrap can reach, and the first symptom is that
+// member reading nothing one commit later. The by-value arm admits a member without ever passing
+// through ProposeAdd, so the question is asked again here, once per package, before anything is
+// staged. Rejected: asking it in mls's list rules, where it would judge every Add of every
+// profile by a v1 extension type.
+//
+// THE BY-REFERENCE VECTOR IS EMPTY AND NOT NIL. CreateCommit reads nil as "every proposal cached
+// for this epoch" and an empty slice as "none of them", and the interface's contract is the
+// second. A caller that never saw a proposal can process what this builds precisely because
+// nothing it builds names one.
+//
+// NOTHING IS STAGED ON A REFUSAL. Every return before CreateCommit leaves the group where it
+// stood, and CreateCommit's own refusals do the same -- self.pending is written only at its end.
+func (self *connectMlsHandle) CommitAdd(keyPackages [][]byte) ([]byte, []byte, []byte, error) {
+	if len(keyPackages) == 0 {
+		return nil, nil, nil, fmt.Errorf("%w: no key packages", ErrEngineCommitAddEmpty)
+	}
+	byValue := make([]mls.Proposal, 0, len(keyPackages))
+	for i, encoded := range keyPackages {
+		var keyPackage mls.KeyPackage
+		if err := syntax.Unmarshal(encoded, &keyPackage); err != nil {
+			return nil, nil, nil, fmt.Errorf("%w: key package %d of %d does not decode: %w",
+				ErrEngineCommitAddKeyPackage, i, len(keyPackages), err)
+		}
+		if _, err := mls.LeafKeysOf(&keyPackage.LeafNode); err != nil {
+			return nil, nil, nil, fmt.Errorf("%w: key package %d of %d: %w",
+				ErrEngineCommitAddKeyPackage, i, len(keyPackages), err)
+		}
+		byValue = append(byValue, mls.Proposal{
+			ProposalType: mls.ProposalTypeAdd,
+			Add:          &mls.Add{KeyPackage: keyPackage},
+		})
+	}
+	result, err := self.group.CreateCommit([][]byte{}, byValue, nil)
 	if err != nil {
 		return nil, nil, nil, err
 	}
