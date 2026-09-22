@@ -40,9 +40,12 @@
 // body and the head under, and the two macs master section 9.2 authorizes a write and a
 // read with, together with the two per epoch keys those macs run under. Beside those, in
 // attachment.go, is the server attachment of spec A section 5.11: the one structured field
-// of a record the server may read, its four kinds and their kind discriminator, and every
+// of a record the server may read, its four bodies and their kind discriminator, and every
 // question spec B section 5.1 check 3 asks of a parsed one, so that the server asks rather
-// than re-derives. The key schedule does NOT land beside them and no longer lands at all:
+// than re-derives. Beside those four is a fifth body, the epoch digest attachment of ruling
+// 27, which is the epoch attachment with its two keys replaced by one digest over both of
+// them; it has a door of its own and that file's comment argues which server refuses it and
+// why that refusal is the rollout. The key schedule does NOT land beside them and no longer lands at all:
 // it IS in connect/messagegroup, which no message server links, and it takes these types
 // from here. As of m1 wave 1 that package holds the storage root and the three retention
 // class keys, the record key ladder, both ratchets, the group engine and its connect/mls

@@ -19,6 +19,20 @@
 //	WrapTag         := LP(wrap_target_handle) ‖ u64(epoch)
 //	EpochComplete   := u64(epoch) ‖ u32(wrap_count)
 //
+// A SIXTH KIND is defined here that section 5.11 does not carry yet, and THE SIXTH KIND
+// below says why, what refuses it, and what that refusal buys:
+//
+//	  kind 0x0005  EpochDigest     what 0x0001 becomes: the six PUBLIC fields of an
+//	                               EpochAttachment, and the DIGEST of its two keys in
+//	                               place of the keys themselves
+//
+//	EpochDigest     := u64(epoch) ‖ u16(alg_id) ‖ u32(media_ttl_seconds)
+//	                 ‖ u32(durable_ttl_seconds) ‖ LP(group_context_hash)
+//	                 ‖ u32(expected_wrap_count) ‖ LP(H(epoch_keys))
+//
+//	epoch_keys      := "URmessage/v1/epochkeys" ‖ u64(opens_epoch) ‖ LP(write_key)
+//	                 ‖ LP(read_key)
+//
 // codec.go states the rule that generated a layout and it holds here too: a field whose
 // width is fixed by its go type encodes raw at that width, and a field whose length varies
 // encodes as LP(x). That rule is what decides the go types below rather than the other way
@@ -59,10 +73,12 @@
 //
 // The second is the unknown kind. It is a decode error and never a silently ignored
 // attachment. Check 3 is what stands between a record and the database, and an attachment
-// the server cannot parse is one it cannot check: a record carrying kind 0x0005 that
+// the server cannot parse is one it cannot check: a record carrying kind 0x0006 that
 // parsed to "nothing worth looking at" would take the epoch key install path, the recovery
 // index and the wrap index with it, all of them unexamined. The same rule applies on the
-// encode side, so a caller cannot build one either.
+// encode side, so a caller cannot build one either. (This paragraph named 0x0005 until
+// ruling 27 defined that code; the point is about a code nothing defines, so it now names
+// the first one that still is not defined.)
 //
 // The third is durable_ttl_seconds, and it is the check most likely to be added by
 // somebody being careful. It has TWO wire sentinels and both are legal here: 0 means the
@@ -83,9 +99,58 @@
 // about the attachment's own contents is answered here so the server never re-derives it,
 // which is spec B section 12.1 A-2: the server "parses them with
 // message.ParseServerAttachment and never reimplements them".
+//
+// ── THE SIXTH KIND ──────────────────────────────────────────────────────────────────
+//
+// Kind 0x0005 is here because spec B section 5.4's RULED EpochAttachment block was
+// RE-OPENED, narrowly, by ruling 27 of 2026-09-22, and a re-opened ruling is worth the
+// sentence that says which two statements could not both be true. Section 5.4 puts
+// read_key[n+1] and write_key[n+1] IN THE CLEAR inside a structure the server serves back
+// verbatim; section 5.3 and MASTER section 9.2 promise that a member removed at epoch n
+// keeps access "until epoch n's read key ages out, and no longer". The commit that removes
+// the member is sealed AT epoch n, is fetchable under read_key[n], and carries the keys of
+// n+1 — so the removed member ladders every future epoch forever, and the two sentences
+// are not a preference between readings but a contradiction. Measured, twice, against the
+// server: a fetch under a learned read key answered REASON_OK and a forged write under a
+// learned write key answered REASON_OK. A specification that contradicts itself is
+// amended.
+//
+// What the amendment does here, and it is the whole of it: the two keys leave the served
+// structure and are replaced by ONE 32 octet digest over both of them. The keys ride
+// beside the record instead, as request fields, which is a later step and not this file's.
+// Nothing else moves — RecordHeader, the write_auth preimage, message_id and
+// format_version are all untouched — because THE BINDING IS ALREADY THERE AND IS FREE: the
+// attachment's octets are hashed into AAD_head and into the write_auth preimage, so the
+// mac covers the attachment, the attachment covers the digest, and the digest covers the
+// keys. A server recomputes H(epoch_keys) over the fields it was handed and compares it
+// against a value the mac already authenticated. No new preimage term, no new mac call
+// site, no format_version bump, no flag day.
+//
+// THE TWO DOORS, WHICH ARE THE ROLLOUT AND NOT A MODE. EncodeServerAttachment and
+// ParseServerAttachment are spec B section 5.1 check 3's door and they serve exactly the
+// five kinds section 5.11 defines; EncodeEpochDigestAttachment and
+// ParseEpochDigestAttachment are the sixth kind's door. The codec, the body table and
+// checkServerAttachment are ONE set of code behind both, so the two doors cannot come to
+// disagree about what an attachment is — what differs is only which kinds each one serves,
+// and that is serverAttachmentKindServed, one map, one line.
+//
+// THE PROPERTY THAT LINE BUYS is the reason the sixth kind can ship before anything else
+// does. A record carrying a kind 0x0005 attachment encodes, ParseRecords back with
+// is_commit set and the attachment slot byte intact, while ParseServerAttachment refuses
+// the same octets BY NAME with the kind in the message. So a STALE SERVER — one that has
+// not learned to carry the keys as request fields, which is every server today — refuses
+// the commit loudly at check 3 instead of installing an epoch whose keys it was never
+// handed, while a STALE RECEIVER follows the commit correctly, because no receive path in
+// connect or sdk reads a single field of an EpochAttachment: it hashes the octets and
+// nothing more. The rollout is then server-serves-both, then clients-emit-0x0005, then
+// server-stops-serving-0x0001, and each step is that one map.
+//
+// 0x0001 IS FROZEN AND STAYS READABLE. Nothing above changes one octet of it, and the
+// vectors that pin it are the ones that were there before this kind existed.
 package message
 
 import (
+	"crypto/sha256"
 	"fmt"
 
 	"github.com/urnetwork/connect/mls/syntax"
@@ -94,27 +159,60 @@ import (
 // The kind discriminator, u16 on the wire.
 type ServerAttachmentKind uint16
 
-// The five kinds spec A section 5.11 defines. The codes are the spec's; nothing here may
-// renumber them, because they reach the write_auth mac and both aeads by way of
-// H(server_attachment) and a renumbering is a record every other implementation refuses.
+// The five kinds spec A section 5.11 defines, and the sixth ruling 27 defines. The codes
+// are the spec's; nothing here may renumber them, because they reach the write_auth mac and
+// both aeads by way of H(server_attachment) and a renumbering is a record every other
+// implementation refuses.
 const (
-	AttachmentNone     ServerAttachmentKind = 0x0000
-	AttachmentEpoch    ServerAttachmentKind = 0x0001
-	AttachmentRecovery ServerAttachmentKind = 0x0002
-	AttachmentWrap     ServerAttachmentKind = 0x0003
-	AttachmentComplete ServerAttachmentKind = 0x0004
+	AttachmentNone        ServerAttachmentKind = 0x0000
+	AttachmentEpoch       ServerAttachmentKind = 0x0001
+	AttachmentRecovery    ServerAttachmentKind = 0x0002
+	AttachmentWrap        ServerAttachmentKind = 0x0003
+	AttachmentComplete    ServerAttachmentKind = 0x0004
+	AttachmentEpochDigest ServerAttachmentKind = 0x0005
 )
 
 // The kinds this package knows, as a lookup rather than a chain of comparisons, for the
 // reason record.go's classPrunable is one: a kind added later has to be given an answer
 // here instead of inheriting one from whichever side of a bound it happens to fall.
 var serverAttachmentKindKnown = map[ServerAttachmentKind]bool{
+	AttachmentNone:        true,
+	AttachmentEpoch:       true,
+	AttachmentRecovery:    true,
+	AttachmentWrap:        true,
+	AttachmentComplete:    true,
+	AttachmentEpochDigest: true,
+}
+
+// The kinds spec B section 5.1 check 3's door serves, which is a SMALLER set than the one
+// above and is the whole of the rollout the file comment describes.
+//
+// It is a map of its own rather than a subtraction, for the reason serverAttachmentKindKnown
+// is a map rather than a bound: a kind added later is given an answer here instead of
+// inheriting one. Today it is the five kinds section 5.11 defines, and kind 0x0005 is
+// deliberately absent — a server that accepted it would install an epoch whose two keys it
+// was never handed, because the fields those keys ride in do not exist yet. The day they
+// do, AttachmentEpochDigest joins this map and ParseServerAttachment serves six.
+var serverAttachmentKindServed = map[ServerAttachmentKind]bool{
 	AttachmentNone:     true,
 	AttachmentEpoch:    true,
 	AttachmentRecovery: true,
 	AttachmentWrap:     true,
 	AttachmentComplete: true,
 }
+
+// The one kind the epoch digest door serves. Written as the same shape as the map above so
+// that "which kinds does this door serve" is one question with one answer per door.
+var epochDigestKindServed = map[ServerAttachmentKind]bool{
+	AttachmentEpochDigest: true,
+}
+
+// What each door is called in its own refusal, so a reader of a log knows which of the two
+// answered rather than only that something did.
+const (
+	serverAttachmentDoorName = "spec B section 5.1 check 3's door"
+	epochDigestDoorName      = "the epoch digest door"
+)
 
 // The exact widths spec A section 5.11 gives the six length prefixed fields. Written as
 // named constants rather than as the array widths of go types, because the fields are
@@ -127,7 +225,23 @@ const (
 	recoveryHandleBytes        = 16
 	recoveryVerifyPubBytes     = 32
 	wrapTargetHandleBytes      = 16
+	// H is SHA-256 per master section 0's notation line, so the digest of epoch_keys is
+	// this wide and no other width is a digest of anything. It is a named constant beside
+	// the six above because it is the same kind of fact: a length prefixed field of an
+	// attachment whose width this file checks rather than types.
+	epochKeysDigestBytes = 32
 )
+
+// The domain separation label of the epoch keys digest, raw ascii and never length
+// prefixed, exactly as the four labels in aad.go and writeauth.go are.
+//
+// It is its own constant and is never computed from another label or shares a prefix
+// constant with one, for the reason those files give at length: the separation between two
+// preimages rests on the bytes of their labels differing, a shared constant is one edit
+// away from making two of them agree, and a preimage that agrees with another protocol's is
+// a preimage that can be replayed into it. attachment_test.go holds every label this package
+// declares to that as a property over the source rather than over a list.
+const epochKeysLabel = "URmessage/v1/epochkeys"
 
 // The algorithm identifier each kind that carries one names, from master section 7.1's
 // registry: 0x0031 is HKDF-SHA-256, which is what derived write_key and read_key, and
@@ -139,9 +253,13 @@ const (
 // EpochAttachment announcing 0x0001 would be claiming its two 32 octet keys came out of a
 // signature algorithm, which is not a v1 record with an unusual field but a record built
 // by something that does not know what the field is for.
+// EpochDigest names the same 0x0031 EpochAttachment does, and it names it for the same
+// reason: the field says which algorithm derived the two keys the attachment is about, and
+// hashing them rather than carrying them does not change what derived them.
 var attachmentAlgIds = map[ServerAttachmentKind]uint16{
-	AttachmentEpoch:    0x0031,
-	AttachmentRecovery: 0x0001,
+	AttachmentEpoch:       0x0031,
+	AttachmentRecovery:    0x0001,
+	AttachmentEpochDigest: 0x0031,
 }
 
 // The epoch attachment: everything the server needs in order to verify the epoch this
@@ -171,6 +289,95 @@ type EpochAttachment struct {
 	// zero would name a wrap set the EpochComplete marker can never match, leaving the
 	// group readable but not writable with nothing able to close it.
 	ExpectedWrapCount uint32
+}
+
+// The epoch digest attachment: everything the epoch attachment above says about the epoch
+// this commit opens, with the two keys replaced by one digest over both of them.
+//
+// Six of its seven fields are the six PUBLIC fields of EpochAttachment, in EpochAttachment's
+// own order and with their own meanings, and they are declared here rather than by embedding
+// that type because embedding would put write_key and read_key one selector away from a
+// structure whose whole purpose is not to have them.
+type EpochDigestAttachment struct {
+	// The epoch this attachment OPENS, which spec B section 5.1 check 3 requires to be
+	// current_epoch + 1. That comparison is the server's — it is the party that holds
+	// current_epoch — and is deliberately not made here.
+	Epoch uint64
+	AlgId uint16
+	// Both retention fields are the whole u32 range, both of durable's sentinels included,
+	// exactly as they are on EpochAttachment. The file comment says why there is no check
+	// here and why adding one refuses commits.
+	MediaTtlSeconds   uint32
+	DurableTtlSeconds uint32
+	GroupContextHash  []byte
+	// Device wraps plus recovery wraps plus the one snapshot, for the epoch this opens.
+	// Greater than zero, always, for EpochAttachment's reason unchanged.
+	ExpectedWrapCount uint32
+	// H(epoch_keys), exactly 32 octets: SHA-256 over
+	//
+	//	"URmessage/v1/epochkeys" ‖ u64(opens_epoch) ‖ LP(write_key) ‖ LP(read_key)
+	//
+	// and EpochKeysDigest is the one function in this package that computes it. The two
+	// keys are LP framed inside the preimage, so no choice of one key's octets can move a
+	// boundary into the other's, and opens_epoch is inside it so that one epoch's pair
+	// cannot be replayed as another's.
+	//
+	// The server does not learn the keys from this. It is handed them beside the record and
+	// recomputes this value, which the write_auth mac already covers by way of
+	// H(server_attachment) — so the digest is a binding and never a delivery.
+	EpochKeysDigest []byte
+}
+
+// EpochKeysDigest is H(epoch_keys): the one value an EpochDigestAttachment carries about
+// the two keys it does not carry.
+//
+//	epoch_keys := "URmessage/v1/epochkeys" ‖ u64(opens_epoch) ‖ LP(write_key) ‖ LP(read_key)
+//
+// H is SHA-256, per master section 0's notation line, and the answer is its thirty two
+// octets. It is exported because both ends compute it: the committer to fill the field, and
+// the server to check the field against the keys it was handed. A second implementation that
+// computed a different one would have every commit refused at a comparison rather than
+// anywhere legible, which is why the vectors in attachment_test.go pin the preimage as well
+// as the digest.
+//
+// It refuses a key that is not exactly thirty two octets rather than hashing it. A digest
+// over a short key is a digest nothing else reproduces, and the one caller that could get
+// here with one is a caller that looked a key up and got nothing back — which is the empty
+// key writeauth.go's ErrAuthKeyLength exists to keep out of a mac, met one layer further out.
+func EpochKeysDigest(opensEpoch uint64, writeKey []byte, readKey []byte) ([]byte, error) {
+	preimage, err := epochKeysPreimage(opensEpoch, writeKey, readKey)
+	if err != nil {
+		return nil, err
+	}
+	digest := sha256.Sum256(preimage)
+	return digest[:], nil
+}
+
+// The bytes the digest above is taken over, in the block at the top of this file.
+//
+// It is a function of its own rather than four lines inside EpochKeysDigest so that the
+// preimage is a value a test can pin, which is what makes "the label is these octets" and
+// "opens_epoch is in here" observable at all: a digest alone moves as one opaque number
+// whichever term went missing.
+//
+// The label is raw ascii and is NOT length prefixed, exactly as the four labels in aad.go
+// and writeauth.go are, so a reader of the bytes meets twenty two label octets and then the
+// first field. What separates this preimage from those four is the bytes of the label alone.
+func epochKeysPreimage(opensEpoch uint64, writeKey []byte, readKey []byte) ([]byte, error) {
+	if err := checkAttachmentWidth("write_key", writeKey, epochWriteKeyBytes); err != nil {
+		return nil, err
+	}
+	if err := checkAttachmentWidth("read_key", readKey, epochReadKeyBytes); err != nil {
+		return nil, err
+	}
+	writer := syntax.NewWriter()
+	writer.WriteRaw([]byte(epochKeysLabel))
+	writer.WriteUint64(opensEpoch)
+	writer.WriteOpaqueLP(writeKey)
+	writer.WriteOpaqueLP(readKey)
+	// the writer is sticky: the first failure latches and every later call is a no op, so
+	// this is the one place the build is asked whether it worked.
+	return writer.Bytes()
 }
 
 // The recovery tag: the handle the server indexes recovery wraps by, and the public half
@@ -213,11 +420,12 @@ type EpochComplete struct {
 // so an attachment carrying an EpochAttachment under the WrapTag tag is refused rather
 // than encoded as a wrap tag with the epoch attachment quietly dropped.
 type ServerAttachment struct {
-	Kind     ServerAttachmentKind
-	Epoch    *EpochAttachment
-	Recovery *RecoveryTag
-	Wrap     *WrapTag
-	Complete *EpochComplete
+	Kind        ServerAttachmentKind
+	Epoch       *EpochAttachment
+	Recovery    *RecoveryTag
+	Wrap        *WrapTag
+	Complete    *EpochComplete
+	EpochDigest *EpochDigestAttachment
 }
 
 // The kind the bodies actually set say this is, and how many of them are set.
@@ -242,6 +450,9 @@ func (self *ServerAttachment) bodyKind() (ServerAttachmentKind, int) {
 	if self.Complete != nil {
 		kind, set = AttachmentComplete, set+1
 	}
+	if self.EpochDigest != nil {
+		kind, set = AttachmentEpochDigest, set+1
+	}
 	return kind, set
 }
 
@@ -263,6 +474,36 @@ func EncodeServerAttachment(a *ServerAttachment) ([]byte, error) {
 	if err := checkServerAttachment(a); err != nil {
 		return nil, err
 	}
+	if err := checkAttachmentKindServed(a.Kind, serverAttachmentKindServed, serverAttachmentDoorName); err != nil {
+		return nil, err
+	}
+	return encodeAttachmentBytes(a)
+}
+
+// EncodeEpochDigestAttachment serialises the sixth kind, and is the committer's whole
+// interface to it.
+//
+// It takes the body rather than a ServerAttachment because a door that serves one kind has
+// no discriminator left for a caller to get wrong, and because the mistake this replaces —
+// building a ServerAttachment, setting Kind to the digest kind, and reaching
+// EncodeServerAttachment's refusal — is one a type can prevent instead of report.
+//
+// Everything it refuses, it refuses through the same checkServerAttachment the other door
+// runs, so there is no attachment one door will write and the other will fail to read.
+func EncodeEpochDigestAttachment(d *EpochDigestAttachment) ([]byte, error) {
+	a := &ServerAttachment{Kind: AttachmentEpochDigest, EpochDigest: d}
+	if err := checkServerAttachment(a); err != nil {
+		return nil, err
+	}
+	return encodeAttachmentBytes(a)
+}
+
+// The framing both doors write, over an attachment that has already been checked.
+//
+// It is one function rather than one per door because the layout is one layout: two doors
+// with two writers is two encodings of one attachment the day one of them is edited, and
+// H(server_attachment) is over exactly one of them.
+func encodeAttachmentBytes(a *ServerAttachment) ([]byte, error) {
 	if a.Kind == AttachmentNone {
 		return nil, nil
 	}
@@ -291,6 +532,45 @@ func EncodeServerAttachment(a *ServerAttachment) ([]byte, error) {
 //
 // The returned attachment has exactly one body set, and it is the one Kind names.
 func ParseServerAttachment(b []byte) (*ServerAttachment, error) {
+	attachment, err := parseAttachmentBytes(b)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkAttachmentKindServed(attachment.Kind, serverAttachmentKindServed, serverAttachmentDoorName); err != nil {
+		return nil, err
+	}
+	return attachment, nil
+}
+
+// ParseEpochDigestAttachment deserialises the sixth kind, and is the only way to read one.
+//
+// It answers the body rather than a ServerAttachment for the reason its encoding sibling
+// takes one: a door that serves one kind hands back the one thing it can have parsed, and a
+// caller that had to test a discriminator afterwards would be a caller that could forget to.
+//
+// It refuses every other kind by name, the five section 5.11 defines included, because the
+// question this door answers is "is this the digest attachment" and a yes for kind 0x0001
+// would be the epoch key install path reached through the function that exists to take the
+// keys out of it.
+func ParseEpochDigestAttachment(b []byte) (*EpochDigestAttachment, error) {
+	attachment, err := parseAttachmentBytes(b)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkAttachmentKindServed(attachment.Kind, epochDigestKindServed, epochDigestDoorName); err != nil {
+		return nil, err
+	}
+	return attachment.EpochDigest, nil
+}
+
+// The parse both doors run, over every kind this package defines and before either door
+// asks whether it serves the one it found.
+//
+// The split is what makes the refusal above say "a kind this door does not serve" rather
+// than "these octets are not an attachment": the octets ARE an attachment, they are checked
+// as one, and only then is the kind weighed against the door. A parser that refused on the
+// kind alone would be unable to tell a caller which of the two it had met.
+func parseAttachmentBytes(b []byte) (*ServerAttachment, error) {
 	if len(b) == 0 {
 		return &ServerAttachment{Kind: AttachmentNone}, nil
 	}
@@ -341,6 +621,14 @@ func writeAttachmentBody(w *syntax.Writer, a *ServerAttachment) {
 	case AttachmentComplete:
 		w.WriteUint64(a.Complete.Epoch)
 		w.WriteUint32(a.Complete.WrapCount)
+	case AttachmentEpochDigest:
+		w.WriteUint64(a.EpochDigest.Epoch)
+		w.WriteUint16(a.EpochDigest.AlgId)
+		w.WriteUint32(a.EpochDigest.MediaTtlSeconds)
+		w.WriteUint32(a.EpochDigest.DurableTtlSeconds)
+		w.WriteOpaqueLP(a.EpochDigest.GroupContextHash)
+		w.WriteUint32(a.EpochDigest.ExpectedWrapCount)
+		w.WriteOpaqueLP(a.EpochDigest.EpochKeysDigest)
 	}
 }
 
@@ -388,6 +676,17 @@ func readAttachmentBody(r *syntax.Reader, a *ServerAttachment) error {
 		complete.WrapCount, _ = r.ReadUint32()
 		a.Complete = complete
 		return nil
+	case AttachmentEpochDigest:
+		digest := &EpochDigestAttachment{}
+		digest.Epoch, _ = r.ReadUint64()
+		digest.AlgId, _ = r.ReadUint16()
+		digest.MediaTtlSeconds, _ = r.ReadUint32()
+		digest.DurableTtlSeconds, _ = r.ReadUint32()
+		digest.GroupContextHash, _ = r.ReadOpaqueLP()
+		digest.ExpectedWrapCount, _ = r.ReadUint32()
+		digest.EpochKeysDigest, _ = r.ReadOpaqueLP()
+		a.EpochDigest = digest
+		return nil
 	}
 	return fmt.Errorf("%w: 0x%04x, and an attachment this layer cannot parse is one the server cannot check",
 		ErrServerAttachmentKindUnknown, uint16(a.Kind))
@@ -421,8 +720,27 @@ func checkServerAttachment(a *ServerAttachment) error {
 		return checkWrapTag(a.Wrap)
 	case AttachmentComplete:
 		return checkEpochComplete(a.Complete)
+	case AttachmentEpochDigest:
+		return checkEpochDigestAttachment(a.EpochDigest)
 	}
 	return nil
+}
+
+// Whether a door serves the kind it has been handed.
+//
+// It answers yes for a kind this package does not define at all, and that is the whole of
+// how it composes with the refusal above rather than shadowing it: an undefined kind is
+// checkServerAttachment's to refuse, with ErrServerAttachmentKindUnknown and the sentence
+// about an attachment the server cannot check, and a gate here that got there first would
+// re-label every one of the 65530 codes nothing defines as a kind that merely went to the
+// wrong window. The two refusals mean different things to a caller — "nobody defines this"
+// against "this door does not serve it yet" — so they are two sentinels and this one is
+// reached only for a kind that is well formed and defined.
+func checkAttachmentKindServed(kind ServerAttachmentKind, served map[ServerAttachmentKind]bool, door string) error {
+	if !serverAttachmentKindKnown[kind] || served[kind] {
+		return nil
+	}
+	return fmt.Errorf("%w: kind 0x%04x at %s", ErrServerAttachmentKindNotServed, uint16(kind), door)
 }
 
 // The epoch attachment's own checks: three exact widths, the algorithm identifier its kind
@@ -444,6 +762,43 @@ func checkEpochAttachment(e *EpochAttachment) error {
 	// own snapshot in the wrap set, so zero is not a small fan out but a marker condition
 	// no EpochComplete can ever satisfy: the group would stay readable and unwritable with
 	// nothing able to close it.
+	if e.ExpectedWrapCount == 0 {
+		return fmt.Errorf("%w: the epoch it opens expects no wraps at all, and its own snapshot is one",
+			ErrExpectedWrapCountZero)
+	}
+	return nil
+}
+
+// The epoch digest attachment's own checks: the algorithm identifier its kind names, two
+// exact widths, and a wrap set with something in it.
+//
+// It is checkEpochAttachment's list with write_key and read_key struck and the digest put
+// in their place, which is what the amendment is, and it is DELIBERATELY the same list in
+// every other respect. What is absent is as load bearing here as it is there: no comparison
+// against either durable_ttl_seconds sentinel, no bound on media_ttl_seconds, and no epoch
+// arithmetic.
+//
+// THE THREE CLAUSES OF CHECK 3 THAT ARE NOT HERE ARE NOT HERE FOR KIND 0x0005 EITHER, and
+// the reason is the one spec B section 5.1 check 3 already gives of kind 0x0001:
+// "epoch == current_epoch + 1" and the marker's matching wrap_count both need group state
+// the attachment does not carry, and "an epoch attachment iff is_commit" needs the record
+// header beside it. A codec that reached for current_epoch would be a codec with a database.
+// The fourth question this kind adds — does the digest equal H over the keys the submitter
+// handed us — is the server's for exactly the same reason: this layer is never handed the
+// keys, which is the point of the amendment.
+func checkEpochDigestAttachment(e *EpochDigestAttachment) error {
+	if err := checkAttachmentAlgId(AttachmentEpochDigest, e.AlgId); err != nil {
+		return err
+	}
+	if err := checkAttachmentWidth("group_context_hash", e.GroupContextHash, epochGroupContextHashBytes); err != nil {
+		return err
+	}
+	// the width IS the check this layer can make of the digest. It cannot recompute the
+	// value — it holds neither key — so what it can say is that the field is a SHA-256
+	// output's worth of octets and not a truncation somebody would compare a prefix of.
+	if err := checkAttachmentWidth("epoch_keys_digest", e.EpochKeysDigest, epochKeysDigestBytes); err != nil {
+		return err
+	}
 	if e.ExpectedWrapCount == 0 {
 		return fmt.Errorf("%w: the epoch it opens expects no wraps at all, and its own snapshot is one",
 			ErrExpectedWrapCountZero)

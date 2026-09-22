@@ -68,6 +68,20 @@
 # checkout left behind".
 mls/testdata/corpus/** -text
 
+# message/testdata/fuzz/** IS THE SAME RULE ON THE SAME MACHINE and the line above did not
+# reach it, which was measured rather than reasoned about: `git add` on the fifteen entries
+# of FuzzParseEpochDigestAttachment answered "LF will be replaced by CRLF the next time Git
+# touches it", fifteen times. These entries are go's own fuzz corpus format -- a header line
+# and then []byte("\x00\x05…") -- so they are ASCII with no NUL in them, which is exactly
+# the shape the paragraph above says git rewrites. A CRLF checkout does not corrupt the
+# OCTETS they encode; it puts a carriage return on the end of the line, strconv.Unquote
+# refuses it, and every checked-in interop vector in these directories becomes unreadable on
+# a fresh Windows clone. The existing FuzzParseRecord and FuzzParseServerAttachment entries
+# are under the same exposure and are LF on disk today only because of whatever last wrote
+# them; this line is what makes that a property of the repository rather than of the tool.
+# It rewrites no git object -- all of them are LF in the index already.
+message/testdata/fuzz/** -text
+
 # messagegroup/testdata/eph-window-kat.txt is ONE HALF OF A PAIR. msgrepo carries the same 57
 # answers, byte for byte, at its own module root, and each repository drives its own copy of
 # MASTER section 8's sender formula over them. That is the only fastening available: Spec B

@@ -33,13 +33,14 @@
 // publishes it, while a sentinel only an unpublished function can reach is not, because
 // publishing it would widen the server's allowlist with a name no server can use.
 //
-// Six more are of the first kind and are owed the amendment rather than already carrying
-// it. ErrServerAttachmentKindUnknown, ErrServerAttachmentBody,
+// Seven more are of the first kind and are owed the amendment rather than already carrying
+// it. ErrServerAttachmentKindUnknown, ErrServerAttachmentKindNotServed,
+// ErrServerAttachmentBody,
 // ErrServerAttachmentNoneEncoded, ErrServerAttachmentFieldLength, ErrServerAttachmentAlgId
 // and ErrExpectedWrapCountZero are all reachable from ParseServerAttachment and
 // EncodeServerAttachment, and both of those are on section 12.1's block in spec A and in
 // spec B's character for character restatement of it. So by the rule in the paragraph above
-// each of the six is owed a line in both refusal blocks, and neither block carries one yet:
+// each of the seven is owed a line in both refusal blocks, and neither block carries one yet:
 // those blocks list nine names, all of them the record codec's, and were written before this
 // encoding existed. Spec B section 5.1 check 3 is the caller that needs them — it is the
 // server's static shape check, it calls ParseServerAttachment, and a refusal it cannot name
@@ -115,6 +116,28 @@ var (
 	// kind nobody recognises would carry the epoch key install, the recovery index and
 	// the wrap index past every question check 3 asks of them.
 	ErrServerAttachmentKindUnknown = errors.New("message: server attachment kind is not one spec A section 5.11 defines")
+	// Fires when a door is handed a kind this package DOES define and that door does not
+	// serve, in both directions of that one rule: kind 0x0005 at spec B section 5.1 check
+	// 3's door, and any of section 5.11's five at the epoch digest door. One sentinel
+	// because it is one rule — a door serves the kinds it serves — and a caller that told
+	// the two directions apart would be acting on a distinction the wire does not carry.
+	// The door is named in the message, for the reader who has to know which of the two
+	// answered.
+	//
+	// It is NOT ErrServerAttachmentKindUnknown, and the difference is the whole of ruling
+	// 27's rollout. "Nobody defines this code" is a record no conforming implementation
+	// ever wrote. "This door does not serve this code yet" is a record a conforming
+	// implementation writes on purpose, and this refusal is what makes a server that has
+	// not learned to carry the epoch keys beside the record refuse such a commit loudly at
+	// check 3 rather than install an epoch whose keys it was never handed. A caller matches
+	// the sentinel and never the message text, which is guardrail G7 of spec A section 5.9
+	// and the reason this is a sentinel at all.
+	//
+	// It is owed a line in spec A and spec B section 12.1's refusal blocks under the rule
+	// the comment at the top of this file states, exactly as the six before it are: it is
+	// reachable from ParseServerAttachment and EncodeServerAttachment, both of which are on
+	// that published block. It is recorded here with them rather than quietly added.
+	ErrServerAttachmentKindNotServed = errors.New("message: a server attachment door was handed a kind it does not serve")
 	// Fires when an attachment's kind and the body it carries disagree, in both
 	// directions: a kind with no body, a kind with the wrong body, and two bodies set at
 	// once. One sentinel because it is one rule — an attachment is exactly one kind and

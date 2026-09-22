@@ -73,10 +73,14 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -185,6 +189,40 @@ func (self rawWrapTag) encode(t testing.TB) []byte {
 	return bs
 }
 
+// The epoch digest attachment's body as raw values.
+//
+// Written out field by field beside the four above rather than derived from
+// rawEpochAttachment with two fields dropped, for the reason rawAttachment exists at all:
+// the point of this half of the file is to state the layout independently of the code under
+// test, and a raw builder that took its field ORDER from the one it is checking would agree
+// with a permutation of it.
+type rawEpochDigestAttachment struct {
+	epoch             uint64
+	algId             uint16
+	mediaTtlSeconds   uint32
+	durableTtlSeconds uint32
+	groupContextHash  []byte
+	expectedWrapCount uint32
+	epochKeysDigest   []byte
+}
+
+func (self rawEpochDigestAttachment) encode(t testing.TB) []byte {
+	t.Helper()
+	writer := syntax.NewWriter()
+	writer.WriteUint64(self.epoch)
+	writer.WriteUint16(self.algId)
+	writer.WriteUint32(self.mediaTtlSeconds)
+	writer.WriteUint32(self.durableTtlSeconds)
+	writer.WriteOpaqueLP(self.groupContextHash)
+	writer.WriteUint32(self.expectedWrapCount)
+	writer.WriteOpaqueLP(self.epochKeysDigest)
+	bs, err := writer.Bytes()
+	if err != nil {
+		t.Fatalf("the raw epoch digest attachment does not encode: %v", err)
+	}
+	return bs
+}
+
 // The marker's body as raw values.
 type rawEpochComplete struct {
 	epoch     uint64
@@ -240,6 +278,16 @@ func rawAttachmentOf(t testing.TB, a *ServerAttachment) rawAttachment {
 			epoch:     a.Complete.Epoch,
 			wrapCount: a.Complete.WrapCount,
 		}.encode(t)
+	case a.EpochDigest != nil:
+		raw.body = rawEpochDigestAttachment{
+			epoch:             a.EpochDigest.Epoch,
+			algId:             a.EpochDigest.AlgId,
+			mediaTtlSeconds:   a.EpochDigest.MediaTtlSeconds,
+			durableTtlSeconds: a.EpochDigest.DurableTtlSeconds,
+			groupContextHash:  a.EpochDigest.GroupContextHash,
+			expectedWrapCount: a.EpochDigest.ExpectedWrapCount,
+			epochKeysDigest:   a.EpochDigest.EpochKeysDigest,
+		}.encode(t)
 	}
 	return raw
 }
@@ -264,14 +312,24 @@ var specAttachmentKindCodes = map[ServerAttachmentKind]uint16{
 	AttachmentComplete: 0x0004,
 }
 
-// The names section 5.11's table gives the five codes, for a failure message that says
-// which kind is meant rather than which number.
+// The kind codes RULED since section 5.11 was written, and what each one names. It is a
+// second table rather than a sixth row of the one above, and the split is the point: the
+// five above are what a server built against the published section 5.11 serves, and the
+// ones here are what this package defines and that door does not serve yet. A reader who
+// wants to know which is which reads the two names.
+var ruledAttachmentKindCodes = map[ServerAttachmentKind]uint16{
+	AttachmentEpochDigest: 0x0005,
+}
+
+// The names section 5.11's table gives the five codes and ruling 27 gives the sixth, for a
+// failure message that says which kind is meant rather than which number.
 var specAttachmentKindNames = map[ServerAttachmentKind]string{
-	AttachmentNone:     "NONE",
-	AttachmentEpoch:    "EpochAttachment",
-	AttachmentRecovery: "RecoveryTag",
-	AttachmentWrap:     "WrapTag",
-	AttachmentComplete: "EpochComplete",
+	AttachmentNone:        "NONE",
+	AttachmentEpoch:       "EpochAttachment",
+	AttachmentRecovery:    "RecoveryTag",
+	AttachmentWrap:        "WrapTag",
+	AttachmentComplete:    "EpochComplete",
+	AttachmentEpochDigest: "EpochDigest",
 }
 
 // The written down codes, sorted, as the one alphabet every derived set is compared against.
@@ -282,6 +340,71 @@ func specAttachmentCodes() []int {
 	}
 	slices.Sort(codes)
 	return codes
+}
+
+// Every code this package defines, whichever door serves it: the two written down tables
+// joined, sorted.
+//
+// The walks that are about the PACKAGE's alphabet — the body pointers of ServerAttachment,
+// the length prefixed fields of every body, the codes nothing defines — run over this, and
+// the walks that are about section 5.11's door run over specAttachmentCodes. Getting that
+// distinction wrong in either direction is how the sixth kind would end up pinned by
+// nothing while every property in this file went on holding over the five that were already
+// here, which is the failure TestEveryKindThatCarriesABodyHasAGoldenVector was written to
+// prevent.
+func definedAttachmentCodes() []int {
+	codes := specAttachmentCodes()
+	for _, code := range ruledAttachmentKindCodes {
+		codes = append(codes, int(code))
+	}
+	slices.Sort(codes)
+	return codes
+}
+
+// The codes ruling 27 defines and section 5.11's door does not serve, sorted. Derived by
+// subtracting one written down table from the other rather than listed a third time.
+func ruledAttachmentCodes() []int {
+	served := map[int]bool{}
+	for _, code := range specAttachmentCodes() {
+		served[code] = true
+	}
+	codes := []int{}
+	for _, code := range definedAttachmentCodes() {
+		if !served[code] {
+			codes = append(codes, code)
+		}
+	}
+	slices.Sort(codes)
+	return codes
+}
+
+// ── the doors ───────────────────────────────────────────────────────────────────────
+
+// One attachment encoded at the door that serves its kind.
+//
+// Every property in this file that is about an ATTACHMENT rather than about one door goes
+// through this pair, so that the sixth kind is under the same walks as the other five
+// instead of having its own weaker copies of them. Which door a kind is served at is read
+// off the package's own answer — the digest kind has a typed door and everything else has
+// section 5.11's — and not off a list here.
+func encodeAtItsDoor(a *ServerAttachment) ([]byte, error) {
+	if a.Kind == AttachmentEpochDigest {
+		return EncodeEpochDigestAttachment(a.EpochDigest)
+	}
+	return EncodeServerAttachment(a)
+}
+
+// One encoding parsed at the door that serves the kind named, with the parsed attachment
+// rebuilt into the one shape the comparisons in this file take.
+func parseAtItsDoor(kind ServerAttachmentKind, bs []byte) (*ServerAttachment, error) {
+	if kind == AttachmentEpochDigest {
+		digest, err := ParseEpochDigestAttachment(bs)
+		if err != nil {
+			return nil, err
+		}
+		return &ServerAttachment{Kind: AttachmentEpochDigest, EpochDigest: digest}, nil
+	}
+	return ParseServerAttachment(bs)
 }
 
 // ── the corpus ──────────────────────────────────────────────────────────────────────
@@ -356,6 +479,35 @@ func validEpochAttachment(rotation int, epoch uint64, media uint32, durable uint
 	}
 }
 
+// A valid epoch digest attachment at one point of the cross product.
+//
+// Its digest is the package's own EpochKeysDigest over the SAME two key ramps
+// validEpochAttachment fills write_key and read_key with, which is what makes a corpus
+// entry here the corresponding entry there with the keys replaced by their digest — the
+// relation the whole amendment is. The vectors are where that relation is pinned against
+// arithmetic done outside this package; here it only has to be the same relation everywhere.
+func validEpochDigestAttachment(t testing.TB, rotation int, epoch uint64, media uint32, durable uint32, count uint32) *ServerAttachment {
+	t.Helper()
+	digest, err := EpochKeysDigest(epoch,
+		attachmentFiller(attachmentWriteKeyTag, rotation, epochWriteKeyBytes),
+		attachmentFiller(attachmentReadKeyTag, rotation, epochReadKeyBytes))
+	if err != nil {
+		t.Fatalf("EpochKeysDigest refused two 32 octet keys: %v", err)
+	}
+	return &ServerAttachment{
+		Kind: AttachmentEpochDigest,
+		EpochDigest: &EpochDigestAttachment{
+			Epoch:             epoch,
+			AlgId:             attachmentAlgIds[AttachmentEpochDigest],
+			MediaTtlSeconds:   media,
+			DurableTtlSeconds: durable,
+			GroupContextHash:  attachmentFiller(attachmentGroupContextTag, rotation, epochGroupContextHashBytes),
+			ExpectedWrapCount: count,
+			EpochKeysDigest:   digest,
+		},
+	}
+}
+
 // A valid recovery tag at one content rotation.
 func validRecoveryTag(rotation int) *ServerAttachment {
 	return &ServerAttachment{
@@ -398,14 +550,18 @@ func validEpochComplete(epoch uint64, count uint32) *ServerAttachment {
 func validAttachmentsByKind(t testing.TB) map[ServerAttachmentKind]*ServerAttachment {
 	t.Helper()
 	byKind := map[ServerAttachmentKind]*ServerAttachment{
-		AttachmentNone:     {Kind: AttachmentNone},
-		AttachmentEpoch:    validEpochAttachment(0, 42, 2592000, 0xFFFFFFFF, 1501),
-		AttachmentRecovery: validRecoveryTag(0),
-		AttachmentWrap:     validWrapTag(0, 0x100000000),
-		AttachmentComplete: validEpochComplete(42, 1501),
+		AttachmentNone:        {Kind: AttachmentNone},
+		AttachmentEpoch:       validEpochAttachment(0, 42, 2592000, 0xFFFFFFFF, 1501),
+		AttachmentRecovery:    validRecoveryTag(0),
+		AttachmentWrap:        validWrapTag(0, 0x100000000),
+		AttachmentComplete:    validEpochComplete(42, 1501),
+		AttachmentEpochDigest: validEpochDigestAttachment(t, 0, 42, 2592000, 0xFFFFFFFF, 1501),
+	}
+	if len(byKind) != len(definedAttachmentCodes()) {
+		t.Fatalf("there are %d valid attachments and this package defines %d kinds", len(byKind), len(definedAttachmentCodes()))
 	}
 	for kind, attachment := range byKind {
-		if _, err := EncodeServerAttachment(attachment); err != nil {
+		if _, err := encodeAtItsDoor(attachment); err != nil {
 			t.Fatalf("the valid attachment for kind 0x%04x does not encode: %v", uint16(kind), err)
 		}
 	}
@@ -572,6 +728,27 @@ func attachmentDifference(left *ServerAttachment, right *ServerAttachment) strin
 			return "Complete.WrapCount"
 		}
 	}
+	if (left.EpochDigest == nil) != (right.EpochDigest == nil) {
+		return "EpochDigest presence"
+	}
+	if left.EpochDigest != nil {
+		switch {
+		case left.EpochDigest.Epoch != right.EpochDigest.Epoch:
+			return "EpochDigest.Epoch"
+		case left.EpochDigest.AlgId != right.EpochDigest.AlgId:
+			return "EpochDigest.AlgId"
+		case left.EpochDigest.MediaTtlSeconds != right.EpochDigest.MediaTtlSeconds:
+			return "EpochDigest.MediaTtlSeconds"
+		case left.EpochDigest.DurableTtlSeconds != right.EpochDigest.DurableTtlSeconds:
+			return "EpochDigest.DurableTtlSeconds"
+		case !bytes.Equal(left.EpochDigest.GroupContextHash, right.EpochDigest.GroupContextHash):
+			return "EpochDigest.GroupContextHash"
+		case left.EpochDigest.ExpectedWrapCount != right.EpochDigest.ExpectedWrapCount:
+			return "EpochDigest.ExpectedWrapCount"
+		case !bytes.Equal(left.EpochDigest.EpochKeysDigest, right.EpochDigest.EpochKeysDigest):
+			return "EpochDigest.EpochKeysDigest"
+		}
+	}
 	return ""
 }
 
@@ -587,6 +764,8 @@ func attachmentBodyValue(a *ServerAttachment) reflect.Value {
 		return reflect.ValueOf(a.Wrap).Elem()
 	case a.Complete != nil:
 		return reflect.ValueOf(a.Complete).Elem()
+	case a.EpochDigest != nil:
+		return reflect.ValueOf(a.EpochDigest).Elem()
 	}
 	return reflect.Value{}
 }
@@ -616,7 +795,7 @@ func attachmentWidthFields(t testing.TB) []attachmentWidthField {
 	t.Helper()
 	fields := []attachmentWidthField{}
 	byKind := validAttachmentsByKind(t)
-	for _, code := range specAttachmentCodes() {
+	for _, code := range definedAttachmentCodes() {
 		kind := ServerAttachmentKind(code)
 		body := attachmentBodyValue(byKind[kind])
 		if !body.IsValid() {
@@ -666,6 +845,13 @@ func encodableKindCodes(t testing.TB) []int {
 		},
 		func(kind ServerAttachmentKind) *ServerAttachment {
 			a := validEpochComplete(7, 3)
+			a.Kind = kind
+			return a
+		},
+		// the sixth body is offered to this door as well, so the answer below is the door's
+		// and not an artefact of never having handed it one
+		func(kind ServerAttachmentKind) *ServerAttachment {
+			a := validEpochDigestAttachment(t, 0, 7, 1, 2, 3)
 			a.Kind = kind
 			return a
 		},
@@ -838,13 +1024,113 @@ const attachmentCompleteVectorHex = "0004" +
 	"000000000000002a" +
 	"000005dd"
 
-// The four vectors by kind, so the coverage assertion below can be about the set rather than
-// about four function names somebody remembered to write.
+// ── the epoch digest vectors, and the digest they are about ─────────────────────────
+//
+// THESE ARE THE INTEROP VECTORS RULING 31 ASKS FOR, and the whole of what makes them worth
+// writing is that a second implementation can reach them without this package. The digest
+// below was derived by a program that imports nothing from here — the preimage is written
+// out octet by octet and the SHA-256 over it is stated — and the two keys it is taken over
+// are the SAME two ramps the kind 0x0001 vector above already pins on the wire. So the
+// relation ruling 27 is can be checked end to end from two numbers that were both fixed
+// outside this encoder: take the 0x0001 vector, lift write_key and read_key out of it,
+// hash them with the epoch they open, and land on the field below.
+
+// The epoch_keys preimage of the vector below, pinned separately from its digest.
+//
+// A digest alone moves as one opaque number whichever term went missing from under it, so
+// the preimage is pinned as well and derived by hand, one line per term:
+//
+//	55526d…6b657973                   "URmessage/v1/epochkeys", raw ascii, no prefix,
+//	                                  twenty two octets
+//	000000000000002a                  u64(opens_epoch): 42, the epoch these keys open
+//	00000020 70..8f                   LP(write_key): 32 octets, the 0x0001 vector's ramp
+//	00000020 90..af                   LP(read_key): 32 octets, the 0x0001 vector's ramp
+//
+// which adds to 22 + 8 + 36 + 36 = 102 octets.
+const attachmentEpochKeysPreimageHex = "55526d6573736167652f76312f65706f63686b657973" +
+	"000000000000002a" +
+	"00000020" + "707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f" +
+	"00000020" + "909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeaf"
+
+// SHA-256 of the 102 octets above.
+const attachmentEpochKeysDigestHex = "7c90acd7bfb098300e400ec5260501f0b3f60a2953c9573039e2af91f650dc82"
+
+// The same two keys at opens_epoch = 1 rather than 42, and its digest.
+//
+// It is here so that the interop check for the epoch term is a VECTOR and not a property
+// over this package's own output: an implementation that left u64(opens_epoch) out of the
+// preimage reproduces neither of these two numbers, and an implementation that reproduces
+// one and not the other has put the epoch somewhere else in the preimage than here.
+const attachmentEpochKeysPreimageEpochOneHex = "55526d6573736167652f76312f65706f63686b657973" +
+	"0000000000000001" +
+	"00000020" + "707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f" +
+	"00000020" + "909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeaf"
+
+const attachmentEpochKeysDigestEpochOneHex = "607906ee99e44f42bf4fd6f6e474087fe3761252c9bcd6a8d7eade4efb8c8123"
+
+// The epoch digest attachment, pinned to its exact octets.
+//
+// Derived by hand from the block at the top of attachment.go, one line per field. It is the
+// kind 0x0001 vector with its two LP keys struck and one LP digest appended, which is the
+// amendment and is why the two vectors share every other octet:
+//
+//	0005                              u16(kind): 0x0005, an EpochDigest
+//	0000005e                          LP(body): 94 octets, the sum of the lines below
+//	000000000000002a                  u64(epoch): 42, the epoch this attachment OPENS
+//	0031                              u16(alg_id): HKDF-SHA-256, master section 7.1
+//	00278d00                          u32(media_ttl_seconds): 2592000, thirty days
+//	ffffffff                          u32(durable_ttl_seconds): the indefinite sentinel
+//	00000020 c0..df                   LP(group_context_hash): 32 octets, a ramp from 0xc0
+//	000005dd                          u32(expected_wrap_count): 1501
+//	00000020 7c90..dc82               LP(H(epoch_keys)): the digest pinned above
+//
+// The body adds to 8 + 2 + 4 + 4 + 36 + 4 + 36 = 94 = 0x5e, and the whole attachment to
+// 2 + 4 + 94 = 100 — thirty six octets shorter than the 0x0001 vector, which is exactly the
+// two LP framed keys that left.
+const attachmentEpochDigestVectorHex = "0005" +
+	"0000005e" +
+	"000000000000002a" +
+	"0031" +
+	"00278d00" +
+	"ffffffff" +
+	"00000020" + "c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf" +
+	"000005dd" +
+	"00000020" + attachmentEpochKeysDigestHex
+
+// The second epoch digest vector: the OTHER durable_ttl_seconds sentinel, an
+// expected_wrap_count of one, and the digest at opens_epoch = 1.
+//
+//	0005                              u16(kind): 0x0005, an EpochDigest
+//	0000005e                          LP(body): 94 octets, the same 94 — no field of this
+//	                                  body has a variable width, so both sentinels and both
+//	                                  wrap counts encode to one length
+//	0000000000000001                  u64(epoch): 1, the first epoch a commit ever opens
+//	0031                              u16(alg_id): HKDF-SHA-256
+//	00000000                          u32(media_ttl_seconds): 0
+//	00000000                          u32(durable_ttl_seconds): the UNSET sentinel, the one
+//	                                  the vector above does not carry
+//	00000020 c0..df                   LP(group_context_hash): 32 octets, a ramp from 0xc0
+//	00000001                          u32(expected_wrap_count): 1, the smallest legal fan
+//	                                  out — an epoch that opens with its own snapshot alone
+//	00000020 6079..8123                LP(H(epoch_keys)): the epoch-1 digest pinned above
+const attachmentEpochDigestSecondVectorHex = "0005" +
+	"0000005e" +
+	"0000000000000001" +
+	"0031" +
+	"00000000" +
+	"00000000" +
+	"00000020" + "c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf" +
+	"00000001" +
+	"00000020" + attachmentEpochKeysDigestEpochOneHex
+
+// The five vectors by kind, so the coverage assertion below can be about the set rather than
+// about five function names somebody remembered to write.
 var attachmentGoldenVectors = map[ServerAttachmentKind]string{
-	AttachmentEpoch:    attachmentEpochVectorHex,
-	AttachmentRecovery: attachmentRecoveryVectorHex,
-	AttachmentWrap:     attachmentWrapVectorHex,
-	AttachmentComplete: attachmentCompleteVectorHex,
+	AttachmentEpoch:       attachmentEpochVectorHex,
+	AttachmentRecovery:    attachmentRecoveryVectorHex,
+	AttachmentWrap:        attachmentWrapVectorHex,
+	AttachmentComplete:    attachmentCompleteVectorHex,
+	AttachmentEpochDigest: attachmentEpochDigestVectorHex,
 }
 
 // The attachment each vector is of, built from the same values the derivation above names.
@@ -882,7 +1168,34 @@ func attachmentGoldenValues() map[ServerAttachmentKind]*ServerAttachment {
 			Kind:     AttachmentComplete,
 			Complete: &EpochComplete{Epoch: 42, WrapCount: 1501},
 		},
+		AttachmentEpochDigest: {
+			Kind: AttachmentEpochDigest,
+			EpochDigest: &EpochDigestAttachment{
+				Epoch:             42,
+				AlgId:             0x0031,
+				MediaTtlSeconds:   2592000,
+				DurableTtlSeconds: 0xFFFFFFFF,
+				GroupContextHash:  aadRamp(0xc0, 32),
+				ExpectedWrapCount: 1501,
+				// the digest is the hexadecimal string pinned above and not a call to
+				// EpochKeysDigest: a vector built from the function it pins is a vector
+				// that moves with it, and the whole point of this one is that the number
+				// came from outside this package.
+				EpochKeysDigest: mustHex(attachmentEpochKeysDigestHex),
+			},
+		},
 	}
+}
+
+// One pinned hexadecimal string as octets. It panics rather than reporting, because every
+// caller is a constant in this file and a constant that is not hexadecimal is a typo rather
+// than an input.
+func mustHex(s string) []byte {
+	bs, err := hex.DecodeString(s)
+	if err != nil {
+		panic(fmt.Sprintf("a pinned vector is not hexadecimal: %v", err))
+	}
+	return bs
 }
 
 // Every kind is pinned to its exact octets, and back.
@@ -893,7 +1206,7 @@ func attachmentGoldenValues() map[ServerAttachmentKind]*ServerAttachment {
 // derived hexadecimal string does not move at all, and a permutation lands on it.
 func TestEveryKindIsPinnedToItsExactBytes(t *testing.T) {
 	values := attachmentGoldenValues()
-	for _, code := range specAttachmentCodes() {
+	for _, code := range definedAttachmentCodes() {
 		kind := ServerAttachmentKind(code)
 		want, pinned := attachmentGoldenVectors[kind]
 		if !pinned {
@@ -904,7 +1217,10 @@ func TestEveryKindIsPinnedToItsExactBytes(t *testing.T) {
 		if attachment == nil {
 			t.Fatalf("%s has a vector and no value to build it from", name)
 		}
-		got := mustEncodeAttachment(t, name, attachment)
+		got, err := encodeAtItsDoor(attachment)
+		if err != nil {
+			t.Fatalf("%s: the door that serves it refused a valid attachment: %v", name, err)
+		}
 		if hex.EncodeToString(got) != want {
 			t.Fatalf("the %s vector encodes to\n%s\nwant\n%s", name, hex.EncodeToString(got), want)
 		}
@@ -918,7 +1234,7 @@ func TestEveryKindIsPinnedToItsExactBytes(t *testing.T) {
 		if len(got) != attachmentFramingBytes+int(declared) {
 			t.Errorf("the %s vector is %d octets and declares a body of %d", name, len(got), declared)
 		}
-		parsed, err := ParseServerAttachment(got)
+		parsed, err := parseAtItsDoor(kind, got)
 		if err != nil {
 			t.Fatalf("the %s vector does not parse: %v", name, err)
 		}
@@ -945,8 +1261,14 @@ func TestEveryKindThatCarriesABodyHasAGoldenVector(t *testing.T) {
 			want = append(want, code)
 		}
 	}
+	// the kinds section 5.11's door does not serve carry bodies too, and a vector is owed
+	// for each of them for the same reason: the door they ARE served at is the one that
+	// writes them, and a kind pinned by nothing is a kind every other property in this file
+	// goes on holding around
+	want = append(want, ruledAttachmentCodes()...)
+	slices.Sort(want)
 	if !slices.Equal(pinned, want) {
-		t.Errorf("the vectors pin %v and the encoder writes bodies for %v", pinned, want)
+		t.Errorf("the vectors pin %v and the doors write bodies for %v", pinned, want)
 	}
 }
 
@@ -1254,20 +1576,20 @@ func TestEveryLengthPrefixedFieldIsItsExactWidthAndNoOther(t *testing.T) {
 			body := attachmentBodyValue(fresh)
 			body.FieldByName(field.name).Set(reflect.ValueOf(fillBytes(0xFE, length)))
 			what := fmt.Sprintf("%s.%s at %d octets, want %d", specAttachmentKindNames[field.kind], field.name, length, field.width)
-			if _, err := EncodeServerAttachment(fresh); err == nil {
+			if _, err := encodeAtItsDoor(fresh); err == nil {
 				t.Fatalf("%s: the encoder accepted it", what)
 			} else if !errors.Is(err, ErrServerAttachmentFieldLength) {
 				t.Errorf("%s: the encoder refused with %v, want ErrServerAttachmentFieldLength", what, err)
 			}
 			bs := rawAttachmentOf(t, fresh).encode(t)
-			if _, err := ParseServerAttachment(bs); err == nil {
+			if _, err := parseAtItsDoor(field.kind, bs); err == nil {
 				t.Fatalf("%s: the parser accepted it", what)
 			} else if !errors.Is(err, ErrServerAttachmentFieldLength) {
 				t.Errorf("%s: the parser refused with %v, want ErrServerAttachmentFieldLength", what, err)
 			}
 			// and the width itself still passes, so the walk cannot be satisfied by a
 			// package that refuses every length
-			if _, err := EncodeServerAttachment(attachment); err != nil {
+			if _, err := encodeAtItsDoor(attachment); err != nil {
 				t.Fatalf("%s: the valid attachment stopped encoding: %v", what, err)
 			}
 		}
@@ -1295,8 +1617,8 @@ func TestEveryAlgorithmIdentifierButTheKindsOwnIsRefused(t *testing.T) {
 		}
 		for value := 0; value <= 0xFFFF; value++ {
 			field.Set(reflect.ValueOf(uint16(value)))
-			_, encodeErr := EncodeServerAttachment(attachment)
-			_, parseErr := ParseServerAttachment(rawAttachmentOf(t, attachment).encode(t))
+			_, encodeErr := encodeAtItsDoor(attachment)
+			_, parseErr := parseAtItsDoor(kind, rawAttachmentOf(t, attachment).encode(t))
 			if uint16(value) == want {
 				if encodeErr != nil || parseErr != nil {
 					t.Fatalf("kind 0x%04x refused its own identifier 0x%04x: %v / %v", uint16(kind), value, encodeErr, parseErr)
@@ -1359,7 +1681,7 @@ func TestAnEpochAttachmentExpectingNoWrapsIsRefused(t *testing.T) {
 // wrap index past every question check 3 asks of them.
 func TestAnUnknownKindIsADecodeError(t *testing.T) {
 	defined := map[int]bool{}
-	for _, code := range specAttachmentCodes() {
+	for _, code := range definedAttachmentCodes() {
 		defined[code] = true
 	}
 	body := rawEpochComplete{epoch: 42, wrapCount: 1501}.encode(t)
@@ -1385,6 +1707,29 @@ func TestAnUnknownKindIsADecodeError(t *testing.T) {
 		t.Fatalf("%d kinds were refused and %d are undefined", refusals, 0x10000-len(defined))
 	}
 	t.Logf("%d undefined kinds refused on both sides", refusals)
+
+	// THE COMPLEMENT THIS LOOP REMOVED, named rather than left implicit. The walk above is
+	// about codes NOTHING defines, and it now skips six rather than five — so the reader is
+	// owed, in the same test, what the sixth one does instead of being refused here. It is
+	// refused too, at section 5.11's door, and under a DIFFERENT sentinel: "nobody defines
+	// this" and "this door does not serve this" are two facts, and a caller that could not
+	// tell them apart would read a conforming implementation's commit as a corrupt one.
+	for _, code := range ruledAttachmentCodes() {
+		kind := ServerAttachmentKind(code)
+		valid := validAttachmentsByKind(t)[kind]
+		bs, err := encodeAtItsDoor(valid)
+		if err != nil {
+			t.Fatalf("kind 0x%04x does not encode at its own door: %v", code, err)
+		}
+		if _, err := ParseServerAttachment(bs); !errors.Is(err, ErrServerAttachmentKindNotServed) {
+			t.Errorf("section 5.11's door refused kind 0x%04x with %v, want ErrServerAttachmentKindNotServed", code, err)
+		}
+		if _, err := EncodeServerAttachment(valid); !errors.Is(err, ErrServerAttachmentKindNotServed) {
+			t.Errorf("section 5.11's encoder refused kind 0x%04x with %v, want ErrServerAttachmentKindNotServed", code, err)
+		}
+	}
+	t.Logf("%d ruled kinds refused at section 5.11's door under ErrServerAttachmentKindNotServed: %v",
+		len(ruledAttachmentCodes()), ruledAttachmentCodes())
 }
 
 // A kind and a body that disagree are refused rather than resolved.
@@ -1400,9 +1745,9 @@ func TestAnUnknownKindIsADecodeError(t *testing.T) {
 // asserted below over a cross product of its own.
 func TestAKindAndABodyThatDisagreeAreRefused(t *testing.T) {
 	byKind := validAttachmentsByKind(t)
-	for _, code := range specAttachmentCodes() {
+	for _, code := range definedAttachmentCodes() {
 		kind := ServerAttachmentKind(code)
-		for _, otherCode := range specAttachmentCodes() {
+		for _, otherCode := range definedAttachmentCodes() {
 			other := ServerAttachmentKind(otherCode)
 			if other == kind {
 				continue
@@ -1453,7 +1798,7 @@ func attachmentBodyFields(t testing.TB) []attachmentBodyField {
 			continue
 		}
 		var value reflect.Value
-		for _, code := range specAttachmentCodes() {
+		for _, code := range definedAttachmentCodes() {
 			field := reflect.ValueOf(*byKind[ServerAttachmentKind(code)]).Field(i)
 			if field.IsNil() {
 				continue
@@ -1659,7 +2004,11 @@ func TestTheEncoderAndTheParserAdmitTheSameAttachments(t *testing.T) {
 	for _, count := range []uint32{0, 1} {
 		add(fmt.Sprintf("epoch wraps %d", count), validEpochAttachment(0, 42, 1, 1, count))
 	}
-	top := specAttachmentCodes()[len(specAttachmentCodes())-1]
+	// past the top of every code this PACKAGE defines, not of section 5.11's five: with
+	// 0x0005 defined, the old reading named a kind the encoder refuses for a different
+	// reason and this candidate would have stopped being about an undefined code at all
+	defined := definedAttachmentCodes()
+	top := defined[len(defined)-1]
 	add("a kind past the top of the alphabet", &ServerAttachment{Kind: ServerAttachmentKind(top + 1)})
 
 	encoded := 0
@@ -1694,6 +2043,768 @@ func TestTheEncoderAndTheParserAdmitTheSameAttachments(t *testing.T) {
 		t.Fatal("the space reached no refusal, so the agreement says nothing about what either half refuses")
 	}
 	t.Logf("%d candidates, %d encoded and %d refused by both halves", len(candidates), encoded, refused)
+}
+
+// ── the sixth kind ──────────────────────────────────────────────────────────────────
+//
+// Ruling 27 of 2026-09-22 re-opened spec B section 5.4's RULED EpochAttachment block and
+// replaced its two cleartext keys with one digest over both of them, under a new kind
+// 0x0005. Ruling 31 says where that design is cheapest to find wrong: "the interop vectors
+// are where it comes out clean or does not." So what is asserted below is not that the
+// encoder agrees with itself. It is
+//
+//	(1) the preimage, octet by octet, against a derivation done outside this package;
+//	(2) the digest over it, twice, at two epochs, so that leaving u64(opens_epoch) out
+//	    reproduces neither number;
+//	(3) that the kind 0x0005 vector IS the kind 0x0001 vector with its two keys hashed,
+//	    computed from the 0x0001 vector's own octets rather than from a second copy of the
+//	    values — which is the amendment stated as an equation between two pinned strings;
+//	(4) the rollout property, which is what lets this land alone: a record carrying one of
+//	    these encodes, parses back with is_commit set and the slot intact, while section
+//	    5.11's door refuses the same octets by name.
+
+// The corpus for the sixth kind: every axis its body has, computed rather than listed.
+//
+// The axes are the ones the block at the top of attachment.go gives it — the u64 boundaries
+// on epoch, the u32 boundaries on both retention fields with both durable sentinels among
+// them, the u32 boundaries above zero on expected_wrap_count, and three content rotations
+// across the two length prefixed fields. It is its own corpus rather than a sixth arm of
+// attachmentCorpus because that corpus is section 5.11's door's, and this kind is served at
+// another one.
+func epochDigestCorpus(t testing.TB) []attachmentCorpusEntry {
+	t.Helper()
+	entries := []attachmentCorpusEntry{}
+	for rotation := range attachmentRotations {
+		for _, epoch := range u64Boundaries() {
+			for _, media := range u32Boundaries() {
+				for _, durable := range u32Boundaries() {
+					for _, count := range u32BoundariesAboveZero() {
+						name := fmt.Sprintf("digest rot=%d epoch=%d media=%d durable=%d wraps=%d",
+							rotation, epoch, media, durable, count)
+						entries = append(entries, attachmentCorpusEntry{
+							name:       name,
+							attachment: validEpochDigestAttachment(t, rotation, epoch, media, durable, count),
+						})
+					}
+				}
+			}
+		}
+	}
+	if len(entries) == 0 {
+		t.Fatal("the epoch digest corpus is empty, so every property asserted over it would hold vacuously")
+	}
+	return entries
+}
+
+// One corpus entry per durable_ttl_seconds value, for the walks that try all 255
+// alternatives at every offset. Derived by grouping the corpus, so both sentinels are in the
+// subset by construction.
+func epochDigestWalkCorpus(t testing.TB) []attachmentCorpusEntry {
+	t.Helper()
+	seen := map[uint32]bool{}
+	subset := []attachmentCorpusEntry{}
+	for _, entry := range epochDigestCorpus(t) {
+		durable := entry.attachment.EpochDigest.DurableTtlSeconds
+		if seen[durable] {
+			continue
+		}
+		seen[durable] = true
+		subset = append(subset, entry)
+	}
+	if len(subset) == 0 {
+		t.Fatal("the epoch digest walk subset is empty, so every property asserted over it would hold vacuously")
+	}
+	return subset
+}
+
+// The preimage is the octets the block at the top of attachment.go states, at two epochs.
+//
+// The preimage is pinned as well as the digest because a digest alone moves as one opaque
+// number whichever term went missing from under it: drop the label, drop the epoch, swap the
+// two keys, and every one of those answers is thirty two plausible octets that this package
+// goes on agreeing with itself about.
+func TestTheEpochKeysPreimageIsPinnedToItsExactBytes(t *testing.T) {
+	for _, pinned := range []struct {
+		epoch    uint64
+		preimage string
+		digest   string
+	}{
+		{epoch: 42, preimage: attachmentEpochKeysPreimageHex, digest: attachmentEpochKeysDigestHex},
+		{epoch: 1, preimage: attachmentEpochKeysPreimageEpochOneHex, digest: attachmentEpochKeysDigestEpochOneHex},
+	} {
+		got, err := epochKeysPreimage(pinned.epoch, aadRamp(0x70, 32), aadRamp(0x90, 32))
+		if err != nil {
+			t.Fatalf("epoch %d: the preimage does not build: %v", pinned.epoch, err)
+		}
+		if hex.EncodeToString(got) != pinned.preimage {
+			t.Fatalf("epoch %d: the preimage is\n%s\nwant\n%s", pinned.epoch, hex.EncodeToString(got), pinned.preimage)
+		}
+		// the label is twenty two octets of raw ascii with no length prefix in front of it,
+		// so the preimage opens with the label's own bytes and the epoch begins at 22
+		if want := []byte(epochKeysLabel); !bytes.Equal(got[:len(want)], want) {
+			t.Errorf("epoch %d: the preimage does not open with the label's own octets", pinned.epoch)
+		}
+		if want, got := 22+8+36+36, len(got); got != want {
+			t.Errorf("epoch %d: the preimage is %d octets and the block adds to %d", pinned.epoch, got, want)
+		}
+		// and the digest is SHA-256 of exactly those octets, stated as the hash of the
+		// pinned string rather than as the package's answer
+		sum := sha256.Sum256(mustHex(pinned.preimage))
+		if hex.EncodeToString(sum[:]) != pinned.digest {
+			t.Fatalf("epoch %d: SHA-256 of the pinned preimage is %s and the pinned digest is %s",
+				pinned.epoch, hex.EncodeToString(sum[:]), pinned.digest)
+		}
+		digest, err := EpochKeysDigest(pinned.epoch, aadRamp(0x70, 32), aadRamp(0x90, 32))
+		if err != nil {
+			t.Fatalf("epoch %d: EpochKeysDigest refused two 32 octet keys: %v", pinned.epoch, err)
+		}
+		if hex.EncodeToString(digest) != pinned.digest {
+			t.Fatalf("epoch %d: EpochKeysDigest answered %s, want %s", pinned.epoch, hex.EncodeToString(digest), pinned.digest)
+		}
+		if len(digest) != epochKeysDigestBytes {
+			t.Errorf("epoch %d: the digest is %d octets, want %d", pinned.epoch, len(digest), epochKeysDigestBytes)
+		}
+	}
+}
+
+// Every input of the digest changes it: the epoch, every octet of the write key, and every
+// octet of the read key.
+//
+// The two vectors above are the interop half of this and they are two points. This is the
+// property around them, and it is what catches the term that is present in the pinned case
+// and ignored everywhere else — a preimage that wrote the epoch but read it from the wrong
+// place, or that LP framed one key and raw wrote the other, agrees with the vectors at
+// exactly one value and with nothing else.
+func TestEveryInputOfTheEpochKeysDigestChangesIt(t *testing.T) {
+	writeKey := aadRamp(0x70, 32)
+	readKey := aadRamp(0x90, 32)
+	base, err := EpochKeysDigest(42, writeKey, readKey)
+	if err != nil {
+		t.Fatalf("EpochKeysDigest refused two 32 octet keys: %v", err)
+	}
+	seen := map[string]string{hex.EncodeToString(base): "the unaltered inputs"}
+	altered := 0
+	note := func(what string, digest []byte) {
+		altered++
+		key := hex.EncodeToString(digest)
+		if already, collided := seen[key]; collided {
+			t.Errorf("%s and %s give the same digest, so that input is not in the preimage", what, already)
+			return
+		}
+		seen[key] = what
+	}
+	for _, epoch := range u64Boundaries() {
+		if epoch == 42 {
+			continue
+		}
+		digest, err := EpochKeysDigest(epoch, writeKey, readKey)
+		if err != nil {
+			t.Fatalf("epoch %d was refused: %v", epoch, err)
+		}
+		note(fmt.Sprintf("epoch %d", epoch), digest)
+	}
+	for i := range writeKey {
+		altered := slices.Clone(writeKey)
+		altered[i] ^= 0xFF
+		digest, err := EpochKeysDigest(42, altered, readKey)
+		if err != nil {
+			t.Fatalf("a flipped write_key octet was refused: %v", err)
+		}
+		note(fmt.Sprintf("write_key octet %d flipped", i), digest)
+	}
+	for i := range readKey {
+		altered := slices.Clone(readKey)
+		altered[i] ^= 0xFF
+		digest, err := EpochKeysDigest(42, writeKey, altered)
+		if err != nil {
+			t.Fatalf("a flipped read_key octet was refused: %v", err)
+		}
+		note(fmt.Sprintf("read_key octet %d flipped", i), digest)
+	}
+	// and the two keys are not interchangeable: LP frames each of them, so swapping them is
+	// a different preimage and not the same octets in a different order
+	swapped, err := EpochKeysDigest(42, readKey, writeKey)
+	if err != nil {
+		t.Fatalf("the swapped keys were refused: %v", err)
+	}
+	note("the two keys swapped", swapped)
+	// the count is derived from what the walk actually did rather than written as
+	// arithmetic over the boundary tables, because that arithmetic was wrong the first time
+	// this test ran — it subtracted an epoch 42 the boundary table does not contain — and a
+	// walk whose own size is a guess is a walk that can shrink without saying so
+	if want := 1 + altered; len(seen) != want {
+		t.Errorf("%d distinct digests over %d altered inputs plus the unaltered one", len(seen), altered)
+	}
+	if altered == 0 {
+		t.Fatal("nothing was altered, so this property held over one digest")
+	}
+	t.Logf("%d altered inputs, %d distinct digests", altered, len(seen))
+}
+
+// A key that is not exactly thirty two octets has no digest.
+//
+// Both keys, every length either side, and the refusal is the field length sentinel rather
+// than a digest over whatever was handed in. The caller that reaches this is a server or a
+// committer that looked a key up and got nothing back, and hashing that would produce a
+// value a second implementation holding the real key can never reproduce — which surfaces
+// as a commit refused at a comparison with nothing to say why.
+func TestTheEpochKeysDigestRefusesAKeyThatIsNotThirtyTwoOctets(t *testing.T) {
+	good := aadRamp(0x70, 32)
+	refusals := 0
+	for length := 0; length <= 64; length++ {
+		if length == epochWriteKeyBytes {
+			continue
+		}
+		short := fillBytes(0xFB, length)
+		if _, err := EpochKeysDigest(42, short, good); !errors.Is(err, ErrServerAttachmentFieldLength) {
+			t.Fatalf("a write_key of %d octets answered %v, want ErrServerAttachmentFieldLength", length, err)
+		}
+		if _, err := EpochKeysDigest(42, good, short); !errors.Is(err, ErrServerAttachmentFieldLength) {
+			t.Fatalf("a read_key of %d octets answered %v, want ErrServerAttachmentFieldLength", length, err)
+		}
+		refusals++
+	}
+	if refusals == 0 {
+		t.Fatal("no length was refused, so this walk asserted nothing")
+	}
+	// the positive control, in the same test: the one length it does not refuse
+	if _, err := EpochKeysDigest(42, good, good); err != nil {
+		t.Fatalf("two 32 octet keys were refused: %v", err)
+	}
+	t.Logf("%d lengths refused on both keys, and 32 accepted", refusals)
+}
+
+// The kind 0x0005 vector IS the kind 0x0001 vector with its two keys hashed.
+//
+// This is ruling 27 written as an equation between two pinned hexadecimal strings, and it is
+// the strongest statement in this file about the amendment, because neither side of it is
+// this encoder's output: the left is the vector aad_test.go pinned independently before this
+// kind existed, and the right is a string derived by a program that imports nothing from
+// here. What runs between them is the package, and the six public fields are LIFTED OUT OF
+// THE 0x0001 VECTOR'S OWN OCTETS rather than written a second time, so a field that moved in
+// one vector and not the other fails here instead of being copied into both.
+func TestTheEpochDigestVectorIsTheEpochVectorWithItsKeysHashed(t *testing.T) {
+	epoch, err := ParseServerAttachment(mustHex(attachmentEpochVectorHex))
+	if err != nil {
+		t.Fatalf("the kind 0x0001 vector does not parse: %v", err)
+	}
+	digest, err := EpochKeysDigest(epoch.Epoch.Epoch, epoch.Epoch.WriteKey, epoch.Epoch.ReadKey)
+	if err != nil {
+		t.Fatalf("the kind 0x0001 vector's own keys were refused: %v", err)
+	}
+	built := &EpochDigestAttachment{
+		Epoch:             epoch.Epoch.Epoch,
+		AlgId:             epoch.Epoch.AlgId,
+		MediaTtlSeconds:   epoch.Epoch.MediaTtlSeconds,
+		DurableTtlSeconds: epoch.Epoch.DurableTtlSeconds,
+		GroupContextHash:  epoch.Epoch.GroupContextHash,
+		ExpectedWrapCount: epoch.Epoch.ExpectedWrapCount,
+		EpochKeysDigest:   digest,
+	}
+	bs, err := EncodeEpochDigestAttachment(built)
+	if err != nil {
+		t.Fatalf("the lifted attachment does not encode: %v", err)
+	}
+	if hex.EncodeToString(bs) != attachmentEpochDigestVectorHex {
+		t.Fatalf("the kind 0x0001 vector with its keys hashed is\n%s\nand the kind 0x0005 vector is\n%s",
+			hex.EncodeToString(bs), attachmentEpochDigestVectorHex)
+	}
+	// and the size relation the amendment buys, stated as the two LP framed keys that left
+	// rather than as two numbers
+	left := 2*(4+epochWriteKeyBytes) - (4 + epochKeysDigestBytes)
+	if want, got := len(mustHex(attachmentEpochVectorHex))-left, len(bs); got != want {
+		t.Errorf("the kind 0x0005 vector is %d octets and the kind 0x0001 vector less two LP keys plus one LP digest is %d", got, want)
+	}
+}
+
+// The second vector: the other durable sentinel, the smallest legal fan out, and the epoch
+// that makes its digest a different number from the first vector's.
+func TestTheSecondEpochDigestVectorIsPinnedToItsExactBytes(t *testing.T) {
+	built := &EpochDigestAttachment{
+		Epoch:             1,
+		AlgId:             0x0031,
+		MediaTtlSeconds:   0,
+		DurableTtlSeconds: 0,
+		GroupContextHash:  aadRamp(0xc0, 32),
+		ExpectedWrapCount: 1,
+		EpochKeysDigest:   mustHex(attachmentEpochKeysDigestEpochOneHex),
+	}
+	bs, err := EncodeEpochDigestAttachment(built)
+	if err != nil {
+		t.Fatalf("the second vector does not encode: %v", err)
+	}
+	if hex.EncodeToString(bs) != attachmentEpochDigestSecondVectorHex {
+		t.Fatalf("the second vector encodes to\n%s\nwant\n%s", hex.EncodeToString(bs), attachmentEpochDigestSecondVectorHex)
+	}
+	parsed, err := ParseEpochDigestAttachment(bs)
+	if err != nil {
+		t.Fatalf("the second vector does not parse: %v", err)
+	}
+	if difference := attachmentDifference(
+		&ServerAttachment{Kind: AttachmentEpochDigest, EpochDigest: built},
+		&ServerAttachment{Kind: AttachmentEpochDigest, EpochDigest: parsed},
+	); difference != "" {
+		t.Errorf("the second vector does not round trip: %s differs", difference)
+	}
+	// the two vectors carry the two durable sentinels and no other value, which is the half
+	// of spec B section 7.3 case 3 a hand written range check breaks silently
+	first, err := ParseEpochDigestAttachment(mustHex(attachmentEpochDigestVectorHex))
+	if err != nil {
+		t.Fatalf("the first vector does not parse: %v", err)
+	}
+	if first.DurableTtlSeconds != 0xFFFFFFFF || parsed.DurableTtlSeconds != 0 {
+		t.Errorf("the two vectors carry durable_ttl_seconds %d and %d, want the indefinite sentinel and the unset one",
+			first.DurableTtlSeconds, parsed.DurableTtlSeconds)
+	}
+	if parsed.ExpectedWrapCount != 1 {
+		t.Errorf("the second vector expects %d wraps, want the smallest legal fan out of 1", parsed.ExpectedWrapCount)
+	}
+	// and the two digests differ although the two keys are identical, which is u64(epoch)
+	// inside the preimage observed on the wire rather than through the helper
+	if bytes.Equal(first.EpochKeysDigest, parsed.EpochKeysDigest) {
+		t.Error("the two vectors carry the same digest over the same keys at two epochs, so opens_epoch is not in the preimage")
+	}
+}
+
+// THE ROLLOUT PROPERTY, and it is the whole of why the sixth kind can land before the field
+// pair that carries the keys does.
+//
+// A record carrying a kind this door does not serve ENCODES, ParseRecords back with
+// is_commit still set and its attachment slot byte intact, while ParseServerAttachment
+// refuses the same octets BY NAME with the kind in the message. So a server that has not
+// learned to carry the epoch keys beside the record refuses the commit loudly at spec B
+// section 5.1 check 3, and a receiver — which never reads a field of the attachment, only
+// hashes its octets — follows the commit correctly.
+//
+// It is written over the kinds this package defines and section 5.11's door does not serve,
+// derived, rather than over 0x0005 written down: the property is about the RELATION between
+// the two doors and it has to keep its meaning when the field list of the body moves or a
+// seventh kind is ruled. The positive control is in the same test and is a real kind 0x0001
+// attachment on the same record shape, because a door that refused everything would satisfy
+// the first half of this on its own.
+func TestARecordCarriesAKindTheServersDoorRefusesByName(t *testing.T) {
+	byKind := validAttachmentsByKind(t)
+	refused := 0
+	for _, code := range ruledAttachmentCodes() {
+		kind := ServerAttachmentKind(code)
+		attachment, err := encodeAtItsDoor(byKind[kind])
+		if err != nil {
+			t.Fatalf("kind 0x%04x does not encode at its own door: %v", code, err)
+		}
+		slot := recordSlotRoundTrip(t, attachment)
+		// the parser's refusal, by sentinel and with the kind in the message
+		_, parseErr := ParseServerAttachment(slot)
+		if parseErr == nil {
+			t.Fatalf("section 5.11's door accepted kind 0x%04x, and a server that accepts it installs an epoch whose keys it was never handed", code)
+		}
+		if !errors.Is(parseErr, ErrServerAttachmentKindNotServed) {
+			t.Fatalf("section 5.11's door refused kind 0x%04x with %v, want ErrServerAttachmentKindNotServed", code, parseErr)
+		}
+		if named := fmt.Sprintf("0x%04x", code); !strings.Contains(parseErr.Error(), named) {
+			t.Errorf("the refusal of kind %s reads %q and does not name the kind", named, parseErr.Error())
+		}
+		// and the same octets still parse at the door that does serve them, so what the
+		// record carried is an attachment and not a malformed field
+		if _, err := parseAtItsDoor(kind, slot); err != nil {
+			t.Fatalf("kind 0x%04x does not parse at its own door after the record round trip: %v", code, err)
+		}
+		refused++
+	}
+	if refused == 0 {
+		t.Fatal("no kind is defined and unserved, so this property held over nothing")
+	}
+
+	// THE POSITIVE CONTROL, in the same test: every kind section 5.11's door does serve goes
+	// through the identical record round trip and is ACCEPTED there.
+	accepted := 0
+	for _, code := range specAttachmentCodes() {
+		kind := ServerAttachmentKind(code)
+		if kind == AttachmentNone {
+			continue
+		}
+		attachment, err := EncodeServerAttachment(byKind[kind])
+		if err != nil {
+			t.Fatalf("kind 0x%04x does not encode: %v", code, err)
+		}
+		slot := recordSlotRoundTrip(t, attachment)
+		parsed, err := ParseServerAttachment(slot)
+		if err != nil {
+			t.Fatalf("section 5.11's door refused kind 0x%04x after the record round trip: %v", code, err)
+		}
+		if difference := attachmentDifference(byKind[kind], parsed); difference != "" {
+			t.Errorf("kind 0x%04x did not survive the record: %s differs", code, difference)
+		}
+		accepted++
+	}
+	if accepted == 0 {
+		t.Fatal("the control accepted nothing, so the refusals above say nothing about the door")
+	}
+	t.Logf("%d kinds refused by name at section 5.11's door and %d accepted, through the identical record", refused, accepted)
+}
+
+// One commit record carrying these attachment octets, encoded, parsed back, and its
+// attachment slot handed back.
+//
+// The assertions about the record itself are here rather than at the call site because they
+// are the same three every time and each is a different way the property could be satisfied
+// vacuously: the record has to ENCODE, it has to come back with is_commit still set — the
+// bit a commit is refused for losing — and the slot has to be the identical octets rather
+// than something the codec normalised.
+func recordSlotRoundTrip(t testing.TB, attachment []byte) []byte {
+	t.Helper()
+	record := Record{
+		Header: RecordHeader{
+			Epoch:            1,
+			StreamIndex:      7,
+			IsCommit:         true,
+			RetentionClass:   RetentionPermanent,
+			SizeBucket:       SizeBucket256,
+			ServerAttachment: attachment,
+		},
+		CtHead: fillBytes(ctHeadTag, 96),
+		CtBody: ctBodyFiller(SizeBucketCtBodyBytes(SizeBucket256)),
+	}
+	copy(record.Header.GroupId[:], fillBytes(groupIdTag, 32))
+	copy(record.Header.SenderHandle[:], fillBytes(senderHandleTag, 16))
+	copy(record.Header.BodyHash[:], fillBytes(bodyHashTag, 32))
+	copy(record.WriteAuth[:], fillBytes(writeAuthTag, 32))
+	bs, err := EncodeRecord(&record)
+	if err != nil {
+		t.Fatalf("a commit carrying a %d octet attachment does not encode: %v", len(attachment), err)
+	}
+	parsed, err := ParseRecord(bs)
+	if err != nil {
+		t.Fatalf("a commit carrying a %d octet attachment does not parse back: %v", len(attachment), err)
+	}
+	if !parsed.Header.IsCommit {
+		t.Fatal("the record came back with is_commit clear, and a commit that loses that bit is a commit the server refuses")
+	}
+	if !bytes.Equal(parsed.Header.ServerAttachment, attachment) {
+		t.Fatalf("the attachment slot came back as %d octets and went in as %d", len(parsed.Header.ServerAttachment), len(attachment))
+	}
+	return parsed.Header.ServerAttachment
+}
+
+// The epoch digest door writes its own kind and reads no other.
+//
+// Derived the way the alphabet above is: the valid encoding's leading u16 is replaced by
+// each of the 65536 values in turn and the set this door accepts has to be the one code it
+// writes. A door that read the body first and the kind afterwards, or that fell back to a
+// default, lands here — and so does the edit that would undo the whole rollout, because
+// accepting kind 0x0001 at this door is the epoch key install path reached through the
+// function that exists to take the keys out of it.
+func TestTheEpochDigestDoorParsesItsOwnKindAndNoOther(t *testing.T) {
+	valid, err := EncodeEpochDigestAttachment(validAttachmentsByKind(t)[AttachmentEpochDigest].EpochDigest)
+	if err != nil {
+		t.Fatalf("the valid epoch digest does not encode: %v", err)
+	}
+	kind, err := syntax.NewReader(valid[:2]).ReadUint16()
+	if err != nil {
+		t.Fatalf("the encoding carries no kind: %v", err)
+	}
+	if want := ruledAttachmentKindCodes[AttachmentEpochDigest]; kind != want {
+		t.Fatalf("the epoch digest door writes kind 0x%04x and ruling 27 gives it 0x%04x", kind, want)
+	}
+	accepted := []int{}
+	relabelled := slices.Clone(valid)
+	for code := 0; code <= 0xFFFF; code++ {
+		relabelled[0] = byte(code >> 8)
+		relabelled[1] = byte(code)
+		if _, err := ParseEpochDigestAttachment(relabelled); err == nil {
+			accepted = append(accepted, code)
+		}
+	}
+	if !slices.Equal(accepted, []int{int(kind)}) {
+		t.Errorf("the epoch digest door accepts %v, want exactly [%d]", accepted, kind)
+	}
+	// and the refusal of a kind section 5.11 DOES define is the door sentinel and not a
+	// decode failure, which is the direction a caller has to be able to tell apart
+	if _, err := ParseEpochDigestAttachment(mustHex(attachmentEpochVectorHex)); !errors.Is(err, ErrServerAttachmentKindNotServed) {
+		t.Errorf("the epoch digest door refused a real kind 0x0001 attachment with %v, want ErrServerAttachmentKindNotServed", err)
+	}
+}
+
+// Byte exact both ways over the sixth kind's whole corpus, and the encoding is the layout
+// stated independently in rawEpochDigestAttachment.
+func TestEveryEpochDigestRoundTripsByteExactAndIsTheStatedLayout(t *testing.T) {
+	entries := epochDigestCorpus(t)
+	for _, entry := range entries {
+		first, err := EncodeEpochDigestAttachment(entry.attachment.EpochDigest)
+		if err != nil {
+			t.Fatalf("%s: the door refused a valid attachment: %v", entry.name, err)
+		}
+		want := rawAttachmentOf(t, entry.attachment).encode(t)
+		if !bytes.Equal(first, want) {
+			t.Fatalf("%s: the encoder wrote\n%s\nand the layout is\n%s", entry.name, hex.EncodeToString(first), hex.EncodeToString(want))
+		}
+		parsed, err := ParseEpochDigestAttachment(first)
+		if err != nil {
+			t.Fatalf("%s: an attachment this package encoded does not parse: %v", entry.name, err)
+		}
+		if difference := attachmentDifference(entry.attachment,
+			&ServerAttachment{Kind: AttachmentEpochDigest, EpochDigest: parsed}); difference != "" {
+			t.Fatalf("%s: the parsed attachment differs from the encoded one: %s", entry.name, difference)
+		}
+		again, err := EncodeEpochDigestAttachment(parsed)
+		if err != nil {
+			t.Fatalf("%s: the parsed attachment does not re-encode: %v", entry.name, err)
+		}
+		if !bytes.Equal(first, again) {
+			t.Fatalf("%s: re-encoding gave %d different octets, so this attachment has two encodings", entry.name, len(again))
+		}
+	}
+	t.Logf("%d epoch digest attachments round tripped byte exact", len(entries))
+}
+
+// Nothing malformed is silently accepted and changed: every single octet truncation is
+// refused, every trailing octet is refused, and every single octet corruption either is
+// refused or re-encodes to exactly the corrupted bytes.
+//
+// The last one is the half a round trip over well formed attachments cannot see. Read
+// expected_wrap_count as a u16 and every attachment this package writes still round trips,
+// because the two octets it ignores are two it also never wrote.
+func TestEveryAlterationOfAnEpochDigestIsRefusedOrReEncodesToItself(t *testing.T) {
+	truncations := 0
+	trailing := 0
+	corruptions := 0
+	for _, entry := range epochDigestWalkCorpus(t) {
+		valid, err := EncodeEpochDigestAttachment(entry.attachment.EpochDigest)
+		if err != nil {
+			t.Fatalf("%s: the door refused a valid attachment: %v", entry.name, err)
+		}
+		for cut := range len(valid) {
+			if _, err := ParseEpochDigestAttachment(valid[:cut]); err == nil {
+				t.Fatalf("%s: a truncation to %d of %d octets parsed", entry.name, cut, len(valid))
+			}
+			truncations++
+		}
+		for _, extra := range []byte{0x00, 0xFF} {
+			if _, err := ParseEpochDigestAttachment(append(slices.Clone(valid), extra)); err == nil {
+				t.Fatalf("%s: a trailing 0x%02x parsed", entry.name, extra)
+			}
+			trailing++
+		}
+		for offset := range valid {
+			for delta := 1; delta <= 0xFF; delta++ {
+				corrupted := slices.Clone(valid)
+				corrupted[offset] = byte(int(corrupted[offset]) + delta)
+				parsed, err := ParseEpochDigestAttachment(corrupted)
+				if err != nil {
+					corruptions++
+					continue
+				}
+				again, err := EncodeEpochDigestAttachment(parsed)
+				if err != nil {
+					t.Fatalf("%s: octet %d corrupted parsed and then refused to re-encode: %v", entry.name, offset, err)
+				}
+				if !bytes.Equal(again, corrupted) {
+					t.Fatalf("%s: octet %d corrupted parsed and re-encoded to different octets, so those bytes have two readings", entry.name, offset)
+				}
+				corruptions++
+			}
+		}
+	}
+	if truncations == 0 || trailing == 0 || corruptions == 0 {
+		t.Fatalf("the walk made %d truncations, %d trailing octets and %d corruptions", truncations, trailing, corruptions)
+	}
+	t.Logf("%d truncations, %d trailing octets and %d corruptions", truncations, trailing, corruptions)
+}
+
+// An epoch digest that expects no wraps is refused, on both sides of its door.
+//
+// The same clause of spec B section 5.1 check 3 kind 0x0001 answers, and it is asserted here
+// rather than inherited: the check is per body, and a body that grew its own arm could have
+// dropped it.
+func TestAnEpochDigestExpectingNoWrapsIsRefused(t *testing.T) {
+	attachment := validEpochDigestAttachment(t, 0, 42, 1, 1, 0)
+	_, err := EncodeEpochDigestAttachment(attachment.EpochDigest)
+	if !errors.Is(err, ErrExpectedWrapCountZero) {
+		t.Fatalf("the encoder answered %v, want ErrExpectedWrapCountZero", err)
+	}
+	bs := rawAttachmentOf(t, attachment).encode(t)
+	if _, err := ParseEpochDigestAttachment(bs); !errors.Is(err, ErrExpectedWrapCountZero) {
+		t.Fatalf("the parser answered %v, want ErrExpectedWrapCountZero", err)
+	}
+	// every other value of the field is accepted, so the refusal is about zero and not about
+	// the field
+	for _, count := range u32BoundariesAboveZero() {
+		if _, err := EncodeEpochDigestAttachment(validEpochDigestAttachment(t, 0, 42, 1, 1, count).EpochDigest); err != nil {
+			t.Errorf("expected_wrap_count %d was refused: %v", count, err)
+		}
+	}
+}
+
+// The set of epoch digests the encoder writes and the set the parser reads are one set.
+//
+// The same property the two halves of section 5.11's door are held to, asserted at this door
+// as well, over a space computed from the edges of every rule the checks have: a length
+// either side of every exact width, an algorithm identifier either side of the one its kind
+// names, an expected_wrap_count of zero and one. Both halves run the one
+// checkServerAttachment, so what this observes is that neither has grown a check of its own.
+func TestTheEncoderAndTheParserAdmitTheSameEpochDigests(t *testing.T) {
+	candidates := []struct {
+		name       string
+		attachment *ServerAttachment
+	}{}
+	add := func(name string, a *ServerAttachment) {
+		candidates = append(candidates, struct {
+			name       string
+			attachment *ServerAttachment
+		}{name: name, attachment: a})
+	}
+	add("the valid one", validAttachmentsByKind(t)[AttachmentEpochDigest])
+	for _, field := range attachmentWidthFields(t) {
+		if field.kind != AttachmentEpochDigest {
+			continue
+		}
+		for _, length := range []int{field.width - 1, field.width, field.width + 1} {
+			if length < 0 {
+				continue
+			}
+			fresh := validAttachmentsByKind(t)[AttachmentEpochDigest]
+			attachmentBodyValue(fresh).FieldByName(field.name).Set(reflect.ValueOf(fillBytes(0xFD, length)))
+			add(fmt.Sprintf("%s at %d", field.name, length), fresh)
+		}
+	}
+	want := attachmentAlgIds[AttachmentEpochDigest]
+	for _, value := range []uint16{want - 1, want, want + 1} {
+		fresh := validAttachmentsByKind(t)[AttachmentEpochDigest]
+		fresh.EpochDigest.AlgId = value
+		add(fmt.Sprintf("alg 0x%04x", value), fresh)
+	}
+	for _, count := range []uint32{0, 1} {
+		add(fmt.Sprintf("wraps %d", count), validEpochDigestAttachment(t, 0, 42, 1, 1, count))
+	}
+
+	encoded := 0
+	refused := 0
+	for _, candidate := range candidates {
+		_, encodeErr := EncodeEpochDigestAttachment(candidate.attachment.EpochDigest)
+		_, parseErr := ParseEpochDigestAttachment(rawAttachmentOf(t, candidate.attachment).encode(t))
+		if (encodeErr == nil) != (parseErr == nil) {
+			t.Errorf("%s: the encoder says %v and the parser says %v; the two halves disagree about whether this attachment exists",
+				candidate.name, encodeErr, parseErr)
+			continue
+		}
+		if encodeErr != nil {
+			refused++
+			continue
+		}
+		encoded++
+	}
+	if encoded == 0 {
+		t.Fatal("the space reached no attachment the encoder writes, so the agreement holds vacuously")
+	}
+	if refused == 0 {
+		t.Fatal("the space reached no refusal, so the agreement says nothing about what either half refuses")
+	}
+	t.Logf("%d candidates, %d encoded and %d refused by both halves", len(candidates), encoded, refused)
+}
+
+// ── the labels this package composes under ──────────────────────────────────────────
+
+// Every domain separation label this package declares, read out of the SOURCE rather than
+// off a list.
+//
+// A list is what this project has been walked past twelve times. What is derived here is the
+// class — every string literal in a non test file of this package whose value begins with
+// the protocol's own prefix — so a label declared later is under the rule below the day it
+// is written, with nobody remembering to add it.
+func packageLabels(t testing.TB) map[string][]string {
+	t.Helper()
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("the label gate cannot read this package's directory: %v", err)
+	}
+	labels := map[string][]string{}
+	files := 0
+	fset := token.NewFileSet()
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		files++
+		file, err := parser.ParseFile(fset, name, nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("the label gate cannot parse %s: %v", name, err)
+		}
+		ast.Inspect(file, func(node ast.Node) bool {
+			literal, isLiteral := node.(*ast.BasicLit)
+			if !isLiteral || literal.Kind != token.STRING {
+				return true
+			}
+			value, err := strconv.Unquote(literal.Value)
+			if err != nil || !strings.HasPrefix(value, labelProtocolPrefix) {
+				return true
+			}
+			labels[value] = append(labels[value], fmt.Sprintf("%s:%d", name, fset.Position(literal.Pos()).Line))
+			return true
+		})
+	}
+	if files == 0 {
+		t.Fatal("the label gate read no go source in this package, so it would report clean having read nothing")
+	}
+	if len(labels) == 0 {
+		t.Fatalf("the label gate found no label at all across %d files, which cannot be true while aad.go declares two", files)
+	}
+	return labels
+}
+
+// The prefix every label in this protocol carries, which is what makes the class derivable at
+// all. It is deliberately not one of the labels: a gate that looked for one of the values it
+// judges would find exactly that one.
+const labelProtocolPrefix = "URmessage/"
+
+// No label this package declares is a prefix of another, and the sixth kind's is one of them.
+//
+// aad.go's two labels and writeauth.go's two are each held to this pairwise in their own
+// files, and each of those tests is about ONE pair. This is the same rule over the class, and
+// it is the rule that matters when a label is added: the separation between two preimages
+// rests on the bytes of their labels differing INSIDE the shorter of the two, because nothing
+// stands between the label and the first field. A label that is a prefix of another is a
+// preimage a choice of the following field can turn into the other protocol's, and both
+// preimages still build.
+func TestNoLabelThisPackageDeclaresIsAPrefixOfAnother(t *testing.T) {
+	labels := packageLabels(t)
+	names := []string{}
+	for label := range labels {
+		names = append(names, label)
+	}
+	slices.Sort(names)
+	t.Logf("%d labels declared in this package: %v", len(names), names)
+
+	// the positive control, inline: the four labels that were here before the sixth kind
+	// was, and the one it added. A derivation that quietly stopped matching would report an
+	// empty class, and the emptiness above is a Fatal for that reason; this is the stronger
+	// half, because a derivation that matched the wrong literals would report a full one.
+	for _, want := range []string{aadBodyLabel, aadHeadLabel, writeAuthLabel, requestAuthLabel, epochKeysLabel} {
+		if _, declared := labels[want]; !declared {
+			t.Errorf("the walk did not find %q, which this package declares as a constant", want)
+		}
+	}
+	if len(names) != 5 {
+		t.Errorf("the walk found %d labels and this package declares 5; a label added is a label owed a line in the control above", len(names))
+	}
+
+	for _, left := range names {
+		for _, right := range names {
+			if left == right {
+				continue
+			}
+			if strings.HasPrefix(right, left) {
+				t.Errorf("%q (%v) is a prefix of %q (%v), so no choice of the field after the shorter one separates the two preimages",
+					left, labels[left], right, labels[right])
+			}
+		}
+	}
+	// and each label is declared in exactly one place, so no two preimages can be moved
+	// together by one edit
+	for label, sites := range labels {
+		if 1 < len(sites) {
+			t.Errorf("%q is written at %v; a label at two sites is two preimages one edit can make equal", label, sites)
+		}
+	}
 }
 
 // ── the fuzz target ─────────────────────────────────────────────────────────────────
@@ -1790,6 +2901,108 @@ func FuzzParseServerAttachment(f *testing.F) {
 				uint16(attachment.Kind), set, uint16(carried))
 		}
 		again, err := EncodeServerAttachment(attachment)
+		if err != nil {
+			t.Fatalf("accepted %d octets and then refused to re-encode them: %v", len(bs), err)
+		}
+		if !bytes.Equal(again, bs) {
+			t.Fatalf("accepted %d octets and re-encoded to %d different ones, so this attachment has two encodings", len(bs), len(again))
+		}
+	})
+}
+
+// ── the sixth kind's fuzz target ────────────────────────────────────────────────────
+
+const epochDigestFuzzCorpusDir = "testdata/fuzz/FuzzParseEpochDigestAttachment"
+
+// The corpus checked in beside the sixth kind's target is read, and it says something.
+//
+// THESE ARE THE INTEROP VECTORS ON DISK. The two valid entries are the two vectors this file
+// pins — the indefinite durable sentinel at expected_wrap_count 1501, and the unset sentinel
+// at expected_wrap_count 1 over a digest at a different epoch — so a second implementation
+// can read the octets out of this directory without a go toolchain and check its own parser
+// and its own digest against them. The rest are the near miss framings a byte walk does not
+// produce, including a real kind 0x0001 attachment, which this door must refuse by name.
+func TestTheCheckedInEpochDigestFuzzCorpusIsReadAndSaysSomething(t *testing.T) {
+	entries, err := os.ReadDir(epochDigestFuzzCorpusDir)
+	if err != nil {
+		t.Fatalf("the checked-in fuzz corpus is unreadable at %s: %v", epochDigestFuzzCorpusDir, err)
+	}
+	accepted := 0
+	refused := 0
+	pinned := map[string]bool{
+		attachmentEpochDigestVectorHex:       false,
+		attachmentEpochDigestSecondVectorHex: false,
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		bs := fuzzCorpusEntry(t, filepath.Join(epochDigestFuzzCorpusDir, entry.Name()))
+		digest, err := ParseEpochDigestAttachment(bs)
+		if err != nil {
+			refused++
+			continue
+		}
+		accepted++
+		if _, carried := pinned[hex.EncodeToString(bs)]; carried {
+			pinned[hex.EncodeToString(bs)] = true
+		}
+		again, err := EncodeEpochDigestAttachment(digest)
+		if err != nil {
+			t.Fatalf("%s: parsed and then refused to re-encode: %v", entry.Name(), err)
+		}
+		if !bytes.Equal(again, bs) {
+			t.Fatalf("%s: parsed and re-encoded to %d different octets, so this attachment has two encodings", entry.Name(), len(again))
+		}
+	}
+	if accepted+refused == 0 {
+		t.Fatalf("%s holds no corpus entry, so the fuzz target replays nothing but its own well formed seeds", epochDigestFuzzCorpusDir)
+	}
+	if accepted == 0 {
+		t.Fatalf("%s: all %d entries are refused, so no entry ever reaches the re-encode half of the property", epochDigestFuzzCorpusDir, refused)
+	}
+	if refused == 0 {
+		t.Fatalf("%s: all %d entries are accepted, so the malformed inputs it exists to carry are gone", epochDigestFuzzCorpusDir, accepted)
+	}
+	// the vectors are ON DISK and not only in this file, which is the whole of what makes
+	// them reachable by an implementation that is not this one
+	for vector, onDisk := range pinned {
+		if !onDisk {
+			t.Errorf("the vector %s… is pinned in this file and is in no corpus entry, so no second implementation can read it", vector[:12])
+		}
+	}
+	t.Logf("%d corpus entries, %d accepted and %d refused", accepted+refused, accepted, refused)
+}
+
+// The one property that has to hold over bytes nobody chose, at the sixth kind's door: an
+// input is refused, or it re-encodes to itself exactly.
+func FuzzParseEpochDigestAttachment(f *testing.F) {
+	for _, entry := range epochDigestWalkCorpus(f) {
+		bs, err := EncodeEpochDigestAttachment(entry.attachment.EpochDigest)
+		if err != nil {
+			f.Fatalf("%s: the door refused a corpus attachment: %v", entry.name, err)
+		}
+		f.Add(bs)
+	}
+	for _, vector := range []string{attachmentEpochDigestVectorHex, attachmentEpochDigestSecondVectorHex, attachmentEpochVectorHex} {
+		bs, err := hex.DecodeString(vector)
+		if err != nil {
+			f.Fatalf("a pinned vector is not hexadecimal: %v", err)
+		}
+		f.Add(bs)
+	}
+	f.Add([]byte{})
+	f.Add([]byte{0x00, 0x05})
+
+	f.Fuzz(func(t *testing.T, bs []byte) {
+		digest, err := ParseEpochDigestAttachment(bs)
+		if err != nil {
+			return
+		}
+		if digest == nil {
+			t.Fatalf("accepted %d octets and answered no attachment at all", len(bs))
+		}
+		again, err := EncodeEpochDigestAttachment(digest)
 		if err != nil {
 			t.Fatalf("accepted %d octets and then refused to re-encode them: %v", len(bs), err)
 		}
