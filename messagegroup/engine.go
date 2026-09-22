@@ -122,6 +122,34 @@ type GroupHandle interface {
 	MemberCount() int
 	MemberAt(i int) (leafIndex uint32, identityPub []byte, leafKeys []byte, err error)
 
+	// RoleAt is the thirty fourth method, added 2026-09-22 for ledger item 242's R4, and it is a
+	// SECOND PROJECTION OF THE SNAPSHOT MemberAt ALREADY BUILDS rather than a second computation:
+	// connect/mls resolves every member's role against urmessage_group_policy inside Members()
+	// (group.go's membersLocked), and MemberAt throws that field away because the epoch fan out it
+	// was written for wraps to leaf keys and has no use for a role.
+	//
+	// IT IS KEYED BY LEAF INDEX AND NOT BY ORDINAL, which is the one signature decision. MemberAt
+	// is half of an ordinal PAIR -- MemberCount and MemberAt, so a caller walking 0..n-1 need not
+	// know which leaves are blank -- and every caller of this one arrives holding a LEAF: a
+	// record's sender is authenticated to a leaf, and a leaf's ordinal is a function of which
+	// other leaves happen to be occupied at that epoch. A method keyed on the ordinal would make
+	// its caller walk the membership to convert, which is the walk this method exists to replace,
+	// and would answer a DIFFERENT member for the same leaf after any removal.
+	//
+	// THE ROLE IS A STRING AND IT IS connect/mls's OWN Role.String() -- "observer", "member",
+	// "admin", "owner". A uint8 here would be either a re-export of mls.Role under another name or
+	// a second numbering nobody can hold equal to the first; the string is the spelling MASTER
+	// section 11 uses and the spelling the cgo surface already answers.
+	//
+	// AN UNNAMED IDENTITY READS AS "member", AND A CONTEXT CARRYING NO 0xF001 READS EVERY MEMBER
+	// AS "member" -- item 242's rulings 8 and 20 -- and neither is decided here: both are already
+	// Members()' reading, so this projection and the sdk's commit arm cannot come to disagree
+	// about the same group at the same epoch. A policy-less context is therefore NOT an error.
+	// What IS an error is a leaf no member of this group stands at, for MemberAt's stated reason:
+	// every absence on this interface is an error and never a zero value, and a nil identity
+	// beside an empty role would read downstream as an unnamed member rather than as nobody.
+	RoleAt(leaf uint32) (identityPub []byte, role string, err error)
+
 	// the two named secrets of MASTER section 8.2, and the exporter. Nothing else: EpochSecret
 	// is deliberately absent, which is guardrail G6 seen from this side -- an accessor taking a
 	// name would reach epoch_secret, confirmation_key and membership_key through the same door.
@@ -923,6 +951,31 @@ func (self *connectMlsHandle) MemberAt(i int) (uint32, []byte, []byte, error) {
 		return 0, nil, nil, fmt.Errorf("%w: %w", ErrEngineMemberLeafKeys, err)
 	}
 	return uint32(member.LeafIndex), member.IdentityPub, leafKeys.ExtensionData, nil
+}
+
+// RoleAt projects one member's credential identity and its role, KEYED BY LEAF INDEX.
+//
+// IT READS THE SAME self.group.Members() SNAPSHOT MemberAt READS AND TAKES A SECOND FIELD OFF IT.
+// membersLocked already runs GroupPolicyOf over the group context's extension list and sets
+// Member.Role from it, so the policy is parsed exactly once per snapshot and this method computes
+// nothing: it selects. The two readings of an unnamed identity connect/mls used to hold -- RoleOf
+// without its bool answering OBSERVER, Members() answering MEMBER -- were closed to MEMBER at R1,
+// and taking the role off Members() is what keeps this door on the same side of that.
+//
+// THE LEAF KEYS EXTENSION IS NOT REQUIRED HERE, which is the one way this differs from MemberAt
+// beyond the key. MemberAt refuses a member with no urmessage_leaf_keys because its caller is
+// about to wrap an epoch secret to that key and a nil there is a member silently left out of the
+// epoch. A ROLE is not a wrap target: a leaf admitted without leaf keys is a member with a role,
+// it is exactly the leaf the receiving arm's R6d refuses a commit for, and refusing to say what
+// role it holds would hide the member rather than the defect.
+func (self *connectMlsHandle) RoleAt(leaf uint32) ([]byte, string, error) {
+	for _, member := range self.group.Members() {
+		if uint32(member.LeafIndex) != leaf {
+			continue
+		}
+		return member.IdentityPub, member.Role.String(), nil
+	}
+	return nil, "", fmt.Errorf("%w: leaf %d at epoch %d", ErrEngineMemberLeaf, leaf, self.group.Epoch())
 }
 
 // Export is RFC 9420 section 8.5's exporter, which MASTER section 7 derives mls_secret from.

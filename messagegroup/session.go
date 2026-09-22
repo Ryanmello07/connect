@@ -144,6 +144,14 @@ type GroupSession struct {
 	// at Close, so every entry is at most PastEpochWindow behind the epoch above.
 	pastEpochLoader PastEpochLoader
 	pastEpochs      map[uint64]*pastEpoch
+
+	// THIS EPOCH'S leaf -> (identity, role) table, and the session's own half of what every
+	// pastEpoch holds in its roles field. Ledger item 242's R4; epochRole in pastepoch.go is the
+	// whole account of why nothing in it is key material and why it must still not outlive the
+	// epoch it describes. It is nil until the first ask and it is DROPPED -- not erased -- in
+	// installEpochOnLoop, on the line beside the one that re-makes pastEpochs, because the leaf
+	// index is its key and an install is exactly what changes the role at a leaf.
+	roles map[uint32]epochRole
 }
 
 // senderLadderKey is what one of this session's own sender ladders is held under.
@@ -738,6 +746,15 @@ func (self *GroupSession) installEpochOnLoop(groupHandleKeyEpoch0 []byte) error 
 		past.Zeroize()
 	}
 	self.pastEpochs = map[uint64]*pastEpoch{}
+	// AND THIS EPOCH'S ROLE TABLE GOES WITH THEM, item 242's ruling 18. It is dropped and not
+	// erased -- a credential identity is published in its own leaf node and a role is a row of a
+	// group context extension the transcript covers, so there is no secret in it -- but it is
+	// dropped HERE, because it is keyed by LEAF INDEX and a commit that changes a role changes
+	// nothing else about the leaf. A table that survived this line would answer epoch n+1's
+	// question with the role that leaf held at epoch n, which is the one reading item 242's ruling
+	// 21 exists to make impossible. The prior epochs' tables die three lines up, as fields of the
+	// schedules re-made there.
+	self.roles = nil
 	self.groupHandleKey = handleKey
 	self.storageRoot = root
 	self.classKeys = DeriveClassKeys(root)
@@ -852,6 +869,10 @@ func (self *GroupSession) zeroizeOnLoop() {
 	self.ephRoot = nil
 	self.senders = map[senderLadderKey]*SenderRatchet{}
 	self.pastEpochs = map[uint64]*pastEpoch{}
+	// dropped and not erased, for installEpochOnLoop's reason at the same field: nothing in it is
+	// a secret, and what it must not do is outlive the epoch it describes. A closed session has
+	// no epoch, so it holds no table.
+	self.roles = nil
 }
 
 // The exporter label and length MASTER section 7 derives mls_secret at.

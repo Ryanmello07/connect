@@ -58,6 +58,11 @@ var sectionSixGroupHandle = map[string]string{
 	"OwnLeafIndex": "func() uint32",
 	"MemberCount":  "func() int",
 	"MemberAt":     "func(i int) (leafIndex uint32, identityPub []byte, leafKeys []byte, err error)",
+	// AMENDED 2026-09-22 for ledger item 242's R4, OBSERVER read-only: the second projection of
+	// the membership snapshot MemberAt already builds, keyed by LEAF INDEX because every caller of
+	// it arrives holding a leaf that an open authenticated, and answering connect/mls's own
+	// Role.String() because a uint8 here would be a re-export of mls.Role under another name.
+	"RoleAt": "func(leaf uint32) (identityPub []byte, role string, err error)",
 
 	"Export":              "func(label string, context []byte, length int) ([]byte, error)",
 	"PairwiseExport":      "func(label string, peer uint32, length int) ([]byte, error)",
@@ -254,8 +259,16 @@ func TestTheEngineInterfacesAreExactlySectionSixsBlock(t *testing.T) {
 	// clears a staged epoch instead of forking itself off the group. Two methods and not four,
 	// for the reason the interface gives; and two rather than none because the alternative --
 	// keep merging first -- is the fork the seam's own Commit contract names.
-	if len(sectionSixGroupEngine) != 5 || len(sectionSixGroupHandle) != 33 {
-		t.Errorf("section 6's block is transcribed as %d and %d methods; it was measured at 5 and 33, and a change to either is a change to the seam",
+	//
+	// AND IT IS 5 AND 34 FROM 2026-09-22's R4 of the same item, OBSERVER read-only: the HANDLE
+	// half gains RoleAt, ONE method and the only one R4 needs. It reads the Role field
+	// (*mls.Group).Members() already resolves and MemberAt throws away, keyed by leaf index rather
+	// than by ordinal because a record's sender is authenticated to a LEAF. It is on this seam
+	// rather than in the sdk because the answer has to be read off the handle of the record's OWN
+	// epoch -- item 242's ruling 17 -- and the only door onto a prior epoch's handle is the
+	// session, behind this interface.
+	if len(sectionSixGroupEngine) != 5 || len(sectionSixGroupHandle) != 34 {
+		t.Errorf("section 6's block is transcribed as %d and %d methods; it was measured at 5 and 34, and a change to either is a change to the seam",
 			len(sectionSixGroupEngine), len(sectionSixGroupHandle))
 	}
 }
@@ -273,7 +286,7 @@ func TestTheEngineInterfacesAreExactlySectionSixsBlock(t *testing.T) {
 // a type change rather than a factory change.
 //
 // The scope question (R3a) is answered separately from the class question: the CLASS is the
-// method set of both interfaces read off the syntax tree, which is 33 members at this commit and
+// method set of both interfaces read off the syntax tree, which is 34 members at this commit and
 // is never a list; the SCOPE is engine.go, because that is the file section 2.2's tree puts the
 // interface in and an interface declared anywhere else would fail
 // TestThisPackageIsBuiltFromExactlyTheseImports before it reached here.

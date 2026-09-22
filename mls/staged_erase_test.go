@@ -1166,6 +1166,14 @@ var typesTheEraseClassReachesThatOweNoErase = map[string]string{
 		"applies the result owns it, exactly as PathDecryptResult's row says of the state it hands out",
 	"CachedProposal": "a proposal this member received and the reference it is keyed by. Both went to every " +
 		"member of the group and to the delivery service; ProposalCache.byRef is excused for the same reason",
+	"epochRole": "one leaf's credential identity and its role at one epoch, ledger item 242's R4 and its " +
+		"ruling 18. It is ReceiverRatchetKey's row read for a different pair: both halves travel in the " +
+		"clear and every member of the group already holds them. The identity is published in the leaf " +
+		"node it stands in -- in the ratchet tree beside every Welcome, and answered on request by " +
+		"(*Group).Members, which is where this value is read FROM -- and the role is one row of " +
+		"urmessage_group_policy, an entry of the group context extension list the transcript covers. An " +
+		"erase here would blank octets an attacker reading the wire already has. What the two tables " +
+		"holding these owe is a LIFETIME and not an erase, and GroupSession.roles says what it is",
 	"ReceiverRatchetKey": "the two values one receiver ratchet is TRACKED under: the sender handle the message " +
 		"server routes on, which every member of the group computes and which is in the cleartext header of " +
 		"every record, and the retention class wire byte, which is one octet of that same header. It is " +
@@ -1374,6 +1382,20 @@ var theFieldsOfTheEraseClassThatAreNotKeyMaterial = map[string]string{
 		"MASTER section 8.4 moved the framing in front of the rung, where no field-based reading could " +
 		"see them: what changed is the representation and not the exposure. The one value on this chain " +
 		"that is key material is recordKey, and zeroize erases it on every exit including the refusals",
+	"GroupSession.roles": "this epoch's leaf -> (identity, role) table, ledger item 242's R4 and its " +
+		"ruling 18. Both halves of an entry are values every member of the group already holds: a " +
+		"credential identity is published in the leaf node it stands in, which every member holds and " +
+		"every joiner is handed in its Welcome -- Group.cred and connectMlsEngine.cred are excused in " +
+		"the same words -- and a role is one row of urmessage_group_policy, an entry of the group " +
+		"context extension list the transcript covers and every Welcome carries, excused as " +
+		"Group.context is. What this table owes is not an erase but a LIFETIME: it is keyed by LEAF " +
+		"INDEX and a role change moves nothing else about a leaf, so a table that survived an epoch " +
+		"install would answer the new epoch's question with the role that leaf held at the old one. " +
+		"installEpochOnLoop drops it on the line beside the one re-making pastEpochs, and zeroizeOnLoop " +
+		"with the rest",
+	"pastEpoch.roles": "the same table for one PRIOR epoch, held as a field of that epoch's schedule " +
+		"rather than in a map keyed by epoch precisely so that the schedule's death is its death; see " +
+		"GroupSession.roles for why nothing in it is key material",
 	"connectMlsEngine.cred": "this device's credential, which is its identity public key. It is published " +
 		"in the leaf node of every group this engine founds, every member holds it and every joiner is " +
 		"handed it in its Welcome; Group.cred is excused in the same words",

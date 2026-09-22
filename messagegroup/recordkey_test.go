@@ -858,6 +858,31 @@ var recordKeyOneWayProbes = map[string]func(secret []byte) [][]byte{
 		}
 		return [][]byte{record.CtHead, record.CtBody, record.WriteAuth[:], record.Header.BodyHash[:]}
 	},
+	// LEDGER ITEM 242's R4, AND THE FIRST ROW WHOSE SUBJECT DERIVES NOTHING. RoleAt is in this
+	// class because it is exported and reaches the key schedule -- its prior-epoch arm routes
+	// through the lookup that rebuilds an epoch's class keys out of a storage root -- and what it
+	// ANSWERS is a credential identity read off a ratchet tree and a role read off a group context
+	// extension. The rung arrives as the session's pq_secret, which is the ikm of every storage
+	// root this session extracts, and the octets that come back are a function of neither it nor
+	// any expansion: a leaf's published identity and four ascii bytes. That is the row rather than
+	// a reason to leave the member out, because "this one answers nothing derived" is a claim the
+	// walk below can check and a missing row is a claim nobody made.
+	"RoleAt": func(secret []byte) [][]byte {
+		fixture, err := buildProbeSession(secret)
+		if err != nil {
+			return nil
+		}
+		defer fixture.session.Close()
+		epoch, err := fixture.session.Epoch()
+		if err != nil {
+			return nil
+		}
+		identityPub, role, err := fixture.session.RoleAt(epoch, fixture.handle.OwnLeafIndex())
+		if err != nil {
+			return nil
+		}
+		return [][]byte{identityPub, []byte(role)}
+	},
 }
 
 func TestNothingExportedLeadsBackwardsAlongTheLadder(t *testing.T) {

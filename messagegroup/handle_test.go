@@ -272,6 +272,19 @@ var handleLeafIndexReadings = map[string]string{
 	"refuseFrameBindingsOnLoop": "LP -- it binds the leaf only through SenderHandle, because MASTER " +
 		"section 8.4.3's R1 is the comparison of the handle the frame's signer expands to against the " +
 		"handle the record carries, and a second spelling here would refuse every honest record",
+	// THE THIRD READING, AND IT IS NEITHER. It is written out rather than left off because the
+	// class above is derived from reachability -- takes a uint32 AND reaches the key schedule --
+	// and item 242's R4 is the first member of it that takes a leaf index and puts it into no
+	// derivation whatever. Leaving the row off would have been the only way to say that, and an
+	// absent row is what this gate exists to refuse.
+	"RoleAt": "neither -- ledger item 242's R4 reads the identity and role standing at a leaf of " +
+		"ONE EPOCH'S ratchet tree, so the number is a tree position and a map key: it is compared " +
+		"against a member's LeafIndex and used to look an entry up, and no octet of it is written " +
+		"into any expansion. It is in this class because it ROUTES THROUGH scheduleForOnLoop, whose " +
+		"prior-epoch arm rebuilds that epoch's class keys from a storage root -- reachability, which " +
+		"is the property, and not a binding. Two declarations carry the name, the seam's projection " +
+		"and the session's door, and the reading is the same for both",
+	"roleAtOnLoop": "neither -- RoleAt's body, and the same reading for the same reason",
 }
 
 func TestEveryLeafIndexDerivationDeclaresItsReadingAndSharesOneHelper(t *testing.T) {

@@ -306,7 +306,15 @@ func noncerebindWhere(fileSet *token.FileSet, path string, declaration string, a
 // TrackSenderAt is TrackSender for a prior epoch. Neither reaches self.serverNonce -- a prior
 // epoch's schedule is a read schedule and holds no write key for the nonce to be mac'd under --
 // so the banned subset stays empty and the complement is unchanged.
-const noncerebindExportedSessionMethods = 15
+//
+// Ledger item 242's R4 adds the sixteenth, and this one DOES answer octets: RoleAt answers the
+// credential identity standing at one leaf at one epoch, beside that identity's role. It joins the
+// complement this gate prints rather than the banned subset, and for a reason stronger than "its
+// body does not mention the field": the identity it answers is read off a RATCHET TREE -- the
+// session's own handle for its own epoch, a prior epoch's rebuilt one otherwise -- and the write
+// key the nonce is mac'd under is on neither. So the banned subset stays empty and the complement
+// grows by one.
+const noncerebindExportedSessionMethods = 16
 
 // Property 4 -- THE NARROWING, AND IT IS THE ONE PLACE IN THIS FILE WHERE AN EMPTINESS IS THE
 // PROPERTY RATHER THAN A DEFECT IN IT.

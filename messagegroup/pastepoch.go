@@ -86,11 +86,41 @@ type PastEpochLoader func(epoch uint64) (GroupHandle, error)
 // ClassKeys and through ReceiverRatchets. The handle is closed by the same erase because it IS
 // key material: an open mls.Group holds the epoch's key schedule and its secret tree, and Close is
 // the erase mls declares for both.
+//
+// AND ONE FIELD OF IT IS NOT KEY MATERIAL AND IS DELIBERATELY NOT IN Zeroize: roles, item 242's
+// ruling 18. See epochRole for what it holds, why nothing in it is a secret, and why it must
+// still not outlive the handle above.
 type pastEpoch struct {
 	handle    GroupHandle
 	at        uint64
 	classKeys *ClassKeys
 	receivers *ReceiverRatchets
+	// this epoch's leaf -> (identity, role) table, built on the first ask and nil until then.
+	// It is erased by NOTHING and dropped WITH THIS WHOLE VALUE at installEpochOnLoop, which is
+	// the point: see epochRole.
+	roles map[uint32]epochRole
+}
+
+// epochRole is one leaf's credential identity and its role AT ONE EPOCH, as the seam spells both.
+//
+// NOTHING HERE IS KEY MATERIAL AND IT IS NOT IN pastEpoch.Zeroize -- item 242's ruling 18, and the
+// reason is the one connect/mls's erase table already writes for Group.cred and Group.context. A
+// credential identity is published in its own leaf node, which every member holds and every joiner
+// is handed in its Welcome; a role is a row of urmessage_group_policy, which is an entry of the
+// group context extension list that the transcript covers and that travels beside every Welcome.
+// Erasing either would destroy a value every member of the group already has.
+//
+// AND YET THE TABLE MUST NOT OUTLIVE ITS HANDLE, which is a LIFETIME rule and not an erase rule.
+// The table is a projection of ONE epoch's ratchet tree and ONE epoch's policy; the handle it was
+// projected from is the only thing that says which epoch that was. installEpochOnLoop re-makes
+// self.pastEpochs wholesale at every epoch install, and a table held anywhere else -- a map on the
+// session keyed by epoch, say -- would survive that and answer an epoch's question with a role
+// read at another epoch, which is precisely the mistake item 242's ruling 21 exists to prevent.
+// So the table is a FIELD OF THE SCHEDULE, and the schedule's death is its death. The session's
+// own epoch has the same table in self.roles, dropped in the same body at the same line.
+type epochRole struct {
+	identityPub []byte
+	role        string
 }
 
 // Zeroize erases the class keys and every ladder, closes the handle, and drops all three.
@@ -236,6 +266,136 @@ func (self *GroupSession) scheduleForOnLoop(epoch uint64) (GroupHandle, *Receive
 		return nil, nil, err
 	}
 	return past.handle, past.receivers, nil
+}
+
+// RoleAt answers the credential identity standing at one LEAF at one EPOCH of this group, and the
+// role that identity held AT THAT EPOCH.
+//
+// THE IDENTITY BEHIND A ROLE CHECK IS READ OFF THE RECORD'S OWN EPOCH'S TREE AND NEVER OFF
+// walk.leaves. SenderHandle(group_handle_key, leaf) is a function of the leaf index and a
+// group-lifetime key and nothing else, so a handle can never distinguish two identities that
+// occupied one leaf at different epochs (ledger item 245); walk.leaves stays a cheap pre-filter
+// answering "is this handle a leaf of this group at all", and the authentication is R1 inside
+// OpenRecord. A caller asks this with the leaf that open AUTHENTICATED and with that record's own
+// epoch, never with a leaf it resolved from a header's claimed sender_handle.
+//
+// IT READS THE HANDLE AN OPEN AT THAT EPOCH READS AND NO OTHER -- item 242's ruling 17, and the
+// whole of what that ruling buys is here: the route is scheduleForOnLoop, the same three-armed
+// lookup openRecordOnLoop takes, so a door reading the same handle the open read CANNOT FAIL WHERE
+// THE OPEN SUCCEEDED, and every refusal it can answer is one that record's own open answered
+// first, by the same sentinel. A second LoadGroup on the sdk side would have manufactured an
+// "undeterminable role" state this session never produces, and a past epoch's handle is key
+// material with an erase owner besides.
+//
+// AND THE CONDITION ON THAT SENTENCE, MEASURED RATHER THAN ASSUMED: it holds for an ask taken with
+// NO EPOCH INSTALL BETWEEN IT AND THE OPEN. While a schedule is held, nothing moves what this
+// answers -- the only method an open calls on the epoch's handle is Unprotect, and (*mls.Group)
+// writes its tree and its context in the merge and nowhere else, so any number of opens leave
+// Members() saying the same thing. installEpochOnLoop is the one thing that breaks it: it closes
+// every held handle and re-makes self.pastEpochs wholesale, and it is reachable BETWEEN two
+// records of one walk, because the sdk ingests a commit in the same loop that opens application
+// records. After one, the next ask at epoch n is a fresh load rather than the open's own handle,
+// and that load can refuse where the open did not -- a record that opened at exactly
+// PastEpochWindow behind is PastEpochWindow+1 behind after the install, and the state mls keeps
+// for it has been deleted by the same merge. That is why item 242's ruling 21 CAPTURES the role
+// AT OPEN rather than deriving it at render: the capture is what keeps the ask inside the window
+// this paragraph describes.
+//
+// THE ANSWER IS A FACT ABOUT AN EPOCH AND NOT ABOUT NOW. A member demoted at epoch n+1 held its
+// old role at epoch n and everything it sent there was sent with it (item 242's ruling 21, and
+// Spec A's "read from the transcript-covered group-context extension of the SENDING EPOCH -- never
+// from current membership"). A caller that wants the role now asks at the session's own epoch.
+//
+// The three refusals are scheduleForOnLoop's, unchanged and by the same sentinels; a leaf nobody
+// stands at, at an epoch this session DID reach, is ErrEngineMemberLeaf and is a different thing.
+func (self *GroupSession) RoleAt(epoch uint64, leaf uint32) ([]byte, string, error) {
+	var identityPub []byte
+	var role string
+	var err error
+	if postErr := self.do(func() {
+		if self.closing {
+			err = ErrSessionClosed
+			return
+		}
+		identityPub, role, err = self.roleAtOnLoop(epoch, leaf)
+	}); postErr != nil {
+		return nil, "", postErr
+	}
+	return identityPub, role, err
+}
+
+// roleAtOnLoop is RoleAt's body. The caller is the loop goroutine.
+func (self *GroupSession) roleAtOnLoop(epoch uint64, leaf uint32) ([]byte, string, error) {
+	handle, _, err := self.scheduleForOnLoop(epoch)
+	if err != nil {
+		return nil, "", err
+	}
+	table, err := self.roleTableOnLoop(epoch)
+	if err != nil {
+		return nil, "", err
+	}
+	named, stands := table[leaf]
+	if !stands {
+		identityPub, role, err := handle.RoleAt(leaf)
+		if err != nil {
+			// A LEAF NOBODY STANDS AT IS NOT CACHED, which is pastEpochOnLoop's own rule for a
+			// refusal one line of reasoning up: the table is what this epoch's tree says, and a
+			// refusal is what it does not say. At the SESSION'S OWN epoch the tree moves under
+			// this table only at an install, which empties it; caching the absence would buy one
+			// Members() call and would make the table a record of questions rather than of
+			// members.
+			return nil, "", err
+		}
+		named = epochRole{identityPub: identityPub, role: role}
+		table[leaf] = named
+	}
+	// THE IDENTITY IS COPIED ON THE WAY OUT. The table is held across calls, so the slice inside
+	// it is one every later caller would be handed too; mls clones the identity into each
+	// Members() snapshot for exactly this reason -- a caller handed a window onto the live tree
+	// writes through it -- and a cache in front of that call would give the clone back if this
+	// line did not.
+	identityPub := make([]byte, len(named.identityPub))
+	copy(identityPub, named.identityPub)
+	return identityPub, named.role, nil
+}
+
+// roleTableOnLoop answers one epoch's leaf -> (identity, role) table, ALLOCATED ON THE FIRST ASK
+// and held until the schedule it belongs to is dropped.
+//
+// IT IS FILLED ONE LEAF AT A TIME AND NOT ALL AT ONCE, which is forced by the seam rather than
+// chosen: the only enumeration GroupHandle offers is the MemberCount / MemberAt ordinal pair, and
+// MemberAt REFUSES a member whose leaf carries no urmessage_leaf_keys -- a leaf the receiving arm's
+// R6d refuses a commit for, but one that can stand in a group a hostile mls build committed into.
+// A table built by walking that pair would be unable to answer what role such a member holds,
+// which would hide the member rather than the defect, and it would cost one Members() snapshot per
+// leaf to build besides.
+//
+// WHERE THE TABLE IS HELD IS WHAT MAKES IT DIE ON TIME (item 242's ruling 18). The session's own
+// epoch keeps it in self.roles and a prior epoch keeps it in its own schedule, and
+// installEpochOnLoop drops both in the same body -- self.roles to nil beside the fields it
+// re-derives, self.pastEpochs re-made wholesale. There is no map keyed by epoch anywhere, because
+// a table that outlived an epoch install would answer an epoch's question with a role read at a
+// later one: the leaf index is the key, an install does not change it, and the role at it is
+// exactly what an install can change.
+//
+// The caller is the loop goroutine.
+func (self *GroupSession) roleTableOnLoop(epoch uint64) (map[uint32]epochRole, error) {
+	held := &self.roles
+	if epoch != self.epoch {
+		past, isHeld := self.pastEpochs[epoch]
+		if !isHeld {
+			// unreachable through scheduleForOnLoop, which installs the schedule before it
+			// answers a prior epoch's handle. It is a refusal rather than a fresh map so that a
+			// future caller reaching this body by another route is told rather than cached into.
+			return nil, fmt.Errorf("%w: epoch %d: its schedule is not held by this session",
+				ErrPastEpochUnobtainable, epoch)
+		}
+		held = &past.roles
+	}
+	if *held == nil {
+		*held = map[uint32]epochRole{}
+	}
+	return *held, nil
 }
 
 // pastEpochOnLoop answers the schedule of one prior epoch, building it on first use.

@@ -180,6 +180,17 @@ var (
 	// fan out wraps to that key, so a nil answer here is a member silently left out of an
 	// epoch every other member can open.
 	ErrEngineMemberLeafKeys = errors.New("messagegroup: a member's leaf carries no urmessage_leaf_keys extension this engine can read")
+	// Fires when RoleAt is asked about a leaf no member of the group stands at, at the epoch the
+	// handle is at. It is ErrEngineMemberOrdinal's sibling at the other key and it is a refusal
+	// for the same reason: a zero answer here is a nil identity beside an empty role, which the
+	// reader of a role -- item 242's R4, deciding whether to render a record collapsed -- cannot
+	// tell from an unnamed member, and an unnamed member is a MEMBER that may send.
+	//
+	// IT IS A SEPARATE SENTINEL FROM THE EPOCH REFUSALS BESIDE IT, and that separation is load
+	// bearing: "this device holds no schedule for that epoch" is ErrEpochOutOfWindow or
+	// ErrPastEpochUnobtainable and is the same answer an OPEN at that epoch gives, while this one
+	// says the epoch was reached and nobody was there.
+	ErrEngineMemberLeaf = errors.New("messagegroup: no member of this group stands at that leaf")
 	// Fires when ApplyCommit is handed an EngineProcessed this handle did not stage -- one
 	// built by a keyed composite literal outside this package, which section 6 says is legal
 	// go, or one staged by another handle of this package. It is a typed refusal and never a
