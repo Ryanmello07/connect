@@ -413,7 +413,7 @@ grep -rnE '(if|for|case) .*\.Name|\.Type\.(In|Out|Kind|Elem|NumIn|NumOut|IsVaria
 Their recall against the derivation is measured on every run and stated here, and the sites they do
 not reach are named in the test log:
 
-**gates-recall: 104/176**
+**gates-recall: 104/178**
 
 **That fraction is a MEASUREMENT and not a claim.** These patterns were fitted against the tree as
 it stands, which is instance-derived by construction — which is exactly why the number is published
@@ -576,6 +576,8 @@ Each row carries one verdict:
 | `message/codec_agreement_test.go` `lpFieldValue` | name | `field.Name == name` | DRIVER — a lookup of the one field the caller named, over the whole structure. It decides no class. |
 | `message/codec_agreement_test.go` `lpFieldValue` | shape | `field.Type.Kind() == reflect.Struct` | DRIVER — the recursion, so a field nested inside a struct is reached rather than dropped. It widens the walk. |
 | `message/writeauth_test.go` `writeAuthCoveredNames` | shape | `field.Type == headerType` | DRIVER — decides whether a field contributes its own name or the twelve the header expands to; every field contributes. |
+| `messagegroup/engineroles_test.go` `liveTreeOf` | shape | `field.Type != reflect.TypeOf((*mls.RatchetTree)(nil))` | NARROWING/refusal — fatal: the fixture that builds the identity-swap commit writes through mls.Group's unexported tree field, found by name, and a field of any other type is reported with a sentence rather than written through. It decides no class; it guards one write. |
+| `messagegroup/engineroles_test.go` `liveTreeOf` | attribute | `tree == nil where tree = *(**mls.RatchetTree)(unsafe.Add(unsafe.Pointer(adapter.group), field.Offset))` | NARROWING/refusal — fatal: the live group holds no tree, which no fixture of this package produces, and the swap would otherwise dereference nil inside the test rather than name it. |
 | `messagegroup/epoch_test.go` `TestAProvisionalEpochDeclaresNoFieldAbleToHoldACachedEnvKey` | name | `!slices.Contains(declared, name)` | NARROWING/refusal — the other direction: a row naming a field the type no longer declares is reported. |
 | `messagegroup/epoch_test.go` `TestAProvisionalEpochDeclaresNoFieldAbleToHoldACachedEnvKey` | name | `isRowed where isRowed = epochProvisionalFields[name]` | NARROWING/refusal — a field with no row is reported on the else arm; nothing leaves silently. |
 | `messagegroup/epoch_test.go` `TestEveryAccessorOfAProvisionalEpochAnswersTheValueItWasBuiltFrom` | name | `!isRowed where isRowed = epochAccessorAnswers[method.Name]` | NARROWING/refusal — an accessor with no row saying which of section 5.12 step 1's values it answers is reported. |

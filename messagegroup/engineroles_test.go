@@ -16,8 +16,10 @@ import (
 	"bytes"
 	"errors"
 	"go/ast"
+	"reflect"
 	"strings"
 	"testing"
+	"unsafe"
 
 	"github.com/urnetwork/connect/mls"
 	"github.com/urnetwork/connect/mls/syntax"
@@ -94,7 +96,10 @@ func identityAtLeaf(t *testing.T, handle GroupHandle, leaf uint32) []byte {
 }
 
 // membersOf is a handle's live membership projected onto the seam's ProcessedMember, which is
-// the anchor every case compares MembersAfter against once the commit is applied.
+// the anchor every case compares MembersAfter against once the commit is applied. MemberAt
+// refuses a member whose leaf carries no urmessage_leaf_keys, so every entry it answers is one
+// with HasLeafKeys true, and the anchor says so; the one case with a keyless member anchors
+// against that refusal instead.
 func membersOf(t *testing.T, handle GroupHandle) []ProcessedMember {
 	t.Helper()
 	out := []ProcessedMember{}
@@ -103,7 +108,7 @@ func membersOf(t *testing.T, handle GroupHandle) []ProcessedMember {
 		if err != nil {
 			t.Fatalf("MemberAt(%d): %v", at, err)
 		}
-		out = append(out, ProcessedMember{Leaf: leaf, Identity: identity})
+		out = append(out, ProcessedMember{Leaf: leaf, Identity: identity, HasLeafKeys: true})
 	}
 	return out
 }
@@ -114,11 +119,23 @@ func assertSameMembers(t *testing.T, what string, got []ProcessedMember, want []
 		t.Fatalf("%s: %d members, want %d", what, len(got), len(want))
 	}
 	for i := range want {
-		if got[i].Leaf != want[i].Leaf || !bytes.Equal(got[i].Identity, want[i].Identity) {
-			t.Fatalf("%s: member %d is leaf %d identity %x, want leaf %d identity %x",
-				what, i, got[i].Leaf, got[i].Identity, want[i].Leaf, want[i].Identity)
+		if got[i].Leaf != want[i].Leaf || !bytes.Equal(got[i].Identity, want[i].Identity) || got[i].HasLeafKeys != want[i].HasLeafKeys {
+			t.Fatalf("%s: member %d is leaf %d identity %x leaf keys %v, want leaf %d identity %x leaf keys %v",
+				what, i, got[i].Leaf, got[i].Identity, got[i].HasLeafKeys, want[i].Leaf, want[i].Identity, want[i].HasLeafKeys)
 		}
 	}
+}
+
+// memberAtLeaf is the MembersAfter entry standing at one leaf, or a fatal for none.
+func memberAtLeaf(t *testing.T, what string, members []ProcessedMember, leaf uint32) ProcessedMember {
+	t.Helper()
+	for _, member := range members {
+		if member.Leaf == leaf {
+			return member
+		}
+	}
+	t.Fatalf("%s: MembersAfter holds nobody at leaf %d: %v", what, leaf, members)
+	return ProcessedMember{}
 }
 
 // TestThePreCommitExtensionListIsReadableThroughPublicMlsApi is item 242's R1 step 2, held as a
@@ -906,6 +923,382 @@ func TestCommitterIdentityIsReadOffTheLiveGroupAndMembersAfterOffTheStagedValue(
 		t.Errorf("answer.MembersAfter is drawn from %s, which is not handed processed.Commit: the membership after is the STAGED tree's, and a read off the live group answers the tree the commit is leaving", spellingOf(membersCall.Fun))
 	}
 	t.Logf("CommitterIdentity is drawn from %s and MembersAfter from %s", spellingOf(identityCall.Fun), spellingOf(membersCall.Fun))
+}
+
+// TestCommitRemoveOfTwoLeavesInAFiveMemberGroup is the Remove arm over MORE THAN ONE leaf, which
+// no other case in this package builds: TestCommitRemoveOfLeafTwoInAFourMemberGroup removes one,
+// so a CommitRemove that built a proposal for leaves[0] alone -- or a RemovedLeaves that
+// answered the first entry alone -- passed every case there was. Leaves 1 and 3 of five, chosen
+// so that neither is the first nor the last leaf and the survivors straddle both: a cold
+// receiver at leaf 2, which never saw a proposal, holds RemovedLeaves == [1, 3] and a
+// MembersAfter of exactly leaves 0, 2 and 4; both removed members are handed the report and
+// told ErrRemovedFromGroup; and the anchor is the survivor's membership after ApplyCommit.
+func TestCommitRemoveOfTwoLeavesInAFiveMemberGroup(t *testing.T) {
+	chain := newCommitAddChain(t, "roles-remove-two-of-five")
+	third, fourth, fifth := newTestEngine(t), newTestEngine(t), newTestEngine(t)
+	keyPackages := [][]byte{}
+	for _, engine := range []*testEngine{third, fourth, fifth} {
+		keyPackage, err := engine.engine.NewKeyPackage()
+		if err != nil {
+			t.Fatalf("NewKeyPackage: %v", err)
+		}
+		keyPackages = append(keyPackages, keyPackage)
+	}
+	commit, welcome, ratchetTree, err := chain.founded.CommitAdd(keyPackages)
+	if err != nil {
+		t.Fatalf("CommitAdd of three: %v", err)
+	}
+	processed, err := chain.joined.Process(commit)
+	if err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	if err := chain.joined.ApplyCommit(processed); err != nil {
+		t.Fatalf("ApplyCommit: %v", err)
+	}
+	if err := chain.founded.MergePendingCommit(); err != nil {
+		t.Fatalf("MergePendingCommit: %v", err)
+	}
+	handles := map[uint32]GroupHandle{0: chain.founded, 1: chain.joined}
+	for _, engine := range []*testEngine{third, fourth, fifth} {
+		handle, err := engine.engine.JoinFromWelcome(welcome, ratchetTree)
+		if err != nil {
+			t.Fatalf("a join: %v", err)
+		}
+		defer handle.Close()
+		handles[handle.OwnLeafIndex()] = handle
+	}
+	for leaf := uint32(0); leaf < 5; leaf += 1 {
+		if _, held := handles[leaf]; !held {
+			t.Fatalf("no member stands at leaf %d; the group is not five members at leaves 0..4", leaf)
+		}
+	}
+	if chain.founded.MemberCount() != 5 {
+		t.Fatalf("the founder sees %d members, want 5", chain.founded.MemberCount())
+	}
+	membersBefore := membersOf(t, handles[2])
+	before := contextExtensionsOf(t, handles[2])
+
+	removal, welcome, _, err := chain.founded.CommitRemove([]uint32{1, 3})
+	if err != nil {
+		t.Fatalf("CommitRemove([1, 3]): %v", err)
+	}
+	if welcome != nil {
+		t.Fatal("a remove answered a welcome")
+	}
+	wantAfter := []ProcessedMember{}
+	for _, member := range membersBefore {
+		if member.Leaf != 1 && member.Leaf != 3 {
+			wantAfter = append(wantAfter, member)
+		}
+	}
+	if len(wantAfter) != 3 {
+		t.Fatalf("the expected survivors are %v, want three", wantAfter)
+	}
+	// the cold survivor at leaf 2
+	survivor, err := handles[2].Process(removal)
+	if err != nil {
+		t.Fatalf("the survivor's Process: %v", err)
+	}
+	if len(survivor.RemovedLeaves) != 2 || survivor.RemovedLeaves[0] != 1 || survivor.RemovedLeaves[1] != 3 {
+		t.Fatalf("RemovedLeaves = %v, want [1 3]: a Remove of more than one leaf carries every one of them", survivor.RemovedLeaves)
+	}
+	if len(survivor.AddedLeaves) != 0 || len(survivor.UpdatedLeaves) != 0 {
+		t.Fatalf("a remove-only commit reports AddedLeaves %v and UpdatedLeaves %v", survivor.AddedLeaves, survivor.UpdatedLeaves)
+	}
+	assertSameMembers(t, "the survivor's MembersAfter", survivor.MembersAfter, wantAfter)
+	for _, member := range survivor.MembersAfter {
+		if member.Leaf == 1 || member.Leaf == 3 {
+			t.Fatalf("MembersAfter still holds leaf %d, which this commit removes", member.Leaf)
+		}
+	}
+	assertSameExtensions(t, "the survivor's ContextExtensionsAfter", survivor.ContextExtensionsAfter, before)
+	if !bytes.Equal(survivor.CommitterIdentity, chain.founder.identityPub) {
+		t.Fatalf("CommitterIdentity = %x, want the founder's %x", survivor.CommitterIdentity, chain.founder.identityPub)
+	}
+	// both removed members hold the report, with the same two leaves and the same three survivors
+	for _, leaf := range []uint32{1, 3} {
+		removed, err := handles[leaf].Process(removal)
+		if err != nil {
+			t.Fatalf("the removed member at leaf %d: Process: %v", leaf, err)
+		}
+		if len(removed.RemovedLeaves) != 2 || removed.RemovedLeaves[0] != 1 || removed.RemovedLeaves[1] != 3 {
+			t.Fatalf("the removed member at leaf %d holds RemovedLeaves = %v, want [1 3]", leaf, removed.RemovedLeaves)
+		}
+		assertSameMembers(t, "the removed member's MembersAfter", removed.MembersAfter, wantAfter)
+		if err := handles[leaf].ApplyCommit(removed); !errors.Is(err, mls.ErrRemovedFromGroup) {
+			t.Fatalf("the removed member at leaf %d: ApplyCommit answered %v, want mls.ErrRemovedFromGroup", leaf, err)
+		}
+	}
+
+	// THE ANCHOR, at every survivor
+	if err := handles[2].ApplyCommit(survivor); err != nil {
+		t.Fatalf("the survivor's ApplyCommit: %v", err)
+	}
+	fifthProcessed, err := handles[4].Process(removal)
+	if err != nil {
+		t.Fatalf("the fifth member's Process: %v", err)
+	}
+	if err := handles[4].ApplyCommit(fifthProcessed); err != nil {
+		t.Fatalf("the fifth member's ApplyCommit: %v", err)
+	}
+	if err := chain.founded.MergePendingCommit(); err != nil {
+		t.Fatalf("MergePendingCommit: %v", err)
+	}
+	assertSameMembers(t, "MembersAfter against the survivor's membership after ApplyCommit", survivor.MembersAfter, membersOf(t, handles[2]))
+	assertSameEpochSecret(t, 3, map[string]GroupHandle{
+		"the committer":    chain.founded,
+		"the survivor":     handles[2],
+		"the fifth member": handles[4],
+	})
+}
+
+// liveTreeOf is the ratchet tree the *mls.Group behind a handle of this package is RUNNING ON,
+// reached through the field mls keeps unexported, so that a case can build the one commit the
+// identity-continuity rule exists for: one whose path leaf carries an identity the pre-commit
+// tree does not. The path leaf is the committer's live leaf cloned and re-signed
+// (mls/treekem.go, CreateUpdatePathSecrets), so the write below is exactly the write mls's own
+// TestTheCommittersOwnPathCanSwapItsLeafIdentityAndOnlyThePreCommitTreeStillNamesIt makes one
+// package over -- committer.tree.Leaf(own).Credential.Identity = ... -- spelled from outside
+// that package.
+//
+// unsafe IS IN A TEST AND NOWHERE ELSE, and it is here because nothing weaker reaches the
+// fixture: no exported door of mls changes a leaf's credential, a doctored persisted state is
+// refused by the restore's tree hash, and a hostile committer is by definition one that did not
+// walk this seam's doors. The alternative was to leave MembersAfter's identity source pinned by
+// the source reading alone, and that reading is passed by a projection that takes identities
+// off the live group for every leaf that already exists -- which is the mutant this fixture is
+// for. The field is found by name and checked by type, so a rename or a retype in mls fails
+// here with a sentence rather than reading past the end of the struct.
+func liveTreeOf(t *testing.T, handle GroupHandle) *mls.RatchetTree {
+	t.Helper()
+	adapter, isAdapter := handle.(*connectMlsHandle)
+	if !isAdapter || adapter.group == nil {
+		t.Fatal("the handle is not this package's adapter over a live *mls.Group")
+	}
+	field, found := reflect.TypeOf((*mls.Group)(nil)).Elem().FieldByName("tree")
+	if !found {
+		t.Fatal("mls.Group declares no field named tree; the swap fixture writes the leaf the committer's path is cloned from, and this is the line to move")
+	}
+	if field.Type != reflect.TypeOf((*mls.RatchetTree)(nil)) {
+		t.Fatalf("mls.Group's tree field is a %s, want *mls.RatchetTree; the swap fixture is written over the wrong storage", field.Type)
+	}
+	tree := *(**mls.RatchetTree)(unsafe.Add(unsafe.Pointer(adapter.group), field.Offset))
+	if tree == nil {
+		t.Fatal("the live group holds no ratchet tree")
+	}
+	return tree
+}
+
+// TestMembersAfterNamesTheIdentityTheCommitLeavesAtTheCommittersLeaf is the behavioural half
+// of what TestCommitterIdentityIsReadOffTheLiveGroupAndMembersAfterOffTheStagedValue pins off
+// the source, over the one commit that tells the two readings apart: the committer's own path
+// leaf carries an identity its pre-commit leaf did not, mls accepts it, and the seam must answer
+// CommitterIdentity as the PRE-commit identity and MembersAfter at CommitterLeaf as the
+// POST-commit one. The authorizer's continuity rule is the comparison of those two, and it is
+// vacuous the moment either is read off the other's tree.
+//
+// WHAT THIS KILLS THAT THE SOURCE READING DOES NOT: a projection that reads identities off the
+// live group for every leaf that exists there and off the staged value only for added leaves.
+// That projection is handed processed.Commit, so the source reading passes it; over every
+// honest commit in this package the two trees agree at every surviving leaf, so every
+// behavioural case passes it; and over the swap it hands the authorizer the pre-commit identity
+// at exactly the leaf whose change the rule must see. The commit here carries no Add and no
+// Update, so the committer's leaf is a leaf that exists live, and the entry for it can only be
+// right by being read off the staged tree.
+//
+// The control runs first, over an honest path commit in the same group: the two reads agree.
+// The anchor is the membership the receiver holds after ApplyCommit, which is the swap.
+func TestMembersAfterNamesTheIdentityTheCommitLeavesAtTheCommittersLeaf(t *testing.T) {
+	chain := newCommitAddChain(t, "roles-identity-swap")
+	if bytes.Equal(chain.founder.identityPub, chain.joiner.identityPub) {
+		t.Fatal("the founder and the joiner share an identity, so a swap between them is invisible")
+	}
+	own := chain.founded.OwnLeafIndex()
+
+	// a bare commit through the seam carries a path, because RFC 9420 requires one of a commit
+	// with no proposals -- so the committer's leaf is rewritten and nothing is added or updated
+	pathCommitAt := func(t *testing.T) *EngineProcessed {
+		t.Helper()
+		commit, _, _, err := chain.founded.Commit([][]byte{})
+		if err != nil {
+			t.Fatalf("the founder's bare Commit: %v", err)
+		}
+		processed, err := chain.joined.Process(commit)
+		if err != nil {
+			t.Fatalf("the joiner's Process: %v; mls has grown an identity continuity rule, and this case is the line to move", err)
+		}
+		if processed.CommitterLeaf != own || len(processed.AddedLeaves) != 0 || len(processed.UpdatedLeaves) != 0 {
+			t.Fatalf("the commit is by leaf %d with adds %v and updates %v; this case needs the founder's bare path commit", processed.CommitterLeaf, processed.AddedLeaves, processed.UpdatedLeaves)
+		}
+		return processed
+	}
+
+	// THE CONTROL: over an honest path commit the two reads agree, at the founder's identity
+	honest := pathCommitAt(t)
+	if !bytes.Equal(honest.CommitterIdentity, chain.founder.identityPub) {
+		t.Fatalf("over an honest commit CommitterIdentity = %x, want the founder's %x", honest.CommitterIdentity, chain.founder.identityPub)
+	}
+	if at := memberAtLeaf(t, "the honest commit", honest.MembersAfter, own); !bytes.Equal(at.Identity, chain.founder.identityPub) {
+		t.Fatalf("over an honest commit MembersAfter at the committer's leaf = %x, want the founder's %x", at.Identity, chain.founder.identityPub)
+	}
+	if err := chain.joined.ApplyCommit(honest); err != nil {
+		t.Fatalf("ApplyCommit of the honest commit: %v", err)
+	}
+	if err := chain.founded.MergePendingCommit(); err != nil {
+		t.Fatalf("MergePendingCommit of the honest commit: %v", err)
+	}
+
+	// THE SWAP, made as a dishonest committer makes it: its own live leaf now claims the
+	// joiner's identity, the next path leaf is cloned from it and re-signed with the untouched
+	// signature key, and every honest receiver accepts the commit
+	liveTreeOf(t, chain.founded).Leaf(mls.LeafIndex(own)).Credential.Identity = bytes.Clone(chain.joiner.identityPub)
+	swapped := pathCommitAt(t)
+	if !bytes.Equal(swapped.CommitterIdentity, chain.founder.identityPub) {
+		t.Fatalf("over the swap CommitterIdentity = %x, want the founder's pre-commit %x: the committer is named by the tree the commit leaves, and the continuity comparison is made against itself", swapped.CommitterIdentity, chain.founder.identityPub)
+	}
+	atCommitter := memberAtLeaf(t, "the swapped commit", swapped.MembersAfter, own)
+	if !bytes.Equal(atCommitter.Identity, chain.joiner.identityPub) {
+		t.Fatalf("over the swap MembersAfter at the committer's leaf = %x, want the joiner's %x, which the path put there: the entry is being read off the live group because the leaf exists there, and the authorizer is handed the identity the commit REPLACED", atCommitter.Identity, chain.joiner.identityPub)
+	}
+	if bytes.Equal(swapped.CommitterIdentity, atCommitter.Identity) {
+		t.Fatal("the two reads agree over the swap, so the comparison the authorizer makes cannot see it")
+	}
+	if !atCommitter.HasLeafKeys {
+		t.Fatal("the swapped path leaf reads as keyless; the clone carries the leaf keys the live leaf did")
+	}
+	// the joiner's own entry is untouched by the swap
+	if at := memberAtLeaf(t, "the swapped commit", swapped.MembersAfter, chain.joined.OwnLeafIndex()); !bytes.Equal(at.Identity, chain.joiner.identityPub) {
+		t.Fatalf("the joiner's own entry = %x, want %x", at.Identity, chain.joiner.identityPub)
+	}
+
+	// THE ANCHOR: the merge installs the swap, and the membership the receiver holds afterwards
+	// is what MembersAfter said before it -- the joiner's identity on both leaves
+	if err := chain.joined.ApplyCommit(swapped); err != nil {
+		t.Fatalf("ApplyCommit of the swapped commit: %v; mls has grown an identity continuity rule, and this case is the line to move", err)
+	}
+	assertSameMembers(t, "MembersAfter against the receiver's membership after the swap is installed", swapped.MembersAfter, membersOf(t, chain.joined))
+	if !bytes.Equal(identityAtLeaf(t, chain.joined, own), chain.joiner.identityPub) {
+		t.Fatal("the swap was not installed at the receiver, so the anchor above compared two honest readings")
+	}
+}
+
+// TestMembersAfterReportsALeafAdmittedWithoutLeafKeys is HasLeafKeys, over the one commit that
+// can put a keyless leaf in a group: an Add of a key package with no urmessage_leaf_keys, built
+// through mls directly and past both send doors, which is what a hostile mls build does. mls
+// accepts it -- mls's own TestTheStagedTreeAnswersWhetherEachLeafCarriesLeafKeysAndMlsAdmitsALeaf
+// Without pins that acceptance and is the line to move if it changes -- and an honest receiver's
+// Process answers HasLeafKeys == false at the added leaf and true at every other. The anchor is
+// the first symptom the fact exists to pre-empt: after ApplyCommit, MemberAt at that member's
+// ordinal refuses with ErrEngineMemberLeafKeys. The control is the same shape over a key package
+// that carries the extension, which answers true at the added leaf too.
+func TestMembersAfterReportsALeafAdmittedWithoutLeafKeys(t *testing.T) {
+	chain := newCommitAddChain(t, "roles-keyless-leaf")
+	third := newTestEngine(t)
+	// the send doors refuse it, which is the control that the package is keyless for the reason
+	// this case names, and the reason the commit below is built past them
+	encoded := commitAddKeyPackageWithoutLeafKeys(t, third)
+	if _, _, _, err := chain.founded.CommitAdd([][]byte{encoded}); !errors.Is(err, ErrEngineCommitAddKeyPackage) {
+		t.Fatalf("CommitAdd over the keyless package answered %v, want ErrEngineCommitAddKeyPackage: the send door has stopped asking", err)
+	}
+	if _, err := chain.founded.ProposeAdd(encoded); !errors.Is(err, mls.ErrMalformedExtension) {
+		t.Fatalf("ProposeAdd over the keyless package answered %v, want mls.ErrMalformedExtension: the send door has stopped asking", err)
+	}
+	var keyless mls.KeyPackage
+	if err := syntax.Unmarshal(encoded, &keyless); err != nil {
+		t.Fatalf("decode the keyless package: %v", err)
+	}
+	adapter, isAdapter := chain.founded.(*connectMlsHandle)
+	if !isAdapter {
+		t.Fatal("the founder's handle is not this package's adapter")
+	}
+	result, err := adapter.group.CreateCommit([][]byte{}, []mls.Proposal{{
+		ProposalType: mls.ProposalTypeAdd,
+		Add:          &mls.Add{KeyPackage: keyless},
+	}}, nil)
+	if err != nil {
+		t.Fatalf("mls's CreateCommit over a by-value Add of the keyless package: %v; mls has grown a receive-side leaf keys rule, and this case is the line to move", err)
+	}
+
+	processed, err := chain.joined.Process(result.Commit)
+	if err != nil {
+		t.Fatalf("the joiner's Process of a commit adding a keyless leaf: %v; mls has grown a receive-side leaf keys rule, and this case is the line to move", err)
+	}
+	if len(processed.AddedLeaves) != 1 {
+		t.Fatalf("AddedLeaves = %v, want one leaf", processed.AddedLeaves)
+	}
+	added := processed.AddedLeaves[0]
+	if len(processed.MembersAfter) != 3 {
+		t.Fatalf("MembersAfter holds %d members, want 3", len(processed.MembersAfter))
+	}
+	for _, member := range processed.MembersAfter {
+		if member.Leaf == added {
+			if member.HasLeafKeys {
+				t.Fatalf("the keyless leaf %d reads HasLeafKeys == true", added)
+			}
+			if !bytes.Equal(member.Identity, third.identityPub) {
+				t.Fatalf("the added leaf carries identity %x, want the third device's %x", member.Identity, third.identityPub)
+			}
+			continue
+		}
+		if !member.HasLeafKeys {
+			t.Fatalf("leaf %d, which carries the extension, reads HasLeafKeys == false; the fact answers false for everybody", member.Leaf)
+		}
+	}
+
+	// THE ANCHOR: after the merge the seam's own membership door refuses that member by name
+	if err := chain.joined.ApplyCommit(processed); err != nil {
+		t.Fatalf("ApplyCommit: %v", err)
+	}
+	if err := chain.founded.MergePendingCommit(); err != nil {
+		t.Fatalf("MergePendingCommit: %v", err)
+	}
+	refused, answered := 0, 0
+	for at := 0; at < chain.joined.MemberCount(); at += 1 {
+		leaf, _, _, err := chain.joined.MemberAt(at)
+		if errors.Is(err, ErrEngineMemberLeafKeys) {
+			refused += 1
+			continue
+		}
+		if err != nil {
+			t.Fatalf("MemberAt(%d): %v", at, err)
+		}
+		if leaf == added {
+			t.Fatalf("MemberAt answers the keyless member at leaf %d with no refusal", added)
+		}
+		answered += 1
+	}
+	if refused != 1 || answered != 2 {
+		t.Fatalf("after the merge MemberAt refused %d members and answered %d, want 1 and 2: the symptom HasLeafKeys pre-empts is not what it was measured to be", refused, answered)
+	}
+
+	// THE CONTROL: the same shape over a package that carries the extension answers true at
+	// the added leaf, and the keyless member still reads false one commit later
+	fourth := newTestEngine(t)
+	keyed, err := fourth.engine.NewKeyPackage()
+	if err != nil {
+		t.Fatalf("NewKeyPackage: %v", err)
+	}
+	commit, _, _, err := chain.founded.CommitAdd([][]byte{keyed})
+	if err != nil {
+		t.Fatalf("the control CommitAdd: %v", err)
+	}
+	control, err := chain.joined.Process(commit)
+	if err != nil {
+		t.Fatalf("the control Process: %v", err)
+	}
+	if len(control.AddedLeaves) != 1 {
+		t.Fatalf("the control's AddedLeaves = %v, want one leaf", control.AddedLeaves)
+	}
+	if at := memberAtLeaf(t, "the control", control.MembersAfter, control.AddedLeaves[0]); !at.HasLeafKeys {
+		t.Fatal("a keyed added leaf reads HasLeafKeys == false; the fact answers false for every added leaf and the keyless reading above agrees with it for the wrong reason")
+	}
+	if at := memberAtLeaf(t, "the control", control.MembersAfter, added); at.HasLeafKeys {
+		t.Fatal("the keyless member reads as keyed one commit later; the fact is not being read off the leaf")
+	}
+	if err := chain.joined.DiscardProcessed(control); err != nil {
+		t.Fatalf("DiscardProcessed of the control: %v", err)
+	}
+	chain.founded.ClearPendingCommit()
 }
 
 // spellingOf is a selector chain or identifier as the source spells it, and a marker for any

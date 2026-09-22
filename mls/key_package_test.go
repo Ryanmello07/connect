@@ -1868,7 +1868,6 @@ func TestNewKeyPackageAndTheSignerTakingConstructorAnswerOneKeyPackage(t *testin
 			t.Errorf("the retained seeds are %x and %x", drew.signPriv, handed.signPriv)
 		}
 
-
 		// PROPERTY 2, and it is what makes the ordering claim falsifiable rather than
 		// decorative: the equality holds ONLY over the advanced stream. Over the UNADVANCED one
 		// the signer-taking constructor derives its init pair from the octets the signature draw

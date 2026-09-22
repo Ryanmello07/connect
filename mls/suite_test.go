@@ -45,7 +45,7 @@ func TestChaChaSuiteParams(t *testing.T) {
 		Nh:          32, Nk: 32, Nn: 12, Nt: 16,
 		Nsecret: 32, Nenc: 32, Npk: 32, Nsk: 32,
 		NsigPub: 32, NsigPriv: 32,
-		Nsig:    64,
+		Nsig: 64,
 	}
 	if *params != want {
 		t.Fatalf("params = %+v, want %+v", *params, want)
@@ -70,7 +70,7 @@ func TestAesGcmSuiteParams(t *testing.T) {
 		Nh:          32, Nk: 16, Nn: 12, Nt: 16,
 		Nsecret: 32, Nenc: 32, Npk: 32, Nsk: 32,
 		NsigPub: 32, NsigPriv: 32,
-		Nsig:    64,
+		Nsig: 64,
 	}
 	if *params != want {
 		t.Fatalf("params = %+v, want %+v", *params, want)

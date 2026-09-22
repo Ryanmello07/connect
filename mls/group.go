@@ -151,6 +151,31 @@ var (
 	// value it passed was erased.
 	errStagedCommitErased = errors.New("mls: the staged commit's key material has been erased")
 
+	// errStagedCommitInstalled is a staged commit whose epoch a merge has ALREADY INSTALLED --
+	// the shell MergePendingCommit leaves behind after it moves the schedule, the secret tree,
+	// the leaf private state and the plan into the group and detaches all four -- handed to a
+	// door that installs one.
+	//
+	// THE SAME ONE RULE AS errStagedCommitErased, AT THE SAME TWO DOORS, and it exists because
+	// the shell is the one other value of this type that walks the provenance pair: the group
+	// id and the prior epoch are public facts that survive the detach exactly as they survive
+	// the erase, the erased flag is NOT set on a shell -- it was installed, not erased -- and so
+	// a shell handed to a SECOND live instance of the same group at the same epoch clears every
+	// check the door made and reaches the merge. MEASURED, 2026-09-21, through the exported API
+	// alone: two views of one member at one epoch, the first applies a Processed and the second
+	// is handed the same value; the merge erased the second view's live schedule, assigned the
+	// shell's nil one in its place, and the persist dereferenced it -- a panic inside
+	// ApplyCommit, and an instance that then panicked on every Protect after it. Reachable only
+	// through raw mls: messagegroup's seam refuses a value staged by another handle by name
+	// before mls is asked anything ((*connectMlsHandle).stagedBy), and releases the staged half
+	// on its own install, so no EngineProcessed reaches this door as a shell.
+	//
+	// It is a value of its own and not errStagedCommitErased because the two are two facts a
+	// caller acts on differently: an erased value is one the caller discarded and owes nothing
+	// further, and an installed one is one the caller already applied -- at THIS instance or,
+	// as measured, at another view of the same member -- and is holding past its life.
+	errStagedCommitInstalled = errors.New("mls: the staged commit's epoch has already been installed and the value is a shell")
+
 	errCreationConfirmationTag = errors.New("mls: the epoch 0 confirmation tag is not a tag of this suite's width")
 
 	// and the same refusal one epoch on. A SECOND VALUE and not errCreationConfirmationTag,
@@ -2697,6 +2722,16 @@ func (self *Group) MergePendingCommit() error {
 	if self.pending.erased {
 		return errStagedCommitErased
 	}
+	// and the second door of errStagedCommitInstalled's, for the same reason and in the same
+	// place: this is the method that assigns the staged schedule over the live one, so a shell
+	// that reached it would erase this group's epoch three statements down and install nothing
+	// in its place. Nothing in this package files a shell as pending -- ApplyCommit refuses one
+	// before it does -- and the guard stands here so that holds for the callers nobody
+	// enumerated. Read BEFORE the erase of the epoch this merge would close, which is the
+	// whole point: a refusal after that line is a group with no epoch at all.
+	if self.pending.installed() {
+		return errStagedCommitInstalled
+	}
 	staged := self.pending
 	// THE EPOCH THIS MERGE CLOSES IS ERASED AS IT IS DROPPED. There is no past-epoch window in
 	// this build -- task 19 adds one -- so the schedule, the secret tree and the leaf private
@@ -2744,9 +2779,11 @@ func (self *Group) MergePendingCommit() error {
 	// context, the leaf vectors, the provenance pair -- and no key material, and an erase run on
 	// it afterwards erases nothing this group is running on. The plan is detached with them
 	// because its Private half is the same pointer as ownPriv. The flag is NOT set: this value
-	// was installed, not erased, and a second ApplyCommit of it is refused by the provenance
-	// pair as a commit of an epoch this group has left, which is the refusal already pinned for
-	// that shape.
+	// was installed, not erased, and a second ApplyCommit of it is refused BY NAME, as
+	// errStagedCommitInstalled, read off the nil schedule this detach leaves. Until 2026-09-21
+	// that second ApplyCommit was left to the provenance pair, and the pair does not see a
+	// shell handed to another live view of the same member at the same epoch: measured, that
+	// view walked the whole door and panicked in the persist on this nil.
 	staged.schedule = nil
 	staged.secretTree = nil
 	staged.ownPriv = nil
@@ -4497,6 +4534,17 @@ func (self *Group) ApplyCommit(processed *Processed) error {
 	if staged.erased {
 		self.stateLock.Unlock()
 		return errStagedCommitErased
+	}
+	// AN INSTALLED STAGED COMMIT INSTALLS NOTHING EITHER, read SECOND and for the same reason:
+	// a shell's group id and prior epoch are the ones it was staged with, its erased flag is
+	// not set, and so it walks the pair below and reaches the merge, which assigns its nil
+	// schedule over the live one and dereferences it at the persist. See errStagedCommitInstalled
+	// for the measurement and for why the seam cannot reach this. It is read before the pair so
+	// that a value the caller has finished with is named as such wherever it is handed, rather
+	// than as a value of the wrong epoch at one instance and a panic at another.
+	if staged.installed() {
+		self.stateLock.Unlock()
+		return errStagedCommitInstalled
 	}
 	// through crypto/subtle for guardrail 8 class reason, which is the class and not this line: a
 	// group id is public, and every comparison of octets in this package is spelled the one way.

@@ -212,6 +212,26 @@ func (self *StagedCommit) Zeroize() {
 	self.erased = true
 }
 
+// installed reports a SHELL: a value that staged an epoch and no longer holds its key
+// schedule, because (*Group).MergePendingCommit moved the schedule into the group and
+// detached it. It is the second condition the two install doors read before the provenance
+// pair, beside erased, and it is read off the STORAGE rather than off a flag set at the
+// detach, for the reason the erase class gives: the hazard is a door that installs a value
+// holding no schedule -- the merge assigns nil over the live one and the persist dereferences
+// it -- and a predicate written over the storage refuses every value in that state whatever
+// path put it there, where a flag would refuse the values somebody remembered to mark.
+//
+// THE REPORT A REMOVED MEMBER IS HANDED IS NOT A SHELL, and the second clause is what says
+// so: stageInboundCommitLocked builds that value with no schedule because a removed member
+// derives no epoch, and (*Group).ApplyCommit answers it with ErrRemovedFromGroup on its own
+// arm. The report is the ONE legitimate schedule-less value of this type, it is the value
+// that carries selfRemoved, and a predicate without this clause refuses every removal --
+// TestApplyCommitReadsProvenanceBeforeTheRemovalArm and every self-removal case in
+// messagegroup go red on that mutant.
+func (self *StagedCommit) installed() bool {
+	return self.schedule == nil && !self.selfRemoved
+}
+
 // Epoch is the epoch this commit opens.
 func (self *StagedCommit) Epoch() uint64 { return self.epoch }
 
@@ -316,6 +336,34 @@ func (self *StagedCommit) LeafIdentityAfter(leaf LeafIndex) ([]byte, bool) {
 		return nil, false
 	}
 	return cloneBytes(node.Credential.Identity), true
+}
+
+// LeafHasKeysAfter reports whether the POST-commit tree's leaf carries a urmessage_leaf_keys
+// (0xF002) extension this profile can wrap to, and false for a leaf that is blank or outside
+// the tree. See OccupiedLeavesAfter for which tree this reads and why.
+//
+// IT IS LeafKeysOf'S ANSWER AND NOT A LOOKUP OF THE TAG, because the question a receiving
+// client asks is "can an epoch wrap reach this leaf" and that is what LeafKeysOf decides: a
+// leaf carrying the type twice, or carrying a body that does not parse, is one no wrap
+// addresses, and both send doors -- ProposeAdd and messagegroup's CommitAdd -- refuse a key
+// package by that same call. This is its receiving-side twin, and it exists because the
+// receiving side had no twin: mls's list validation does not require the extension (a leaf
+// need only LIST the type in its capabilities), the sdk's authorizer could not see whether an
+// added leaf carried one, and a hostile mls build that never ran the send door admits a leaf
+// every honest member's next epoch wrap silently skips. Ledger item 242's R1 carried that into
+// R2 as the one hardening owed; this is the fact it needs, answered off the tree the group is
+// about to enter. The extension body is not answered, because no caller of this decision
+// wraps anything; the wrap reads the LIVE tree after the merge.
+func (self *StagedCommit) LeafHasKeysAfter(leaf LeafIndex) bool {
+	if self.tree == nil {
+		return false
+	}
+	node := self.tree.Leaf(leaf)
+	if node == nil {
+		return false
+	}
+	_, err := LeafKeysOf(node)
+	return err == nil
 }
 
 // EpochAuthenticator is the new epoch's fork-detection value, as storage the caller owns.

@@ -112,15 +112,37 @@ func TestApplyCommitRefusesACommitStagedAgainstAnotherEpoch(t *testing.T) {
 		t.Fatalf("the first MergePendingCommit: %v", err)
 	}
 
-	// BACKWARD: the same value handed back after it was applied. It is the caller shape this whole
-	// binding is about -- a Processed held across a policy decision -- and without the binding the
-	// second call reinstalls an epoch whose key material this group has already taken ownership of.
-	if err := receiver.ApplyCommit(staged); !errors.Is(err, errApplyCommitNotThisEpochs) {
-		t.Fatalf("ApplyCommit of an already applied commit = %v, want errApplyCommitNotThisEpochs", err)
+	// BACKWARD: a value of this group staged against the epoch it has just left. The laggard --
+	// a second view at the epoch the commit was staged against -- stages the same commit and
+	// never applies it, so what the receiver is handed is a LIVE staged epoch of its own group
+	// and of no epoch it is in, and the epoch comparison is the only thing that refuses it.
+	//
+	// It used to be the receiver's OWN value handed back after it was applied, and that value is
+	// now refused one door earlier, by name: an installed value is a shell, and
+	// staged_commit_install_test.go holds that the shell is read before this pair. So the shape
+	// this arm is about -- a Processed held across a policy decision and handed back late -- is
+	// built here from a value that still holds its epoch, which is the only value the pair can
+	// be the refusal of.
+	stale, err := laggard.ProcessMessage(first.Commit)
+	if err != nil {
+		t.Fatalf("the laggard's ProcessMessage of the first commit: %v", err)
+	}
+	// the laggard's staged epoch is erased when this case is done with it, which is the
+	// discipline every drop site of a staged epoch is held to
+	defer stale.Commit.Zeroize()
+	if stale.Commit.installed() || stale.Commit.Epoch() != staged.Commit.Epoch() {
+		t.Fatal("the laggard's staged value is not a live staged epoch of the commit the receiver applied, so this arm observes something else")
+	}
+	if err := receiver.ApplyCommit(stale); !errors.Is(err, errApplyCommitNotThisEpochs) {
+		t.Fatalf("ApplyCommit of a live staged commit of the epoch this group has left = %v, want errApplyCommitNotThisEpochs", err)
 	}
 	if receiver.Epoch() != committer.Epoch() {
 		t.Fatalf("the replayed ApplyCommit moved the receiver to epoch %d, committer at %d",
 			receiver.Epoch(), committer.Epoch())
+	}
+	// and the value the receiver installed, handed back, is named for what it is
+	if err := receiver.ApplyCommit(staged); !errors.Is(err, errStagedCommitInstalled) {
+		t.Fatalf("ApplyCommit of the value this receiver installed = %v, want errStagedCommitInstalled", err)
 	}
 
 	// FORWARD: a commit staged against an epoch the laggard has not reached.

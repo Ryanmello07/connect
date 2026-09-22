@@ -275,15 +275,28 @@ const (
 )
 
 // ProcessedMember is one occupied leaf of the tree a commit ENTERS, with the credential identity
-// that leaf carries.
+// that leaf carries and whether it carries a wrap target.
 //
 // It is a go type on the seam for GroupHandle's standing reason -- an mls.LeafIndex or an
-// mls.Member here would be a re-export -- and it carries the identity and nothing else because the
-// identity is what a role is keyed by: MASTER section 6's urmessage_group_policy names members by
-// credential identity, and item 242's ruling 6 ships the role model keyed on it as it stands.
+// mls.Member here would be a re-export -- and it carries the identity because the identity is
+// what a role is keyed by: MASTER section 6's urmessage_group_policy names members by credential
+// identity, and item 242's ruling 6 ships the role model keyed on it as it stands.
+//
+// HasLeafKeys, ADDED 2026-09-21 AS THE ONE HARDENING R1 CARRIED INTO R2, is whether the leaf
+// carries a urmessage_leaf_keys (0xF002) extension this profile can wrap to, read off the STAGED
+// tree by the same call both send doors refuse a key package with -- mls.LeafKeysOf, through
+// (*mls.StagedCommit).LeafHasKeysAfter -- so a leaf carrying the type twice or a body that does
+// not parse reads false here exactly as it is refused there. It is here because the receiving
+// side had no twin of that refusal: mls's list rules require an added leaf to LIST the type and
+// never to carry one, this seam's CommitAdd and ProposeAdd are doors a hostile mls build never
+// walks, and a keyless leaf admitted past them is a member every honest epoch wrap silently
+// skips -- the first symptom is MemberAt refusing that ordinal one commit later, and the second
+// is that member reading nothing. The authorizer refuses an Add whose leaf reads false; nothing
+// below it does. A bool and not the body, because no caller of that decision wraps anything.
 type ProcessedMember struct {
-	Leaf     uint32
-	Identity []byte
+	Leaf        uint32
+	Identity    []byte
+	HasLeafKeys bool
 }
 
 // ExtensionBytes is one group-context extension as octets: the RFC 9420 extension type and its
@@ -377,14 +390,18 @@ type EngineProcessed struct {
 	// The same rule's other arm, an Update, is the caller's to check the same way: every
 	// UpdatedLeaves entry's identity in MembersAfter against the pre-commit membership.
 	//
-	// MembersAfter is EVERY occupied leaf of the STAGED, post-commit tree with its identity, in
-	// leaf order: what the added identities, identity continuity on Update and on the
-	// committer's own path, and the post-commit identity set the policy is judged against are
-	// all computed from. It is read off the staged commit's own tree -- the one ApplyCommit
-	// installs -- and never off a membership diff, which a caller could only take after
-	// applying. A commit that removes THIS member is answered off the report mls hands a removed
-	// member: the post-proposal tree, minus the committer's path, which a removed member cannot
-	// open.
+	// MembersAfter is EVERY occupied leaf of the STAGED, post-commit tree with its identity and
+	// its wrap-target fact, in leaf order: what the added identities, identity continuity on
+	// Update and on the committer's own path, the post-commit identity set the policy is judged
+	// against, and whether every added leaf can be wrapped to are all computed from. It is read
+	// off the staged commit's own tree -- the one ApplyCommit installs -- and never off a
+	// membership diff, which a caller could only take after applying, AND NEVER OFF THE LIVE
+	// GROUP for a leaf that happens to exist there: over the swap above, the entry at
+	// CommitterLeaf names the identity the path put there, which is the whole of what the
+	// comparison reads, and TestMembersAfterNamesTheIdentityTheCommitLeavesAtTheCommittersLeaf
+	// builds that commit and holds it. A commit that removes THIS member is answered off the
+	// report mls hands a removed member: the post-proposal tree, minus the committer's path,
+	// which a removed member cannot open.
 	//
 	// ContextExtensionsAfter is the FULL post-commit group-context extension list, so a caller
 	// can check the policy the commit installs AND that every other entry -- 0x0003
@@ -1246,9 +1263,18 @@ func (self *connectMlsHandle) Process(message []byte) (*EngineProcessed, error) 
 	return answer, nil
 }
 
-// processedMembersOf is the staged tree's occupied leaves with their identities, projected onto
-// the seam's type in the one direction the boundary allows: an mls.LeafIndex becomes a uint32
-// here and nowhere else. The identities are the clones mls's accessor answers.
+// processedMembersOf is the staged tree's occupied leaves with their identities and their
+// wrap-target facts, projected onto the seam's type in the one direction the boundary allows: an
+// mls.LeafIndex becomes a uint32 here and nowhere else. The identities are the clones mls's
+// accessor answers.
+//
+// EVERY FIELD IS READ OFF THE STAGED VALUE AND NOTHING OFF THE LIVE GROUP, which is why this
+// takes the staged commit and nothing else: a leaf that exists before and after a commit carries
+// the identity the commit LEFT there, and over the committer's own path that can differ from the
+// one the live tree still holds -- TestMembersAfterNamesTheIdentityTheCommitLeavesAtTheCommitters
+// Leaf builds that commit and holds this reading over it. A projection that took the identity
+// off the live group wherever the leaf already existed would pass every honest commit and hand
+// the authorizer the pre-commit identity at exactly the leaf whose change it must see.
 func processedMembersOf(staged *mls.StagedCommit) []ProcessedMember {
 	leaves := staged.OccupiedLeavesAfter()
 	out := make([]ProcessedMember, 0, len(leaves))
@@ -1257,7 +1283,11 @@ func processedMembersOf(staged *mls.StagedCommit) []ProcessedMember {
 		if !held {
 			continue
 		}
-		out = append(out, ProcessedMember{Leaf: uint32(leaf), Identity: identity})
+		out = append(out, ProcessedMember{
+			Leaf:        uint32(leaf),
+			Identity:    identity,
+			HasLeafKeys: staged.LeafHasKeysAfter(leaf),
+		})
 	}
 	return out
 }

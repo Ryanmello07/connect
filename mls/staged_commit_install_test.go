@@ -447,3 +447,194 @@ func TestAnInstalledStagedCommitIsAShellWhoseEraseTouchesNothingLive(t *testing.
 		t.Fatal("the two members disagree on the epoch after the next commit")
 	}
 }
+
+// TestAnInstalledStagedCommitIsRefusedByNameAtEveryDoorAndAtEveryView is the fourth property
+// of the install doors and the one the shell case above could not see: WHAT THE DOORS DO WITH
+// THE SHELL WHEN IT COMES BACK. A shell keeps the public facts about the commit, and two of
+// those facts are the group id and the prior epoch -- the whole of what the provenance pair
+// reads -- so a shell handed to a SECOND live instance of the same member at the epoch the
+// commit was staged against clears the pair, is not flagged erased, removes nobody, and reaches
+// the merge. Measured before the refusal below existed, through the exported API alone: the
+// merge erased that instance's live schedule, assigned the shell's nil one over it, and the
+// persist dereferenced it -- a panic inside ApplyCommit and an instance that panicked on every
+// Protect after it.
+//
+// Held at three places, because the refusal is one rule and each place is a way of not having
+// written it:
+//
+//   - THE SECOND VIEW, which is the measured shape: refused by name, alive, and -- the control
+//     -- able to process and apply the same commit itself afterwards.
+//   - THE SAME INSTANCE, which has moved on: refused by name and NOT by the epoch pair, which is
+//     the ordering the header asks for -- a value the caller has finished with is named as such
+//     wherever it is handed. commit_provenance_test.go's backward arm used to expect the pair
+//     here and now expects this.
+//   - THE MERGE DOOR, reached with a shell filed as pending the way the erased case reaches it:
+//     refused before the erase of the epoch the merge would close, group unmoved.
+//
+// AND THE REPORT A REMOVED MEMBER IS HANDED IS THE CONTROL IN THE OTHER DIRECTION: it holds no
+// schedule either, it is the one legitimate value of this type that does not, and the door
+// still answers it on the removal arm. A predicate that read the schedule alone would refuse
+// every removal, and that is a mutant this case kills together with the removal cases above.
+//
+// Reachable only through raw mls. messagegroup's seam refuses a value staged by another handle
+// by name before mls is asked anything -- (*connectMlsHandle).stagedBy -- and releases the staged
+// half on its own install, so no EngineProcessed reaches this door as a shell; the case is here
+// because the door is here, and a door that holds only for the callers somebody enumerated is
+// the shape this file's header names.
+func TestAnInstalledStagedCommitIsRefusedByNameAtEveryDoorAndAtEveryView(t *testing.T) {
+	crypto := testCrypto(t)
+	committer, receiver, _, _, material := testTwoMemberGroupNamed(t, crypto, "installed-shell")
+	defer committer.Close()
+	defer receiver.Close()
+	// the second view: the join door run again over the same Welcome, which is
+	// commit_provenance_test.go's device and puts this instance at the same epoch as the receiver
+	second, err := material.join(t, nil)
+	if err != nil {
+		t.Fatalf("the second view this case hands the shell to: %v", err)
+	}
+	defer second.Close()
+	if second.Epoch() != receiver.Epoch() || !bytes.Equal(second.EpochAuthenticator(), receiver.EpochAuthenticator()) {
+		t.Fatal("the two views are not one member at one epoch, so the provenance pair would refuse the shell below for a reason that is not this case's")
+	}
+
+	result, err := committer.CreateCommit(nil, nil, nil)
+	if err != nil {
+		t.Fatalf("CreateCommit: %v", err)
+	}
+	processed, err := receiver.ProcessMessage(result.Commit)
+	if err != nil {
+		t.Fatalf("ProcessMessage: %v", err)
+	}
+	own := committer.stagedForTest()
+	if own == nil || processed.Commit == nil {
+		t.Fatal("one of the two installs has nothing staged")
+	}
+	// the controls: neither value is a shell before its install, and the predicate reads the
+	// same thing the doors read
+	if processed.Commit.installed() || own.installed() {
+		t.Fatal("a staged value reads as installed before anything installed it, so every refusal below is over the wrong condition")
+	}
+	if err := receiver.ApplyCommit(processed); err != nil {
+		t.Fatalf("ApplyCommit: %v", err)
+	}
+	if err := committer.MergePendingCommit(); err != nil {
+		t.Fatalf("MergePendingCommit: %v", err)
+	}
+	if !processed.Commit.installed() || !own.installed() {
+		t.Fatal("an installed staged value does not read as installed, so the doors below refuse nothing")
+	}
+	if processed.Commit.erased || own.erased {
+		t.Fatal("the install flagged a value erased; this case is about the value the erase flag cannot see")
+	}
+
+	// THE SECOND VIEW: refused by name, and alive
+	epochBefore := second.Epoch()
+	authenticatorBefore := bytes.Clone(second.EpochAuthenticator())
+	if len(authenticatorBefore) == 0 {
+		t.Fatal("the second view answers no epoch authenticator before the call, so a bricked instance and a live one read the same here")
+	}
+	if err := second.ApplyCommit(processed); !errors.Is(err, errStagedCommitInstalled) {
+		t.Fatalf("a second view's ApplyCommit over a shell the first view installed = %v, want errStagedCommitInstalled", err)
+	}
+	if second.Epoch() != epochBefore {
+		t.Fatalf("the refused ApplyCommit moved the second view from epoch %d to %d", epochBefore, second.Epoch())
+	}
+	if !bytes.Equal(second.EpochAuthenticator(), authenticatorBefore) {
+		t.Fatal("the refused ApplyCommit changed the second view's epoch authenticator: the shell's nil schedule was installed over the live one")
+	}
+	// alive rather than merely unmoved, through the door that panicked before the refusal existed
+	if _, err := second.Protect(nil, []byte("the second view is still here")); err != nil {
+		t.Fatalf("the second view cannot protect a message after refusing a shell: %v", err)
+	}
+	// and it left nothing pending, which is what would block the control below
+	if _, err := second.CreateCommit(nil, nil, nil); err != nil {
+		t.Fatalf("the second view cannot commit after refusing a shell: %v; the refusal filed the shell as pending", err)
+	}
+	second.ClearPendingCommit()
+	// THE CONTROL: the same commit, processed by this view itself, installs
+	ownProcessed, err := second.ProcessMessage(result.Commit)
+	if err != nil {
+		t.Fatalf("the second view's own ProcessMessage of the commit it was handed a shell of: %v", err)
+	}
+	if err := second.ApplyCommit(ownProcessed); err != nil {
+		t.Fatalf("the second view's own ApplyCommit: %v; the refusal above is then a refusal of every value and not of a shell", err)
+	}
+	if !bytes.Equal(second.EpochAuthenticator(), receiver.EpochAuthenticator()) {
+		t.Fatal("the two views disagree on the epoch after the second applied its own staged value")
+	}
+
+	// THE SAME INSTANCE, which has moved on: named as a shell and not as a value of another
+	// epoch, which is the ordering against the provenance pair
+	replayed := receiver.ApplyCommit(processed)
+	if !errors.Is(replayed, errStagedCommitInstalled) {
+		t.Fatalf("the receiver's second ApplyCommit of the value it installed = %v, want errStagedCommitInstalled: the shell is read before the epoch pair", replayed)
+	}
+	if errors.Is(replayed, errApplyCommitNotThisEpochs) {
+		t.Fatal("the shell refusal also carries the epoch pair's sentinel; the two are two facts and this one is the one the caller acts on")
+	}
+	if receiver.Epoch() != committer.Epoch() {
+		t.Fatalf("the refused ApplyCommit moved the receiver to epoch %d, committer at %d", receiver.Epoch(), committer.Epoch())
+	}
+
+	// THE MERGE DOOR, with the committer's own shell filed as pending the way the erased case
+	// files an erased one. What is held is that the refusal comes BEFORE the erase of the epoch
+	// this merge would close: the authenticator is the schedule's, and a merge that erased first
+	// and refused second leaves a group whose authenticator is nothing.
+	epochBefore = committer.Epoch()
+	authenticatorBefore = bytes.Clone(committer.EpochAuthenticator())
+	committer.stateLock.Lock()
+	committer.pending = own
+	committer.stateLock.Unlock()
+	if err := committer.MergePendingCommit(); !errors.Is(err, errStagedCommitInstalled) {
+		t.Fatalf("MergePendingCommit over a shell filed as pending = %v, want errStagedCommitInstalled", err)
+	}
+	if committer.Epoch() != epochBefore {
+		t.Fatalf("the refused merge moved the committer from epoch %d to %d", epochBefore, committer.Epoch())
+	}
+	if !bytes.Equal(committer.EpochAuthenticator(), authenticatorBefore) {
+		t.Fatal("the refused merge changed the committer's epoch authenticator: the live epoch was erased before the shell was refused")
+	}
+	if _, err := committer.Protect(nil, []byte("the committer is still here")); err != nil {
+		t.Fatalf("the committer cannot protect a message after the refused merge: %v", err)
+	}
+	// the pending shell is left where it is, which is that door's discipline at every refusal,
+	// and it is dropped through the ordinary door -- whose erase, on a shell, erases nothing live
+	committer.ClearPendingCommit()
+	if !bytes.Equal(committer.EpochAuthenticator(), authenticatorBefore) {
+		t.Fatal("clearing the refused shell erased the committer's live epoch")
+	}
+
+	// THE OTHER DIRECTION: the report a removed member is handed holds no schedule and is NOT a
+	// shell, and the door still answers it on the removal arm
+	removingCommitter, removed, report := testRemovingStagedCommit(t, crypto, "installed-shell-report")
+	defer removingCommitter.Close()
+	defer removed.Close()
+	if report.Commit.installed() {
+		t.Fatal("the report a removed member is handed reads as an installed shell; it holds no schedule because it derived no epoch, and the removal arm is its door")
+	}
+	if err := removed.ApplyCommit(report); !errors.Is(err, ErrRemovedFromGroup) {
+		t.Fatalf("ApplyCommit of a removed member's report = %v, want ErrRemovedFromGroup: a shell predicate that reads the schedule alone refuses every removal", err)
+	}
+
+	// and the three instances that are left agree on the next epoch, so nothing above touched
+	// what the group runs on
+	next, err := committer.CreateCommit(nil, nil, nil)
+	if err != nil {
+		t.Fatalf("the next CreateCommit: %v", err)
+	}
+	for name, view := range map[string]*Group{"the receiver": receiver, "the second view": second} {
+		nextProcessed, err := view.ProcessMessage(next.Commit)
+		if err != nil {
+			t.Fatalf("%s cannot open the next commit: %v", name, err)
+		}
+		if err := view.ApplyCommit(nextProcessed); err != nil {
+			t.Fatalf("%s's next ApplyCommit: %v", name, err)
+		}
+	}
+	if err := committer.MergePendingCommit(); err != nil {
+		t.Fatalf("the next MergePendingCommit: %v", err)
+	}
+	if !bytes.Equal(receiver.EpochAuthenticator(), committer.EpochAuthenticator()) || !bytes.Equal(second.EpochAuthenticator(), committer.EpochAuthenticator()) {
+		t.Fatal("the three instances disagree on the epoch after the next commit")
+	}
+}

@@ -414,4 +414,3 @@ func (self *GroupSession) unframeBodyOnLoop(handle GroupHandle, header *message.
 	}
 	return plaintext, nil
 }
-

@@ -10523,24 +10523,29 @@ var epochSecretMethodsTheSweepDrivesInstead = map[string]string{
 // sweep, and a row for a method that takes none is an error, so the table and the type cannot
 // drift apart silently.
 var stagedCommitMethodArgumentRows = map[string]func(t *testing.T, staged *StagedCommit) [][]reflect.Value{
-	"LeafIdentityAfter": func(t *testing.T, staged *StagedCommit) [][]reflect.Value {
-		// EVERY occupied leaf of the staged tree, which is the whole domain a caller can name
-		// something at, plus one blank leaf inside the tree and one outside it, which are the
-		// two shapes the accessor answers false for. Read off the accessor's own sibling rather
-		// than off a fixed count, so a fixture with more leaves is swept over all of them.
-		rows := [][]reflect.Value{}
-		occupied := staged.OccupiedLeavesAfter()
-		for _, leaf := range occupied {
-			rows = append(rows, []reflect.Value{reflect.ValueOf(leaf)})
-		}
-		var last LeafIndex
-		if len(occupied) != 0 {
-			last = occupied[len(occupied)-1]
-		}
-		rows = append(rows, []reflect.Value{reflect.ValueOf(last + 1)})
-		rows = append(rows, []reflect.Value{reflect.ValueOf(LeafIndex(1 << 20))})
-		return rows
-	},
+	"LeafIdentityAfter": stagedCommitLeafRows,
+	// the second leaf-taking accessor, 2026-09-21's R1 follow-up, over the same domain: it
+	// reads the same tree at the same index and answers a bool, so the rows are the rows.
+	"LeafHasKeysAfter": stagedCommitLeafRows,
+}
+
+// stagedCommitLeafRows is EVERY occupied leaf of the staged tree, which is the whole domain a
+// caller can name something at, plus one blank leaf inside the tree and one outside it, which
+// are the two shapes a leaf-taking accessor answers false for. Read off the accessor's own
+// sibling rather than off a fixed count, so a fixture with more leaves is swept over all of them.
+func stagedCommitLeafRows(t *testing.T, staged *StagedCommit) [][]reflect.Value {
+	rows := [][]reflect.Value{}
+	occupied := staged.OccupiedLeavesAfter()
+	for _, leaf := range occupied {
+		rows = append(rows, []reflect.Value{reflect.ValueOf(leaf)})
+	}
+	var last LeafIndex
+	if len(occupied) != 0 {
+		last = occupied[len(occupied)-1]
+	}
+	rows = append(rows, []reflect.Value{reflect.ValueOf(last + 1)})
+	rows = append(rows, []reflect.Value{reflect.ValueOf(LeafIndex(1 << 20))})
+	return rows
 }
 
 // bytesTheStagedCommitHandsOut is every byte slice reachable through *StagedCommit's own exported

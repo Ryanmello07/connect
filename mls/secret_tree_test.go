@@ -6513,4 +6513,3 @@ func (self *SecretTree) receiverKey(leaf LeafIndex, kind RatchetType, generation
 	}
 	return keys.key, keys.nonce, nil
 }
-

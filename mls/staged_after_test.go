@@ -396,3 +396,133 @@ func TestTheCommittersOwnPathCanSwapItsLeafIdentityAndOnlyThePreCommitTreeStillN
 		t.Fatalf("after the swap is installed the owner's identity is on a leaf: %v, and the receiver's is on %d leaves; want none and two, which is the state item 242's M7 describes", ownerOnALeaf, bobLeaves)
 	}
 }
+
+// TestTheStagedTreeAnswersWhetherEachLeafCarriesLeafKeysAndMlsAdmitsALeafWithout is the third
+// fact a receiving client reads off the staged tree, and the acceptance it rests on, pinned
+// together for the swap case's reason.
+//
+// THE ACCEPTANCE FIRST, because it is the hole. Both send doors refuse a key package whose leaf
+// carries no urmessage_leaf_keys -- ProposeAdd and messagegroup's CommitAdd both ask LeafKeysOf
+// before anything is staged -- and nothing on the receive side asks it: ValSem106 requires an
+// added leaf to LIST the type in its capabilities and never to carry one, and a hostile build
+// that skips its own send door admits a leaf no epoch wrap addresses. So an Add built here by
+// value, through CreateCommit and past ProposeAdd, of a key package without the extension is
+// processed by an honest receiver with no error, and this case says so on purpose: if this
+// package ever grows the rule the ProcessMessage below refuses and this is the line to move.
+// Until then the rule is the authorizer's, one layer up, and what it needs from here is the
+// FACT.
+//
+// THE FACT: LeafHasKeysAfter answers false at the leaf the keyless Add landed and true at
+// every other occupied leaf, off the staged tree and before the merge. The control is the
+// same commit shape over a key package that carries the extension, which answers true at
+// every leaf including the added one -- so an accessor that answered false for every added
+// leaf, or false for everybody, fails here rather than passing by agreeing with the hole. And
+// the anchor is the group after the merge: (*Group).Members answers a nil LeafKeys for exactly
+// that member, which is the first symptom the receiving-side fact exists to pre-empt.
+func TestTheStagedTreeAnswersWhetherEachLeafCarriesLeafKeysAndMlsAdmitsALeafWithout(t *testing.T) {
+	crypto := testCrypto(t)
+	committer, receiver, _, _ := testTwoMemberGroup(t, crypto)
+	defer committer.Close()
+	defer receiver.Close()
+
+	// a key package signed by a real signer over a real credential, minus the one extension:
+	// LeafKeysOf refuses it, which is the send doors' refusal, and it is the control that the
+	// package is keyless for the reason this case names
+	carol := testIdentity(t, crypto, "carol")
+	keyless, _, _, err := NewKeyPackageWithSigner(crypto, crypto.Suite(), carol.SigPriv,
+		BasicCredential(carol.IdentityPub), testCapabilities(), nil)
+	if err != nil {
+		t.Fatalf("a key package with no leaf keys: %v", err)
+	}
+	if _, err := LeafKeysOf(&keyless.LeafNode); !errors.Is(err, ErrMalformedExtension) {
+		t.Fatalf("LeafKeysOf over the keyless package = %v, want ErrMalformedExtension: the package this case adds is not keyless", err)
+	}
+	// and the send door refuses it, so the by-value commit below is the only way in
+	encodedKeyless, err := syntax.Marshal(keyless)
+	if err != nil {
+		t.Fatalf("encode the keyless package: %v", err)
+	}
+	if _, err := committer.ProposeAdd(encodedKeyless); !errors.Is(err, ErrMalformedExtension) {
+		t.Fatalf("ProposeAdd over the keyless package = %v, want ErrMalformedExtension: the send door has stopped asking, and this case is then not about a hole the receive side alone has", err)
+	}
+
+	result, err := committer.CreateCommit([][]byte{}, []Proposal{{
+		ProposalType: ProposalTypeAdd,
+		Add:          &Add{KeyPackage: *keyless},
+	}}, nil)
+	if err != nil {
+		t.Fatalf("CreateCommit over a by-value Add of a keyless package: %v; this package has grown a receive-side leaf keys rule at the committer, and this case is the line to move", err)
+	}
+	processed, err := receiver.ProcessMessage(result.Commit)
+	if err != nil {
+		t.Fatalf("ProcessMessage of a commit adding a keyless leaf: %v; this package has grown a receive-side leaf keys rule, and this case is the line to move", err)
+	}
+	staged := processed.Commit
+	if staged == nil || len(staged.AddedLeaves()) != 1 {
+		t.Fatal("the commit did not stage exactly one Add, so nothing below is about the keyless leaf")
+	}
+	added := staged.AddedLeaves()[0]
+	if staged.LeafHasKeysAfter(added) {
+		t.Fatalf("LeafHasKeysAfter(the keyless leaf %d) = true, want false", added)
+	}
+	occupied := staged.OccupiedLeavesAfter()
+	if !slices.Contains(occupied, added) {
+		t.Fatalf("the added leaf %d is not among the post-commit leaves %v", added, occupied)
+	}
+	for _, leaf := range occupied {
+		if leaf == added {
+			continue
+		}
+		if !staged.LeafHasKeysAfter(leaf) {
+			t.Fatalf("LeafHasKeysAfter(leaf %d) = false for a leaf that carries the extension; the accessor answers false for everybody", leaf)
+		}
+	}
+	// blank and outside the tree, which are the two shapes every leaf-taking accessor of this
+	// type answers false for
+	if staged.LeafHasKeysAfter(occupied[len(occupied)-1]+1) || staged.LeafHasKeysAfter(LeafIndex(1<<20)) {
+		t.Fatal("LeafHasKeysAfter answers true for a blank leaf or one outside the tree")
+	}
+
+	// THE ANCHOR: after the merge, the group's own membership view carries no leaf keys for
+	// exactly that member and leaf keys for every other
+	if err := receiver.ApplyCommit(processed); err != nil {
+		t.Fatalf("ApplyCommit: %v", err)
+	}
+	if err := committer.MergePendingCommit(); err != nil {
+		t.Fatalf("MergePendingCommit: %v", err)
+	}
+	for _, member := range receiver.Members() {
+		if (member.LeafKeys == nil) != (member.LeafIndex == added) {
+			t.Fatalf("after the merge the member at leaf %d carries leaf keys: %v; the staged answer said %v for that leaf",
+				member.LeafIndex, member.LeafKeys != nil, staged.LeafHasKeysAfter(member.LeafIndex))
+		}
+	}
+
+	// THE CONTROL: the same shape over a package that carries the extension answers true at the
+	// added leaf too
+	dave := testIdentity(t, crypto, "dave")
+	keyed, _, _ := testKeyPackage(t, crypto, dave)
+	control, err := committer.CreateCommit([][]byte{}, []Proposal{{
+		ProposalType: ProposalTypeAdd,
+		Add:          &Add{KeyPackage: *keyed},
+	}}, nil)
+	if err != nil {
+		t.Fatalf("the control CreateCommit: %v", err)
+	}
+	controlProcessed, err := receiver.ProcessMessage(control.Commit)
+	if err != nil {
+		t.Fatalf("the control ProcessMessage: %v", err)
+	}
+	controlStaged := controlProcessed.Commit
+	if controlStaged == nil || len(controlStaged.AddedLeaves()) != 1 {
+		t.Fatal("the control commit did not stage exactly one Add")
+	}
+	if !controlStaged.LeafHasKeysAfter(controlStaged.AddedLeaves()[0]) {
+		t.Fatal("LeafHasKeysAfter(a keyed added leaf) = false; the accessor answers false for every added leaf and the keyless reading above agrees with it for the wrong reason")
+	}
+	if controlStaged.LeafHasKeysAfter(added) {
+		t.Fatal("the keyless member reads as keyed one commit later; the accessor is not reading the leaf")
+	}
+	controlStaged.Zeroize()
+	committer.ClearPendingCommit()
+}
