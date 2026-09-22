@@ -3055,6 +3055,20 @@ var groupMethodArgumentRows = map[string]func(t *testing.T, group *Group) [][]re
 			{reflect.ValueOf("URmessage/v1/other"), reflect.ValueOf(exportSweepContext), reflect.ValueOf(nh + 8)},
 		}
 	},
+	// ledger item 242's R2 exporter over the STAGED epoch, driven with Export's three rows. It is
+	// reachable at all because the CreateCommit row above it in method order stages a commit and
+	// nothing between the two clears it -- MergePendingCommit and ClearPendingCommit take nothing
+	// and answer only errors, so the signature filter skips both -- and it is worth driving
+	// because what it answers is derived from the staged epoch's schedule, whose parent secret is
+	// the value a committer must never be handed any more than the live one's.
+	"PendingExport": func(t *testing.T, group *Group) [][]reflect.Value {
+		nh := group.crypto.HashSize()
+		return [][]reflect.Value{
+			{reflect.ValueOf("URmessage/v1/storage"), reflect.ValueOf([]byte(nil)), reflect.ValueOf(nh)},
+			{reflect.ValueOf("URmessage/v1/storage"), reflect.ValueOf(exportSweepContext), reflect.ValueOf(nh)},
+			{reflect.ValueOf("URmessage/v1/other"), reflect.ValueOf(exportSweepContext), reflect.ValueOf(nh + 8)},
+		}
+	},
 	// ledger item 228's pairwise exporter, and it is Export's rows one scope over: one asks for
 	// KDF.Nh octets, so the answer is the same SIZE as the secret guardrail 6 is looking for and
 	// the comparison can mean something, and the other asks for a length that is not KDF.Nh so the

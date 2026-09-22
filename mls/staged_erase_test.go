@@ -1282,6 +1282,15 @@ var typesTheEraseClassReachesThatOweNoErase = map[string]string{
 		"it is one every member of the group holds; Group.context and StagedCommit.context are excused in " +
 		"the same words. It is an answer on EngineProcessed's commit arm and an argument to " +
 		"CommitContextExtensions, and no production declaration holds one in a field",
+	"PendingEpoch": "the epoch a handle's OWN staged commit would open, as the committer reads it before the " +
+		"delivery service has answered (ledger item 242's R2, 2026-09-22): the epoch number, the member count " +
+		"of the staged tree, and the serialized post-commit GroupContext -- which is the value GroupContext " +
+		"answers once the commit is merged, which framing signs and MACs over, and which every member of the " +
+		"group derives for itself from the same commit; Group.context and StagedCommit.context are excused in " +
+		"the same words. The one secret an announcement needs, the staged epoch's exporter, is deliberately " +
+		"NOT a field of it: PendingExport is a call that answers a fresh derivation the caller erases, exactly " +
+		"as Export's is. It is an ANSWER built by (*connectMlsHandle).PendingEpoch per call and no production " +
+		"declaration holds one in a field, so there is no drop site an erase could be reachable from",
 	"PathDecryptResult": "it is an ANSWER and not storage. DecryptUpdatePath builds one per call and hands " +
 		"it to a caller that installs both halves into the epoch it is entering, and no production " +
 		"declaration holds one in a field, so there is no drop site an erase could be reachable from. " +

@@ -2815,6 +2815,94 @@ func (self *Group) MergePendingCommit() error {
 	return self.store.DeleteGroupStateBefore(cloneBytes(self.context.GroupId), cutoff)
 }
 
+// ---------------------------------------------------------------------------
+// the epoch this group's OWN staged commit would open, read before it is entered
+// ---------------------------------------------------------------------------
+
+// THE FOUR ACCESSORS BELOW ARE WHAT LETS A COMMITTER SUBMIT BEFORE IT MERGES, added 2026-09-22
+// for ledger item 242's R2 (the role model's committing arm). MASTER section 9.3 gives the delivery
+// service at most one commit per (group, epoch) and has a losing submitter "re-derive against the
+// winner and retry", and CreateCommit's own header says the staged epoch is staged and not merged
+// for exactly that reason. But the RECORD a committer submits announces the epoch it opens -- the
+// new write and read keys, derived through the new epoch's exporter; a hash of the new group
+// context; the number of members the fan-out will wrap to -- and until now the only door onto any
+// of those was the live group AFTER MergePendingCommit. So every committer merged first and
+// submitted second, and a committer that lost the race was left at a private epoch nobody else
+// entered: measured, an owner that transferred ownership within one fetch interval of an admin's
+// role change could neither open the winner's commit nor seal a record the server would take.
+// These read the same facts off the STAGED value, so the merge can wait for the server's answer
+// and a refusal costs ClearPendingCommit and nothing else.
+//
+// EVERY ONE OF THEM READS self.pending AND NOTHING OFF THE LIVE GROUP, and answers
+// ErrNoPendingCommit when there is none: a caller that reached these with no commit staged is
+// building an announcement for an epoch that does not exist, and the live epoch's facts would
+// announce the epoch the group is already in. PendingExport is the one that reaches key material,
+// and it refuses an erased value and a shell by name as MergePendingCommit does, for the same
+// reason in each case -- an erased schedule exports zeros, and a shell has no schedule at all.
+//
+// NOTHING HERE IS A SETTER AND NOTHING HERE MOVES STATE. What a caller does with the answers --
+// seal an attachment, submit it, then merge or clear -- is the caller's; these four are the reads
+// the live group already offers, one epoch early.
+
+// PendingEpoch is the epoch this group's staged commit opens.
+func (self *Group) PendingEpoch() (uint64, error) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.pending == nil {
+		return 0, ErrNoPendingCommit
+	}
+	return self.pending.epoch, nil
+}
+
+// PendingMemberCount is how many members the group has in the epoch the staged commit opens:
+// every occupied leaf of the staged tree, which is the count Members answers once the commit is
+// merged.
+func (self *Group) PendingMemberCount() (int, error) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.pending == nil {
+		return 0, ErrNoPendingCommit
+	}
+	return len(self.pending.OccupiedLeavesAfter()), nil
+}
+
+// PendingGroupContext is the serialized GroupContext of the epoch the staged commit opens, which
+// is the value GroupContext answers once the commit is merged. Marshal copies, so what this
+// answers shares nothing with the staged value the merge is about to install.
+func (self *Group) PendingGroupContext() ([]byte, error) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.pending == nil {
+		return nil, ErrNoPendingCommit
+	}
+	if self.pending.context == nil {
+		return nil, fmt.Errorf("%w: the staged commit carries no group context", ErrNoPendingCommit)
+	}
+	return syntax.Marshal(self.pending.context)
+}
+
+// PendingExport is Export through the STAGED epoch's schedule: RFC 9420 section 8.5's exporter
+// over the epoch the staged commit opens, which is the value Export answers once the commit is
+// merged. It is the one accessor of the four that reaches key material, and what it hands back
+// is a fresh derivation the caller owns and erases, exactly as Export's answer is.
+func (self *Group) PendingExport(label string, context []byte, length int) ([]byte, error) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.closed {
+		return nil, errGroupClosed
+	}
+	if self.pending == nil {
+		return nil, ErrNoPendingCommit
+	}
+	if self.pending.erased {
+		return nil, errStagedCommitErased
+	}
+	if self.pending.schedule == nil {
+		return nil, errStagedCommitInstalled
+	}
+	return self.pending.schedule.Export(label, context, length)
+}
+
 // LoadGroup restores a group from the epoch state a previous run of this client persisted.
 //
 // THE SIGNING KEY IS THE CALLER'S ARGUMENT AND IS NOT IN THE BLOB, which is the one structural

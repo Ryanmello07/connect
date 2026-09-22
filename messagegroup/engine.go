@@ -209,6 +209,32 @@ type GroupHandle interface {
 	CommitPolicy(policy []byte) (commit []byte, welcome []byte, ratchetTree []byte, err error)
 	CommitRemove(leaves []uint32) (commit []byte, welcome []byte, ratchetTree []byte, err error)
 
+	// PendingEpoch and PendingExport are the two reads that let a committer SUBMIT BEFORE IT
+	// MERGES, added 2026-09-22 for ledger item 242's R2. Commit's own contract says the staged
+	// epoch is staged and not merged because the delivery service accepts at most one commit per
+	// (group, epoch) and an optimistic merge forks the loser (MASTER section 9.3) -- and yet every
+	// committer merged first, because the record that announces an epoch carries facts of that
+	// epoch: its write and read keys through its exporter, a hash of its group context, the count
+	// the fan-out will wrap to, and the number itself; and the only door onto any of them was the
+	// live handle after the merge. Measured, an honest owner whose transfer lost the race to an
+	// admin's role change was left at a private epoch nobody else entered, unable to open the
+	// winner's commit or to seal a record the server would take, until the app restarted.
+	//
+	// PendingEpoch answers the three facts that are not key material in one value, read off the
+	// staged tree and the staged context -- the epoch the staged commit opens, the members it
+	// leaves in the group, and the serialized post-commit GroupContext -- and PendingExport is
+	// Export through the staged epoch's schedule, a fresh derivation the caller owns and erases
+	// exactly as Export's answer is. Both answer an error when nothing is staged, so an
+	// announcement can never be built out of the epoch the group is already in. They are two
+	// methods and not four for the reason EngineProcessed is a value: the facts arrive together
+	// and are read together, and the one that is a secret stays behind a call.
+	//
+	// The values are the ones the live handle answers once MergePendingCommit has run --
+	// engine_test.go holds each of them to its live sibling across a merge -- so a caller that
+	// announces off these and merges after the server said yes announces the epoch it enters.
+	PendingEpoch() (*PendingEpoch, error)
+	PendingExport(label string, context []byte, length int) ([]byte, error)
+
 	MergePendingCommit() error
 	ClearPendingCommit()
 
@@ -306,6 +332,21 @@ type ProcessedMember struct {
 type ExtensionBytes struct {
 	Type uint16
 	Data []byte
+}
+
+// PendingEpoch is the epoch a handle's OWN staged commit would open, as the committer is allowed
+// to see it before the delivery service has accepted the commit: the epoch number, the number of
+// members the staged tree holds, and the serialized post-commit GroupContext. It is what
+// GroupHandle.PendingEpoch answers and it carries no key material; the staged epoch's exporter
+// is GroupHandle.PendingExport, a call rather than a field, so the one secret an announcement
+// needs is derived on demand and erased by the caller rather than parked in a struct.
+//
+// Every field is a value or a copy. GroupContext is a fresh marshal of the staged context, so a
+// caller that keeps this value keeps nothing that aliases the epoch a merge is about to install.
+type PendingEpoch struct {
+	Epoch        uint64
+	MemberCount  int
+	GroupContext []byte
 }
 
 // EngineProcessed is one ingested MLS message as the storage layer is allowed to see it.
@@ -1183,6 +1224,37 @@ func mlsExtensionsOf(extensions []ExtensionBytes) []mls.Extension {
 		}
 	}
 	return out
+}
+
+// PendingEpoch is the epoch this handle's own staged commit would open, projected off mls's
+// three pending accessors onto the seam's value. See the interface for why it exists.
+//
+// EVERY FIELD IS READ OFF THE STAGED VALUE AND NOTHING OFF THE LIVE GROUP, which is the property
+// that makes the method worth having: a projection that read MemberCount or GroupContext off
+// the live handle would announce the epoch the group is already in, and the server would key
+// the new epoch under the old context's hash and the old membership's count. mls's own accessors
+// answer ErrNoPendingCommit when nothing is staged and this adapter passes that through, as it
+// passes MergePendingCommit's through.
+func (self *connectMlsHandle) PendingEpoch() (*PendingEpoch, error) {
+	epoch, err := self.group.PendingEpoch()
+	if err != nil {
+		return nil, err
+	}
+	memberCount, err := self.group.PendingMemberCount()
+	if err != nil {
+		return nil, err
+	}
+	contextBytes, err := self.group.PendingGroupContext()
+	if err != nil {
+		return nil, err
+	}
+	return &PendingEpoch{Epoch: epoch, MemberCount: memberCount, GroupContext: contextBytes}, nil
+}
+
+// PendingExport is Export through the staged epoch's schedule: the same three go types in and
+// the same fresh slice out, and the caller erases it as it erases Export's.
+func (self *connectMlsHandle) PendingExport(label string, context []byte, length int) ([]byte, error) {
+	return self.group.PendingExport(label, context, length)
 }
 
 // MergePendingCommit enters the epoch this handle's own staged commit opens.

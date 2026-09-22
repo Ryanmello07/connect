@@ -1776,6 +1776,10 @@ var labelledFieldFrontier = []string{
 	// behalf is made here instead. The CONTEXT is not a position on this frontier at all, because
 	// nothing a caller passes reaches it: PairwiseExport builds the context itself.
 	"*Group.PairwiseExport label (refused here)",
+	// ledger item 242's R2 exporter over the STAGED epoch, which is Export's row one schedule
+	// over: it forwards its caller's context straight into the staged schedule's Export, and it
+	// arrives here open for exactly the reason Export's does two lines up.
+	"*Group.PendingExport context (open, so a caller must bound what it sends)",
 	// the exported method that took a caller's label straight into a KDFLabel and panicked
 	// on it, while its own signature already carried ErrExportLength for a caller's number
 	"*KeySchedule.Export context (open, so a caller must bound what it sends)",

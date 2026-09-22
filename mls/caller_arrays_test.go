@@ -1591,6 +1591,29 @@ func groupAnswerPairwiseLeaf(t *testing.T, group *Group) LeafIndex {
 	return at
 }
 
+// groupAnswerStagedCommit stages a commit on the group this gate follows when none is staged, so
+// that the four Pending rows have a staged epoch to read.
+//
+// IT IS IDEMPOTENT, for groupAnswerPairwiseLeaf's reason: the four rows carry no projection, so
+// TestAGroupGoesOnPublishingWhatItWasFoundedOn asks each of them TWICE over one group and requires
+// the two answers to be equal, and a helper that staged a fresh commit per call would put a
+// second epoch -- fresh path secrets, a fresh tree hash, a fresh exporter -- in front of the
+// second read, and the row would report a finding against a method that is behaving exactly as
+// specified. The staged commit is the one shape a group with no peers can build: an empty
+// proposal list, which RFC 9420 section 12.4 requires a path for.
+func groupAnswerStagedCommit(t *testing.T, group *Group) {
+	t.Helper()
+	group.stateLock.Lock()
+	staged := group.pending != nil
+	group.stateLock.Unlock()
+	if staged {
+		return
+	}
+	if _, err := group.CreateCommit(nil, nil, nil); err != nil {
+		t.Fatalf("stage the commit this gate's Pending rows read: %v", err)
+	}
+}
+
 // groupAnswerPeer adds a real second member to the group this gate follows and answers that
 // member's own group, so that the three INBOUND rows have a message their group would accept.
 //
@@ -1746,6 +1769,34 @@ func groupAnswerRows(t *testing.T) []groupAnswerRow {
 			_, commitErr := group.CreateCommit(nil, nil, nil)
 			group.ClearPendingCommit()
 			return []any{&commitErr}
+		}},
+		// THE FOUR READS OFF A STAGED COMMIT, ledger item 242's R2 (2026-09-22): what a committer
+		// announces before the delivery service has answered. Each is driven PAST a staged commit
+		// rather than into ErrNoPendingCommit, for the lifecycle rows' reason, and through the
+		// idempotent stager so that the publishing gate's two calls read one staged epoch. The
+		// two that answer octets -- the marshalled staged context and the staged exporter -- are
+		// the two a caller could write through, and both are fresh: Marshal copies, and an
+		// exporter is a derivation.
+		{name: "PendingEpoch", call: func(group *Group) []any {
+			groupAnswerStagedCommit(t, group)
+			answer, err := group.PendingEpoch()
+			return []any{&answer, &err}
+		}},
+		{name: "PendingMemberCount", call: func(group *Group) []any {
+			groupAnswerStagedCommit(t, group)
+			answer, err := group.PendingMemberCount()
+			return []any{&answer, &err}
+		}},
+		{name: "PendingGroupContext", call: func(group *Group) []any {
+			groupAnswerStagedCommit(t, group)
+			answer, err := group.PendingGroupContext()
+			return []any{&answer, &err}
+		}},
+		{name: "PendingExport", call: func(group *Group) []any {
+			groupAnswerStagedCommit(t, group)
+			answer, err := group.PendingExport("the exporter label this gate reads",
+				[]byte("the exporter context this gate reads"), 32)
+			return []any{&answer, &err}
 		}},
 		// THE MESSAGE LIFECYCLE, p7 task 18's four exported methods.
 		//

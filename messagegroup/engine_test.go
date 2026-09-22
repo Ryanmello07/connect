@@ -83,8 +83,18 @@ var sectionSixGroupHandle = map[string]string{
 	"CommitContextExtensions": "func(extensions []ExtensionBytes) (commit []byte, welcome []byte, ratchetTree []byte, err error)",
 	"CommitPolicy":            "func(policy []byte) (commit []byte, welcome []byte, ratchetTree []byte, err error)",
 	"CommitRemove":            "func(leaves []uint32) (commit []byte, welcome []byte, ratchetTree []byte, err error)",
-	"MergePendingCommit":      "func() error",
-	"ClearPendingCommit":      "func()",
+	// AMENDED 2026-09-22 for ledger item 242's R2, the role model's committing arm: the two
+	// reads that let a committer submit before it merges. The record that announces an epoch
+	// carries that epoch's facts -- write and read keys through its exporter, a hash of its
+	// context, the wrap count, the number -- and until these the only door onto them was the
+	// live handle after MergePendingCommit, so every committer merged first and a loser of
+	// MASTER section 9.3's race forked itself. PendingEpoch is the three facts that are not key
+	// material in one value; PendingExport is Export through the staged schedule, a call and
+	// not a field so the secret is derived on demand and erased by the caller.
+	"PendingEpoch":       "func() (*PendingEpoch, error)",
+	"PendingExport":      "func(label string, context []byte, length int) ([]byte, error)",
+	"MergePendingCommit": "func() error",
+	"ClearPendingCommit": "func()",
 
 	"Process":     "func(message []byte) (*EngineProcessed, error)",
 	"ApplyCommit": "func(processed *EngineProcessed) error",
@@ -237,8 +247,15 @@ func TestTheEngineInterfacesAreExactlySectionSixsBlock(t *testing.T) {
 	// commit a receiving client processed and refused, which no caller could otherwise erase
 	// because the staged half is unexported. Four changes to the seam, made with the ruling in
 	// hand, which is again the event this pair of numbers exists to make somebody look at.
-	if len(sectionSixGroupEngine) != 5 || len(sectionSixGroupHandle) != 31 {
-		t.Errorf("section 6's block is transcribed as %d and %d methods; it was measured at 5 and 31, and a change to either is a change to the seam",
+	//
+	// AND IT IS 5 AND 33 FROM 2026-09-22's R2 of the same item: the HANDLE half gains
+	// PendingEpoch and PendingExport, the reads off a handle's OWN staged commit that let the
+	// committing arm submit before it merges, so that a committer which loses the epoch race
+	// clears a staged epoch instead of forking itself off the group. Two methods and not four,
+	// for the reason the interface gives; and two rather than none because the alternative --
+	// keep merging first -- is the fork the seam's own Commit contract names.
+	if len(sectionSixGroupEngine) != 5 || len(sectionSixGroupHandle) != 33 {
+		t.Errorf("section 6's block is transcribed as %d and %d methods; it was measured at 5 and 33, and a change to either is a change to the seam",
 			len(sectionSixGroupEngine), len(sectionSixGroupHandle))
 	}
 }
@@ -256,7 +273,7 @@ func TestTheEngineInterfacesAreExactlySectionSixsBlock(t *testing.T) {
 // a type change rather than a factory change.
 //
 // The scope question (R3a) is answered separately from the class question: the CLASS is the
-// method set of both interfaces read off the syntax tree, which is 31 members at this commit and
+// method set of both interfaces read off the syntax tree, which is 33 members at this commit and
 // is never a list; the SCOPE is engine.go, because that is the file section 2.2's tree puts the
 // interface in and an interface declared anywhere else would fail
 // TestThisPackageIsBuiltFromExactlyTheseImports before it reached here.

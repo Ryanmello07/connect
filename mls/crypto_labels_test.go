@@ -809,6 +809,14 @@ func TestEverySyntaxEncoderInThisPackageUsesTheDefaultLimit(t *testing.T) {
 		// Protect's is that the AAD inside that preimage is built from the generation the seal is
 		// about to consume.
 		"group.go: syntax.Marshal(self.context)",
+		// and ledger item 242's R2 (2026-09-22) encodes the STAGED context once, at the DEFAULT
+		// limit for exactly the live context's reason: PendingGroupContext answers the octets
+		// GroupContext will answer once the staged commit is merged -- the same structure every
+		// framing preimage inlines with no length prefix of its own -- so a staged context this
+		// encoder accepted past MaxVectorLength is one no peer running the default limit could
+		// verify a signature over, and a committer that announced it would announce an epoch its
+		// own group could not enter.
+		"group.go: syntax.Marshal(self.pending.context)",
 		// and the post-commit tree the commit publishes for out of band Welcome delivery, at the
 		// RAISED limit for the reason the persisted blob is: it is the same structure tree.go's own
 		// encoder writes at MaxRatchetTreeLength, and a default limit writer here would refuse to
