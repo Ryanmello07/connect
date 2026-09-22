@@ -763,6 +763,68 @@ var extensionTypeSelectionsOfBothPackages = map[string]extensionTypeSelection{
 			}
 		},
 	},
+	"ExtensionsWithGroupPolicy": {
+		what: "walks every entry and REPLACES the one carrying urmessage_group_policy with the body it was " +
+			"handed, in that entry's own position, copying every other entry where it stands; a list with " +
+			"no policy gains one at the end. It selects by type and it is the one helper both policy doors of " +
+			"the seam go through, so that a policy change leaves required_capabilities and every other entry " +
+			"standing -- ledger item 242's P4. The repeat is NOT decided here: FindExtensionEntry runs first " +
+			"and refuses a list carrying the type twice, so the walk never chooses between two policies and " +
+			"never collapses them, and the body is judged through GroupPolicyOf on the way out",
+		refusesTheRepeat: false,
+		probe: func(t *testing.T) {
+			crypto := testCrypto(t)
+			owner := testIdentity(t, crypto, "owner")
+			admin := testIdentity(t, crypto, "admin")
+			member := testIdentity(t, crypto, "member")
+			policy := testPolicy(t, owner, admin, member)
+			encoded, err := policy.Encode()
+			if err != nil {
+				t.Fatalf("Encode: %v", err)
+			}
+			policy.SetRole(member.IdentityPub, RoleAdmin)
+			replaced, err := policy.Encode()
+			if err != nil {
+				t.Fatalf("Encode the replacement: %v", err)
+			}
+			caps := Extension{ExtensionType: ExtensionTypeRequiredCapabilities, ExtensionData: []byte{0x01}}
+			other := Extension{ExtensionType: ExtensionTypeRatchetTree, ExtensionData: []byte{0x02, 0x02}}
+			held := []Extension{caps, encoded, other}
+			got, err := ExtensionsWithGroupPolicy(held, replaced.ExtensionData)
+			if err != nil {
+				t.Fatalf("ExtensionsWithGroupPolicy over a three entry list: %v", err)
+			}
+			if len(got) != 3 || got[0].ExtensionType != caps.ExtensionType || got[1].ExtensionType != ExtensionTypeUrmessageGroupPolicy || got[2].ExtensionType != other.ExtensionType {
+				t.Fatalf("the list came back as %d entries in an order that is not the caller's; the policy is replaced IN POSITION and nothing else moves", len(got))
+			}
+			if !bytes.Equal(got[0].ExtensionData, caps.ExtensionData) || !bytes.Equal(got[2].ExtensionData, other.ExtensionData) {
+				t.Error("an entry that is not the policy changed across the replacement")
+			}
+			if !bytes.Equal(got[1].ExtensionData, replaced.ExtensionData) {
+				t.Error("the policy entry does not carry the body it was replaced with")
+			}
+			// every body is a copy, the policy's included
+			for i := range got {
+				got[i].ExtensionData[0] ^= 0xff
+			}
+			if !bytes.Equal(held[0].ExtensionData, caps.ExtensionData) || !bytes.Equal(held[2].ExtensionData, other.ExtensionData) || replaced.ExtensionData[0] == got[1].ExtensionData[0] {
+				t.Error("writing through the answer changed the list or the policy it was built from")
+			}
+			// a list with no policy gains one at the end
+			appended, err := ExtensionsWithGroupPolicy([]Extension{caps}, replaced.ExtensionData)
+			if err != nil || len(appended) != 2 || appended[1].ExtensionType != ExtensionTypeUrmessageGroupPolicy {
+				t.Fatalf("a list with no policy answered (%d entries, %v), want the caps entry and the policy after it", len(appended), err)
+			}
+			// the repeat is the lookup's refusal and not a choice made here
+			if _, err := ExtensionsWithGroupPolicy([]Extension{encoded, caps, encoded}, replaced.ExtensionData); !errors.Is(err, ErrMalformedExtension) {
+				t.Errorf("a list carrying the policy twice answered %v, want ErrMalformedExtension from the lookup; a helper that replaced both or the first would be a second door on the repeat", err)
+			}
+			// and a body that is not a policy is refused before it is on the wire
+			if _, err := ExtensionsWithGroupPolicy(held, []byte{0xff}); err == nil {
+				t.Error("a body that does not decode as a policy was accepted into the list")
+			}
+		},
+	},
 	"reconcileWithGroupContext": {
 		what: "compares the leaves' extensions vector against the epoch's POSITIONALLY, entry by entry, after " +
 			"pinning their lengths equal. It selects nothing by type -- both operands of its comparison are read " +

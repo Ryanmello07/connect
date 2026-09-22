@@ -72,13 +72,27 @@ var sectionSixGroupHandle = map[string]string{
 	"ProposeUpdate":      "func() ([]byte, error)",
 	"ProposeGroupPolicy": "func(policy []byte) ([]byte, error)",
 
-	"Commit":             "func(byReference [][]byte) (commit []byte, welcome []byte, ratchetTree []byte, err error)",
-	"CommitAdd":          "func(keyPackages [][]byte) (commit []byte, welcome []byte, ratchetTree []byte, err error)",
-	"MergePendingCommit": "func() error",
-	"ClearPendingCommit": "func()",
+	"Commit":    "func(byReference [][]byte) (commit []byte, welcome []byte, ratchetTree []byte, err error)",
+	"CommitAdd": "func(keyPackages [][]byte) (commit []byte, welcome []byte, ratchetTree []byte, err error)",
+	// AMENDED 2026-09-21 for ledger item 242's R1, the role model's seam plumbing: three more
+	// by-value arms beside CommitAdd, each a commit carrying exactly the named proposals by value
+	// and nothing by reference, and each taking go types -- ExtensionBytes is this package's
+	// spelling of an extension, and a leaf is the uint32 every other method carries. CommitRemove
+	// is on the seam so the receiving arm can be tested against a real Remove; the sdk exposes no
+	// product method over it until items 243, 244 and 245 close.
+	"CommitContextExtensions": "func(extensions []ExtensionBytes) (commit []byte, welcome []byte, ratchetTree []byte, err error)",
+	"CommitPolicy":            "func(policy []byte) (commit []byte, welcome []byte, ratchetTree []byte, err error)",
+	"CommitRemove":            "func(leaves []uint32) (commit []byte, welcome []byte, ratchetTree []byte, err error)",
+	"MergePendingCommit":      "func() error",
+	"ClearPendingCommit":      "func()",
 
 	"Process":     "func(message []byte) (*EngineProcessed, error)",
 	"ApplyCommit": "func(processed *EngineProcessed) error",
+	// AMENDED 2026-09-21 for the same item: the discard door for a commit a receiving client
+	// processed and then REFUSED. A refused commit is a fully derived epoch the caller holds and
+	// nothing else erases, and the staged half is unexported, so only a method of this package
+	// can reach it to erase it.
+	"DiscardProcessed": "func(processed *EngineProcessed) error",
 
 	// AMENDED 2026-09-17 for MASTER section 8.4.2 v2, transcribed from spec A section 8.2's own
 	// amendment block. Three changes, all forced by the generation being inside aad_mls: the seal
@@ -215,8 +229,16 @@ func TestTheEngineInterfacesAreExactlySectionSixsBlock(t *testing.T) {
 	// parameter naming mls.Proposal would be the re-export Property 3 refuses; and it is on the
 	// seam at all because the property it buys -- a member that never saw a proposal processes
 	// the commit -- is one no caller of Commit can reach through Commit.
-	if len(sectionSixGroupEngine) != 5 || len(sectionSixGroupHandle) != 27 {
-		t.Errorf("section 6's block is transcribed as %d and %d methods; it was measured at 5 and 27, and a change to either is a change to the seam",
+	//
+	// AND IT IS 5 AND 31 FROM 2026-09-21's R1 of the role model, ledger item 242: the HANDLE
+	// half gains four. CommitContextExtensions, CommitPolicy and CommitRemove are CommitAdd's
+	// shape over the other three proposal types the receiving arm has to be tested against --
+	// by value, so a receiver needs nothing cached -- and DiscardProcessed is the erase door for a
+	// commit a receiving client processed and refused, which no caller could otherwise erase
+	// because the staged half is unexported. Four changes to the seam, made with the ruling in
+	// hand, which is again the event this pair of numbers exists to make somebody look at.
+	if len(sectionSixGroupEngine) != 5 || len(sectionSixGroupHandle) != 31 {
+		t.Errorf("section 6's block is transcribed as %d and %d methods; it was measured at 5 and 31, and a change to either is a change to the seam",
 			len(sectionSixGroupEngine), len(sectionSixGroupHandle))
 	}
 }

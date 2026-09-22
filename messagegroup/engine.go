@@ -181,11 +181,61 @@ type GroupHandle interface {
 	// signature on this interface names go types only; the decode happens behind the seam.
 	CommitAdd(keyPackages [][]byte) (commit []byte, welcome []byte, ratchetTree []byte, err error)
 
+	// CommitContextExtensions, CommitPolicy and CommitRemove are the by-value arms ledger item
+	// 242's R1 adds beside CommitAdd, 2026-09-21, and they mirror it EXACTLY: each builds one
+	// commit carrying the named proposals by value and nothing by reference, so a member that
+	// never saw a proposal processes it cold, and each names go types only for CommitAdd's
+	// reason -- a parameter naming mls.Proposal would be the re-export Property 3 refuses.
+	//
+	// CommitContextExtensions carries ONE GroupContextExtensions proposal with EXACTLY the list
+	// it is handed, which is RFC 9420 section 12.1.6's WHOLESALE replacement: the caller passes
+	// the full post-commit list, and an entry it leaves out is gone from the group. The seam
+	// judges nothing about the list but that it is not empty. mls's own doors run inside
+	// CreateCommit, and this profile's rule that the list still carries a policy is the
+	// AUTHORIZER's on both arms rather than this adapter's -- which is what lets the receiving
+	// arm be tested against a real commit that strips 0xF001, item 242's P3, through the seam.
+	//
+	// CommitPolicy is the convenience every role change is made through: the group's CURRENT
+	// list with only 0xF001 replaced by the policy it is handed, so 0x0003 required_capabilities
+	// and every other entry survive. It is ProposeGroupPolicy's repaired shape (item 242's P4)
+	// committed by value.
+	//
+	// CommitRemove carries one Remove per leaf. THE SDK EXPOSES NO PRODUCT METHOD OVER IT UNTIL
+	// LEDGER ITEMS 243, 244 AND 245 CLOSE -- pq_secret rotation, the served commit that hands a
+	// removed member the next epoch's keys, and the sender_handle a newcomer inherits each gate
+	// removal on its own -- and it is on the seam now so that the receiving arm can be tested
+	// against a real Remove rather than a hand-built one.
+	CommitContextExtensions(extensions []ExtensionBytes) (commit []byte, welcome []byte, ratchetTree []byte, err error)
+	CommitPolicy(policy []byte) (commit []byte, welcome []byte, ratchetTree []byte, err error)
+	CommitRemove(leaves []uint32) (commit []byte, welcome []byte, ratchetTree []byte, err error)
+
 	MergePendingCommit() error
 	ClearPendingCommit()
 
 	Process(message []byte) (*EngineProcessed, error)
 	ApplyCommit(processed *EngineProcessed) error
+
+	// DiscardProcessed erases the epoch a processed commit staged, for the caller that REFUSED it
+	// between Process and ApplyCommit. AMENDED 2026-09-21 for ledger item 242's R1: MASTER section
+	// 11 has a receiving client reject a bad commit on validation, and a rejected commit is a
+	// fully derived second epoch -- key schedule, secret tree, leaf private state -- that nothing
+	// else would erase. The staged value is the caller's, this handle's Close never sees it, and
+	// a caller that simply dropped it would leave a whole epoch in the heap for the collector to
+	// move around, which is the hazard connect/mls's erase gate exists to refuse. A later
+	// ApplyCommit of the same value refuses rather than installing zeros. It is on the interface
+	// and not a free function for ApplyCommit's reason: the staged half is unexported and only
+	// this package can reach it. A processed application or proposal message holds no epoch and
+	// discarding one is a no-op that answers nil.
+	//
+	// AND APPLY-THEN-DISCARD IS A NO-OP THAT ANSWERS NIL, stated because it is the order every
+	// receiving arm will write -- `defer handle.DiscardProcessed(processed)` beside an
+	// ApplyCommit that then succeeds -- and because the first build of this door got it wrong:
+	// the value a caller holds after ApplyCommit named the epoch the handle had just entered, and
+	// discarding it erased that epoch with no error at the line that did it. ApplyCommit now
+	// releases the staged half on a successful install, so a later discard finds nothing to
+	// erase; a caller may discard every value it processed, applied or refused, and the only
+	// value a discard erases is one that was never installed.
+	DiscardProcessed(processed *EngineProcessed) error
 
 	// AMENDED 2026-09-17 FOR MASTER SECTION 8.4.2 v2, in three places, all forced by the same
 	// sentence: the GENERATION is now inside aad_mls.
@@ -223,6 +273,27 @@ const (
 	EngineProcessedProposal    uint8 = 2
 	EngineProcessedCommit      uint8 = 3
 )
+
+// ProcessedMember is one occupied leaf of the tree a commit ENTERS, with the credential identity
+// that leaf carries.
+//
+// It is a go type on the seam for GroupHandle's standing reason -- an mls.LeafIndex or an
+// mls.Member here would be a re-export -- and it carries the identity and nothing else because the
+// identity is what a role is keyed by: MASTER section 6's urmessage_group_policy names members by
+// credential identity, and item 242's ruling 6 ships the role model keyed on it as it stands.
+type ProcessedMember struct {
+	Leaf     uint32
+	Identity []byte
+}
+
+// ExtensionBytes is one group-context extension as octets: the RFC 9420 extension type and its
+// body, which is the seam's spelling of mls.Extension in both directions. EngineProcessed hands a
+// caller the post-commit list in it and CommitContextExtensions takes one, so a caller can compare
+// two lists entry by entry, and decode the one it cares about, without naming an mls type.
+type ExtensionBytes struct {
+	Type uint16
+	Data []byte
+}
 
 // EngineProcessed is one ingested MLS message as the storage layer is allowed to see it.
 //
@@ -270,6 +341,61 @@ type EngineProcessed struct {
 	AddedLeaves   []uint32
 	RemovedLeaves []uint32
 	UpdatedLeaves []uint32
+
+	// AMENDED 2026-09-21 FOR LEDGER ITEM 242's R1, the receiving arm of the role model. The three
+	// vectors above say WHERE a commit's proposals landed and nothing about WHO, and a role is
+	// keyed by identity: an authorizer holding them alone cannot tell an Add that admits a
+	// stranger from one whose credential merely CLAIMS the owner's identity, cannot see that an
+	// Update or the committer's own path changed a leaf's identity, and cannot read the policy
+	// the commit installs. So the commit arm also carries the three below, populated on that arm
+	// only and zero on the other two, fields and not methods for the reason the paragraph above
+	// gives. Every slice is storage the caller owns, cloned out of the staged value, so nothing
+	// here aliases the epoch ApplyCommit is about to enter.
+	//
+	// CommitterIdentity is the committer's credential identity AS OF THE PRE-COMMIT TREE. It is
+	// authenticated for the reason CommitterLeaf is: Process verified the commit's signature
+	// against that leaf, and this is the identity the leaf carried when it did. It is read off
+	// the live tree at Process time, which is still the pre-commit tree because Process moves no
+	// live state.
+	//
+	// AND THE PRE-COMMIT READING IS THE WHOLE POINT, so it is stated as the obligation it puts
+	// on the caller. connect/mls holds NO identity-continuity rule: the committer's own path
+	// leaf is its current leaf cloned and re-signed, nothing compares the credential identity
+	// on that leaf against the one it replaces, and a committer that rewrote its own leaf's
+	// identity to another member's before committing produces a commit every honest receiver
+	// ACCEPTS -- mls pins that acceptance, and the two reads that tell it apart, in
+	// TestTheCommittersOwnPathCanSwapItsLeafIdentityAndOnlyThePreCommitTreeStillNamesIt.
+	// Over such a commit this field still names the committer as the pre-commit tree knew it,
+	// and MembersAfter at CommitterLeaf names the identity the path put there. THE AUTHORIZER
+	// MUST COMPARE THE TWO -- CommitterIdentity against MembersAfter[CommitterLeaf].Identity --
+	// and refuse the commit when they differ: that comparison is MASTER section 11's rule that
+	// "a leaf's identity does not change across ... the committer's own path", it is made by no
+	// layer below the authorizer, and a receiving arm that skips it hands the committer whatever
+	// role the claimed identity holds. A CommitterIdentity read off the staged tree would name
+	// the victim here and make the comparison vacuous, which is why the reading is pinned off
+	// the source in TestCommitterIdentityIsReadOffTheLiveGroupAndMembersAfterOffTheStagedValue.
+	// The same rule's other arm, an Update, is the caller's to check the same way: every
+	// UpdatedLeaves entry's identity in MembersAfter against the pre-commit membership.
+	//
+	// MembersAfter is EVERY occupied leaf of the STAGED, post-commit tree with its identity, in
+	// leaf order: what the added identities, identity continuity on Update and on the
+	// committer's own path, and the post-commit identity set the policy is judged against are
+	// all computed from. It is read off the staged commit's own tree -- the one ApplyCommit
+	// installs -- and never off a membership diff, which a caller could only take after
+	// applying. A commit that removes THIS member is answered off the report mls hands a removed
+	// member: the post-proposal tree, minus the committer's path, which a removed member cannot
+	// open.
+	//
+	// ContextExtensionsAfter is the FULL post-commit group-context extension list, so a caller
+	// can check the policy the commit installs AND that every other entry -- 0x0003
+	// required_capabilities above all -- is byte-identical to the pre-commit list it decodes out
+	// of GroupContextBytes. A commit carrying no GroupContextExtensions proposal installs the
+	// list the group already had, so this is then the PRE-COMMIT list entry for entry, and the
+	// adapter makes that so for the removed member's report too, whose staged value carries no
+	// context of its own.
+	CommitterIdentity      []byte
+	MembersAfter           []ProcessedMember
+	ContextExtensionsAfter []ExtensionBytes
 
 	// opaque to this package and handed back to ApplyCommit. It is the message these values
 	// were read out of and nothing else; the staged commit is never here.
@@ -809,16 +935,33 @@ func (self *connectMlsHandle) ProposeUpdate() ([]byte, error) {
 	return self.group.ProposeUpdate()
 }
 
-// ProposeGroupPolicy publishes a GroupContextExtensions proposal carrying one policy body.
+// ProposeGroupPolicy publishes a GroupContextExtensions proposal carrying the group's CURRENT
+// extension list with only the policy replaced.
 //
 // This is the one method of the thirteen whose body is not a projection: mls takes a vector of
 // tagged extensions and section 6 takes the body alone, so the 0xF001 tag is applied here. Pairing
 // the body with the tag in one statement is what keeps a caller from pairing it with another.
+//
+// REPAIRED 2026-09-21, ledger item 242's P4. This body used to hand mls a ONE-ENTRY list, and
+// RFC 9420 section 12.1.6's proposal replaces the group's list WHOLESALE -- mls's own header on
+// ProposeGroupContextExtensions says so -- so every policy proposal this seam ever published
+// stripped 0x0003 required_capabilities from the group, measured: after the proposal was committed
+// the context carried the policy and nothing else. The current list is read out of the group's
+// own context, through the same decode every other reader of it uses, and only the 0xF001 entry is
+// replaced; mls.ExtensionsWithGroupPolicy is the one helper, shared with CommitPolicy, so the two
+// doors cannot disagree about which entries survive a policy change -- and it lives in mls
+// rather than here because that package owns what a policy is and owns the one door that refuses
+// a list carrying two of them.
 func (self *connectMlsHandle) ProposeGroupPolicy(policy []byte) ([]byte, error) {
-	return self.group.ProposeGroupContextExtensions([]mls.Extension{{
-		ExtensionType: mls.ExtensionTypeUrmessageGroupPolicy,
-		ExtensionData: policy,
-	}})
+	current, err := self.currentExtensions()
+	if err != nil {
+		return nil, err
+	}
+	replaced, err := mls.ExtensionsWithGroupPolicy(current, policy)
+	if err != nil {
+		return nil, err
+	}
+	return self.group.ProposeGroupContextExtensions(replaced)
 }
 
 // Commit builds a commit over the proposals named by reference, projecting *mls.CommitResult to
@@ -889,6 +1032,142 @@ func (self *connectMlsHandle) CommitAdd(keyPackages [][]byte) ([]byte, []byte, [
 	return result.Commit, result.Welcome, result.RatchetTree, nil
 }
 
+// CommitContextExtensions builds a commit carrying one by-value GroupContextExtensions proposal
+// whose list is EXACTLY the one it was handed. See the interface for what wholesale means and for
+// what this adapter deliberately does not judge; what is decided here is the shape.
+//
+// THE BODIES ARE CLONED ON THE WAY IN, which is CommitAdd's property stated for a list rather than
+// a decode: mls copies every by-value proposal through the codec, so nothing it stages aliases
+// the caller's arrays either way, and the clone here is what makes that a fact about this method
+// rather than about mls's current body.
+//
+// AN EMPTY LIST IS REFUSED BY NAME, as CommitAdd refuses an empty vector: RFC 9420 lets a group
+// carry no extensions, and this profile does not -- a group with no policy has no owner -- so the
+// one list that can never be the caller's intent is refused before anything is staged, and every
+// other list is mls's to judge. THE BY-REFERENCE VECTOR IS EMPTY AND NOT NIL, for CommitAdd's
+// reason, and nothing is staged on a refusal, for its reason.
+func (self *connectMlsHandle) CommitContextExtensions(extensions []ExtensionBytes) ([]byte, []byte, []byte, error) {
+	if len(extensions) == 0 {
+		return nil, nil, nil, fmt.Errorf("%w: no extensions", ErrEngineCommitContextExtensionsEmpty)
+	}
+	result, err := self.group.CreateCommit([][]byte{}, []mls.Proposal{{
+		ProposalType:           mls.ProposalTypeGroupContextExtensions,
+		GroupContextExtensions: &mls.GroupContextExtensions{Extensions: mlsExtensionsOf(extensions)},
+	}}, nil)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return result.Commit, result.Welcome, result.RatchetTree, nil
+}
+
+// CommitPolicy is CommitContextExtensions over the group's current list with only 0xF001
+// replaced: the door every role change goes through. The list is read out of this handle's own
+// context and the replacement is mls.ExtensionsWithGroupPolicy, the same helper
+// ProposeGroupPolicy uses, so a policy committed by value and one proposed by reference leave the
+// same entries standing.
+func (self *connectMlsHandle) CommitPolicy(policy []byte) ([]byte, []byte, []byte, error) {
+	current, err := self.currentExtensions()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	replaced, err := mls.ExtensionsWithGroupPolicy(current, policy)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return self.CommitContextExtensions(extensionBytesOf(replaced))
+}
+
+// CommitRemove builds a commit carrying one by-value Remove per leaf. See the interface for why it
+// exists and for what the sdk does not build over it.
+//
+// THE CONVERSION IS THE SEAM: a uint32 becomes an mls.LeafIndex here and nowhere else, which is
+// this file's header rule. Nothing else is judged here, because mls already judges everything a
+// Remove can be wrong about -- ValSem108 refuses a blank leaf and one outside the tree, and
+// validateCommitterIsNotRemoved refuses this member's own leaf -- and the one thing it does not
+// refuse, an empty vector, is refused by name for CommitAdd's reason: a commit with no proposal
+// and a path is a legitimate MLS commit that removes nobody, and that is never what a caller of
+// this method meant. THE BY-REFERENCE VECTOR IS EMPTY AND NOT NIL, and nothing is staged on a
+// refusal, both for CommitAdd's reasons.
+func (self *connectMlsHandle) CommitRemove(leaves []uint32) ([]byte, []byte, []byte, error) {
+	if len(leaves) == 0 {
+		return nil, nil, nil, fmt.Errorf("%w: no leaves", ErrEngineCommitRemoveEmpty)
+	}
+	byValue := make([]mls.Proposal, 0, len(leaves))
+	for _, leaf := range leaves {
+		byValue = append(byValue, mls.Proposal{
+			ProposalType: mls.ProposalTypeRemove,
+			Remove:       &mls.Remove{Removed: mls.LeafIndex(leaf)},
+		})
+	}
+	result, err := self.group.CreateCommit([][]byte{}, byValue, nil)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return result.Commit, result.Welcome, result.RatchetTree, nil
+}
+
+// currentExtensions is this handle's group-context extension list at the current epoch, decoded
+// out of the same octets GroupContextBytes answers.
+//
+// THROUGH THE ENCODING AND NOT THROUGH AN ACCESSOR, for two reasons that agree. mls exports no
+// extension-list accessor and this adapter adds none, because framedApplicationLength and
+// peekWithGroupSecrets already read the context this way and a third reader through a new door
+// would be a second answer to the same question; and syntax.Unmarshal copies every opaque field
+// it reads, so what this answers shares no array with the epoch the group is running.
+func (self *connectMlsHandle) currentExtensions() ([]mls.Extension, error) {
+	contextBytes, err := self.group.GroupContext()
+	if err != nil {
+		return nil, err
+	}
+	context := &mls.GroupContext{}
+	if err := syntax.Unmarshal(contextBytes, context); err != nil {
+		return nil, err
+	}
+	return context.Extensions, nil
+}
+
+// extensionBytesOf projects an mls extension list onto the seam's type, every entry in its
+// position and every body cloned, in the one direction the boundary allows. A nil list answers
+// nil, so "the staged value carries no list" and "an empty list" keep their difference.
+//
+// IT SELECTS NOTHING, and the per-entry projection is a declaration of its own so that this stays
+// visibly so: extensionBytes is handed one whole entry and reads its tag off that, which is the
+// shape mls's extension-selection gate exempts because a declaration handed a whole entry cannot
+// choose between two of them. A walk here that read a tag out of the vector to skip or pick an
+// entry would be a selection, and that gate would report it for a row.
+func extensionBytesOf(extensions []mls.Extension) []ExtensionBytes {
+	if extensions == nil {
+		return nil
+	}
+	out := make([]ExtensionBytes, len(extensions))
+	for at, extension := range extensions {
+		out[at] = extensionBytes(extension)
+	}
+	return out
+}
+
+// extensionBytes is one whole entry, projected: the tag becomes a uint16 here and nowhere else,
+// and the body is a copy.
+func extensionBytes(extension mls.Extension) ExtensionBytes {
+	return ExtensionBytes{
+		Type: uint16(extension.ExtensionType),
+		Data: append([]byte(nil), extension.ExtensionData...),
+	}
+}
+
+// mlsExtensionsOf is extensionBytesOf's inverse, for the one door that takes a list in: the type
+// becomes an mls.ExtensionType here and nowhere else, and every body is cloned.
+func mlsExtensionsOf(extensions []ExtensionBytes) []mls.Extension {
+	out := make([]mls.Extension, len(extensions))
+	for at, extension := range extensions {
+		out[at] = mls.Extension{
+			ExtensionType: mls.ExtensionType(extension.Type),
+			ExtensionData: append([]byte(nil), extension.Data...),
+		}
+	}
+	return out
+}
+
 // MergePendingCommit enters the epoch this handle's own staged commit opens.
 func (self *connectMlsHandle) MergePendingCommit() error {
 	return self.group.MergePendingCommit()
@@ -937,8 +1216,50 @@ func (self *connectMlsHandle) Process(message []byte) (*EngineProcessed, error) 
 		answer.AddedLeaves = leafIndexValues(processed.Commit.AddedLeaves())
 		answer.RemovedLeaves = leafIndexValues(processed.Commit.RemovedLeaves())
 		answer.UpdatedLeaves = leafIndexValues(processed.Commit.UpdatedLeaves())
+		// WHO, beside where: item 242's R1. The committer's identity is read off the LIVE tree,
+		// which is still the pre-commit tree because ProcessMessage moved no live state, and
+		// the membership after is read off the staged tree. mls's Members clones the identity
+		// it answers, so nothing here is a window onto either tree.
+		committer, isMember := self.group.MemberAt(processed.Commit.Committer())
+		if !isMember {
+			// the staged epoch is erased before it is dropped, which is the erase discipline
+			// and not a courtesy: this value holds a fully derived key schedule.
+			processed.Commit.Zeroize()
+			return nil, fmt.Errorf("%w: the commit's signature verified against leaf %d and the pre-commit tree holds no member there",
+				ErrEngineCommitterUnknown, answer.CommitterLeaf)
+		}
+		answer.CommitterIdentity = committer.IdentityPub
+		answer.MembersAfter = processedMembersOf(processed.Commit)
+		extensions := processed.Commit.GroupContextExtensions()
+		if extensions == nil {
+			// the report a removed member is handed carries no context, and mls documents nil
+			// there as "the list the group already had": this is where that is made so.
+			current, err := self.currentExtensions()
+			if err != nil {
+				processed.Commit.Zeroize()
+				return nil, err
+			}
+			extensions = current
+		}
+		answer.ContextExtensionsAfter = extensionBytesOf(extensions)
 	}
 	return answer, nil
+}
+
+// processedMembersOf is the staged tree's occupied leaves with their identities, projected onto
+// the seam's type in the one direction the boundary allows: an mls.LeafIndex becomes a uint32
+// here and nowhere else. The identities are the clones mls's accessor answers.
+func processedMembersOf(staged *mls.StagedCommit) []ProcessedMember {
+	leaves := staged.OccupiedLeavesAfter()
+	out := make([]ProcessedMember, 0, len(leaves))
+	for _, leaf := range leaves {
+		identity, held := staged.LeafIdentityAfter(leaf)
+		if !held {
+			continue
+		}
+		out = append(out, ProcessedMember{Leaf: uint32(leaf), Identity: identity})
+	}
+	return out
 }
 
 // leafIndexValues projects the staged commit's leaf vectors onto the interface's own type, in
@@ -964,18 +1285,83 @@ func leafIndexValues(leaves []mls.LeafIndex) []uint32 {
 // section 6 says so -- and one staged by a DIFFERENT handle of this package carries another
 // group's commit; both are refused here, so the guarantee is "the commit this handle staged" and
 // not merely "some commit some engine staged".
+//
+// THE STAGED HALF IS DETACHED ON A SUCCESSFUL INSTALL, and that line is what makes
+// DiscardProcessed after ApplyCommit a no-op rather than the erase of a live epoch. Once mls has
+// answered nil the epoch the value staged is this handle's own, and the value the caller goes on
+// holding must reach nothing of it: a later DiscardProcessed finds no staged half and answers
+// nil, which is the shape every receiving arm writes -- `defer handle.DiscardProcessed(processed)`
+// beside an ApplyCommit that then succeeds. mls detaches its own key material at the merge as
+// well (see (*mls.Group).MergePendingCommit, 2026-09-21), so the two readings agree; this one is
+// kept because it is the one this package's own door reads, and because it makes the discard's
+// "nothing staged" arm reachable rather than dead. On mls.ErrRemovedFromGroup the value is left
+// attached: the report a removed member is handed holds no key material -- stageInboundCommitLocked
+// builds it without a schedule, a secret tree or a leaf private state -- so a discard of it erases
+// nothing, and on every other refusal the value is still a staged epoch the caller owes an erase.
+// A value handed back AFTER its install is refused by name, ErrEngineProcessedApplied, before mls
+// is asked anything about it.
 func (self *connectMlsHandle) ApplyCommit(processed *EngineProcessed) error {
+	staged, err := self.stagedBy(processed)
+	if err != nil {
+		return err
+	}
+	if staged.processed == nil {
+		return fmt.Errorf("%w: its staged half was released on the install", ErrEngineProcessedApplied)
+	}
+	if err := self.group.ApplyCommit(staged.processed); err != nil {
+		return err
+	}
+	staged.processed = nil
+	return nil
+}
+
+// DiscardProcessed erases the epoch a processed commit staged. See the interface for why a refused
+// commit owes an erase; what is decided here is that the SAME three refusals ApplyCommit makes are
+// made first, so a value this handle did not stage is neither installed nor erased through it.
+//
+// THE ERASE IS mls's OWN, (*StagedCommit).Zeroize, which is the erase every other drop site of a
+// staged epoch already runs -- ClearPendingCommit's and Close's -- and which sets the flag
+// (*Group).ApplyCommit reads FIRST, so a later ApplyCommit of the same value answers mls's
+// errStagedCommitErased rather than installing zeros. No second flag is kept here: the one mls
+// holds is the one its own door reads, and a copy on this side could only disagree with it.
+//
+// A VALUE APPLYCOMMIT INSTALLED HAS NO STAGED HALF, because ApplyCommit detached it, and the
+// guard below is that arm: it answers nil and erases nothing. TestDiscardProcessedAfterA
+// SuccessfulApplyCommitErasesNothing holds it, and before 2026-09-21 this guard was dead --
+// nothing set the field to nil -- and this method erased the epoch the handle had just entered.
+func (self *connectMlsHandle) DiscardProcessed(processed *EngineProcessed) error {
+	staged, err := self.stagedBy(processed)
+	if err != nil {
+		return err
+	}
+	if staged.processed == nil {
+		return nil
+	}
+	// the application and proposal arms stage no epoch: Zeroize accepts a nil receiver for
+	// exactly this shape and this call spells the guard anyway, so the arm that holds nothing is
+	// visibly the arm that erases nothing.
+	if staged.processed.Commit != nil {
+		staged.processed.Commit.Zeroize()
+	}
+	return nil
+}
+
+// stagedBy answers the staged half of a processed message THIS handle staged, and refuses the
+// three shapes ApplyCommit's header names: no value, a value with no staged half, and one staged
+// by another handle of this package. One body for the two doors that reach the staged half, so
+// they cannot drift apart on what "this handle staged it" means.
+func (self *connectMlsHandle) stagedBy(processed *EngineProcessed) (*stagedProcessed, error) {
 	if processed == nil {
-		return fmt.Errorf("%w: no processed message", ErrEngineProcessedForeign)
+		return nil, fmt.Errorf("%w: no processed message", ErrEngineProcessedForeign)
 	}
 	staged, isStaged := processed.stagedRef.(*stagedProcessed)
 	if !isStaged {
-		return fmt.Errorf("%w: it carries no staged commit this engine put there", ErrEngineProcessedForeign)
+		return nil, fmt.Errorf("%w: it carries no staged commit this engine put there", ErrEngineProcessedForeign)
 	}
 	if staged.handle != self {
-		return fmt.Errorf("%w: it was staged by another handle", ErrEngineProcessedForeign)
+		return nil, fmt.Errorf("%w: it was staged by another handle", ErrEngineProcessedForeign)
 	}
-	return self.group.ApplyCommit(staged.processed)
+	return staged, nil
 }
 
 // Protect seals one application message under the current epoch, for a caller whose aad is a

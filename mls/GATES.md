@@ -413,7 +413,7 @@ grep -rnE '(if|for|case) .*\.Name|\.Type\.(In|Out|Kind|Elem|NumIn|NumOut|IsVaria
 Their recall against the derivation is measured on every run and stated here, and the sites they do
 not reach are named in the test log:
 
-**gates-recall: 101/172**
+**gates-recall: 104/176**
 
 **That fraction is a MEASUREMENT and not a claim.** These patterns were fitted against the tree as
 it stands, which is instance-derived by construction — which is exactly why the number is published
@@ -673,7 +673,11 @@ Each row carries one verdict:
 | `mls/key_schedule_test.go` `bytesTheScheduleKeeps` | name | `!slices.Contains(fields, name)` | NARROWING/refusal — the other direction: a reader for a field the type does not declare is reported. |
 | `mls/key_schedule_test.go` `bytesTheScheduleKeeps` | shape | `answer.result >= method.Type.NumOut()` | NARROWING/refusal — an excuse for a result position the method does not have is reported, because an excuse that can never fire leaves the table looking complete. |
 | `mls/key_schedule_test.go` `bytesTheScheduleKeeps` | shape | `valueType.Field(i).Type != byteSlice` | CLASS/results — membership is "a []byte field of the schedule", read off the field's own type; a member of it with no reader is fatal on the next line. |
-| `mls/key_schedule_test.go` `bytesTheStagedCommitHandsOut` | shape | `method.Type.NumIn() != 1` | NARROWING/refusal — fatal, so an accessor cannot fall outside G6 by growing a parameter. |
+| `mls/key_schedule_test.go` `bytesTheStagedCommitHandsOut` | shape | `method.Type.NumIn() != 1` | DRIVER — chooses the argument rows, as bytesTheGroupHandsOut does; until 2026-09-21 this was the fatal itself, and LeafIdentityAfter is the first accessor of the type to take a parameter. |
+| `mls/key_schedule_test.go` `bytesTheStagedCommitHandsOut` | name | `!driven where driven = stagedCommitMethodArgumentRows[method.Name]` | NARROWING/refusal — an argument-taking method with no rows is fatal; there is no excuse table for this type, so a parameter costs a row. |
+| `mls/key_schedule_test.go` `bytesTheStagedCommitHandsOut` | shape | `len(row)+1 != method.Type.NumIn()` | DRIVER — row width against the member's arity. |
+| `mls/key_schedule_test.go` `bytesTheStagedCommitHandsOut` | shape | `!value.Type().AssignableTo(want)` | DRIVER — the same check over *StagedCommit's rows. |
+| `mls/key_schedule_test.go` `bytesTheStagedCommitHandsOut` | name | `driven where driven = stagedCommitMethodArgumentRows[method.Name]` | NARROWING/refusal — the other direction: rows for a method that takes no arguments are reported. |
 | `mls/key_schedule_test.go` `epochSecretsByField` | shape | `field.Type() != byteSlice` | NARROWING/refusal — fatal: a secret held in anything but a []byte would fall outside every sweep over the derived secrets, so it is reported rather than skipped. |
 | `mls/key_schedule_test.go` `mutatedGroupContexts` | shape | `target.Kind() == reflect.Slice && target.Type().Elem() == extensionType` | NARROWING/refusal — the other arm of the same switch. |
 | `mls/key_schedule_test.go` `mutatedGroupContexts` | shape | `target.Kind() == reflect.Slice && target.Type().Elem().Kind() == reflect.Uint8` | NARROWING/refusal — one arm of a switch whose default is fatal, so a field this gate cannot move fails rather than going unjudged. |

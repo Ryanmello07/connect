@@ -4025,6 +4025,33 @@ func TestEveryConstructionInThisPackageLeavesItsInputAlone(t *testing.T) {
 			}
 			return [][]byte{policy.Roles[0].MemberId, policy.ServerId}
 		}},
+		// the one helper every policy change goes through, item 242's P4 repair. It is handed a
+		// caller's extension list -- every body in it is an Extension.ExtensionData the caller
+		// owns -- and the policy body that replaces one of them, and it answers a list that
+		// becomes a group context outliving every one of those buffers. So every body it answers
+		// must be a COPY: the entry it keeps as well as the one it replaces, because a list holding
+		// a window onto required_capabilities is a context that changes after the group agreed to
+		// it. The two answers read are the kept body and the replaced one.
+		{name: "ExtensionsWithGroupPolicy", call: func(take func([]byte) []byte) [][]byte {
+			encoded, err := (&GroupPolicyExtension{
+				Roles:    []RoleEntry{{MemberId: []byte{0x01, 0x02}, Role: RoleOwner}},
+				ServerId: []byte("urmessage-v1-server"),
+			}).Encode()
+			if err != nil {
+				t.Fatalf("the group policy body this row replaces with: %v", err)
+			}
+			replaced, err := ExtensionsWithGroupPolicy([]Extension{
+				{ExtensionType: ExtensionTypeRequiredCapabilities, ExtensionData: take([]byte{0x01, 0x02, 0x03})},
+				{ExtensionType: ExtensionTypeUrmessageGroupPolicy, ExtensionData: take([]byte{0xff})},
+			}, take(encoded.ExtensionData))
+			if err != nil {
+				t.Fatalf("ExtensionsWithGroupPolicy over a two entry list: %v", err)
+			}
+			if len(replaced) != 2 {
+				t.Fatalf("ExtensionsWithGroupPolicy answered %d entries for a two entry list", len(replaced))
+			}
+			return [][]byte{replaced[0].ExtensionData, replaced[1].ExtensionData}
+		}},
 		// the urmessage_owner_successor decode, whose one produced run is the successor member
 		// id it read. It must be a COPY for the same reason the policy's two are: the body is an
 		// Extension.ExtensionData a caller owns and may reuse, and a nomination holding a window
@@ -5797,9 +5824,9 @@ var providerConstructionsAnsweringOffTheWallClock = map[string]string{
 	// NewLeafNode, so the Lifetime stamped there is inside the KeyPackageTBS this signs, and
 	// two calls a second apart answer different signatures for a reason that is not the
 	// arguments. Everything above the comparisons still runs for it.
-	"NewKeyPackage": "builds its leaf through NewLeafNode, which stamps a key package Lifetime from the wall clock, so two calls a second apart sign different key packages; TestNewKeyPackageReadsEveryArgumentItWasHanded holds it to reading each of its arguments, with the lifetime normalised out and the parameter list derived off its own declaration, TestNewKeyPackageDrawsTheInitAndEncryptionKeysFromSeparateEntropy to answering two key pairs rather than one, TestNewKeyPackageKeepsTheSigningSeedOffTheWireAndBesideItsOwnLeaf to the seed it keeps, and the routing and KDF.Nh differentials to reaching the provider it was handed",
+	"NewKeyPackage":           "builds its leaf through NewLeafNode, which stamps a key package Lifetime from the wall clock, so two calls a second apart sign different key packages; TestNewKeyPackageReadsEveryArgumentItWasHanded holds it to reading each of its arguments, with the lifetime normalised out and the parameter list derived off its own declaration, TestNewKeyPackageDrawsTheInitAndEncryptionKeysFromSeparateEntropy to answering two key pairs rather than one, TestNewKeyPackageKeepsTheSigningSeedOffTheWireAndBesideItsOwnLeaf to the seed it keeps, and the routing and KDF.Nh differentials to reaching the provider it was handed",
 	"NewKeyPackageWithSigner": "builds its leaf through NewLeafNode, which stamps a key package Lifetime from the wall clock, so two calls a second apart sign different key packages; the sibling row above carries the same argument. Everything above the comparisons still runs for it, and what the comparisons would have held is held by name instead: TestNewKeyPackageWithSignerBindsAllFourToTheCallersSigner to the four bindings the caller's key is put on, TestNewKeyPackageWithSignerDrawsTheInitAndEncryptionKeysFromSeparateEntropy to answering two key pairs rather than one, TestNewKeyPackageWithSignerClonesTheCallersSigner to the copy it keeps, and the routing, KDF.Nh and draw-count differentials to reaching the provider it was handed",
-	"NewLeafNode":   "stamps a key package Lifetime from the wall clock, so two calls a second apart sign different leaves; TestNewLeafNodeReadsEveryArgumentItWasHanded holds it to reading each of its arguments, with the lifetime normalised out, and TestNewLeafNodeRoutesThroughTheProviderItWasHanded to routing through the provider",
+	"NewLeafNode":             "stamps a key package Lifetime from the wall clock, so two calls a second apart sign different leaves; TestNewLeafNodeReadsEveryArgumentItWasHanded holds it to reading each of its arguments, with the lifetime normalised out, and TestNewLeafNodeRoutesThroughTheProviderItWasHanded to routing through the provider",
 }
 
 // Every operation on both surfaces is covered, with nothing skipped and nothing excused.

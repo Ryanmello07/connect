@@ -2729,6 +2729,28 @@ func (self *Group) MergePendingCommit() error {
 	// installed six statements above, and (*UpdatePathPlan).Zeroize leaves it alone for that
 	// reason.
 	staged.plan.Zeroize()
+	// AND THE STAGED VALUE IS LEFT A SHELL, which the paragraph below already promised and which,
+	// until 2026-09-21, was not true. The three assignments above MOVE the schedule, the secret
+	// tree and the leaf private state by pointer, so after them the staged value and this group
+	// name one epoch through two handles -- and the staged value is the one a CALLER holds:
+	// ProcessMessage handed it out inside a Processed, and ApplyCommit reaches this method with
+	// it. A caller that then ran (*StagedCommit).Zeroize on its value -- the ordinary cleanup
+	// shape, `defer discard(processed)` beside an ApplyCommit that succeeded, and the exact
+	// shape messagegroup's DiscardProcessed exists for -- erased the epoch this group had just
+	// entered: measured, Export and Protect refused with the erased-epoch error and the next
+	// commit did not decrypt, with no error at the line that did it. So the four fields are
+	// DETACHED here, at the one site that knows they were moved rather than dropped: what the
+	// staged value goes on holding is the public facts about the commit -- the tree, the
+	// context, the leaf vectors, the provenance pair -- and no key material, and an erase run on
+	// it afterwards erases nothing this group is running on. The plan is detached with them
+	// because its Private half is the same pointer as ownPriv. The flag is NOT set: this value
+	// was installed, not erased, and a second ApplyCommit of it is refused by the provenance
+	// pair as a commit of an epoch this group has left, which is the refusal already pinned for
+	// that shape.
+	staged.schedule = nil
+	staged.secretTree = nil
+	staged.ownPriv = nil
+	staged.plan = nil
 	// AND THE STAGED COMMIT IS RELEASED BEFORE THE REBIND RATHER THAN AFTER IT. Every field of it
 	// that holds key material now stands in this group's own storage, so a rebind that refused
 	// while self.pending still pointed at it would leave a group whose staged commit and whose

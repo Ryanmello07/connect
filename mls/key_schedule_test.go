@@ -10516,6 +10516,33 @@ var epochSecretMethodsTheSweepDrivesInstead = map[string]string{
 		"bytesTheGroupHandsOut drives it and compares every octet of that",
 }
 
+// stagedCommitMethodArgumentRows is groupMethodArgumentRows one type over: the argument rows the
+// G6 sweep drives an argument-taking method of *StagedCommit through, so that an accessor which
+// takes a parameter is swept over every value of it a caller could reach rather than falling
+// outside the class by having one. A method with no row here and an argument is a FATAL in the
+// sweep, and a row for a method that takes none is an error, so the table and the type cannot
+// drift apart silently.
+var stagedCommitMethodArgumentRows = map[string]func(t *testing.T, staged *StagedCommit) [][]reflect.Value{
+	"LeafIdentityAfter": func(t *testing.T, staged *StagedCommit) [][]reflect.Value {
+		// EVERY occupied leaf of the staged tree, which is the whole domain a caller can name
+		// something at, plus one blank leaf inside the tree and one outside it, which are the
+		// two shapes the accessor answers false for. Read off the accessor's own sibling rather
+		// than off a fixed count, so a fixture with more leaves is swept over all of them.
+		rows := [][]reflect.Value{}
+		occupied := staged.OccupiedLeavesAfter()
+		for _, leaf := range occupied {
+			rows = append(rows, []reflect.Value{reflect.ValueOf(leaf)})
+		}
+		var last LeafIndex
+		if len(occupied) != 0 {
+			last = occupied[len(occupied)-1]
+		}
+		rows = append(rows, []reflect.Value{reflect.ValueOf(last + 1)})
+		rows = append(rows, []reflect.Value{reflect.ValueOf(LeafIndex(1 << 20))})
+		return rows
+	},
+}
+
 // bytesTheStagedCommitHandsOut is every byte slice reachable through *StagedCommit's own exported
 // surface.
 //
@@ -10525,9 +10552,11 @@ var epochSecretMethodsTheSweepDrivesInstead = map[string]string{
 // delivery service accepting it. Reflection over the compiled method set is what makes an accessor
 // added tomorrow join by existing.
 //
-// EVERY EXPORTED METHOD OF THIS TYPE TAKES NO ARGUMENTS, and that is asserted rather than assumed:
-// an accessor that grew one would be called here with none, which reflect refuses at run time and
-// which would read as a gate that had stopped sweeping.
+// AN ACCESSOR THAT TAKES ARGUMENTS IS DRIVEN THROUGH stagedCommitMethodArgumentRows AND NEVER
+// SKIPPED. Until 2026-09-21 every exported method of this type took none and this sweep fataled on
+// one that did; LeafIdentityAfter is the first to take one, and the answer to it is the one
+// bytesTheGroupHandsOut already gives for Export: a table of rows, held in both directions, so the
+// method is swept over the values a caller can name rather than left outside the class.
 func bytesTheStagedCommitHandsOut(t *testing.T, at string, staged *StagedCommit) []exposedSlice {
 	t.Helper()
 	stagedType := reflect.TypeOf(staged)
@@ -10541,17 +10570,47 @@ func bytesTheStagedCommitHandsOut(t *testing.T, at string, staged *StagedCommit)
 	exposed := []exposedSlice{}
 	for i := range stagedType.NumMethod() {
 		method := stagedType.Method(i)
+		rows := [][]reflect.Value{nil}
 		if method.Type.NumIn() != 1 {
-			t.Fatalf("%s: (*StagedCommit).%s takes arguments and this sweep calls with none; give this type an argument table of its own rather than letting an accessor fall outside G6",
-				at, method.Name)
-		}
-		for index, result := range method.Func.Call([]reflect.Value{reflect.ValueOf(staged)}) {
-			for _, one := range exposedByteSlices(t, "(*StagedCommit)."+method.Name, result) {
-				one.method = method.Name
-				one.result = index
-				one.taken = bytes.Clone(one.bytes)
-				exposed = append(exposed, one)
+			build, driven := stagedCommitMethodArgumentRows[method.Name]
+			if !driven {
+				t.Fatalf("%s: (*StagedCommit).%s takes arguments and this sweep calls with none; give it rows in stagedCommitMethodArgumentRows rather than letting an accessor fall outside G6",
+					at, method.Name)
 			}
+			rows = build(t, staged)
+			if len(rows) == 0 {
+				t.Fatalf("%s: stagedCommitMethodArgumentRows drives (*StagedCommit).%s with no rows at all, so it is swept in name only",
+					at, method.Name)
+			}
+			for _, row := range rows {
+				if len(row)+1 != method.Type.NumIn() {
+					t.Fatalf("%s: stagedCommitMethodArgumentRows drives (*StagedCommit).%s with %d arguments and it takes %d",
+						at, method.Name, len(row), method.Type.NumIn()-1)
+				}
+				for argument, value := range row {
+					if want := method.Type.In(argument + 1); !value.Type().AssignableTo(want) {
+						t.Fatalf("%s: stagedCommitMethodArgumentRows hands (*StagedCommit).%s a %s in argument %d, which takes %s",
+							at, method.Name, value.Type(), argument, want)
+					}
+				}
+			}
+		} else if _, driven := stagedCommitMethodArgumentRows[method.Name]; driven {
+			t.Errorf("stagedCommitMethodArgumentRows drives %s, which takes no arguments", method.Name)
+		}
+		for _, row := range rows {
+			for index, result := range method.Func.Call(append([]reflect.Value{reflect.ValueOf(staged)}, row...)) {
+				for _, one := range exposedByteSlices(t, "(*StagedCommit)."+method.Name, result) {
+					one.method = method.Name
+					one.result = index
+					one.taken = bytes.Clone(one.bytes)
+					exposed = append(exposed, one)
+				}
+			}
+		}
+	}
+	for name := range stagedCommitMethodArgumentRows {
+		if _, found := stagedType.MethodByName(name); !found {
+			t.Errorf("stagedCommitMethodArgumentRows drives %s, which *StagedCommit does not declare", name)
 		}
 	}
 	for _, one := range exposed {

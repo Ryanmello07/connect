@@ -476,16 +476,24 @@ func ParseGroupPolicyFrom(ext Extension) (*GroupPolicyExtension, error) {
 
 // RoleOf returns a member's role and whether the policy names them at all.
 //
-// The false answer is RoleObserver rather than some other zero value, and the two being the same
-// byte is deliberate: a caller that drops the second result treats an unknown member as an
-// observer, which is the least authority this profile has.
+// THE FALSE ANSWER IS RoleMember, ruled 2026-09-21 (MASTER section 11, ledger item 242): a member
+// the policy does not name is a MEMBER. An Add commit names nobody -- a role is a later, separate
+// policy commit -- so every joiner is unnamed until an admin or the owner says otherwise, and the
+// default has to be the role that lets them send. Until that ruling this answered RoleObserver on
+// the argument that the least authority is the safe default, while (*Group).membersLocked one
+// file over defaulted the same member to RoleMember; an authorizer written off the wrong one of
+// the two would have read every joiner as read-only. MASTER section 11 now names the OBSERVER
+// answer as the falsifying one, and TestRoleOfAnUnnamedMemberIsMemberAndNotNamed holds this.
+//
+// The bool is kept: "named MEMBER" and "unnamed" are the same role and different facts, and a
+// caller deciding whether a policy commit may drop an entry needs the second.
 func (self *GroupPolicyExtension) RoleOf(memberId []byte) (Role, bool) {
 	for _, entry := range self.Roles {
 		if sameMemberId(entry.MemberId, memberId) {
 			return entry.Role, true
 		}
 	}
-	return RoleObserver, false
+	return RoleMember, false
 }
 
 // SetRole inserts or replaces a member's role, keeping the canonical order.
@@ -556,6 +564,55 @@ func (self *GroupPolicyExtension) Clone() *GroupPolicyExtension {
 		out.Roles[i] = RoleEntry{MemberId: slices.Clone(entry.MemberId), Role: entry.Role}
 	}
 	return out
+}
+
+// ExtensionsWithGroupPolicy is a COPY of a group context extension list with the 0xF001 entry
+// replaced by the policy body, in its own position, and every other entry kept where it stood; a
+// list carrying no policy gains one at the end.
+//
+// IT IS THE ONE HELPER BEHIND EVERY POLICY CHANGE, on both arms of the seam above this package --
+// a policy proposed by reference and one committed by value go through it -- so that what a
+// policy change does to the REST of the list is decided once, and what it must do is nothing.
+// RFC 9420 section 12.1.6 replaces the list wholesale and this profile requires
+// required_capabilities on every group context, and a policy change that carried a one-entry
+// list stripped it: ledger item 242's P4, measured, every policy proposal the seam ever published
+// left the group with a policy and nothing else. Declared HERE and not in the seam because this
+// package owns what a policy is, and because the repeat question is this package's: the walk
+// below is preceded by FindExtensionEntry, the one door that refuses a list carrying 0xF001
+// twice, so this never chooses between two policies and never collapses them. The body is judged
+// through GroupPolicyOf on the way out, so a body that is not a policy is refused before it is
+// on the wire rather than by the first receiver.
+//
+// Every body is copied, the policy's included: the list this answers becomes a group context
+// that outlives the caller's buffers.
+func ExtensionsWithGroupPolicy(exts []Extension, policy []byte) ([]Extension, error) {
+	if _, _, err := FindExtensionEntry(exts, ExtensionTypeUrmessageGroupPolicy); err != nil {
+		return nil, fmt.Errorf("the extension list carries urmessage_group_policy more than once: %w", err)
+	}
+	replacement := Extension{
+		ExtensionType: ExtensionTypeUrmessageGroupPolicy,
+		ExtensionData: slices.Clone(policy),
+	}
+	out := make([]Extension, 0, len(exts)+1)
+	replaced := false
+	for _, extension := range exts {
+		if extension.ExtensionType == ExtensionTypeUrmessageGroupPolicy {
+			out = append(out, replacement)
+			replaced = true
+			continue
+		}
+		out = append(out, Extension{
+			ExtensionType: extension.ExtensionType,
+			ExtensionData: slices.Clone(extension.ExtensionData),
+		})
+	}
+	if !replaced {
+		out = append(out, replacement)
+	}
+	if _, err := GroupPolicyOf(out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // GroupPolicyOf finds and parses the policy in a group context extension list.

@@ -17,6 +17,8 @@ package mls
 import (
 	"bytes"
 	"errors"
+	"slices"
+	"strings"
 	"testing"
 )
 
@@ -326,5 +328,122 @@ func TestApplyCommitReadsTheEraseFlagBeforeTheRemovalArm(t *testing.T) {
 	}
 	if _, err := receiver.Protect(nil, []byte("not removed by an erased value")); err != nil {
 		t.Fatalf("the receiver cannot protect a message after refusing an erased removing commit: %v", err)
+	}
+}
+
+// TestAnInstalledStagedCommitIsAShellWhoseEraseTouchesNothingLive is the third property of the
+// install doors, and the one the header's two could not see: WHAT THE DOORS LEAVE IN THE VALUE. A
+// merge moves the schedule, the secret tree and the leaf private state into the group by pointer,
+// and until 2026-09-21 it left the staged value pointing at all three -- so the value a caller
+// holds after ApplyCommit named the epoch the group had just entered, and the erase every
+// caller's cleanup runs on a value it has finished with, (*StagedCommit).Zeroize, erased the live
+// epoch. Measured through messagegroup's discard door: Export and Protect refused with the
+// erased-epoch error and the next commit did not decrypt, with no error at the line that did it.
+//
+// Held at BOTH installs, the receiver's ApplyCommit and the committer's MergePendingCommit, over
+// the storage the epoch itself uses and not copies of it: after the install the value holds no
+// key material and no authenticator, it is NOT flagged erased -- it was installed -- and the
+// erase run on it afterwards leaves every secret the group is running on where it was. The plan
+// is the one entry the merge itself erases, so its ladder is read as the merge's own erase and
+// excluded from the "still live" reading rather than counted against it.
+func TestAnInstalledStagedCommitIsAShellWhoseEraseTouchesNothingLive(t *testing.T) {
+	crypto := testCrypto(t)
+	committer, receiver, _, _ := testTwoMemberGroup(t, crypto)
+	defer committer.Close()
+	defer receiver.Close()
+	result, err := committer.CreateCommit(nil, nil, nil)
+	if err != nil {
+		t.Fatalf("CreateCommit: %v", err)
+	}
+	processed, err := receiver.ProcessMessage(result.Commit)
+	if err != nil {
+		t.Fatalf("ProcessMessage: %v", err)
+	}
+	own := committer.stagedForTest()
+	if own == nil || processed.Commit == nil {
+		t.Fatal("one of the two installs has nothing staged, so this case observes half of what it claims")
+	}
+	// the controls: both values hold an epoch before the install, and the storage snapshotted
+	// here is the storage the group will be RUNNING ON afterwards, because the merge moves it
+	// by pointer. Every entry is checked non-zero by the helper.
+	live := map[string]map[string][]byte{}
+	for name, staged := range map[string]*StagedCommit{"the receiver's": processed.Commit, "the committer's": own} {
+		if staged.EpochAuthenticator() == nil {
+			t.Fatalf("%s staged value answers no authenticator before the install, so the shell below observes nothing", name)
+		}
+		live[name] = map[string][]byte{}
+		for entry, secret := range stagedEpochStorage(t, staged) {
+			if strings.HasPrefix(entry, "plan.") {
+				continue
+			}
+			live[name][entry] = secret
+		}
+		if len(live[name]) == 0 {
+			t.Fatalf("%s staged value holds no key material outside the plan, so the erase below is over nothing", name)
+		}
+	}
+
+	if err := receiver.ApplyCommit(processed); err != nil {
+		t.Fatalf("ApplyCommit: %v", err)
+	}
+	if err := committer.MergePendingCommit(); err != nil {
+		t.Fatalf("MergePendingCommit: %v", err)
+	}
+	authenticator := bytes.Clone(receiver.EpochAuthenticator())
+	if len(authenticator) == 0 || !bytes.Equal(authenticator, committer.EpochAuthenticator()) {
+		t.Fatal("the two installs did not enter one epoch, so nothing below is about an installed value")
+	}
+
+	for name, staged := range map[string]*StagedCommit{"the receiver's": processed.Commit, "the committer's": own} {
+		// the shell: the public facts survive, the key material does not, and the value is
+		// not flagged erased because it was not erased
+		if staged.schedule != nil || staged.secretTree != nil || staged.ownPriv != nil || staged.plan != nil {
+			t.Errorf("%s staged value still holds key material after its install (schedule=%v secretTree=%v ownPriv=%v plan=%v); the merge moved it by pointer and left the value naming the live epoch",
+				name, staged.schedule != nil, staged.secretTree != nil, staged.ownPriv != nil, staged.plan != nil)
+		}
+		if staged.erased {
+			t.Errorf("%s staged value is flagged erased after its install; it was installed, and a second ApplyCommit of it is the provenance pair's refusal and not the erase's", name)
+		}
+		if got := staged.EpochAuthenticator(); got != nil {
+			t.Errorf("%s staged value answers a %d octet authenticator after its install, want nothing: the epoch's authenticator is the group's to answer now", name, len(got))
+		}
+		if leaves := staged.OccupiedLeavesAfter(); len(leaves) != 2 {
+			t.Errorf("%s staged value answers %v for the post-commit leaves after its install; the public facts about the commit are what a shell keeps", name, leaves)
+		}
+		// THE PROPERTY: the erase every caller's cleanup runs on a value it has finished with
+		staged.Zeroize()
+		for entry, secret := range live[name] {
+			if !slices.ContainsFunc(secret, func(b byte) bool { return b != 0 }) {
+				t.Errorf("erasing %s installed staged value zeroed %s, which is storage the group is running on", name, entry)
+			}
+		}
+	}
+	// and read through the doors a caller has: the epoch is still there, at both members, and
+	// the next commit still opens
+	if !bytes.Equal(receiver.EpochAuthenticator(), authenticator) || !bytes.Equal(committer.EpochAuthenticator(), authenticator) {
+		t.Fatal("erasing an installed staged value changed a member's epoch authenticator")
+	}
+	if _, err := receiver.Export("test", nil, 32); err != nil {
+		t.Fatalf("the receiver cannot export after erasing the value it applied: %v", err)
+	}
+	if _, err := committer.Protect(nil, []byte("still in the epoch")); err != nil {
+		t.Fatalf("the committer cannot protect after erasing the value it merged: %v", err)
+	}
+	next, err := committer.CreateCommit(nil, nil, nil)
+	if err != nil {
+		t.Fatalf("the next CreateCommit: %v", err)
+	}
+	nextProcessed, err := receiver.ProcessMessage(next.Commit)
+	if err != nil {
+		t.Fatalf("the receiver cannot open the next commit after erasing the value it applied: %v", err)
+	}
+	if err := receiver.ApplyCommit(nextProcessed); err != nil {
+		t.Fatalf("the next ApplyCommit: %v", err)
+	}
+	if err := committer.MergePendingCommit(); err != nil {
+		t.Fatalf("the next MergePendingCommit: %v", err)
+	}
+	if !bytes.Equal(receiver.EpochAuthenticator(), committer.EpochAuthenticator()) {
+		t.Fatal("the two members disagree on the epoch after the next commit")
 	}
 }

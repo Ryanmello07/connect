@@ -183,6 +183,14 @@ type StagedCommit struct {
 // the same pointer when the commit carries an update path: (*UpdatePathPlan).Zeroize erases the
 // ladder and the commit secret and leaves Private to the holder, and its own comment says why.
 //
+// ON A VALUE WHOSE EPOCH WAS INSTALLED IT ERASES NOTHING, and that is (*Group).MergePendingCommit's
+// doing and not a check made here: the merge moves the schedule, the secret tree, the leaf
+// private state and the plan into the group and detaches all four from this value, so the nil
+// guards below find nothing and the flag alone is set. It matters because the value a caller
+// holds after ApplyCommit is this one, and "erase what I processed" written beside an
+// ApplyCommit that succeeded is the ordinary cleanup shape; before the detach (2026-09-21) that
+// shape erased the epoch the group had just entered.
+//
 // The noinline directive is the erase class's rule; see (*TreeKEMPrivate).Zeroize.
 //
 //go:noinline
@@ -232,18 +240,82 @@ func (self *StagedCommit) RemovesSelf() bool { return self.selfRemoved }
 // same list and is here for its reason: an Extension copied by value goes on pointing at the octets
 // the new epoch's group context was built over, so a caller that wrote through one would be
 // rewriting the context this client is about to derive an epoch's secrets under.
+//
+// THE REPORT A REMOVED MEMBER IS HANDED CARRIES NO CONTEXT -- stageInboundCommitLocked says why
+// -- and before 2026-09-21 this accessor dereferenced it. What that report can still answer is
+// the list the commit's own GroupContextExtensions proposal names, because the resolved list is
+// on it; a commit carrying no such proposal installs the extension set the group already had,
+// which this value does not hold and answers nil for. The caller holds the pre-commit context
+// and is told, here, that nil on a self-removing commit means "unchanged".
 func (self *StagedCommit) GroupContextExtensions() []Extension {
-	if self.context.Extensions == nil {
+	extensions := self.postCommitExtensions()
+	if extensions == nil {
 		return nil
 	}
-	out := make([]Extension, 0, len(self.context.Extensions))
-	for _, extension := range self.context.Extensions {
+	out := make([]Extension, 0, len(extensions))
+	for _, extension := range extensions {
 		out = append(out, Extension{
 			ExtensionType: extension.ExtensionType,
 			ExtensionData: cloneBytes(extension.ExtensionData),
 		})
 	}
 	return out
+}
+
+// postCommitExtensions is the extension list the epoch this commit opens carries, UNCOPIED: the
+// staged context's when there is one, and otherwise -- the removed member's report -- what the
+// commit's own GroupContextExtensions proposal names, or nil when it names none.
+func (self *StagedCommit) postCommitExtensions() []Extension {
+	if self.context != nil {
+		return self.context.Extensions
+	}
+	if self.list == nil {
+		return nil
+	}
+	replaced, carried := self.list.Extensions()
+	if !carried {
+		return nil
+	}
+	return replaced
+}
+
+// OccupiedLeavesAfter is every leaf the POST-commit tree holds a member at, in leaf order.
+//
+// It reads the STAGED tree -- the one the commit's proposals built and its update path was merged
+// into -- and never the group's live one, which is the whole of why it is a method of this type
+// rather than of *Group: MASTER section 11 has a receiving client take its authorization decision
+// BETWEEN ProcessMessage and ApplyCommit, on what the commit does, and "who is in the group
+// afterwards" is a fact only the staged tree can answer at that moment. Together with
+// LeafIdentityAfter it is what lets that decision compute the identities a commit adds, check that
+// no leaf's identity changed across an Update or the committer's own path, and read the
+// post-commit identity set the policy is judged against.
+//
+// The report a REMOVED member is handed carries the post-proposal tree too, so this answers there
+// as well. What that tree lacks is the committer's update path, which a removed member cannot
+// open; the leaf it shows at the committer's index is the pre-path one.
+func (self *StagedCommit) OccupiedLeavesAfter() []LeafIndex {
+	if self.tree == nil {
+		return nil
+	}
+	return self.tree.NonBlankLeaves()
+}
+
+// LeafIdentityAfter is the credential identity the POST-commit tree carries at one leaf, as
+// storage the caller owns, and false for a leaf that is blank or outside the tree.
+//
+// THE COPY IS THIS TYPE'S RULE and not a courtesy: the credential is inside the staged tree, that
+// tree is the one MergePendingCommit installs, and a caller writing through the identity would be
+// rewriting the leaf the new epoch's tree hash was taken over. See OccupiedLeavesAfter for which
+// tree this reads and why.
+func (self *StagedCommit) LeafIdentityAfter(leaf LeafIndex) ([]byte, bool) {
+	if self.tree == nil {
+		return nil, false
+	}
+	node := self.tree.Leaf(leaf)
+	if node == nil {
+		return nil, false
+	}
+	return cloneBytes(node.Credential.Identity), true
 }
 
 // EpochAuthenticator is the new epoch's fork-detection value, as storage the caller owns.
@@ -256,8 +328,14 @@ func (self *StagedCommit) GroupContextExtensions() []Extension {
 // says "no fork" about two members who have nothing in common. Nothing else this type exports
 // reads erased storage: the four leaf vectors, the two provenance fields and the context are
 // public facts about the commit and survive the erase on purpose.
+//
+// AN INSTALLED staged commit answers nothing for the same reason, and the second condition is
+// that case: (*Group).MergePendingCommit moves the schedule into the group and detaches it from
+// this value, so a value whose epoch has been entered holds no schedule to answer from. The
+// epoch's authenticator is then the GROUP's to answer, and a caller still holding the staged
+// value after the merge is holding a shell.
 func (self *StagedCommit) EpochAuthenticator() []byte {
-	if self.erased {
+	if self.erased || self.schedule == nil {
 		return nil
 	}
 	return cloneBytes(self.schedule.Secrets().EpochAuthenticator)

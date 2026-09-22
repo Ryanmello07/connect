@@ -563,8 +563,8 @@ func TestGroupPolicyAccessorsAnswerTheRoleSetTheyAreGiven(t *testing.T) {
 	stranger := testIdentity(t, crypto, "stranger")
 	policy := testPolicy(t, owner, admin, member)
 
-	if role, ok := policy.RoleOf(stranger.IdentityPub); ok || role != RoleObserver {
-		t.Errorf("RoleOf(a member the policy does not name) = %v %v, want observer false", role, ok)
+	if role, ok := policy.RoleOf(stranger.IdentityPub); ok || role != RoleMember {
+		t.Errorf("RoleOf(a member the policy does not name) = %v %v, want member false; MASTER section 11 rules the unnamed member a MEMBER", role, ok)
 	}
 	if count := policy.AdminCount(); count != 1 {
 		t.Errorf("AdminCount = %d, want 1; the owner is not an admin, and counting them would let a group with one admin meet a two admin quorum", count)

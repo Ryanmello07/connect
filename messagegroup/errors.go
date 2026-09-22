@@ -148,6 +148,22 @@ var (
 	// carries the index because a caller batching several is otherwise told only that one of
 	// them is wrong.
 	ErrEngineCommitAddKeyPackage = errors.New("messagegroup: a key package handed to CommitAdd is not one this profile can admit")
+	// Fires when CommitContextExtensions is handed an empty list. RFC 9420 section 12.1.6
+	// replaces the group's extension list WHOLESALE, so an empty list is a group with no policy
+	// and no required capabilities -- the one list no caller of this profile can have meant --
+	// and it is refused by name, before anything is staged, rather than becoming whichever
+	// refusal mls or a receiver answers.
+	ErrEngineCommitContextExtensionsEmpty = errors.New("messagegroup: CommitContextExtensions was handed no extensions")
+	// Fires when CommitRemove is handed no leaves, for ErrEngineCommitAddEmpty's reason at the
+	// other arm: a commit carrying no proposal and a path is a legitimate MLS commit that
+	// removes nobody, and that is never what a caller of this method meant.
+	ErrEngineCommitRemoveEmpty = errors.New("messagegroup: CommitRemove was handed no leaves")
+	// Fires when Process has verified a commit's signature against a leaf and the pre-commit
+	// tree holds no member there. It is not a state connect/mls can produce today -- a commit
+	// is signed by a member's leaf and this profile refuses external commits -- and the refusal
+	// is here because the alternative is an EngineProcessed whose CommitterIdentity is nil,
+	// which an authorizer keyed on identity would read as an unnamed MEMBER.
+	ErrEngineCommitterUnknown = errors.New("messagegroup: the pre-commit tree holds no member at the leaf a commit's signature verified against")
 	// Fires when no key package ref the Welcome names is one this device's store holds. It
 	// carries the ref count, the refusal count and the last store error VERBATIM, because
 	// StateStore.TakeKeyPackage answers a bare error with no declared not-found value: a broken
@@ -170,6 +186,13 @@ var (
 	// panic and never a silent no-op, so the guarantee is "the commit THIS handle staged"
 	// rather than "some commit some engine staged".
 	ErrEngineProcessedForeign = errors.New("messagegroup: this handle did not stage that processed message")
+	// Fires when ApplyCommit is handed an EngineProcessed this handle has ALREADY installed. The
+	// install releases the value's staged half -- that is what makes a later DiscardProcessed of
+	// the same value a no-op rather than the erase of a live epoch -- so a second ApplyCommit
+	// finds nothing to install and says so by name, rather than handing mls a value with no
+	// commit in it and answering whatever that door says about the shape. DiscardProcessed of
+	// the same value answers nil: one value, one install, and the cleanup after it costs nothing.
+	ErrEngineProcessedApplied = errors.New("messagegroup: that processed message was already applied by this handle")
 	// Fires when connect/mls answers a processed message whose discriminant and whose arms
 	// disagree, or an opened application message with no content. Neither is a state mls can
 	// produce today; the refusal is here because the alternative to refusing it is a zero

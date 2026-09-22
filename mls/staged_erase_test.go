@@ -1271,6 +1271,17 @@ var typesTheEraseClassReachesThatOweNoErase = map[string]string{
 		"staged a commit and the mls.Processed it staged. It declares no octets of its own -- both fields " +
 		"are pointers -- and both types it points at are members of this class in their own right, which " +
 		"is where the obligation belongs",
+	"ProcessedMember": "one occupied leaf of the tree a commit enters, with the CREDENTIAL IDENTITY that leaf " +
+		"carries: an Ed25519 identity public key read out of a published leaf node, which every member of " +
+		"the group holds, every joiner is handed in its Welcome, and Member.IdentityPub answers one type " +
+		"over. It is an ANSWER carried on EngineProcessed's commit arm and no production declaration holds " +
+		"one in a field, so there is no drop site an erase could be reachable from",
+	"ExtensionBytes": "one group-context extension as octets, the RFC 9420 extension type and its body, " +
+		"which is the seam's spelling of Extension -- a wire type. The lists it travels in are the group " +
+		"context's, which framing signs and MACs over and which every Welcome carries, so every octet of " +
+		"it is one every member of the group holds; Group.context and StagedCommit.context are excused in " +
+		"the same words. It is an answer on EngineProcessed's commit arm and an argument to " +
+		"CommitContextExtensions, and no production declaration holds one in a field",
 	"PathDecryptResult": "it is an ANSWER and not storage. DecryptUpdatePath builds one per call and hands " +
 		"it to a caller that installs both halves into the epoch it is entering, and no production " +
 		"declaration holds one in a field, so there is no drop site an erase could be reachable from. " +
@@ -1504,6 +1515,15 @@ type eraseDropSite struct {
 	// ones it erases: between them, a value that is being MOVED rather than dropped.
 	installed map[string]bool
 	movedOut  map[string]bool
+	// the WHOLE dropped value read out, by pointer, into storage the body was handed -- its
+	// receiver's or a parameter's -- ABOVE the assignment. That is the other shape of a move, and
+	// it is the one (*Group).MergePendingCommit makes over the schedule, the secret tree and
+	// the leaf private state: `self.schedule = staged.schedule` and then, so that the staged
+	// value is the shell the move promises, `staged.schedule = nil`. The second assignment drops
+	// nothing -- the value stands in self.schedule -- and a reading over sub-fields alone
+	// reported it as a schedule left in the heap. Read at a POSITION for the order's usual
+	// reason: an install written below the nil installs the nil.
+	movedWhole bool
 }
 
 // theDropSitesIn reads every assignment to a key-material field of the receiver's own type.
@@ -1518,10 +1538,16 @@ type eraseDropSite struct {
 //     The order is read here too, and for the same reason it is read on the erase: a comparison
 //     written BELOW the assignment says nothing about it, the value it would have refused having
 //     already been dropped by the time it is reached;
-//   - or it MOVES the value, which is (*Group).MergePendingCommit: every field of the dropped
-//     value is either read out into the holder's own storage or erased, and what is left is a
-//     shell. A merge that erased what it had just installed would be the same defect pointing the
-//     other way.
+//   - or it MOVES the value, which is (*Group).MergePendingCommit, in one of two shapes. Field
+//     by field: every field of the dropped value is either read out into the holder's own
+//     storage or erased, and what is left is a shell. Or WHOLE: the value itself is read out,
+//     by pointer, into storage the body was handed -- its receiver's or a parameter's -- above
+//     the assignment, and the assignment is then what MAKES the shell rather than a drop. The
+//     merge does the first over its pending commit and the second over the commit's schedule,
+//     secret tree and leaf private state, and it must do the second: measured on 2026-09-21, a
+//     merge that left those three standing in the staged value left a caller's ordinary
+//     cleanup erasing the epoch the group had just entered. A merge that erased what it had
+//     just installed would be the same defect pointing the other way.
 func theDropSitesIn(reading eraseSourceReading, member string) []eraseDropSite {
 	fields := theFieldsReachingStorageOf(reading, member)
 	byName := map[string]eraseField{}
@@ -1557,6 +1583,11 @@ func theDropSitesIn(reading eraseSourceReading, member string) []eraseDropSite {
 		refusedAt := map[string]int{}
 		installed := map[string]map[string]bool{}
 		movedOut := map[string]map[string]bool{}
+		// where the WHOLE held value was read out into storage the body was handed, per
+		// field: the receiver's storage or a parameter's, which is storage that outlives the
+		// frame. A local is not a position here for the reason it is not one below.
+		handed := eraseHandedNamesOf(method.decl)
+		movedWholeAt := map[string]int{}
 		ast.Inspect(method.decl.Body, func(node ast.Node) bool {
 			switch typed := node.(type) {
 			case *ast.CallExpr:
@@ -1621,6 +1652,14 @@ func theDropSitesIn(reading eraseSourceReading, member string) []eraseDropSite {
 						if !isSelector {
 							continue
 						}
+						// the whole held value, by pointer, into storage the body was handed
+						if base, isBare := left.X.(*ast.Ident); isBare && handed[base.Name] {
+							if field := eraseWholeFieldOn(right, method.self); field != "" {
+								if at, seen := movedWholeAt[field]; !seen || int(typed.Pos()) < at {
+									movedWholeAt[field] = int(typed.Pos())
+								}
+							}
+						}
 						if base, isBare := left.X.(*ast.Ident); !isBare || base.Name != method.self {
 							continue
 						}
@@ -1657,20 +1696,59 @@ func theDropSitesIn(reading eraseSourceReading, member string) []eraseDropSite {
 				}
 				erasedPos, wasErased := erasedAt[field.name]
 				refusedPos, wasRefused := refusedAt[field.name]
+				movedPos, wasMoved := movedWholeAt[field.name]
 				sites = append(sites, eraseDropSite{
-					method:    method,
-					field:     field,
-					at:        int(assign.Pos()),
-					erased:    wasErased && erasedPos < int(assign.Pos()),
-					refused:   wasRefused && refusedPos < int(assign.Pos()),
-					installed: installed[field.name],
-					movedOut:  movedOut[field.name],
+					method:     method,
+					field:      field,
+					at:         int(assign.Pos()),
+					erased:     wasErased && erasedPos < int(assign.Pos()),
+					refused:    wasRefused && refusedPos < int(assign.Pos()),
+					installed:  installed[field.name],
+					movedOut:   movedOut[field.name],
+					movedWhole: wasMoved && movedPos < int(assign.Pos()),
 				})
 			}
 			return true
 		})
 	}
 	return sites
+}
+
+// eraseHandedNamesOf is the names a declaration holds what it was HANDED under: its receiver and
+// its parameters. Storage reached through one of them outlives the frame, which is what makes an
+// assignment into it an install and an assignment into a local not one.
+func eraseHandedNamesOf(function *ast.FuncDecl) map[string]bool {
+	handed := map[string]bool{}
+	if function.Recv != nil {
+		for _, field := range function.Recv.List {
+			for _, name := range field.Names {
+				handed[name.Name] = true
+			}
+		}
+	}
+	if function.Type.Params != nil {
+		for _, field := range function.Type.Params.List {
+			for _, name := range field.Names {
+				handed[name.Name] = true
+			}
+		}
+	}
+	delete(handed, "_")
+	return handed
+}
+
+// eraseWholeFieldOn answers which field of the holder an expression IS, whole: staged.schedule,
+// where staged is the name the holder is read under, answers "schedule", and staged.schedule.x
+// answers nothing, because a sub-field read out is the other reading's.
+func eraseWholeFieldOn(expr ast.Expr, receiver string) string {
+	selector, isSelector := expr.(*ast.SelectorExpr)
+	if !isSelector {
+		return ""
+	}
+	if base, isBare := selector.X.(*ast.Ident); isBare && base.Name == receiver {
+		return selector.Sel.Name
+	}
+	return ""
 }
 
 // eraseBranchLeaves reports whether a branch LEAVES rather than falling through to the
@@ -1992,7 +2070,7 @@ func TestEveryPathThatDropsHeldKeyMaterialErasesItFirst(t *testing.T) {
 				continue
 			}
 			sites += 1
-			if site.erased || site.refused {
+			if site.erased || site.refused || site.movedWhole {
 				continue
 			}
 			held := []string{}
@@ -2064,7 +2142,56 @@ func (self *Mover) merge() {
 	staged := self.pending
 	self.held = staged.held
 	staged.forgotten.Zeroize()
+	staged.held = nil
 	self.pending = nil
+}
+
+// the three neighbours of the shell-making assignment in merge, each ONE thing short of a
+// move: no install at all, the install written below the nil, and an install into a local
+// that goes out of scope with the frame. Every one of them drops a live Held.
+type Detacher struct {
+	pending *Holder
+}
+
+func (self *Detacher) detach() {
+	staged := self.pending
+	staged.held = nil
+}
+
+type Lagger struct {
+	pending *Holder
+	held    *Held
+}
+
+func (self *Lagger) lag() {
+	staged := self.pending
+	staged.held = nil
+	self.held = staged.held
+}
+
+type Leaker struct {
+	pending *Holder
+}
+
+func (self *Leaker) leak() {
+	staged := self.pending
+	kept := staged.held
+	staged.held = nil
+	_ = kept
+}
+
+// and an install into storage of a value this frame BUILT, which is a local however many
+// fields it has: nothing outside the frame holds fresh, so what is installed into it is
+// dropped with it.
+type Builder struct {
+	pending *Holder
+}
+
+func (self *Builder) build() {
+	staged := self.pending
+	fresh := &Lagger{}
+	fresh.held = staged.held
+	staged.held = nil
 }
 
 type Dropper struct {
@@ -2276,7 +2403,7 @@ func eraseControlReading(t *testing.T) {
 	// and the drop sites: Dropper is reported, Mover and Refuser are not.
 	verdicts := map[string]eraseDropSite{}
 	for _, member := range []string{"Mover", "Dropper", "Refuser", "Presumer", "SubFielder",
-		"Trailer", "Held"} {
+		"Trailer", "Held", "Holder"} {
 		for _, site := range theDropSitesIn(reading, member) {
 			verdicts[member+"."+site.method.name] = site
 		}
@@ -2311,6 +2438,31 @@ func eraseControlReading(t *testing.T) {
 	if !move.installed["held"] || !move.movedOut["forgotten"] {
 		t.Errorf("(*Mover).merge is read as installing %v and erasing %v out of the value it drops, want held installed and forgotten erased; a merge whose move goes unread is a merge this gate would demand erase the epoch it just entered",
 			slices.Sorted(maps.Keys(move.installed)), slices.Sorted(maps.Keys(move.movedOut)))
+	}
+	// the WHOLE-VALUE move: merge reads staged.held out into its receiver's storage and then
+	// writes nil over the field, and that assignment makes the shell rather than dropping
+	// anything. Its three neighbours are each one thing short of it and each is a drop.
+	shell, found := verdicts["Holder.merge"]
+	if !found {
+		t.Fatal("the drop reading found no assignment to held in (*Mover).merge through the local it took out of its receiver, so the whole-value move rule below is over nothing")
+	}
+	if !shell.movedWhole {
+		t.Error("(*Mover).merge writes nil over staged.held AFTER installing staged.held into self.held, and the reading does not call that a move; a merge that cannot leave a shell leaves the caller's value naming the epoch it just entered")
+	}
+	for name, why := range map[string]string{
+		"Holder.detach": "nils the field and installs it nowhere",
+		"Holder.lag":    "installs the field BELOW the nil, so what it installs is the nil",
+		"Holder.leak":   "reads the field into a local, which is not a position: the value goes out of scope with the frame",
+		"Holder.build":  "installs the field into storage of a value the frame built, which is a local however many fields it has",
+	} {
+		site, found := verdicts[name]
+		if !found {
+			t.Errorf("the drop reading found no assignment for %s, which %s", name, why)
+			continue
+		}
+		if site.movedWhole || site.erased || site.refused || len(site.installed) != 0 || len(site.movedOut) != 0 {
+			t.Errorf("%s is read as moving, erasing or refusing what it drops -- movedWhole=%v erased=%v refused=%v -- and it %s", name, site.movedWhole, site.erased, site.refused, why)
+		}
 	}
 	presume, found := verdicts["Presumer.release"]
 	if !found {
