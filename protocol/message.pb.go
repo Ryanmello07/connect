@@ -512,9 +512,17 @@ type MessageServerResponse struct {
 	// Safe to add late for a narrow reason, NOT the
 	// general one: it is not on any signed field list.
 	// Response fields are not categorically additive —
-	// FetchAttestation.sig covers nine FetchResponse
+	// FetchAttestation.sig covers TEN FetchAttestation
 	// fields and MASTER §9.4 requires both sides to
 	// agree on that preimage byte for byte.
+	//
+	// (This line read "nine FetchResponse fields" until
+	// ruling 32. Both halves were wrong, and Spec B §4.5
+	// corrected itself the same way: its own list said
+	// nine and held eight, having omitted server_id —
+	// which is not a FetchResponse field at all — and
+	// read_epoch joined the preimage on 2026-09-22. The
+	// ten are transcribed at FetchAttestation below.)
 	//
 	// Types that are valid to be assigned to Body:
 	//
@@ -1523,8 +1531,12 @@ type CreateGroupRequest struct {
 	GroupId           []byte                 `protobuf:"bytes,1,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`                                 // 32 B, CSPRNG, client-chosen
 	InitialCommit     *Record                `protobuf:"bytes,2,opt,name=initial_commit,json=initialCommit,proto3" json:"initial_commit,omitempty"`               // is_commit = 1, epoch = 0
 	BootstrapWriteKey []byte                 `protobuf:"bytes,3,opt,name=bootstrap_write_key,json=bootstrapWriteKey,proto3" json:"bootstrap_write_key,omitempty"` // write_key[0], EXACTLY 32 B. Used only to verify
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// initial_commit. This is self-certification: it is
+	// protected solely by the 20/day per-client_id rate
+	// limit, and nothing else. Stated plainly, not implied.
+	EpochKeys     *EpochKeyDelivery `protobuf:"bytes,4,opt,name=epoch_keys,json=epochKeys,proto3" json:"epoch_keys,omitempty"` // ruling 33. write_key[1] and read_key[1] — the pair
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *CreateGroupRequest) Reset() {
@@ -1574,6 +1586,13 @@ func (x *CreateGroupRequest) GetInitialCommit() *Record {
 func (x *CreateGroupRequest) GetBootstrapWriteKey() []byte {
 	if x != nil {
 		return x.BootstrapWriteKey
+	}
+	return nil
+}
+
+func (x *CreateGroupRequest) GetEpochKeys() *EpochKeyDelivery {
+	if x != nil {
+		return x.EpochKeys
 	}
 	return nil
 }
@@ -1638,17 +1657,147 @@ func (x *CreateGroupResponse) GetApplied() *RetentionApplied {
 	return nil
 }
 
+// ── the epoch key delivery (item 244, ruling 33) ─────────────────────────────
+//
+// The two keys the commit in this request opens its next epoch with, carried BESIDE the
+// record rather than inside it.
+//
+// Spec B §5.4 put write_key[n+1] and read_key[n+1] in the clear inside a structure the
+// server serves back verbatim, while §5.3 promises a member removed at epoch n loses
+// access when epoch n's read key ages out. Both cannot be true: the commit that removes
+// the member is sealed at n, is fetchable under read_key[n], and carries the keys of
+// n+1 — measured, twice, as a fetch and a forged write that both answered REASON_OK
+// under learned keys. Ruling 27 replaced the two keys in the attachment with
+// LP(H(epoch_keys)) under attachment kind 0x0005, and the keys have to arrive by some
+// other road. This is that road.
+//
+// IT IS A REQUEST FIELD AND NEVER A FIELD OF `Record`. That is ruling 33 and it is the
+// whole of what this type buys. `Record` is the server→client type in SIX places —
+// FetchResponse.records, SubmitResult.winning_commit, RecordPush.records,
+// TransientPush.records, WrapFetchResponse.records and GroupRecords.records — against
+// the two client→server carriers that reference this message. A key pair on `Record`
+// would be six serve paths that each have to remember to clear it, which is item 244
+// re-opened once per path; here the served type is structurally unable to carry a key
+// and there is nothing to remember. It also leaves `Record`'s projection contract alone:
+// submit checks proto.Equal(projectionOf(ParseRecord(record_bytes)), sent), and a key is
+// by construction not implied by a projection of record_bytes — which is the entire
+// point of the amendment — so a key on `Record` would answer REASON_REJECTED to every
+// commit rather than protecting one.
+//
+// NOTHING HERE IS INSIDE A MAC, AND IT DOES NOT NEED TO BE. Both carriers are on
+// §4.3.8's req_auth exemption list, so these two numbers are not protocol constants the
+// way MessageServerRequest.body's arm numbers are, and canonical_request_bytes is not
+// computed over either request. The binding is the digest instead, and it is free: the
+// attachment's octets are hashed into AAD_head and into the write_auth preimage, so the
+// MAC covers the attachment, the attachment covers LP(H(epoch_keys)), and the server
+// recomputes H(epoch_keys) over the two keys below and compares against a value the MAC
+// already authenticated. Altering either key fails that comparison. There is no second
+// authenticator to add and no new preimage term.
+//
+// THERE IS NO EPOCH AND NO group_id IN HERE, AND THAT IS NOT AN OMISSION. H(epoch_keys)
+// is taken over LP(group_id) ‖ u64(opens_epoch) ‖ LP(write_key) ‖ LP(read_key), and
+// connect/message gives the server no way to name either scope term itself:
+// message.CheckEpochKeysDigest reads opens_epoch out of the attachment's own body and
+// REFUSES to take one as a parameter, because three epochs are live at that call site —
+// the record header's, the attachment's, and the server's own current_epoch + 1 — and a
+// wrong choice among them type checks. The group is the enclosing request's own
+// group_id, which the server has already verified. A second copy of either value here
+// would be a field the checker will not read and that can disagree with the one the MAC
+// covers: exactly the defect message.NewEpochDigestAttachment exists to make
+// unrepresentable, re-created one layer out where this file cannot close it.
+type EpochKeyDelivery struct {
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	WriteKey []byte                 `protobuf:"bytes,1,opt,name=write_key,json=writeKey,proto3" json:"write_key,omitempty"` // write_key[e], EXACTLY 32 B, where e is the epoch the record
+	// this is aligned with OPENS — its kind 0x0005 attachment's own
+	// `epoch` field, one above the epoch the record is sealed at
+	ReadKey       []byte `protobuf:"bytes,2,opt,name=read_key,json=readKey,proto3" json:"read_key,omitempty"` // read_key[e], EXACTLY 32 B
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *EpochKeyDelivery) Reset() {
+	*x = EpochKeyDelivery{}
+	mi := &file_message_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *EpochKeyDelivery) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*EpochKeyDelivery) ProtoMessage() {}
+
+func (x *EpochKeyDelivery) ProtoReflect() protoreflect.Message {
+	mi := &file_message_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use EpochKeyDelivery.ProtoReflect.Descriptor instead.
+func (*EpochKeyDelivery) Descriptor() ([]byte, []int) {
+	return file_message_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *EpochKeyDelivery) GetWriteKey() []byte {
+	if x != nil {
+		return x.WriteKey
+	}
+	return nil
+}
+
+func (x *EpochKeyDelivery) GetReadKey() []byte {
+	if x != nil {
+		return x.ReadKey
+	}
+	return nil
+}
+
 type SubmitRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	GroupId       []byte                 `protobuf:"bytes,1,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`
-	Records       []*Record              `protobuf:"bytes,2,rep,name=records,proto3" json:"records,omitempty"` // at most Capabilities.max_records_per_submit
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	GroupId []byte                 `protobuf:"bytes,1,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`
+	Records []*Record              `protobuf:"bytes,2,rep,name=records,proto3" json:"records,omitempty"` // at most Capabilities.max_records_per_submit
+	// Ruling 33. The epoch keys for the commit in this batch, POSITIONALLY ALIGNED with
+	// `records` — the alignment SubmitResponse.results already uses in the other
+	// direction, and the long form of what this type is for is at EpochKeyDelivery.
+	//
+	// 3 is free because this message has never had a third field: Spec B §4.3.3 declares
+	// it with 1 and 2 and nothing else, and 14/15 are the file-wide read_epoch/req_auth
+	// slots, which §4.3.8 exempts this arm from and which it does not carry.
+	//
+	// LENGTH: EMPTY, OR EXACTLY AS LONG AS `records`. `results` states the alignment and
+	// leaves the length implicit; this states both, because the two lists fail
+	// differently. A short `results` loses an answer the client can see is missing. A
+	// short `epoch_keys` silently re-aims every later entry at the wrong record, and what
+	// it re-aims is a key.
+	//
+	// AN ENTRY AGAINST A RECORD WITH is_commit = 0 IS REASON_REJECTED, and so is a commit
+	// with no entry. Refusal, and not an empty entry: every field of EpochKeyDelivery has
+	// implicit presence, so a zero entry decodes as two EMPTY KEYS rather than as an
+	// absence — the REASON_OK = 0 hazard recorded at the foot of this file, one message
+	// over — and a commit whose keys never arrived is an epoch the server would install
+	// without having been handed what opens it. Both refusals are decided on values the
+	// server has already verified: `is_commit` is a projection field it checks against
+	// ParseRecord(record_bytes) before it gets here.
+	//
+	// In practice this list is empty or holds exactly one entry. §4.3.3 requires that a
+	// batch containing a commit contain exactly one record, and only a commit opens an
+	// epoch; the general rule is written as the general rule anyway, because the batch
+	// rule is Spec B's to relax and this alignment is not.
+	EpochKeys     []*EpochKeyDelivery `protobuf:"bytes,3,rep,name=epoch_keys,json=epochKeys,proto3" json:"epoch_keys,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *SubmitRequest) Reset() {
 	*x = SubmitRequest{}
-	mi := &file_message_proto_msgTypes[10]
+	mi := &file_message_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1660,7 +1809,7 @@ func (x *SubmitRequest) String() string {
 func (*SubmitRequest) ProtoMessage() {}
 
 func (x *SubmitRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_message_proto_msgTypes[10]
+	mi := &file_message_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1673,7 +1822,7 @@ func (x *SubmitRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SubmitRequest.ProtoReflect.Descriptor instead.
 func (*SubmitRequest) Descriptor() ([]byte, []int) {
-	return file_message_proto_rawDescGZIP(), []int{10}
+	return file_message_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *SubmitRequest) GetGroupId() []byte {
@@ -1686,6 +1835,13 @@ func (x *SubmitRequest) GetGroupId() []byte {
 func (x *SubmitRequest) GetRecords() []*Record {
 	if x != nil {
 		return x.Records
+	}
+	return nil
+}
+
+func (x *SubmitRequest) GetEpochKeys() []*EpochKeyDelivery {
+	if x != nil {
+		return x.EpochKeys
 	}
 	return nil
 }
@@ -1718,7 +1874,7 @@ type Record struct {
 
 func (x *Record) Reset() {
 	*x = Record{}
-	mi := &file_message_proto_msgTypes[11]
+	mi := &file_message_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1730,7 +1886,7 @@ func (x *Record) String() string {
 func (*Record) ProtoMessage() {}
 
 func (x *Record) ProtoReflect() protoreflect.Message {
-	mi := &file_message_proto_msgTypes[11]
+	mi := &file_message_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1743,7 +1899,7 @@ func (x *Record) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Record.ProtoReflect.Descriptor instead.
 func (*Record) Descriptor() ([]byte, []int) {
-	return file_message_proto_rawDescGZIP(), []int{11}
+	return file_message_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *Record) GetRecordBytes() []byte {
@@ -1846,7 +2002,7 @@ type SubmitResponse struct {
 
 func (x *SubmitResponse) Reset() {
 	*x = SubmitResponse{}
-	mi := &file_message_proto_msgTypes[12]
+	mi := &file_message_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1858,7 +2014,7 @@ func (x *SubmitResponse) String() string {
 func (*SubmitResponse) ProtoMessage() {}
 
 func (x *SubmitResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_message_proto_msgTypes[12]
+	mi := &file_message_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1871,7 +2027,7 @@ func (x *SubmitResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SubmitResponse.ProtoReflect.Descriptor instead.
 func (*SubmitResponse) Descriptor() ([]byte, []int) {
-	return file_message_proto_rawDescGZIP(), []int{12}
+	return file_message_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *SubmitResponse) GetResults() []*SubmitResult {
@@ -1895,7 +2051,7 @@ type SubmitResult struct {
 
 func (x *SubmitResult) Reset() {
 	*x = SubmitResult{}
-	mi := &file_message_proto_msgTypes[13]
+	mi := &file_message_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1907,7 +2063,7 @@ func (x *SubmitResult) String() string {
 func (*SubmitResult) ProtoMessage() {}
 
 func (x *SubmitResult) ProtoReflect() protoreflect.Message {
-	mi := &file_message_proto_msgTypes[13]
+	mi := &file_message_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1920,7 +2076,7 @@ func (x *SubmitResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SubmitResult.ProtoReflect.Descriptor instead.
 func (*SubmitResult) Descriptor() ([]byte, []int) {
-	return file_message_proto_rawDescGZIP(), []int{13}
+	return file_message_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *SubmitResult) GetReason() Reason {
@@ -1974,7 +2130,7 @@ type FetchRequest struct {
 
 func (x *FetchRequest) Reset() {
 	*x = FetchRequest{}
-	mi := &file_message_proto_msgTypes[14]
+	mi := &file_message_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1986,7 +2142,7 @@ func (x *FetchRequest) String() string {
 func (*FetchRequest) ProtoMessage() {}
 
 func (x *FetchRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_message_proto_msgTypes[14]
+	mi := &file_message_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1999,7 +2155,7 @@ func (x *FetchRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FetchRequest.ProtoReflect.Descriptor instead.
 func (*FetchRequest) Descriptor() ([]byte, []int) {
-	return file_message_proto_rawDescGZIP(), []int{14}
+	return file_message_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *FetchRequest) GetGroupId() []byte {
@@ -2065,7 +2221,7 @@ type FetchResponse struct {
 
 func (x *FetchResponse) Reset() {
 	*x = FetchResponse{}
-	mi := &file_message_proto_msgTypes[15]
+	mi := &file_message_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2077,7 +2233,7 @@ func (x *FetchResponse) String() string {
 func (*FetchResponse) ProtoMessage() {}
 
 func (x *FetchResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_message_proto_msgTypes[15]
+	mi := &file_message_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2090,7 +2246,7 @@ func (x *FetchResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FetchResponse.ProtoReflect.Descriptor instead.
 func (*FetchResponse) Descriptor() ([]byte, []int) {
-	return file_message_proto_rawDescGZIP(), []int{15}
+	return file_message_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *FetchResponse) GetRecords() []*Record {
@@ -2139,14 +2295,44 @@ type FetchAttestation struct {
 	ServerId          []byte                 `protobuf:"bytes,7,opt,name=server_id,json=serverId,proto3" json:"server_id,omitempty"`
 	ClassMask         uint32                 `protobuf:"varint,8,opt,name=class_mask,json=classMask,proto3" json:"class_mask,omitempty"`
 	HeadsOnly         bool                   `protobuf:"varint,9,opt,name=heads_only,json=headsOnly,proto3" json:"heads_only,omitempty"`
-	Sig               []byte                 `protobuf:"bytes,10,opt,name=sig,proto3" json:"sig,omitempty"` // Ed25519 over the §4.3.4 preimage:
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	ReadEpoch         uint64                 `protobuf:"varint,11,opt,name=read_epoch,json=readEpoch,proto3" json:"read_epoch,omitempty"` // §4.3.4, ruling 32. The epoch ceiling this answer
+	// was served under. §5.1.1's ceiling made
+	// high_water_record_id relative to the reader's own
+	// epoch, so a server applying a SHORTER ceiling than
+	// the request named produces an answer that
+	// proto.Equals the honest answer at that shorter
+	// ceiling — measured at 7 of 12 records, two whole
+	// epochs, withheld with no error and no hole, and the
+	// receiver's omission predicate answering "nothing
+	// omitted". It is in the preimage below for the
+	// reason §4.3.4 gives for class_mask and heads_only:
+	// "so that a filtered fetch is not
+	// byte-indistinguishable from a withholding one".
+	// The ceiling is the third filter, and those two are
+	// the inline control — they are values the client
+	// holds too, and they are signed. What a signature
+	// buys is not the value; it is the server's
+	// attributable commitment to having used it.
+	//
+	// 11, and 11 is free: this message has never had an
+	// eleventh field. NOT 10, because `sig` landed at 10
+	// and a landed field number is never renumbered. NOT
+	// 14, although 14 is the read_epoch slot everywhere
+	// else in this file: 14 is reserved on the REQUEST
+	// messages, whose every field number is inside
+	// canonical_request_bytes and therefore inside a MAC
+	// (Spec A §5.7). This is a response field, it is in
+	// no MAC, and its numbering is pinned by the explicit
+	// named field list below and by nothing else. Spec B
+	// §4.3.4 and MASTER §9.4 both number it 11.
+	Sig           []byte `protobuf:"bytes,10,opt,name=sig,proto3" json:"sig,omitempty"` // Ed25519 over the §4.3.4 preimage:
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *FetchAttestation) Reset() {
 	*x = FetchAttestation{}
-	mi := &file_message_proto_msgTypes[16]
+	mi := &file_message_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2158,7 +2344,7 @@ func (x *FetchAttestation) String() string {
 func (*FetchAttestation) ProtoMessage() {}
 
 func (x *FetchAttestation) ProtoReflect() protoreflect.Message {
-	mi := &file_message_proto_msgTypes[16]
+	mi := &file_message_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2171,7 +2357,7 @@ func (x *FetchAttestation) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FetchAttestation.ProtoReflect.Descriptor instead.
 func (*FetchAttestation) Descriptor() ([]byte, []int) {
-	return file_message_proto_rawDescGZIP(), []int{16}
+	return file_message_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *FetchAttestation) GetGroupId() []byte {
@@ -2237,6 +2423,13 @@ func (x *FetchAttestation) GetHeadsOnly() bool {
 	return false
 }
 
+func (x *FetchAttestation) GetReadEpoch() uint64 {
+	if x != nil {
+		return x.ReadEpoch
+	}
+	return 0
+}
+
 func (x *FetchAttestation) GetSig() []byte {
 	if x != nil {
 		return x.Sig
@@ -2257,7 +2450,7 @@ type SubscribeRequest struct {
 
 func (x *SubscribeRequest) Reset() {
 	*x = SubscribeRequest{}
-	mi := &file_message_proto_msgTypes[17]
+	mi := &file_message_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2269,7 +2462,7 @@ func (x *SubscribeRequest) String() string {
 func (*SubscribeRequest) ProtoMessage() {}
 
 func (x *SubscribeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_message_proto_msgTypes[17]
+	mi := &file_message_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2282,7 +2475,7 @@ func (x *SubscribeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SubscribeRequest.ProtoReflect.Descriptor instead.
 func (*SubscribeRequest) Descriptor() ([]byte, []int) {
-	return file_message_proto_rawDescGZIP(), []int{17}
+	return file_message_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *SubscribeRequest) GetSubscriptions() []*Subscription {
@@ -2323,7 +2516,7 @@ type Subscription struct {
 
 func (x *Subscription) Reset() {
 	*x = Subscription{}
-	mi := &file_message_proto_msgTypes[18]
+	mi := &file_message_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2335,7 +2528,7 @@ func (x *Subscription) String() string {
 func (*Subscription) ProtoMessage() {}
 
 func (x *Subscription) ProtoReflect() protoreflect.Message {
-	mi := &file_message_proto_msgTypes[18]
+	mi := &file_message_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2348,7 +2541,7 @@ func (x *Subscription) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Subscription.ProtoReflect.Descriptor instead.
 func (*Subscription) Descriptor() ([]byte, []int) {
-	return file_message_proto_rawDescGZIP(), []int{18}
+	return file_message_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *Subscription) GetGroupId() []byte {
@@ -2374,7 +2567,7 @@ type SubscribeResponse struct {
 
 func (x *SubscribeResponse) Reset() {
 	*x = SubscribeResponse{}
-	mi := &file_message_proto_msgTypes[19]
+	mi := &file_message_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2386,7 +2579,7 @@ func (x *SubscribeResponse) String() string {
 func (*SubscribeResponse) ProtoMessage() {}
 
 func (x *SubscribeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_message_proto_msgTypes[19]
+	mi := &file_message_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2399,7 +2592,7 @@ func (x *SubscribeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SubscribeResponse.ProtoReflect.Descriptor instead.
 func (*SubscribeResponse) Descriptor() ([]byte, []int) {
-	return file_message_proto_rawDescGZIP(), []int{19}
+	return file_message_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *SubscribeResponse) GetAcks() []*SubscriptionAck {
@@ -2420,7 +2613,7 @@ type RecordPush struct {
 
 func (x *RecordPush) Reset() {
 	*x = RecordPush{}
-	mi := &file_message_proto_msgTypes[20]
+	mi := &file_message_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2432,7 +2625,7 @@ func (x *RecordPush) String() string {
 func (*RecordPush) ProtoMessage() {}
 
 func (x *RecordPush) ProtoReflect() protoreflect.Message {
-	mi := &file_message_proto_msgTypes[20]
+	mi := &file_message_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2445,7 +2638,7 @@ func (x *RecordPush) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RecordPush.ProtoReflect.Descriptor instead.
 func (*RecordPush) Descriptor() ([]byte, []int) {
-	return file_message_proto_rawDescGZIP(), []int{20}
+	return file_message_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *RecordPush) GetGroupId() []byte {
@@ -2479,7 +2672,7 @@ type TransientPush struct {
 
 func (x *TransientPush) Reset() {
 	*x = TransientPush{}
-	mi := &file_message_proto_msgTypes[21]
+	mi := &file_message_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2491,7 +2684,7 @@ func (x *TransientPush) String() string {
 func (*TransientPush) ProtoMessage() {}
 
 func (x *TransientPush) ProtoReflect() protoreflect.Message {
-	mi := &file_message_proto_msgTypes[21]
+	mi := &file_message_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2504,7 +2697,7 @@ func (x *TransientPush) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TransientPush.ProtoReflect.Descriptor instead.
 func (*TransientPush) Descriptor() ([]byte, []int) {
-	return file_message_proto_rawDescGZIP(), []int{21}
+	return file_message_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *TransientPush) GetGroupId() []byte {
@@ -2549,7 +2742,7 @@ type UnsubscribeRequest struct {
 
 func (x *UnsubscribeRequest) Reset() {
 	*x = UnsubscribeRequest{}
-	mi := &file_message_proto_msgTypes[22]
+	mi := &file_message_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2561,7 +2754,7 @@ func (x *UnsubscribeRequest) String() string {
 func (*UnsubscribeRequest) ProtoMessage() {}
 
 func (x *UnsubscribeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_message_proto_msgTypes[22]
+	mi := &file_message_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2574,7 +2767,7 @@ func (x *UnsubscribeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UnsubscribeRequest.ProtoReflect.Descriptor instead.
 func (*UnsubscribeRequest) Descriptor() ([]byte, []int) {
-	return file_message_proto_rawDescGZIP(), []int{22}
+	return file_message_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *UnsubscribeRequest) GetGroupIds() [][]byte {
@@ -2607,7 +2800,7 @@ type BlobGrantRequest struct {
 
 func (x *BlobGrantRequest) Reset() {
 	*x = BlobGrantRequest{}
-	mi := &file_message_proto_msgTypes[23]
+	mi := &file_message_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2619,7 +2812,7 @@ func (x *BlobGrantRequest) String() string {
 func (*BlobGrantRequest) ProtoMessage() {}
 
 func (x *BlobGrantRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_message_proto_msgTypes[23]
+	mi := &file_message_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2632,7 +2825,7 @@ func (x *BlobGrantRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BlobGrantRequest.ProtoReflect.Descriptor instead.
 func (*BlobGrantRequest) Descriptor() ([]byte, []int) {
-	return file_message_proto_rawDescGZIP(), []int{23}
+	return file_message_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *BlobGrantRequest) GetGroupId() []byte {
@@ -2697,7 +2890,7 @@ type BlobGrantResponse struct {
 
 func (x *BlobGrantResponse) Reset() {
 	*x = BlobGrantResponse{}
-	mi := &file_message_proto_msgTypes[24]
+	mi := &file_message_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2709,7 +2902,7 @@ func (x *BlobGrantResponse) String() string {
 func (*BlobGrantResponse) ProtoMessage() {}
 
 func (x *BlobGrantResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_message_proto_msgTypes[24]
+	mi := &file_message_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2722,7 +2915,7 @@ func (x *BlobGrantResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BlobGrantResponse.ProtoReflect.Descriptor instead.
 func (*BlobGrantResponse) Descriptor() ([]byte, []int) {
-	return file_message_proto_rawDescGZIP(), []int{24}
+	return file_message_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *BlobGrantResponse) GetGrantToken() []byte {
@@ -2775,7 +2968,7 @@ type RecoveryFetchRequest struct {
 
 func (x *RecoveryFetchRequest) Reset() {
 	*x = RecoveryFetchRequest{}
-	mi := &file_message_proto_msgTypes[25]
+	mi := &file_message_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2787,7 +2980,7 @@ func (x *RecoveryFetchRequest) String() string {
 func (*RecoveryFetchRequest) ProtoMessage() {}
 
 func (x *RecoveryFetchRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_message_proto_msgTypes[25]
+	mi := &file_message_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2800,7 +2993,7 @@ func (x *RecoveryFetchRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RecoveryFetchRequest.ProtoReflect.Descriptor instead.
 func (*RecoveryFetchRequest) Descriptor() ([]byte, []int) {
-	return file_message_proto_rawDescGZIP(), []int{25}
+	return file_message_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *RecoveryFetchRequest) GetRecoveryHandle() []byte {
@@ -2841,7 +3034,7 @@ type RecoveryFetchResponse struct {
 
 func (x *RecoveryFetchResponse) Reset() {
 	*x = RecoveryFetchResponse{}
-	mi := &file_message_proto_msgTypes[26]
+	mi := &file_message_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2853,7 +3046,7 @@ func (x *RecoveryFetchResponse) String() string {
 func (*RecoveryFetchResponse) ProtoMessage() {}
 
 func (x *RecoveryFetchResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_message_proto_msgTypes[26]
+	mi := &file_message_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2866,7 +3059,7 @@ func (x *RecoveryFetchResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RecoveryFetchResponse.ProtoReflect.Descriptor instead.
 func (*RecoveryFetchResponse) Descriptor() ([]byte, []int) {
-	return file_message_proto_rawDescGZIP(), []int{26}
+	return file_message_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *RecoveryFetchResponse) GetGroups() []*GroupRecords {
@@ -2899,7 +3092,7 @@ type WrapFetchRequest struct {
 
 func (x *WrapFetchRequest) Reset() {
 	*x = WrapFetchRequest{}
-	mi := &file_message_proto_msgTypes[27]
+	mi := &file_message_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2911,7 +3104,7 @@ func (x *WrapFetchRequest) String() string {
 func (*WrapFetchRequest) ProtoMessage() {}
 
 func (x *WrapFetchRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_message_proto_msgTypes[27]
+	mi := &file_message_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2924,7 +3117,7 @@ func (x *WrapFetchRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WrapFetchRequest.ProtoReflect.Descriptor instead.
 func (*WrapFetchRequest) Descriptor() ([]byte, []int) {
-	return file_message_proto_rawDescGZIP(), []int{27}
+	return file_message_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *WrapFetchRequest) GetGroupId() []byte {
@@ -2979,7 +3172,7 @@ type WrapFetchResponse struct {
 
 func (x *WrapFetchResponse) Reset() {
 	*x = WrapFetchResponse{}
-	mi := &file_message_proto_msgTypes[28]
+	mi := &file_message_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2991,7 +3184,7 @@ func (x *WrapFetchResponse) String() string {
 func (*WrapFetchResponse) ProtoMessage() {}
 
 func (x *WrapFetchResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_message_proto_msgTypes[28]
+	mi := &file_message_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3004,7 +3197,7 @@ func (x *WrapFetchResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WrapFetchResponse.ProtoReflect.Descriptor instead.
 func (*WrapFetchResponse) Descriptor() ([]byte, []int) {
-	return file_message_proto_rawDescGZIP(), []int{28}
+	return file_message_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *WrapFetchResponse) GetRecords() []*Record {
@@ -3032,7 +3225,7 @@ type GroupStatusRequest struct {
 
 func (x *GroupStatusRequest) Reset() {
 	*x = GroupStatusRequest{}
-	mi := &file_message_proto_msgTypes[29]
+	mi := &file_message_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3044,7 +3237,7 @@ func (x *GroupStatusRequest) String() string {
 func (*GroupStatusRequest) ProtoMessage() {}
 
 func (x *GroupStatusRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_message_proto_msgTypes[29]
+	mi := &file_message_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3057,7 +3250,7 @@ func (x *GroupStatusRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GroupStatusRequest.ProtoReflect.Descriptor instead.
 func (*GroupStatusRequest) Descriptor() ([]byte, []int) {
-	return file_message_proto_rawDescGZIP(), []int{29}
+	return file_message_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *GroupStatusRequest) GetGroupId() []byte {
@@ -3095,7 +3288,7 @@ type GroupStatusResponse struct {
 
 func (x *GroupStatusResponse) Reset() {
 	*x = GroupStatusResponse{}
-	mi := &file_message_proto_msgTypes[30]
+	mi := &file_message_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3107,7 +3300,7 @@ func (x *GroupStatusResponse) String() string {
 func (*GroupStatusResponse) ProtoMessage() {}
 
 func (x *GroupStatusResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_message_proto_msgTypes[30]
+	mi := &file_message_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3120,7 +3313,7 @@ func (x *GroupStatusResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GroupStatusResponse.ProtoReflect.Descriptor instead.
 func (*GroupStatusResponse) Descriptor() ([]byte, []int) {
-	return file_message_proto_rawDescGZIP(), []int{30}
+	return file_message_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *GroupStatusResponse) GetCurrentEpoch() uint64 {
@@ -3177,7 +3370,7 @@ type CapabilityChange struct {
 
 func (x *CapabilityChange) Reset() {
 	*x = CapabilityChange{}
-	mi := &file_message_proto_msgTypes[31]
+	mi := &file_message_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3189,7 +3382,7 @@ func (x *CapabilityChange) String() string {
 func (*CapabilityChange) ProtoMessage() {}
 
 func (x *CapabilityChange) ProtoReflect() protoreflect.Message {
-	mi := &file_message_proto_msgTypes[31]
+	mi := &file_message_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3202,7 +3395,7 @@ func (x *CapabilityChange) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CapabilityChange.ProtoReflect.Descriptor instead.
 func (*CapabilityChange) Descriptor() ([]byte, []int) {
-	return file_message_proto_rawDescGZIP(), []int{31}
+	return file_message_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *CapabilityChange) GetCapabilities() *Capabilities {
@@ -3243,7 +3436,7 @@ type Backpressure struct {
 
 func (x *Backpressure) Reset() {
 	*x = Backpressure{}
-	mi := &file_message_proto_msgTypes[32]
+	mi := &file_message_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3255,7 +3448,7 @@ func (x *Backpressure) String() string {
 func (*Backpressure) ProtoMessage() {}
 
 func (x *Backpressure) ProtoReflect() protoreflect.Message {
-	mi := &file_message_proto_msgTypes[32]
+	mi := &file_message_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3268,7 +3461,7 @@ func (x *Backpressure) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Backpressure.ProtoReflect.Descriptor instead.
 func (*Backpressure) Descriptor() ([]byte, []int) {
-	return file_message_proto_rawDescGZIP(), []int{32}
+	return file_message_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *Backpressure) GetGroupId() []byte {
@@ -3294,7 +3487,7 @@ type Drain struct {
 
 func (x *Drain) Reset() {
 	*x = Drain{}
-	mi := &file_message_proto_msgTypes[33]
+	mi := &file_message_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3306,7 +3499,7 @@ func (x *Drain) String() string {
 func (*Drain) ProtoMessage() {}
 
 func (x *Drain) ProtoReflect() protoreflect.Message {
-	mi := &file_message_proto_msgTypes[33]
+	mi := &file_message_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3319,7 +3512,7 @@ func (x *Drain) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Drain.ProtoReflect.Descriptor instead.
 func (*Drain) Descriptor() ([]byte, []int) {
-	return file_message_proto_rawDescGZIP(), []int{33}
+	return file_message_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *Drain) GetReconnectAfterMs() uint32 {
@@ -3341,7 +3534,7 @@ type GroupRecords struct {
 
 func (x *GroupRecords) Reset() {
 	*x = GroupRecords{}
-	mi := &file_message_proto_msgTypes[34]
+	mi := &file_message_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3353,7 +3546,7 @@ func (x *GroupRecords) String() string {
 func (*GroupRecords) ProtoMessage() {}
 
 func (x *GroupRecords) ProtoReflect() protoreflect.Message {
-	mi := &file_message_proto_msgTypes[34]
+	mi := &file_message_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3366,7 +3559,7 @@ func (x *GroupRecords) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GroupRecords.ProtoReflect.Descriptor instead.
 func (*GroupRecords) Descriptor() ([]byte, []int) {
-	return file_message_proto_rawDescGZIP(), []int{34}
+	return file_message_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *GroupRecords) GetGroupId() []byte {
@@ -3408,7 +3601,7 @@ type SubscriptionAck struct {
 
 func (x *SubscriptionAck) Reset() {
 	*x = SubscriptionAck{}
-	mi := &file_message_proto_msgTypes[35]
+	mi := &file_message_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3420,7 +3613,7 @@ func (x *SubscriptionAck) String() string {
 func (*SubscriptionAck) ProtoMessage() {}
 
 func (x *SubscriptionAck) ProtoReflect() protoreflect.Message {
-	mi := &file_message_proto_msgTypes[35]
+	mi := &file_message_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3433,7 +3626,7 @@ func (x *SubscriptionAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SubscriptionAck.ProtoReflect.Descriptor instead.
 func (*SubscriptionAck) Descriptor() ([]byte, []int) {
-	return file_message_proto_rawDescGZIP(), []int{35}
+	return file_message_proto_rawDescGZIP(), []int{36}
 }
 
 func (x *SubscriptionAck) GetGroupId() []byte {
@@ -3472,7 +3665,7 @@ type KtGossip struct {
 
 func (x *KtGossip) Reset() {
 	*x = KtGossip{}
-	mi := &file_message_proto_msgTypes[36]
+	mi := &file_message_proto_msgTypes[37]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3484,7 +3677,7 @@ func (x *KtGossip) String() string {
 func (*KtGossip) ProtoMessage() {}
 
 func (x *KtGossip) ProtoReflect() protoreflect.Message {
-	mi := &file_message_proto_msgTypes[36]
+	mi := &file_message_proto_msgTypes[37]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3497,7 +3690,7 @@ func (x *KtGossip) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use KtGossip.ProtoReflect.Descriptor instead.
 func (*KtGossip) Descriptor() ([]byte, []int) {
-	return file_message_proto_rawDescGZIP(), []int{36}
+	return file_message_proto_rawDescGZIP(), []int{37}
 }
 
 func (x *KtGossip) GetKtEpoch() uint64 {
@@ -3568,7 +3761,7 @@ type RetentionApplied struct {
 
 func (x *RetentionApplied) Reset() {
 	*x = RetentionApplied{}
-	mi := &file_message_proto_msgTypes[37]
+	mi := &file_message_proto_msgTypes[38]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3580,7 +3773,7 @@ func (x *RetentionApplied) String() string {
 func (*RetentionApplied) ProtoMessage() {}
 
 func (x *RetentionApplied) ProtoReflect() protoreflect.Message {
-	mi := &file_message_proto_msgTypes[37]
+	mi := &file_message_proto_msgTypes[38]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3593,7 +3786,7 @@ func (x *RetentionApplied) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RetentionApplied.ProtoReflect.Descriptor instead.
 func (*RetentionApplied) Descriptor() ([]byte, []int) {
-	return file_message_proto_rawDescGZIP(), []int{37}
+	return file_message_proto_rawDescGZIP(), []int{38}
 }
 
 func (x *RetentionApplied) GetMediaTtlSeconds() uint32 {
@@ -3666,7 +3859,7 @@ type RendezvousRegisterRequest struct {
 
 func (x *RendezvousRegisterRequest) Reset() {
 	*x = RendezvousRegisterRequest{}
-	mi := &file_message_proto_msgTypes[38]
+	mi := &file_message_proto_msgTypes[39]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3678,7 +3871,7 @@ func (x *RendezvousRegisterRequest) String() string {
 func (*RendezvousRegisterRequest) ProtoMessage() {}
 
 func (x *RendezvousRegisterRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_message_proto_msgTypes[38]
+	mi := &file_message_proto_msgTypes[39]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3691,7 +3884,7 @@ func (x *RendezvousRegisterRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RendezvousRegisterRequest.ProtoReflect.Descriptor instead.
 func (*RendezvousRegisterRequest) Descriptor() ([]byte, []int) {
-	return file_message_proto_rawDescGZIP(), []int{38}
+	return file_message_proto_rawDescGZIP(), []int{39}
 }
 
 func (x *RendezvousRegisterRequest) GetRendezvousId() []byte {
@@ -3746,7 +3939,7 @@ type RendezvousRegisterResponse struct {
 
 func (x *RendezvousRegisterResponse) Reset() {
 	*x = RendezvousRegisterResponse{}
-	mi := &file_message_proto_msgTypes[39]
+	mi := &file_message_proto_msgTypes[40]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3758,7 +3951,7 @@ func (x *RendezvousRegisterResponse) String() string {
 func (*RendezvousRegisterResponse) ProtoMessage() {}
 
 func (x *RendezvousRegisterResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_message_proto_msgTypes[39]
+	mi := &file_message_proto_msgTypes[40]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3771,7 +3964,7 @@ func (x *RendezvousRegisterResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RendezvousRegisterResponse.ProtoReflect.Descriptor instead.
 func (*RendezvousRegisterResponse) Descriptor() ([]byte, []int) {
-	return file_message_proto_rawDescGZIP(), []int{39}
+	return file_message_proto_rawDescGZIP(), []int{40}
 }
 
 func (x *RendezvousRegisterResponse) GetExpireTimeMs() uint64 {
@@ -3798,7 +3991,7 @@ type RendezvousOpenRequest struct {
 
 func (x *RendezvousOpenRequest) Reset() {
 	*x = RendezvousOpenRequest{}
-	mi := &file_message_proto_msgTypes[40]
+	mi := &file_message_proto_msgTypes[41]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3810,7 +4003,7 @@ func (x *RendezvousOpenRequest) String() string {
 func (*RendezvousOpenRequest) ProtoMessage() {}
 
 func (x *RendezvousOpenRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_message_proto_msgTypes[40]
+	mi := &file_message_proto_msgTypes[41]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3823,7 +4016,7 @@ func (x *RendezvousOpenRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RendezvousOpenRequest.ProtoReflect.Descriptor instead.
 func (*RendezvousOpenRequest) Descriptor() ([]byte, []int) {
-	return file_message_proto_rawDescGZIP(), []int{40}
+	return file_message_proto_rawDescGZIP(), []int{41}
 }
 
 func (x *RendezvousOpenRequest) GetRendezvousId() []byte {
@@ -3851,7 +4044,7 @@ type RendezvousOpenResponse struct {
 
 func (x *RendezvousOpenResponse) Reset() {
 	*x = RendezvousOpenResponse{}
-	mi := &file_message_proto_msgTypes[41]
+	mi := &file_message_proto_msgTypes[42]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3863,7 +4056,7 @@ func (x *RendezvousOpenResponse) String() string {
 func (*RendezvousOpenResponse) ProtoMessage() {}
 
 func (x *RendezvousOpenResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_message_proto_msgTypes[41]
+	mi := &file_message_proto_msgTypes[42]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3876,7 +4069,7 @@ func (x *RendezvousOpenResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RendezvousOpenResponse.ProtoReflect.Descriptor instead.
 func (*RendezvousOpenResponse) Descriptor() ([]byte, []int) {
-	return file_message_proto_rawDescGZIP(), []int{41}
+	return file_message_proto_rawDescGZIP(), []int{42}
 }
 
 func (x *RendezvousOpenResponse) GetCardXwingPub() []byte {
@@ -3911,7 +4104,7 @@ type RendezvousDepositRequest struct {
 
 func (x *RendezvousDepositRequest) Reset() {
 	*x = RendezvousDepositRequest{}
-	mi := &file_message_proto_msgTypes[42]
+	mi := &file_message_proto_msgTypes[43]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3923,7 +4116,7 @@ func (x *RendezvousDepositRequest) String() string {
 func (*RendezvousDepositRequest) ProtoMessage() {}
 
 func (x *RendezvousDepositRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_message_proto_msgTypes[42]
+	mi := &file_message_proto_msgTypes[43]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3936,7 +4129,7 @@ func (x *RendezvousDepositRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RendezvousDepositRequest.ProtoReflect.Descriptor instead.
 func (*RendezvousDepositRequest) Descriptor() ([]byte, []int) {
-	return file_message_proto_rawDescGZIP(), []int{42}
+	return file_message_proto_rawDescGZIP(), []int{43}
 }
 
 func (x *RendezvousDepositRequest) GetRendezvousId() []byte {
@@ -3969,7 +4162,7 @@ type RendezvousDepositResponse struct {
 
 func (x *RendezvousDepositResponse) Reset() {
 	*x = RendezvousDepositResponse{}
-	mi := &file_message_proto_msgTypes[43]
+	mi := &file_message_proto_msgTypes[44]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3981,7 +4174,7 @@ func (x *RendezvousDepositResponse) String() string {
 func (*RendezvousDepositResponse) ProtoMessage() {}
 
 func (x *RendezvousDepositResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_message_proto_msgTypes[43]
+	mi := &file_message_proto_msgTypes[44]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3994,7 +4187,7 @@ func (x *RendezvousDepositResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RendezvousDepositResponse.ProtoReflect.Descriptor instead.
 func (*RendezvousDepositResponse) Descriptor() ([]byte, []int) {
-	return file_message_proto_rawDescGZIP(), []int{43}
+	return file_message_proto_rawDescGZIP(), []int{44}
 }
 
 func (x *RendezvousDepositResponse) GetDepositId() uint64 {
@@ -4018,7 +4211,7 @@ type RendezvousCollectRequest struct {
 
 func (x *RendezvousCollectRequest) Reset() {
 	*x = RendezvousCollectRequest{}
-	mi := &file_message_proto_msgTypes[44]
+	mi := &file_message_proto_msgTypes[45]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4030,7 +4223,7 @@ func (x *RendezvousCollectRequest) String() string {
 func (*RendezvousCollectRequest) ProtoMessage() {}
 
 func (x *RendezvousCollectRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_message_proto_msgTypes[44]
+	mi := &file_message_proto_msgTypes[45]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4043,7 +4236,7 @@ func (x *RendezvousCollectRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RendezvousCollectRequest.ProtoReflect.Descriptor instead.
 func (*RendezvousCollectRequest) Descriptor() ([]byte, []int) {
-	return file_message_proto_rawDescGZIP(), []int{44}
+	return file_message_proto_rawDescGZIP(), []int{45}
 }
 
 func (x *RendezvousCollectRequest) GetRendezvousId() []byte {
@@ -4101,7 +4294,7 @@ type RendezvousCollectResponse struct {
 
 func (x *RendezvousCollectResponse) Reset() {
 	*x = RendezvousCollectResponse{}
-	mi := &file_message_proto_msgTypes[45]
+	mi := &file_message_proto_msgTypes[46]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4113,7 +4306,7 @@ func (x *RendezvousCollectResponse) String() string {
 func (*RendezvousCollectResponse) ProtoMessage() {}
 
 func (x *RendezvousCollectResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_message_proto_msgTypes[45]
+	mi := &file_message_proto_msgTypes[46]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4126,7 +4319,7 @@ func (x *RendezvousCollectResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RendezvousCollectResponse.ProtoReflect.Descriptor instead.
 func (*RendezvousCollectResponse) Descriptor() ([]byte, []int) {
-	return file_message_proto_rawDescGZIP(), []int{45}
+	return file_message_proto_rawDescGZIP(), []int{46}
 }
 
 func (x *RendezvousCollectResponse) GetDeposits() []*RendezvousDeposit {
@@ -4175,7 +4368,7 @@ type RendezvousDeposit struct {
 
 func (x *RendezvousDeposit) Reset() {
 	*x = RendezvousDeposit{}
-	mi := &file_message_proto_msgTypes[46]
+	mi := &file_message_proto_msgTypes[47]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4187,7 +4380,7 @@ func (x *RendezvousDeposit) String() string {
 func (*RendezvousDeposit) ProtoMessage() {}
 
 func (x *RendezvousDeposit) ProtoReflect() protoreflect.Message {
-	mi := &file_message_proto_msgTypes[46]
+	mi := &file_message_proto_msgTypes[47]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4200,7 +4393,7 @@ func (x *RendezvousDeposit) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RendezvousDeposit.ProtoReflect.Descriptor instead.
 func (*RendezvousDeposit) Descriptor() ([]byte, []int) {
-	return file_message_proto_rawDescGZIP(), []int{46}
+	return file_message_proto_rawDescGZIP(), []int{47}
 }
 
 func (x *RendezvousDeposit) GetDepositId() uint64 {
@@ -4234,7 +4427,7 @@ type RendezvousRetireRequest struct {
 
 func (x *RendezvousRetireRequest) Reset() {
 	*x = RendezvousRetireRequest{}
-	mi := &file_message_proto_msgTypes[47]
+	mi := &file_message_proto_msgTypes[48]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4246,7 +4439,7 @@ func (x *RendezvousRetireRequest) String() string {
 func (*RendezvousRetireRequest) ProtoMessage() {}
 
 func (x *RendezvousRetireRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_message_proto_msgTypes[47]
+	mi := &file_message_proto_msgTypes[48]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4259,7 +4452,7 @@ func (x *RendezvousRetireRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RendezvousRetireRequest.ProtoReflect.Descriptor instead.
 func (*RendezvousRetireRequest) Descriptor() ([]byte, []int) {
-	return file_message_proto_rawDescGZIP(), []int{47}
+	return file_message_proto_rawDescGZIP(), []int{48}
 }
 
 func (x *RendezvousRetireRequest) GetRendezvousId() []byte {
@@ -4285,7 +4478,7 @@ type RendezvousRetireResponse struct {
 
 func (x *RendezvousRetireResponse) Reset() {
 	*x = RendezvousRetireResponse{}
-	mi := &file_message_proto_msgTypes[48]
+	mi := &file_message_proto_msgTypes[49]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4297,7 +4490,7 @@ func (x *RendezvousRetireResponse) String() string {
 func (*RendezvousRetireResponse) ProtoMessage() {}
 
 func (x *RendezvousRetireResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_message_proto_msgTypes[48]
+	mi := &file_message_proto_msgTypes[49]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4310,7 +4503,7 @@ func (x *RendezvousRetireResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RendezvousRetireResponse.ProtoReflect.Descriptor instead.
 func (*RendezvousRetireResponse) Descriptor() ([]byte, []int) {
-	return file_message_proto_rawDescGZIP(), []int{48}
+	return file_message_proto_rawDescGZIP(), []int{49}
 }
 
 func (x *RendezvousRetireResponse) GetDiscardedDeposits() uint32 {
@@ -4330,7 +4523,7 @@ type RendezvousPush struct {
 
 func (x *RendezvousPush) Reset() {
 	*x = RendezvousPush{}
-	mi := &file_message_proto_msgTypes[49]
+	mi := &file_message_proto_msgTypes[50]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4342,7 +4535,7 @@ func (x *RendezvousPush) String() string {
 func (*RendezvousPush) ProtoMessage() {}
 
 func (x *RendezvousPush) ProtoReflect() protoreflect.Message {
-	mi := &file_message_proto_msgTypes[49]
+	mi := &file_message_proto_msgTypes[50]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4355,7 +4548,7 @@ func (x *RendezvousPush) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RendezvousPush.ProtoReflect.Descriptor instead.
 func (*RendezvousPush) Descriptor() ([]byte, []int) {
-	return file_message_proto_rawDescGZIP(), []int{49}
+	return file_message_proto_rawDescGZIP(), []int{50}
 }
 
 func (x *RendezvousPush) GetRendezvousId() []byte {
@@ -4385,7 +4578,7 @@ type MessageServerFragment struct {
 
 func (x *MessageServerFragment) Reset() {
 	*x = MessageServerFragment{}
-	mi := &file_message_proto_msgTypes[50]
+	mi := &file_message_proto_msgTypes[51]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -4397,7 +4590,7 @@ func (x *MessageServerFragment) String() string {
 func (*MessageServerFragment) ProtoMessage() {}
 
 func (x *MessageServerFragment) ProtoReflect() protoreflect.Message {
-	mi := &file_message_proto_msgTypes[50]
+	mi := &file_message_proto_msgTypes[51]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -4410,7 +4603,7 @@ func (x *MessageServerFragment) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MessageServerFragment.ProtoReflect.Descriptor instead.
 func (*MessageServerFragment) Descriptor() ([]byte, []int) {
-	return file_message_proto_rawDescGZIP(), []int{50}
+	return file_message_proto_rawDescGZIP(), []int{51}
 }
 
 func (x *MessageServerFragment) GetRequestId() uint64 {
@@ -4557,18 +4750,25 @@ const file_message_proto_rawDesc = "" +
 	"\x04port\x18\x02 \x01(\rR\x04port\x12&\n" +
 	"\x0ftls_spki_sha256\x18\x03 \x03(\fR\rtlsSpkiSha256\x12\x1f\n" +
 	"\vpath_prefix\x18\x04 \x01(\tR\n" +
-	"pathPrefix\"\x99\x01\n" +
+	"pathPrefix\"\xd5\x01\n" +
 	"\x12CreateGroupRequest\x12\x19\n" +
 	"\bgroup_id\x18\x01 \x01(\fR\agroupId\x128\n" +
 	"\x0einitial_commit\x18\x02 \x01(\v2\x11.bringyour.RecordR\rinitialCommit\x12.\n" +
-	"\x13bootstrap_write_key\x18\x03 \x01(\fR\x11bootstrapWriteKey\"\x8e\x01\n" +
+	"\x13bootstrap_write_key\x18\x03 \x01(\fR\x11bootstrapWriteKey\x12:\n" +
+	"\n" +
+	"epoch_keys\x18\x04 \x01(\v2\x1b.bringyour.EpochKeyDeliveryR\tepochKeys\"\x8e\x01\n" +
 	"\x13CreateGroupResponse\x12#\n" +
 	"\rcurrent_epoch\x18\x01 \x01(\x04R\fcurrentEpoch\x12\x1b\n" +
 	"\trecord_id\x18\x02 \x01(\x04R\brecordId\x125\n" +
-	"\aapplied\x18\x03 \x01(\v2\x1b.bringyour.RetentionAppliedR\aapplied\"W\n" +
+	"\aapplied\x18\x03 \x01(\v2\x1b.bringyour.RetentionAppliedR\aapplied\"J\n" +
+	"\x10EpochKeyDelivery\x12\x1b\n" +
+	"\twrite_key\x18\x01 \x01(\fR\bwriteKey\x12\x19\n" +
+	"\bread_key\x18\x02 \x01(\fR\areadKey\"\x93\x01\n" +
 	"\rSubmitRequest\x12\x19\n" +
 	"\bgroup_id\x18\x01 \x01(\fR\agroupId\x12+\n" +
-	"\arecords\x18\x02 \x03(\v2\x11.bringyour.RecordR\arecords\"\xbc\x03\n" +
+	"\arecords\x18\x02 \x03(\v2\x11.bringyour.RecordR\arecords\x12:\n" +
+	"\n" +
+	"epoch_keys\x18\x03 \x03(\v2\x1b.bringyour.EpochKeyDeliveryR\tepochKeys\"\xbc\x03\n" +
 	"\x06Record\x12!\n" +
 	"\frecord_bytes\x18\x01 \x01(\fR\vrecordBytes\x12#\n" +
 	"\rsender_handle\x18\x02 \x01(\fR\fsenderHandle\x12\x14\n" +
@@ -4610,7 +4810,7 @@ const file_message_proto_rawDesc = "" +
 	"\x0enext_record_id\x18\x02 \x01(\x04R\fnextRecordId\x12/\n" +
 	"\x14high_water_record_id\x18\x03 \x01(\x04R\x11highWaterRecordId\x12\x1a\n" +
 	"\bcomplete\x18\x04 \x01(\bR\bcomplete\x12=\n" +
-	"\vattestation\x18\x05 \x01(\v2\x1b.bringyour.FetchAttestationR\vattestation\"\xe0\x02\n" +
+	"\vattestation\x18\x05 \x01(\v2\x1b.bringyour.FetchAttestationR\vattestation\"\xff\x02\n" +
 	"\x10FetchAttestation\x12\x19\n" +
 	"\bgroup_id\x18\x01 \x01(\fR\agroupId\x12&\n" +
 	"\x0fsince_record_id\x18\x02 \x01(\x04R\rsinceRecordId\x12&\n" +
@@ -4623,7 +4823,9 @@ const file_message_proto_rawDesc = "" +
 	"\n" +
 	"class_mask\x18\b \x01(\rR\tclassMask\x12\x1d\n" +
 	"\n" +
-	"heads_only\x18\t \x01(\bR\theadsOnly\x12\x10\n" +
+	"heads_only\x18\t \x01(\bR\theadsOnly\x12\x1d\n" +
+	"\n" +
+	"read_epoch\x18\v \x01(\x04R\treadEpoch\x12\x10\n" +
 	"\x03sig\x18\n" +
 	" \x01(\fR\x03sig\"\xa5\x01\n" +
 	"\x10SubscribeRequest\x12=\n" +
@@ -4834,7 +5036,7 @@ func file_message_proto_rawDescGZIP() []byte {
 }
 
 var file_message_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_message_proto_msgTypes = make([]protoimpl.MessageInfo, 51)
+var file_message_proto_msgTypes = make([]protoimpl.MessageInfo, 52)
 var file_message_proto_goTypes = []any{
 	(Direction)(0),                     // 0: bringyour.Direction
 	(Reason)(0),                        // 1: bringyour.Reason
@@ -4848,117 +5050,120 @@ var file_message_proto_goTypes = []any{
 	(*BlobEndpoint)(nil),               // 9: bringyour.BlobEndpoint
 	(*CreateGroupRequest)(nil),         // 10: bringyour.CreateGroupRequest
 	(*CreateGroupResponse)(nil),        // 11: bringyour.CreateGroupResponse
-	(*SubmitRequest)(nil),              // 12: bringyour.SubmitRequest
-	(*Record)(nil),                     // 13: bringyour.Record
-	(*SubmitResponse)(nil),             // 14: bringyour.SubmitResponse
-	(*SubmitResult)(nil),               // 15: bringyour.SubmitResult
-	(*FetchRequest)(nil),               // 16: bringyour.FetchRequest
-	(*FetchResponse)(nil),              // 17: bringyour.FetchResponse
-	(*FetchAttestation)(nil),           // 18: bringyour.FetchAttestation
-	(*SubscribeRequest)(nil),           // 19: bringyour.SubscribeRequest
-	(*Subscription)(nil),               // 20: bringyour.Subscription
-	(*SubscribeResponse)(nil),          // 21: bringyour.SubscribeResponse
-	(*RecordPush)(nil),                 // 22: bringyour.RecordPush
-	(*TransientPush)(nil),              // 23: bringyour.TransientPush
-	(*UnsubscribeRequest)(nil),         // 24: bringyour.UnsubscribeRequest
-	(*BlobGrantRequest)(nil),           // 25: bringyour.BlobGrantRequest
-	(*BlobGrantResponse)(nil),          // 26: bringyour.BlobGrantResponse
-	(*RecoveryFetchRequest)(nil),       // 27: bringyour.RecoveryFetchRequest
-	(*RecoveryFetchResponse)(nil),      // 28: bringyour.RecoveryFetchResponse
-	(*WrapFetchRequest)(nil),           // 29: bringyour.WrapFetchRequest
-	(*WrapFetchResponse)(nil),          // 30: bringyour.WrapFetchResponse
-	(*GroupStatusRequest)(nil),         // 31: bringyour.GroupStatusRequest
-	(*GroupStatusResponse)(nil),        // 32: bringyour.GroupStatusResponse
-	(*CapabilityChange)(nil),           // 33: bringyour.CapabilityChange
-	(*Backpressure)(nil),               // 34: bringyour.Backpressure
-	(*Drain)(nil),                      // 35: bringyour.Drain
-	(*GroupRecords)(nil),               // 36: bringyour.GroupRecords
-	(*SubscriptionAck)(nil),            // 37: bringyour.SubscriptionAck
-	(*KtGossip)(nil),                   // 38: bringyour.KtGossip
-	(*RetentionApplied)(nil),           // 39: bringyour.RetentionApplied
-	(*RendezvousRegisterRequest)(nil),  // 40: bringyour.RendezvousRegisterRequest
-	(*RendezvousRegisterResponse)(nil), // 41: bringyour.RendezvousRegisterResponse
-	(*RendezvousOpenRequest)(nil),      // 42: bringyour.RendezvousOpenRequest
-	(*RendezvousOpenResponse)(nil),     // 43: bringyour.RendezvousOpenResponse
-	(*RendezvousDepositRequest)(nil),   // 44: bringyour.RendezvousDepositRequest
-	(*RendezvousDepositResponse)(nil),  // 45: bringyour.RendezvousDepositResponse
-	(*RendezvousCollectRequest)(nil),   // 46: bringyour.RendezvousCollectRequest
-	(*RendezvousCollectResponse)(nil),  // 47: bringyour.RendezvousCollectResponse
-	(*RendezvousDeposit)(nil),          // 48: bringyour.RendezvousDeposit
-	(*RendezvousRetireRequest)(nil),    // 49: bringyour.RendezvousRetireRequest
-	(*RendezvousRetireResponse)(nil),   // 50: bringyour.RendezvousRetireResponse
-	(*RendezvousPush)(nil),             // 51: bringyour.RendezvousPush
-	(*MessageServerFragment)(nil),      // 52: bringyour.MessageServerFragment
+	(*EpochKeyDelivery)(nil),           // 12: bringyour.EpochKeyDelivery
+	(*SubmitRequest)(nil),              // 13: bringyour.SubmitRequest
+	(*Record)(nil),                     // 14: bringyour.Record
+	(*SubmitResponse)(nil),             // 15: bringyour.SubmitResponse
+	(*SubmitResult)(nil),               // 16: bringyour.SubmitResult
+	(*FetchRequest)(nil),               // 17: bringyour.FetchRequest
+	(*FetchResponse)(nil),              // 18: bringyour.FetchResponse
+	(*FetchAttestation)(nil),           // 19: bringyour.FetchAttestation
+	(*SubscribeRequest)(nil),           // 20: bringyour.SubscribeRequest
+	(*Subscription)(nil),               // 21: bringyour.Subscription
+	(*SubscribeResponse)(nil),          // 22: bringyour.SubscribeResponse
+	(*RecordPush)(nil),                 // 23: bringyour.RecordPush
+	(*TransientPush)(nil),              // 24: bringyour.TransientPush
+	(*UnsubscribeRequest)(nil),         // 25: bringyour.UnsubscribeRequest
+	(*BlobGrantRequest)(nil),           // 26: bringyour.BlobGrantRequest
+	(*BlobGrantResponse)(nil),          // 27: bringyour.BlobGrantResponse
+	(*RecoveryFetchRequest)(nil),       // 28: bringyour.RecoveryFetchRequest
+	(*RecoveryFetchResponse)(nil),      // 29: bringyour.RecoveryFetchResponse
+	(*WrapFetchRequest)(nil),           // 30: bringyour.WrapFetchRequest
+	(*WrapFetchResponse)(nil),          // 31: bringyour.WrapFetchResponse
+	(*GroupStatusRequest)(nil),         // 32: bringyour.GroupStatusRequest
+	(*GroupStatusResponse)(nil),        // 33: bringyour.GroupStatusResponse
+	(*CapabilityChange)(nil),           // 34: bringyour.CapabilityChange
+	(*Backpressure)(nil),               // 35: bringyour.Backpressure
+	(*Drain)(nil),                      // 36: bringyour.Drain
+	(*GroupRecords)(nil),               // 37: bringyour.GroupRecords
+	(*SubscriptionAck)(nil),            // 38: bringyour.SubscriptionAck
+	(*KtGossip)(nil),                   // 39: bringyour.KtGossip
+	(*RetentionApplied)(nil),           // 40: bringyour.RetentionApplied
+	(*RendezvousRegisterRequest)(nil),  // 41: bringyour.RendezvousRegisterRequest
+	(*RendezvousRegisterResponse)(nil), // 42: bringyour.RendezvousRegisterResponse
+	(*RendezvousOpenRequest)(nil),      // 43: bringyour.RendezvousOpenRequest
+	(*RendezvousOpenResponse)(nil),     // 44: bringyour.RendezvousOpenResponse
+	(*RendezvousDepositRequest)(nil),   // 45: bringyour.RendezvousDepositRequest
+	(*RendezvousDepositResponse)(nil),  // 46: bringyour.RendezvousDepositResponse
+	(*RendezvousCollectRequest)(nil),   // 47: bringyour.RendezvousCollectRequest
+	(*RendezvousCollectResponse)(nil),  // 48: bringyour.RendezvousCollectResponse
+	(*RendezvousDeposit)(nil),          // 49: bringyour.RendezvousDeposit
+	(*RendezvousRetireRequest)(nil),    // 50: bringyour.RendezvousRetireRequest
+	(*RendezvousRetireResponse)(nil),   // 51: bringyour.RendezvousRetireResponse
+	(*RendezvousPush)(nil),             // 52: bringyour.RendezvousPush
+	(*MessageServerFragment)(nil),      // 53: bringyour.MessageServerFragment
 }
 var file_message_proto_depIdxs = []int32{
 	5,  // 0: bringyour.MessageServerRequest.hello:type_name -> bringyour.HelloRequest
 	10, // 1: bringyour.MessageServerRequest.create_group:type_name -> bringyour.CreateGroupRequest
-	12, // 2: bringyour.MessageServerRequest.submit:type_name -> bringyour.SubmitRequest
-	16, // 3: bringyour.MessageServerRequest.fetch:type_name -> bringyour.FetchRequest
-	19, // 4: bringyour.MessageServerRequest.subscribe:type_name -> bringyour.SubscribeRequest
-	24, // 5: bringyour.MessageServerRequest.unsubscribe:type_name -> bringyour.UnsubscribeRequest
-	31, // 6: bringyour.MessageServerRequest.group_status:type_name -> bringyour.GroupStatusRequest
-	25, // 7: bringyour.MessageServerRequest.blob_grant:type_name -> bringyour.BlobGrantRequest
-	27, // 8: bringyour.MessageServerRequest.recovery_fetch:type_name -> bringyour.RecoveryFetchRequest
-	29, // 9: bringyour.MessageServerRequest.wrap_fetch:type_name -> bringyour.WrapFetchRequest
-	40, // 10: bringyour.MessageServerRequest.rendezvous_register:type_name -> bringyour.RendezvousRegisterRequest
-	42, // 11: bringyour.MessageServerRequest.rendezvous_open:type_name -> bringyour.RendezvousOpenRequest
-	44, // 12: bringyour.MessageServerRequest.rendezvous_deposit:type_name -> bringyour.RendezvousDepositRequest
-	46, // 13: bringyour.MessageServerRequest.rendezvous_collect:type_name -> bringyour.RendezvousCollectRequest
-	49, // 14: bringyour.MessageServerRequest.rendezvous_retire:type_name -> bringyour.RendezvousRetireRequest
+	13, // 2: bringyour.MessageServerRequest.submit:type_name -> bringyour.SubmitRequest
+	17, // 3: bringyour.MessageServerRequest.fetch:type_name -> bringyour.FetchRequest
+	20, // 4: bringyour.MessageServerRequest.subscribe:type_name -> bringyour.SubscribeRequest
+	25, // 5: bringyour.MessageServerRequest.unsubscribe:type_name -> bringyour.UnsubscribeRequest
+	32, // 6: bringyour.MessageServerRequest.group_status:type_name -> bringyour.GroupStatusRequest
+	26, // 7: bringyour.MessageServerRequest.blob_grant:type_name -> bringyour.BlobGrantRequest
+	28, // 8: bringyour.MessageServerRequest.recovery_fetch:type_name -> bringyour.RecoveryFetchRequest
+	30, // 9: bringyour.MessageServerRequest.wrap_fetch:type_name -> bringyour.WrapFetchRequest
+	41, // 10: bringyour.MessageServerRequest.rendezvous_register:type_name -> bringyour.RendezvousRegisterRequest
+	43, // 11: bringyour.MessageServerRequest.rendezvous_open:type_name -> bringyour.RendezvousOpenRequest
+	45, // 12: bringyour.MessageServerRequest.rendezvous_deposit:type_name -> bringyour.RendezvousDepositRequest
+	47, // 13: bringyour.MessageServerRequest.rendezvous_collect:type_name -> bringyour.RendezvousCollectRequest
+	50, // 14: bringyour.MessageServerRequest.rendezvous_retire:type_name -> bringyour.RendezvousRetireRequest
 	1,  // 15: bringyour.MessageServerResponse.reason:type_name -> bringyour.Reason
 	6,  // 16: bringyour.MessageServerResponse.hello:type_name -> bringyour.HelloResponse
 	11, // 17: bringyour.MessageServerResponse.create_group:type_name -> bringyour.CreateGroupResponse
-	14, // 18: bringyour.MessageServerResponse.submit:type_name -> bringyour.SubmitResponse
-	17, // 19: bringyour.MessageServerResponse.fetch:type_name -> bringyour.FetchResponse
-	21, // 20: bringyour.MessageServerResponse.subscribe:type_name -> bringyour.SubscribeResponse
-	32, // 21: bringyour.MessageServerResponse.group_status:type_name -> bringyour.GroupStatusResponse
-	26, // 22: bringyour.MessageServerResponse.blob_grant:type_name -> bringyour.BlobGrantResponse
-	28, // 23: bringyour.MessageServerResponse.recovery_fetch:type_name -> bringyour.RecoveryFetchResponse
-	30, // 24: bringyour.MessageServerResponse.wrap_fetch:type_name -> bringyour.WrapFetchResponse
-	41, // 25: bringyour.MessageServerResponse.rendezvous_register:type_name -> bringyour.RendezvousRegisterResponse
-	43, // 26: bringyour.MessageServerResponse.rendezvous_open:type_name -> bringyour.RendezvousOpenResponse
-	45, // 27: bringyour.MessageServerResponse.rendezvous_deposit:type_name -> bringyour.RendezvousDepositResponse
-	47, // 28: bringyour.MessageServerResponse.rendezvous_collect:type_name -> bringyour.RendezvousCollectResponse
-	50, // 29: bringyour.MessageServerResponse.rendezvous_retire:type_name -> bringyour.RendezvousRetireResponse
-	22, // 30: bringyour.MessageServerPush.records:type_name -> bringyour.RecordPush
-	23, // 31: bringyour.MessageServerPush.transient:type_name -> bringyour.TransientPush
-	33, // 32: bringyour.MessageServerPush.capability:type_name -> bringyour.CapabilityChange
-	34, // 33: bringyour.MessageServerPush.backpressure:type_name -> bringyour.Backpressure
-	35, // 34: bringyour.MessageServerPush.drain:type_name -> bringyour.Drain
-	51, // 35: bringyour.MessageServerPush.rendezvous:type_name -> bringyour.RendezvousPush
+	15, // 18: bringyour.MessageServerResponse.submit:type_name -> bringyour.SubmitResponse
+	18, // 19: bringyour.MessageServerResponse.fetch:type_name -> bringyour.FetchResponse
+	22, // 20: bringyour.MessageServerResponse.subscribe:type_name -> bringyour.SubscribeResponse
+	33, // 21: bringyour.MessageServerResponse.group_status:type_name -> bringyour.GroupStatusResponse
+	27, // 22: bringyour.MessageServerResponse.blob_grant:type_name -> bringyour.BlobGrantResponse
+	29, // 23: bringyour.MessageServerResponse.recovery_fetch:type_name -> bringyour.RecoveryFetchResponse
+	31, // 24: bringyour.MessageServerResponse.wrap_fetch:type_name -> bringyour.WrapFetchResponse
+	42, // 25: bringyour.MessageServerResponse.rendezvous_register:type_name -> bringyour.RendezvousRegisterResponse
+	44, // 26: bringyour.MessageServerResponse.rendezvous_open:type_name -> bringyour.RendezvousOpenResponse
+	46, // 27: bringyour.MessageServerResponse.rendezvous_deposit:type_name -> bringyour.RendezvousDepositResponse
+	48, // 28: bringyour.MessageServerResponse.rendezvous_collect:type_name -> bringyour.RendezvousCollectResponse
+	51, // 29: bringyour.MessageServerResponse.rendezvous_retire:type_name -> bringyour.RendezvousRetireResponse
+	23, // 30: bringyour.MessageServerPush.records:type_name -> bringyour.RecordPush
+	24, // 31: bringyour.MessageServerPush.transient:type_name -> bringyour.TransientPush
+	34, // 32: bringyour.MessageServerPush.capability:type_name -> bringyour.CapabilityChange
+	35, // 33: bringyour.MessageServerPush.backpressure:type_name -> bringyour.Backpressure
+	36, // 34: bringyour.MessageServerPush.drain:type_name -> bringyour.Drain
+	52, // 35: bringyour.MessageServerPush.rendezvous:type_name -> bringyour.RendezvousPush
 	7,  // 36: bringyour.HelloResponse.server_keys:type_name -> bringyour.ServerKey
 	8,  // 37: bringyour.HelloResponse.capabilities:type_name -> bringyour.Capabilities
 	9,  // 38: bringyour.HelloResponse.blob_endpoint:type_name -> bringyour.BlobEndpoint
-	38, // 39: bringyour.HelloResponse.kt_gossip:type_name -> bringyour.KtGossip
-	13, // 40: bringyour.CreateGroupRequest.initial_commit:type_name -> bringyour.Record
-	39, // 41: bringyour.CreateGroupResponse.applied:type_name -> bringyour.RetentionApplied
-	13, // 42: bringyour.SubmitRequest.records:type_name -> bringyour.Record
-	15, // 43: bringyour.SubmitResponse.results:type_name -> bringyour.SubmitResult
-	1,  // 44: bringyour.SubmitResult.reason:type_name -> bringyour.Reason
-	13, // 45: bringyour.SubmitResult.winning_commit:type_name -> bringyour.Record
-	39, // 46: bringyour.SubmitResult.applied:type_name -> bringyour.RetentionApplied
-	13, // 47: bringyour.FetchResponse.records:type_name -> bringyour.Record
-	18, // 48: bringyour.FetchResponse.attestation:type_name -> bringyour.FetchAttestation
-	20, // 49: bringyour.SubscribeRequest.subscriptions:type_name -> bringyour.Subscription
-	37, // 50: bringyour.SubscribeResponse.acks:type_name -> bringyour.SubscriptionAck
-	13, // 51: bringyour.RecordPush.records:type_name -> bringyour.Record
-	13, // 52: bringyour.TransientPush.records:type_name -> bringyour.Record
-	0,  // 53: bringyour.BlobGrantRequest.direction:type_name -> bringyour.Direction
-	36, // 54: bringyour.RecoveryFetchResponse.groups:type_name -> bringyour.GroupRecords
-	13, // 55: bringyour.WrapFetchResponse.records:type_name -> bringyour.Record
-	39, // 56: bringyour.GroupStatusResponse.applied:type_name -> bringyour.RetentionApplied
-	8,  // 57: bringyour.CapabilityChange.capabilities:type_name -> bringyour.Capabilities
-	7,  // 58: bringyour.CapabilityChange.server_keys:type_name -> bringyour.ServerKey
-	9,  // 59: bringyour.CapabilityChange.blob_endpoint:type_name -> bringyour.BlobEndpoint
-	13, // 60: bringyour.GroupRecords.records:type_name -> bringyour.Record
-	1,  // 61: bringyour.SubscriptionAck.reason:type_name -> bringyour.Reason
-	48, // 62: bringyour.RendezvousCollectResponse.deposits:type_name -> bringyour.RendezvousDeposit
-	63, // [63:63] is the sub-list for method output_type
-	63, // [63:63] is the sub-list for method input_type
-	63, // [63:63] is the sub-list for extension type_name
-	63, // [63:63] is the sub-list for extension extendee
-	0,  // [0:63] is the sub-list for field type_name
+	39, // 39: bringyour.HelloResponse.kt_gossip:type_name -> bringyour.KtGossip
+	14, // 40: bringyour.CreateGroupRequest.initial_commit:type_name -> bringyour.Record
+	12, // 41: bringyour.CreateGroupRequest.epoch_keys:type_name -> bringyour.EpochKeyDelivery
+	40, // 42: bringyour.CreateGroupResponse.applied:type_name -> bringyour.RetentionApplied
+	14, // 43: bringyour.SubmitRequest.records:type_name -> bringyour.Record
+	12, // 44: bringyour.SubmitRequest.epoch_keys:type_name -> bringyour.EpochKeyDelivery
+	16, // 45: bringyour.SubmitResponse.results:type_name -> bringyour.SubmitResult
+	1,  // 46: bringyour.SubmitResult.reason:type_name -> bringyour.Reason
+	14, // 47: bringyour.SubmitResult.winning_commit:type_name -> bringyour.Record
+	40, // 48: bringyour.SubmitResult.applied:type_name -> bringyour.RetentionApplied
+	14, // 49: bringyour.FetchResponse.records:type_name -> bringyour.Record
+	19, // 50: bringyour.FetchResponse.attestation:type_name -> bringyour.FetchAttestation
+	21, // 51: bringyour.SubscribeRequest.subscriptions:type_name -> bringyour.Subscription
+	38, // 52: bringyour.SubscribeResponse.acks:type_name -> bringyour.SubscriptionAck
+	14, // 53: bringyour.RecordPush.records:type_name -> bringyour.Record
+	14, // 54: bringyour.TransientPush.records:type_name -> bringyour.Record
+	0,  // 55: bringyour.BlobGrantRequest.direction:type_name -> bringyour.Direction
+	37, // 56: bringyour.RecoveryFetchResponse.groups:type_name -> bringyour.GroupRecords
+	14, // 57: bringyour.WrapFetchResponse.records:type_name -> bringyour.Record
+	40, // 58: bringyour.GroupStatusResponse.applied:type_name -> bringyour.RetentionApplied
+	8,  // 59: bringyour.CapabilityChange.capabilities:type_name -> bringyour.Capabilities
+	7,  // 60: bringyour.CapabilityChange.server_keys:type_name -> bringyour.ServerKey
+	9,  // 61: bringyour.CapabilityChange.blob_endpoint:type_name -> bringyour.BlobEndpoint
+	14, // 62: bringyour.GroupRecords.records:type_name -> bringyour.Record
+	1,  // 63: bringyour.SubscriptionAck.reason:type_name -> bringyour.Reason
+	49, // 64: bringyour.RendezvousCollectResponse.deposits:type_name -> bringyour.RendezvousDeposit
+	65, // [65:65] is the sub-list for method output_type
+	65, // [65:65] is the sub-list for method input_type
+	65, // [65:65] is the sub-list for extension type_name
+	65, // [65:65] is the sub-list for extension extendee
+	0,  // [0:65] is the sub-list for field type_name
 }
 
 func init() { file_message_proto_init() }
@@ -5013,7 +5218,7 @@ func file_message_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_message_proto_rawDesc), len(file_message_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   51,
+			NumMessages:   52,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

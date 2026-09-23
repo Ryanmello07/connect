@@ -67,9 +67,17 @@ message MessageServerResponse {
                                         // Safe to add late for a narrow reason, NOT the
                                         // general one: it is not on any signed field list.
                                         // Response fields are not categorically additive —
-                                        // FetchAttestation.sig covers nine FetchResponse
+                                        // FetchAttestation.sig covers TEN FetchAttestation
                                         // fields and MASTER §9.4 requires both sides to
                                         // agree on that preimage byte for byte.
+                                        //
+                                        // (This line read "nine FetchResponse fields" until
+                                        // ruling 32. Both halves were wrong, and Spec B §4.5
+                                        // corrected itself the same way: its own list said
+                                        // nine and held eight, having omitted server_id —
+                                        // which is not a FetchResponse field at all — and
+                                        // read_epoch joined the preimage on 2026-09-22. The
+                                        // ten are transcribed at FetchAttestation below.)
     oneof body {
         HelloResponse         hello           = 10;
         CreateGroupResponse   create_group    = 11;
@@ -206,7 +214,20 @@ message CreateGroupRequest {
                                       // initial_commit. This is self-certification: it is
                                       // protected solely by the 20/day per-client_id rate
                                       // limit, and nothing else. Stated plainly, not implied.
-    // initial_commit's server_attachment is an EpochAttachment carrying write_key[1].
+    EpochKeyDelivery epoch_keys = 4;  // ruling 33. write_key[1] and read_key[1] — the pair
+                                      // initial_commit's attachment is the DIGEST of. One
+                                      // and not repeated: this request carries exactly one
+                                      // record and it is always a commit.
+                                      //
+                                      // 4 is free because this message has never had a
+                                      // fourth field: Spec B §4.3.2 declares it with 1..3
+                                      // and nothing else, and 14/15 are the file-wide
+                                      // read_epoch/req_auth slots, which §4.3.8 exempts this
+                                      // arm from and which it does not carry.
+    // initial_commit's server_attachment is a kind 0x0005 EpochDigest carrying
+    // LP(H(epoch_keys)) over the pair above. (It read "an EpochAttachment carrying
+    // write_key[1]" until ruling 27 took the two keys out of the served structure; the
+    // attachment still says everything about epoch 1 that it said before, minus the keys.)
 }
 message CreateGroupResponse {
     uint64 current_epoch      = 1;    // always 1
@@ -215,11 +236,96 @@ message CreateGroupResponse {
 }
 
 
+// ── the epoch key delivery (item 244, ruling 33) ─────────────────────────────
+//
+// The two keys the commit in this request opens its next epoch with, carried BESIDE the
+// record rather than inside it.
+//
+// Spec B §5.4 put write_key[n+1] and read_key[n+1] in the clear inside a structure the
+// server serves back verbatim, while §5.3 promises a member removed at epoch n loses
+// access when epoch n's read key ages out. Both cannot be true: the commit that removes
+// the member is sealed at n, is fetchable under read_key[n], and carries the keys of
+// n+1 — measured, twice, as a fetch and a forged write that both answered REASON_OK
+// under learned keys. Ruling 27 replaced the two keys in the attachment with
+// LP(H(epoch_keys)) under attachment kind 0x0005, and the keys have to arrive by some
+// other road. This is that road.
+//
+// IT IS A REQUEST FIELD AND NEVER A FIELD OF `Record`. That is ruling 33 and it is the
+// whole of what this type buys. `Record` is the server→client type in SIX places —
+// FetchResponse.records, SubmitResult.winning_commit, RecordPush.records,
+// TransientPush.records, WrapFetchResponse.records and GroupRecords.records — against
+// the two client→server carriers that reference this message. A key pair on `Record`
+// would be six serve paths that each have to remember to clear it, which is item 244
+// re-opened once per path; here the served type is structurally unable to carry a key
+// and there is nothing to remember. It also leaves `Record`'s projection contract alone:
+// submit checks proto.Equal(projectionOf(ParseRecord(record_bytes)), sent), and a key is
+// by construction not implied by a projection of record_bytes — which is the entire
+// point of the amendment — so a key on `Record` would answer REASON_REJECTED to every
+// commit rather than protecting one.
+//
+// NOTHING HERE IS INSIDE A MAC, AND IT DOES NOT NEED TO BE. Both carriers are on
+// §4.3.8's req_auth exemption list, so these two numbers are not protocol constants the
+// way MessageServerRequest.body's arm numbers are, and canonical_request_bytes is not
+// computed over either request. The binding is the digest instead, and it is free: the
+// attachment's octets are hashed into AAD_head and into the write_auth preimage, so the
+// MAC covers the attachment, the attachment covers LP(H(epoch_keys)), and the server
+// recomputes H(epoch_keys) over the two keys below and compares against a value the MAC
+// already authenticated. Altering either key fails that comparison. There is no second
+// authenticator to add and no new preimage term.
+//
+// THERE IS NO EPOCH AND NO group_id IN HERE, AND THAT IS NOT AN OMISSION. H(epoch_keys)
+// is taken over LP(group_id) ‖ u64(opens_epoch) ‖ LP(write_key) ‖ LP(read_key), and
+// connect/message gives the server no way to name either scope term itself:
+// message.CheckEpochKeysDigest reads opens_epoch out of the attachment's own body and
+// REFUSES to take one as a parameter, because three epochs are live at that call site —
+// the record header's, the attachment's, and the server's own current_epoch + 1 — and a
+// wrong choice among them type checks. The group is the enclosing request's own
+// group_id, which the server has already verified. A second copy of either value here
+// would be a field the checker will not read and that can disagree with the one the MAC
+// covers: exactly the defect message.NewEpochDigestAttachment exists to make
+// unrepresentable, re-created one layer out where this file cannot close it.
+message EpochKeyDelivery {
+    bytes write_key = 1;   // write_key[e], EXACTLY 32 B, where e is the epoch the record
+                           // this is aligned with OPENS — its kind 0x0005 attachment's own
+                           // `epoch` field, one above the epoch the record is sealed at
+    bytes read_key  = 2;   // read_key[e], EXACTLY 32 B
+}
+
+
 // ── §4.3.3 Submit ────────────────────────────────────────────────────────────
 
 message SubmitRequest {
     bytes  group_id = 1;
     repeated Record records = 2;    // at most Capabilities.max_records_per_submit
+
+    // Ruling 33. The epoch keys for the commit in this batch, POSITIONALLY ALIGNED with
+    // `records` — the alignment SubmitResponse.results already uses in the other
+    // direction, and the long form of what this type is for is at EpochKeyDelivery.
+    //
+    // 3 is free because this message has never had a third field: Spec B §4.3.3 declares
+    // it with 1 and 2 and nothing else, and 14/15 are the file-wide read_epoch/req_auth
+    // slots, which §4.3.8 exempts this arm from and which it does not carry.
+    //
+    // LENGTH: EMPTY, OR EXACTLY AS LONG AS `records`. `results` states the alignment and
+    // leaves the length implicit; this states both, because the two lists fail
+    // differently. A short `results` loses an answer the client can see is missing. A
+    // short `epoch_keys` silently re-aims every later entry at the wrong record, and what
+    // it re-aims is a key.
+    //
+    // AN ENTRY AGAINST A RECORD WITH is_commit = 0 IS REASON_REJECTED, and so is a commit
+    // with no entry. Refusal, and not an empty entry: every field of EpochKeyDelivery has
+    // implicit presence, so a zero entry decodes as two EMPTY KEYS rather than as an
+    // absence — the REASON_OK = 0 hazard recorded at the foot of this file, one message
+    // over — and a commit whose keys never arrived is an epoch the server would install
+    // without having been handed what opens it. Both refusals are decided on values the
+    // server has already verified: `is_commit` is a projection field it checks against
+    // ParseRecord(record_bytes) before it gets here.
+    //
+    // In practice this list is empty or holds exactly one entry. §4.3.3 requires that a
+    // batch containing a commit contain exactly one record, and only a commit opens an
+    // epoch; the general rule is written as the general rule anyway, because the batch
+    // rule is Spec B's to relax and this alignment is not.
+    repeated EpochKeyDelivery epoch_keys = 3;
 }
 
 message Record {
@@ -245,6 +351,22 @@ message Record {
 
     // Server-assigned. Ignored on submit, populated on read. Never authenticated.
     uint64 record_id          = 13;
+
+    // NO FIELD 14, AND NO EPOCH KEYS. Both deliberate, and neither is a gap to fill.
+    //
+    // 14 is spoken for. Spec B §4.3.3 declares `uint64 eph_window = 14` on this message
+    // and this file does not carry it: the eph window landed in the record CODEC, at
+    // format version 0x02, and never in this projection. The number is not free, and
+    // giving it to something else would put a different field at 14 from the one every
+    // reader of §4.3.3 expects.
+    //
+    // The two epoch keys are NOT here — ruling 33 — and the long form is at
+    // EpochKeyDelivery. The short form is two facts about this type. It is the
+    // server→client record in six places, so a key field here would be six serve paths
+    // that must each remember to clear it. And every field below `record_bytes` is
+    // verified equal to the corresponding field of ParseRecord(record_bytes), which no
+    // key can satisfy: a key is by construction not implied by a projection of the
+    // record's own octets, which is the entire point of taking the keys out of them.
 }
 
 message SubmitResponse {
@@ -290,14 +412,61 @@ message FetchAttestation {
     bytes  server_id            = 7;
     uint32 class_mask           = 8;
     bool   heads_only           = 9;
+    uint64 read_epoch           = 11;   // §4.3.4, ruling 32. The epoch ceiling this answer
+                                        // was served under. §5.1.1's ceiling made
+                                        // high_water_record_id relative to the reader's own
+                                        // epoch, so a server applying a SHORTER ceiling than
+                                        // the request named produces an answer that
+                                        // proto.Equals the honest answer at that shorter
+                                        // ceiling — measured at 7 of 12 records, two whole
+                                        // epochs, withheld with no error and no hole, and the
+                                        // receiver's omission predicate answering "nothing
+                                        // omitted". It is in the preimage below for the
+                                        // reason §4.3.4 gives for class_mask and heads_only:
+                                        // "so that a filtered fetch is not
+                                        // byte-indistinguishable from a withholding one".
+                                        // The ceiling is the third filter, and those two are
+                                        // the inline control — they are values the client
+                                        // holds too, and they are signed. What a signature
+                                        // buys is not the value; it is the server's
+                                        // attributable commitment to having used it.
+                                        //
+                                        // 11, and 11 is free: this message has never had an
+                                        // eleventh field. NOT 10, because `sig` landed at 10
+                                        // and a landed field number is never renumbered. NOT
+                                        // 14, although 14 is the read_epoch slot everywhere
+                                        // else in this file: 14 is reserved on the REQUEST
+                                        // messages, whose every field number is inside
+                                        // canonical_request_bytes and therefore inside a MAC
+                                        // (Spec A §5.7). This is a response field, it is in
+                                        // no MAC, and its numbering is pinned by the explicit
+                                        // named field list below and by nothing else. Spec B
+                                        // §4.3.4 and MASTER §9.4 both number it 11.
     bytes  sig                  = 10;   // Ed25519 over the §4.3.4 preimage:
                                         //   "URmessage/v1/attest" ‖ LP(server_id) ‖ LP(group_id)
                                         //     ‖ u64(since_record_id) ‖ u64(until_record_id)
                                         //     ‖ u64(high_water_record_id)
                                         //     ‖ u32(class_mask) ‖ u8(heads_only)
+                                        //     ‖ u64(read_epoch)
                                         //     ‖ u32(count) ‖ u64(record_id[0]) ‖ …
                                         //       ‖ u64(record_id[count-1])
                                         //     ‖ u64(server_time_ms)
+                                        //
+                                        // THOSE ARE THE TEN ATTESTED FIELDS, AND NOTHING IN
+                                        // THIS REPOSITORY COMPUTES OR VERIFIES THIS
+                                        // SIGNATURE. The block above is a transcription of
+                                        // Spec B §4.3.4, not a Go function: the label
+                                        // "URmessage/v1/attest" appears in no .go file here,
+                                        // where "URmessage/v1/write" and "URmessage/v1/req"
+                                        // are both built in message/writeauth.go — the two
+                                        // preimages this repository DOES own, and the
+                                        // positive control for that absence. The message
+                                        // server's handler for it is unbuilt,
+                                        // Capabilities.attestation_supported is false, and no
+                                        // fleet key exists. read_epoch joins the preimage now
+                                        // so that whoever builds it builds it over the
+                                        // ceiling too, which is the argument FOR taking the
+                                        // field today rather than against.
 }
 
 

@@ -474,6 +474,39 @@ var knownAuthenticatorFields = []string{
 	"req_auth", "register_auth", "open_auth", "deposit_auth", "collect_auth", "retire_auth",
 }
 
+// readEpochIsAMacInput says whether a message's `read_epoch` is one of the ones
+// Spec B §4.3 reserves field 14 for.
+//
+// THE RULE WAS NARROWED BY RULING 32, AND IT IS A PREDICATE SO THAT WHAT THE
+// NARROWING REMOVES CAN BE PRINTED. Until 2026-09-22 the assertion below was "every
+// field named read_epoch in this file is field 14", over every message in it. That
+// held because every read_epoch there had ever been was a REQUEST's, and a request's
+// every field number is inside canonical_request_bytes and therefore inside the
+// req_auth MAC (Spec A §5.7) — which is the entire reason 14 is reserved rather than
+// merely conventional. Ruling 32 put a read_epoch on FetchAttestation, which is a
+// RESPONSE sub-message: it is in no MAC, its numbering is pinned by §4.3.4's
+// explicit named preimage list and by nothing else, and Spec B §4.3.4 and MASTER
+// §9.4 both number it 11 because `sig` landed at 10 and a landed field number is
+// never renumbered.
+//
+// The predicate is "this message carries a req_auth" — the same seed set
+// reqAuthSeeds derives the MAC-input closure from — and not a list of message names,
+// so a new authenticated request with a read_epoch is inside the rule on the day it
+// is added. The test PRINTS THE COMPLEMENT, every read_epoch the predicate excludes,
+// and fails unless that complement is exactly what this narrowing was taken for. A
+// gate that was widened by being narrowed is the failure mode here, and an exclusion
+// list checked in both directions is what makes it noisy instead of silent.
+func readEpochIsAMacInput(md protoreflect.MessageDescriptor) bool {
+	return md.Fields().ByName("req_auth") != nil
+}
+
+// readEpochOutsideTheMac is the complement the narrowing above is allowed to have,
+// transcribed from Spec B §4.3.4 with the number that section gives it. The walk
+// asserts the complement it actually finds EQUALS this, in both directions.
+var readEpochOutsideTheMac = map[string]int{
+	"bringyour.FetchAttestation.read_epoch": 11,
+}
+
 // TestReqAuthAndReadEpochUseTheirReservedFieldNumbers walks every message in
 // message.proto, not a list of the ones that happen to have these fields today,
 // and derives the authenticator class by name rather than enumerating it.
@@ -485,6 +518,7 @@ func TestReqAuthAndReadEpochUseTheirReservedFieldNumbers(t *testing.T) {
 	msgs := fd.Messages()
 	foundAuth := map[string]bool{}
 	checkedEpoch := 0
+	excluded := map[string]int{}
 	for i := 0; i < msgs.Len(); i++ {
 		md := msgs.Get(i)
 		fields := md.Fields()
@@ -506,9 +540,15 @@ func TestReqAuthAndReadEpochUseTheirReservedFieldNumbers(t *testing.T) {
 				}
 			}
 			if name == "read_epoch" {
+				if !readEpochIsAMacInput(md) {
+					excluded[string(f.FullName())] = int(f.Number())
+					continue
+				}
 				checkedEpoch++
 				if f.Number() != 14 {
-					t.Errorf("%s.read_epoch is field %d; Spec B §4.3 reserves 14 for it", md.FullName(), f.Number())
+					t.Errorf("%s.read_epoch is field %d; Spec B §4.3 reserves 14 for it on every "+
+						"message that carries a req_auth, because its number is inside "+
+						"canonical_request_bytes (Spec A §5.7)", md.FullName(), f.Number())
 				}
 			}
 		}
@@ -524,6 +564,38 @@ func TestReqAuthAndReadEpochUseTheirReservedFieldNumbers(t *testing.T) {
 				"to derive, so the field-15 assertion is now passing over a smaller set than it "+
 				"claims to cover.", name)
 		}
+	}
+
+	// THE COMPLEMENT, PRINTED. Everything readEpochIsAMacInput removed from the
+	// field-14 rule, with the number it is at instead, checked against the one
+	// exclusion ruling 32 bought. An empty complement would mean the narrowing is
+	// doing nothing and the predicate is wrong; a larger one would mean a read_epoch
+	// escaped the rule after this test was narrowed, which is the failure this block
+	// exists to catch and the reason the narrowing is not simply an `if` on a name.
+	t.Logf("field-14 rule applied to %d read_epoch fields; complement (excluded) = %v", checkedEpoch, excluded)
+	for name, number := range excluded {
+		want, allowed := readEpochOutsideTheMac[name]
+		if !allowed {
+			t.Errorf("%s is outside the field-14 rule because its message carries no req_auth, and "+
+				"nothing in this file says it may be. Either it belongs on an authenticated request "+
+				"— in which case it is field 14 — or Spec B gives it a number of its own and that "+
+				"number belongs in readEpochOutsideTheMac with the section that says so.", name)
+			continue
+		}
+		if number != want {
+			t.Errorf("%s is field %d; Spec B numbers it %d", name, number, want)
+		}
+	}
+	for name := range readEpochOutsideTheMac {
+		if _, found := excluded[name]; !found {
+			t.Errorf("readEpochOutsideTheMac excuses %s from the field-14 rule, and the walk did not "+
+				"exclude it. Either it is gone from message.proto or it has moved onto a req_auth "+
+				"carrier, and in both cases the excuse is now covering nothing.", name)
+		}
+	}
+	if len(excluded) == 0 {
+		t.Error("the complement is empty, so readEpochIsAMacInput narrowed nothing and this whole " +
+			"block is passing vacuously over a rule that is still the old one")
 	}
 }
 

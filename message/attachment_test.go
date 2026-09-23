@@ -488,7 +488,7 @@ func validEpochAttachment(rotation int, epoch uint64, media uint32, durable uint
 // arithmetic done outside this package; here it only has to be the same relation everywhere.
 func validEpochDigestAttachment(t testing.TB, rotation int, epoch uint64, media uint32, durable uint32, count uint32) *ServerAttachment {
 	t.Helper()
-	digest, err := EpochKeysDigest(epoch,
+	digest, err := EpochKeysDigest(attachmentVectorGroupId(), epoch,
 		attachmentFiller(attachmentWriteKeyTag, rotation, epochWriteKeyBytes),
 		attachmentFiller(attachmentReadKeyTag, rotation, epochReadKeyBytes))
 	if err != nil {
@@ -1035,6 +1035,22 @@ const attachmentCompleteVectorHex = "0004" +
 // outside this encoder: take the 0x0001 vector, lift write_key and read_key out of it,
 // hash them with the epoch they open, and land on the field below.
 
+// The group_id every epoch_keys vector in this file is taken over, and it is not a fresh
+// ramp: it is aadKatCommitHeader's own GroupId — the group of the commit whose attachment
+// the kind 0x0001 vector IS, which this file already asserts is aad_test.go's own octets.
+// Ruling 34 put LP(group_id) in the preimage to make the digest a statement about an epoch
+// OF A GROUP, and taking the group from anywhere but the record these vectors are about
+// would have made it a statement about nothing.
+const attachmentEpochKeysGroupHex = "1112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30"
+
+// The same value as the [32]byte the three functions take, which is the record header's own
+// type for a group id.
+func attachmentVectorGroupId() [32]byte {
+	var out [32]byte
+	copy(out[:], aadRamp(0x11, 32))
+	return out
+}
+
 // The epoch_keys preimage of the vector below, pinned separately from its digest.
 //
 // A digest alone moves as one opaque number whichever term went missing from under it, so
@@ -1042,31 +1058,44 @@ const attachmentCompleteVectorHex = "0004" +
 //
 //	55526d…6b657973                   "URmessage/v1/epochkeys", raw ascii, no prefix,
 //	                                  twenty two octets
+//	00000020 11..30                   LP(group_id): 32 octets, the KAT commit's own group
 //	000000000000002a                  u64(opens_epoch): 42, the epoch these keys open
 //	00000020 70..8f                   LP(write_key): 32 octets, the 0x0001 vector's ramp
 //	00000020 90..af                   LP(read_key): 32 octets, the 0x0001 vector's ramp
 //
-// which adds to 22 + 8 + 36 + 36 = 102 octets.
+// which adds to 22 + 36 + 8 + 36 + 36 = 138 octets.
+//
+// THE GROUP IS AHEAD OF THE EPOCH, and this is where that ordering is pinned rather than
+// argued: an implementation that wrote the same five terms with LP(group_id) after
+// u64(opens_epoch) reproduces neither digest below, at either epoch.
 const attachmentEpochKeysPreimageHex = "55526d6573736167652f76312f65706f63686b657973" +
+	"00000020" + attachmentEpochKeysGroupHex +
 	"000000000000002a" +
 	"00000020" + "707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f" +
 	"00000020" + "909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeaf"
 
-// SHA-256 of the 102 octets above.
-const attachmentEpochKeysDigestHex = "7c90acd7bfb098300e400ec5260501f0b3f60a2953c9573039e2af91f650dc82"
+// SHA-256 of the 138 octets above.
+//
+// (It was 7c90acd7…f650dc82, over 102 octets with no group term, until ruling 34 — taken
+// while the kind was one commit old and nothing consumed the digest. The superseded number
+// is written down because a vector that moved is worth more than a vector that was always
+// this: an implementation still reproducing it has the pre-ruling preimage.)
+const attachmentEpochKeysDigestHex = "73121debb8fa9aed4f70847f1c90314f1f1e99795906acaa7c5b3ee54518eafa"
 
-// The same two keys at opens_epoch = 1 rather than 42, and its digest.
+// The same two keys and the same group at opens_epoch = 1 rather than 42, and its digest.
 //
 // It is here so that the interop check for the epoch term is a VECTOR and not a property
 // over this package's own output: an implementation that left u64(opens_epoch) out of the
 // preimage reproduces neither of these two numbers, and an implementation that reproduces
 // one and not the other has put the epoch somewhere else in the preimage than here.
 const attachmentEpochKeysPreimageEpochOneHex = "55526d6573736167652f76312f65706f63686b657973" +
+	"00000020" + attachmentEpochKeysGroupHex +
 	"0000000000000001" +
 	"00000020" + "707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f" +
 	"00000020" + "909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeaf"
 
-const attachmentEpochKeysDigestEpochOneHex = "607906ee99e44f42bf4fd6f6e474087fe3761252c9bcd6a8d7eade4efb8c8123"
+// (Was 607906ee…fb8c8123 over 102 octets, for the reason above.)
+const attachmentEpochKeysDigestEpochOneHex = "54395ba26817b7a906bf0279ac3ed86447cbb98005e90b8b2164df973fb4172c"
 
 // The epoch digest attachment, pinned to its exact octets.
 //
@@ -2120,9 +2149,9 @@ func epochDigestWalkCorpus(t testing.TB) []attachmentCorpusEntry {
 // The preimage is the octets the block at the top of attachment.go states, at two epochs.
 //
 // The preimage is pinned as well as the digest because a digest alone moves as one opaque
-// number whichever term went missing from under it: drop the label, drop the epoch, swap the
-// two keys, and every one of those answers is thirty two plausible octets that this package
-// goes on agreeing with itself about.
+// number whichever term went missing from under it: drop the label, drop the group, drop the
+// epoch, put the group after the epoch, swap the two keys, and every one of those answers is
+// thirty two plausible octets that this package goes on agreeing with itself about.
 func TestTheEpochKeysPreimageIsPinnedToItsExactBytes(t *testing.T) {
 	for _, pinned := range []struct {
 		epoch    uint64
@@ -2132,7 +2161,7 @@ func TestTheEpochKeysPreimageIsPinnedToItsExactBytes(t *testing.T) {
 		{epoch: 42, preimage: attachmentEpochKeysPreimageHex, digest: attachmentEpochKeysDigestHex},
 		{epoch: 1, preimage: attachmentEpochKeysPreimageEpochOneHex, digest: attachmentEpochKeysDigestEpochOneHex},
 	} {
-		got, err := epochKeysPreimage(pinned.epoch, aadRamp(0x70, 32), aadRamp(0x90, 32))
+		got, err := epochKeysPreimage(attachmentVectorGroupId(), pinned.epoch, aadRamp(0x70, 32), aadRamp(0x90, 32))
 		if err != nil {
 			t.Fatalf("epoch %d: the preimage does not build: %v", pinned.epoch, err)
 		}
@@ -2140,12 +2169,18 @@ func TestTheEpochKeysPreimageIsPinnedToItsExactBytes(t *testing.T) {
 			t.Fatalf("epoch %d: the preimage is\n%s\nwant\n%s", pinned.epoch, hex.EncodeToString(got), pinned.preimage)
 		}
 		// the label is twenty two octets of raw ascii with no length prefix in front of it,
-		// so the preimage opens with the label's own bytes and the epoch begins at 22
+		// so the preimage opens with the label's own bytes and LP(group_id) begins at 22
 		if want := []byte(epochKeysLabel); !bytes.Equal(got[:len(want)], want) {
 			t.Errorf("epoch %d: the preimage does not open with the label's own octets", pinned.epoch)
 		}
-		if want, got := 22+8+36+36, len(got); got != want {
+		if want, got := 22+36+8+36+36, len(got); got != want {
 			t.Errorf("epoch %d: the preimage is %d octets and the block adds to %d", pinned.epoch, got, want)
+		}
+		// and the group is the term AFTER the label and BEFORE the epoch, checked at the
+		// offset rather than as a substring: a preimage carrying the group anywhere else is
+		// a preimage that still contains these thirty six octets
+		if want := mustHex("00000020" + attachmentEpochKeysGroupHex); !bytes.Equal(got[22:22+len(want)], want) {
+			t.Errorf("epoch %d: LP(group_id) does not sit between the label and the epoch", pinned.epoch)
 		}
 		// and the digest is SHA-256 of exactly those octets, stated as the hash of the
 		// pinned string rather than as the package's answer
@@ -2154,7 +2189,7 @@ func TestTheEpochKeysPreimageIsPinnedToItsExactBytes(t *testing.T) {
 			t.Fatalf("epoch %d: SHA-256 of the pinned preimage is %s and the pinned digest is %s",
 				pinned.epoch, hex.EncodeToString(sum[:]), pinned.digest)
 		}
-		digest, err := EpochKeysDigest(pinned.epoch, aadRamp(0x70, 32), aadRamp(0x90, 32))
+		digest, err := EpochKeysDigest(attachmentVectorGroupId(), pinned.epoch, aadRamp(0x70, 32), aadRamp(0x90, 32))
 		if err != nil {
 			t.Fatalf("epoch %d: EpochKeysDigest refused two 32 octet keys: %v", pinned.epoch, err)
 		}
@@ -2167,18 +2202,23 @@ func TestTheEpochKeysPreimageIsPinnedToItsExactBytes(t *testing.T) {
 	}
 }
 
-// Every input of the digest changes it: the epoch, every octet of the write key, and every
-// octet of the read key.
+// Every input of the digest changes it: every octet of the group, the epoch, every octet of
+// the write key, and every octet of the read key.
 //
 // The two vectors above are the interop half of this and they are two points. This is the
 // property around them, and it is what catches the term that is present in the pinned case
 // and ignored everywhere else — a preimage that wrote the epoch but read it from the wrong
 // place, or that LP framed one key and raw wrote the other, agrees with the vectors at
 // exactly one value and with nothing else.
+//
+// The group walk is ruling 34's half and it is the same shape as the other three: thirty two
+// flips, each one a group that differs from the vector's in one octet, each one a digest
+// nothing else in this walk collides with. A build that took the group term out entirely
+// collapses all thirty two into the unaltered digest and fails at the first of them.
 func TestEveryInputOfTheEpochKeysDigestChangesIt(t *testing.T) {
 	writeKey := aadRamp(0x70, 32)
 	readKey := aadRamp(0x90, 32)
-	base, err := EpochKeysDigest(42, writeKey, readKey)
+	base, err := EpochKeysDigest(attachmentVectorGroupId(), 42, writeKey, readKey)
 	if err != nil {
 		t.Fatalf("EpochKeysDigest refused two 32 octet keys: %v", err)
 	}
@@ -2193,11 +2233,20 @@ func TestEveryInputOfTheEpochKeysDigestChangesIt(t *testing.T) {
 		}
 		seen[key] = what
 	}
+	for i := 0; i < 32; i++ {
+		group := attachmentVectorGroupId()
+		group[i] ^= 0xFF
+		digest, err := EpochKeysDigest(group, 42, writeKey, readKey)
+		if err != nil {
+			t.Fatalf("a flipped group_id octet was refused: %v", err)
+		}
+		note(fmt.Sprintf("group_id octet %d flipped", i), digest)
+	}
 	for _, epoch := range u64Boundaries() {
 		if epoch == 42 {
 			continue
 		}
-		digest, err := EpochKeysDigest(epoch, writeKey, readKey)
+		digest, err := EpochKeysDigest(attachmentVectorGroupId(), epoch, writeKey, readKey)
 		if err != nil {
 			t.Fatalf("epoch %d was refused: %v", epoch, err)
 		}
@@ -2206,7 +2255,7 @@ func TestEveryInputOfTheEpochKeysDigestChangesIt(t *testing.T) {
 	for i := range writeKey {
 		altered := slices.Clone(writeKey)
 		altered[i] ^= 0xFF
-		digest, err := EpochKeysDigest(42, altered, readKey)
+		digest, err := EpochKeysDigest(attachmentVectorGroupId(), 42, altered, readKey)
 		if err != nil {
 			t.Fatalf("a flipped write_key octet was refused: %v", err)
 		}
@@ -2215,7 +2264,7 @@ func TestEveryInputOfTheEpochKeysDigestChangesIt(t *testing.T) {
 	for i := range readKey {
 		altered := slices.Clone(readKey)
 		altered[i] ^= 0xFF
-		digest, err := EpochKeysDigest(42, writeKey, altered)
+		digest, err := EpochKeysDigest(attachmentVectorGroupId(), 42, writeKey, altered)
 		if err != nil {
 			t.Fatalf("a flipped read_key octet was refused: %v", err)
 		}
@@ -2223,7 +2272,7 @@ func TestEveryInputOfTheEpochKeysDigestChangesIt(t *testing.T) {
 	}
 	// and the two keys are not interchangeable: LP frames each of them, so swapping them is
 	// a different preimage and not the same octets in a different order
-	swapped, err := EpochKeysDigest(42, readKey, writeKey)
+	swapped, err := EpochKeysDigest(attachmentVectorGroupId(), 42, readKey, writeKey)
 	if err != nil {
 		t.Fatalf("the swapped keys were refused: %v", err)
 	}
@@ -2256,10 +2305,10 @@ func TestTheEpochKeysDigestRefusesAKeyThatIsNotThirtyTwoOctets(t *testing.T) {
 			continue
 		}
 		short := fillBytes(0xFB, length)
-		if _, err := EpochKeysDigest(42, short, good); !errors.Is(err, ErrServerAttachmentFieldLength) {
+		if _, err := EpochKeysDigest(attachmentVectorGroupId(), 42, short, good); !errors.Is(err, ErrServerAttachmentFieldLength) {
 			t.Fatalf("a write_key of %d octets answered %v, want ErrServerAttachmentFieldLength", length, err)
 		}
-		if _, err := EpochKeysDigest(42, good, short); !errors.Is(err, ErrServerAttachmentFieldLength) {
+		if _, err := EpochKeysDigest(attachmentVectorGroupId(), 42, good, short); !errors.Is(err, ErrServerAttachmentFieldLength) {
 			t.Fatalf("a read_key of %d octets answered %v, want ErrServerAttachmentFieldLength", length, err)
 		}
 		refusals++
@@ -2268,7 +2317,7 @@ func TestTheEpochKeysDigestRefusesAKeyThatIsNotThirtyTwoOctets(t *testing.T) {
 		t.Fatal("no length was refused, so this walk asserted nothing")
 	}
 	// the positive control, in the same test: the one length it does not refuse
-	if _, err := EpochKeysDigest(42, good, good); err != nil {
+	if _, err := EpochKeysDigest(attachmentVectorGroupId(), 42, good, good); err != nil {
 		t.Fatalf("two 32 octet keys were refused: %v", err)
 	}
 	t.Logf("%d lengths refused on both keys, and 32 accepted", refusals)
@@ -2288,7 +2337,7 @@ func TestTheEpochDigestVectorIsTheEpochVectorWithItsKeysHashed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the kind 0x0001 vector does not parse: %v", err)
 	}
-	digest, err := EpochKeysDigest(epoch.Epoch.Epoch, epoch.Epoch.WriteKey, epoch.Epoch.ReadKey)
+	digest, err := EpochKeysDigest(attachmentVectorGroupId(), epoch.Epoch.Epoch, epoch.Epoch.WriteKey, epoch.Epoch.ReadKey)
 	if err != nil {
 		t.Fatalf("the kind 0x0001 vector's own keys were refused: %v", err)
 	}
@@ -2773,11 +2822,11 @@ func TestTheRightKeysAtTheWrongEpochAreRefusedByTheOnlyCheckThatCanSeeThem(t *te
 	if err != nil {
 		t.Fatalf("the door refused the first vector: %v", err)
 	}
-	if err := CheckEpochKeysDigest(control, writeKey, readKey); err != nil {
+	if err := CheckEpochKeysDigest(attachmentVectorGroupId(), control, writeKey, readKey); err != nil {
 		t.Fatalf("control: the first vector's own keys are refused at its own epoch: %v", err)
 	}
 
-	err = CheckEpochKeysDigest(parsed, writeKey, readKey)
+	err = CheckEpochKeysDigest(attachmentVectorGroupId(), parsed, writeKey, readKey)
 	if err == nil {
 		t.Fatal("the right keys at the wrong epoch were accepted, so nothing ties the digest's epoch to the attachment's")
 	}
@@ -2788,7 +2837,7 @@ func TestTheRightKeysAtTheWrongEpochAreRefusedByTheOnlyCheckThatCanSeeThem(t *te
 	// and the OTHER wrong choice at the same call site: a server reaching for the record
 	// header's epoch — the epoch the commit is SEALED at, one below the one it OPENS — lands
 	// on a digest that matches, which is why the epoch is not a parameter of the checker
-	byHand, err := EpochKeysDigest(42, writeKey, readKey)
+	byHand, err := EpochKeysDigest(attachmentVectorGroupId(), 42, writeKey, readKey)
 	if err != nil {
 		t.Fatalf("EpochKeysDigest refused the two ramps: %v", err)
 	}
@@ -2796,6 +2845,80 @@ func TestTheRightKeysAtTheWrongEpochAreRefusedByTheOnlyCheckThatCanSeeThem(t *te
 		t.Fatal("the wrong epoch vector's digest is not the one at 42, so this test is not measuring what it says")
 	}
 	t.Logf("the wrong epoch vector carries H(epoch_keys) at 42 in a body that opens 43; CheckEpochKeysDigest refuses it and a checker taking the epoch as a parameter would not")
+}
+
+// The digest of the vector's own two keys, at the vector's own epoch, under A DIFFERENT
+// GROUP: aadKatOrdinaryHeader's 0x21 ramp rather than the commit header's 0x11 ramp.
+//
+// Ruling 34's failing direction, and it is a number rather than a property for the reason the
+// wrong epoch vector is octets rather than a construction: an implementation that left
+// LP(group_id) out of the preimage answers ONE digest for both groups, and the cheapest way
+// for it to find that out is a second number it cannot reproduce. Derived outside this
+// package by the same hand method as the other two.
+const attachmentEpochKeysDigestOtherGroupHex = "7789a6e53aec247dcd5b0740a3cc885a29c1f08a15cf792a61f4cba78f6f95cf"
+
+// THE OTHER FAILING DIRECTION: the right keys at the right epoch, of the wrong group.
+//
+// This one cannot be a vector of the attachment's octets the way the wrong epoch one is,
+// because the group is deliberately not a field of the body — so the mismatch lives in the
+// one argument the server brings from outside, and that is exactly where ruling 34 says the
+// exposure was. Before the group joined the preimage, every assertion below held with the
+// groups swapped: one digest served every group, and an epoch's key pair from one group
+// verified against an attachment submitted in another.
+func TestTheRightKeysOfTheWrongGroupAreRefused(t *testing.T) {
+	body, err := ParseEpochDigestAttachment(mustHex(attachmentEpochDigestVectorHex))
+	if err != nil {
+		t.Fatalf("the first vector does not parse: %v", err)
+	}
+	writeKey, readKey := attachmentVectorKeys()
+
+	// the inline positive control, in the same test: the vector's own group is accepted, so a
+	// checker that refused everything cannot pass the half below
+	if err := CheckEpochKeysDigest(attachmentVectorGroupId(), body, writeKey, readKey); err != nil {
+		t.Fatalf("control: the vector's own group is refused: %v", err)
+	}
+
+	var other [32]byte
+	copy(other[:], aadRamp(0x21, 32))
+	if other == attachmentVectorGroupId() {
+		t.Fatal("the two groups are the same value, so this test compares a group with itself")
+	}
+	err = CheckEpochKeysDigest(other, body, writeKey, readKey)
+	if err == nil {
+		t.Fatal("the right keys at the right epoch of another group were accepted, so the digest says nothing about which group it is an epoch of")
+	}
+	if !errors.Is(err, ErrEpochKeysDigestMismatch) {
+		t.Fatalf("the wrong group is refused with %v, want ErrEpochKeysDigestMismatch", err)
+	}
+
+	// and the other group's number is pinned, so an implementation without the group term
+	// meets a second value it cannot reproduce rather than only a refusal it can explain away
+	otherDigest, err := EpochKeysDigest(other, body.Epoch, writeKey, readKey)
+	if err != nil {
+		t.Fatalf("EpochKeysDigest refused the two ramps under the other group: %v", err)
+	}
+	if hex.EncodeToString(otherDigest) != attachmentEpochKeysDigestOtherGroupHex {
+		t.Fatalf("the other group's digest is %s, want %s", hex.EncodeToString(otherDigest), attachmentEpochKeysDigestOtherGroupHex)
+	}
+	if hex.EncodeToString(body.EpochKeysDigest) == attachmentEpochKeysDigestOtherGroupHex {
+		t.Fatal("the two groups give the same digest, so LP(group_id) is not in the preimage")
+	}
+
+	// every octet of the group is in it, not just the first: a preimage that framed a
+	// truncated or padded group would agree with the vector and disagree with these
+	flipped := 0
+	for i := 0; i < 32; i++ {
+		near := attachmentVectorGroupId()
+		near[i] ^= 0xFF
+		if err := CheckEpochKeysDigest(near, body, writeKey, readKey); !errors.Is(err, ErrEpochKeysDigestMismatch) {
+			t.Fatalf("a group differing from the vector's in octet %d answered %v, want ErrEpochKeysDigestMismatch", i, err)
+		}
+		flipped++
+	}
+	if flipped != 32 {
+		t.Fatalf("walked %d group octets, want 32", flipped)
+	}
+	t.Logf("the vector's own group is accepted, another group and all %d one-octet neighbours are refused", flipped)
 }
 
 // NewEpochDigestAttachment reads the epoch ONCE, from the body it is building, so the
@@ -2811,7 +2934,7 @@ func TestNewEpochDigestAttachmentReadsTheEpochOnceFromTheBodyItBuilds(t *testing
 	epochs := []uint64{0, 1, 2, 42, 43, 0x100000000, 0xFFFFFFFFFFFFFFFF}
 	built := map[uint64]*EpochDigestAttachment{}
 	for _, epoch := range epochs {
-		one, err := NewEpochDigestAttachment(EpochDigestAttachment{
+		one, err := NewEpochDigestAttachment(attachmentVectorGroupId(), EpochDigestAttachment{
 			Epoch:             epoch,
 			AlgId:             attachmentAlgIds[AttachmentEpochDigest],
 			MediaTtlSeconds:   2592000,
@@ -2825,7 +2948,7 @@ func TestNewEpochDigestAttachmentReadsTheEpochOnceFromTheBodyItBuilds(t *testing
 		if one.Epoch != epoch {
 			t.Fatalf("epoch %d: the body it built opens %d", epoch, one.Epoch)
 		}
-		if err := CheckEpochKeysDigest(one, writeKey, readKey); err != nil {
+		if err := CheckEpochKeysDigest(attachmentVectorGroupId(), one, writeKey, readKey); err != nil {
 			t.Fatalf("epoch %d: what the constructor built does not check out against the keys it was handed: %v", epoch, err)
 		}
 		built[epoch] = one
@@ -2838,7 +2961,7 @@ func TestNewEpochDigestAttachmentReadsTheEpochOnceFromTheBodyItBuilds(t *testing
 			}
 			moved := *built[mine]
 			moved.Epoch = other
-			err := CheckEpochKeysDigest(&moved, writeKey, readKey)
+			err := CheckEpochKeysDigest(attachmentVectorGroupId(), &moved, writeKey, readKey)
 			if err == nil {
 				t.Fatalf("the digest built at epoch %d still checks out in a body that opens %d", mine, other)
 			}
@@ -2867,7 +2990,7 @@ func TestNewEpochDigestAttachmentRefusesADigestItDidNotCompute(t *testing.T) {
 		ExpectedWrapCount: 1501,
 	}
 	// the control first: unset, it is built and it is the pinned vector's own digest
-	answer, err := NewEpochDigestAttachment(public, writeKey, readKey)
+	answer, err := NewEpochDigestAttachment(attachmentVectorGroupId(), public, writeKey, readKey)
 	if err != nil {
 		t.Fatalf("control: the constructor refused a body with no digest on it: %v", err)
 	}
@@ -2885,7 +3008,7 @@ func TestNewEpochDigestAttachmentRefusesADigestItDidNotCompute(t *testing.T) {
 	} {
 		already := public
 		already.EpochKeysDigest = arriving
-		if _, err := NewEpochDigestAttachment(already, writeKey, readKey); err == nil {
+		if _, err := NewEpochDigestAttachment(attachmentVectorGroupId(), already, writeKey, readKey); err == nil {
 			t.Fatalf("a body arriving with %d digest octets was accepted", len(arriving))
 		} else if !errors.Is(err, ErrEpochKeysDigestPresence) {
 			t.Fatalf("a body arriving with %d digest octets is refused with %v, want ErrEpochKeysDigestPresence", len(arriving), err)
@@ -2929,7 +3052,7 @@ func TestNewEpochDigestAttachmentAnswersNothingItsOwnDoorWouldRefuse(t *testing.
 		{name: "a 31 octet write_key", public: good, keys: [2][]byte{aadRamp(0x70, 31), readKey}},
 		{name: "an empty read_key", public: good, keys: [2][]byte{writeKey, nil}},
 	} {
-		answer, err := NewEpochDigestAttachment(one.public, one.keys[0], one.keys[1])
+		answer, err := NewEpochDigestAttachment(attachmentVectorGroupId(), one.public, one.keys[0], one.keys[1])
 		if err != nil {
 			refused++
 			continue
@@ -2938,7 +3061,7 @@ func TestNewEpochDigestAttachmentAnswersNothingItsOwnDoorWouldRefuse(t *testing.
 		if _, err := EncodeEpochDigestAttachment(answer); err != nil {
 			t.Errorf("%s: the constructor answered a body the door then refused: %v", one.name, err)
 		}
-		if err := CheckEpochKeysDigest(answer, one.keys[0], one.keys[1]); err != nil {
+		if err := CheckEpochKeysDigest(attachmentVectorGroupId(), answer, one.keys[0], one.keys[1]); err != nil {
 			t.Errorf("%s: the constructor answered a body that does not check out against its own keys: %v", one.name, err)
 		}
 	}
@@ -2966,7 +3089,7 @@ func TestCheckEpochKeysDigestRefusesEveryAlterationOfEitherKey(t *testing.T) {
 	}
 	// the positive control, first: without it every refusal below is satisfied by a checker
 	// that answers no to everything
-	if err := CheckEpochKeysDigest(body, writeKey, readKey); err != nil {
+	if err := CheckEpochKeysDigest(attachmentVectorGroupId(), body, writeKey, readKey); err != nil {
 		t.Fatalf("control: the vector's own two keys are refused: %v", err)
 	}
 
@@ -2975,7 +3098,7 @@ func TestCheckEpochKeysDigestRefusesEveryAlterationOfEitherKey(t *testing.T) {
 		for _, which := range []int{0, 1} {
 			keys := [2][]byte{bytes.Clone(writeKey), bytes.Clone(readKey)}
 			keys[which][at] ^= 0x80
-			err := CheckEpochKeysDigest(body, keys[0], keys[1])
+			err := CheckEpochKeysDigest(attachmentVectorGroupId(), body, keys[0], keys[1])
 			if err == nil {
 				t.Fatalf("a bit flipped at octet %d of key %d still checks out", at, which)
 			}
@@ -2987,7 +3110,7 @@ func TestCheckEpochKeysDigestRefusesEveryAlterationOfEitherKey(t *testing.T) {
 	}
 	// the two keys swapped: the same 64 octets in the other order, which an unframed or
 	// order blind preimage would accept
-	if err := CheckEpochKeysDigest(body, readKey, writeKey); err == nil {
+	if err := CheckEpochKeysDigest(attachmentVectorGroupId(), body, readKey, writeKey); err == nil {
 		t.Fatal("the two keys swapped still check out, so the preimage does not distinguish them")
 	} else if !errors.Is(err, ErrEpochKeysDigestMismatch) {
 		t.Fatalf("the two keys swapped are refused with %v, want ErrEpochKeysDigestMismatch", err)
@@ -2999,7 +3122,7 @@ func TestCheckEpochKeysDigestRefusesEveryAlterationOfEitherKey(t *testing.T) {
 		for _, which := range []int{0, 1} {
 			keys := [2][]byte{writeKey, readKey}
 			keys[which] = wrong
-			err := CheckEpochKeysDigest(body, keys[0], keys[1])
+			err := CheckEpochKeysDigest(attachmentVectorGroupId(), body, keys[0], keys[1])
 			if !errors.Is(err, ErrServerAttachmentFieldLength) {
 				t.Fatalf("a %d octet key %d is refused with %v, want ErrServerAttachmentFieldLength", len(wrong), which, err)
 			}
@@ -3014,11 +3137,11 @@ func TestCheckEpochKeysDigestRefusesEveryAlterationOfEitherKey(t *testing.T) {
 	for _, truncated := range [][]byte{nil, {}, body.EpochKeysDigest[:16], body.EpochKeysDigest[:31]} {
 		shortened := *body
 		shortened.EpochKeysDigest = truncated
-		if err := CheckEpochKeysDigest(&shortened, writeKey, readKey); !errors.Is(err, ErrEpochKeysDigestMismatch) {
+		if err := CheckEpochKeysDigest(attachmentVectorGroupId(), &shortened, writeKey, readKey); !errors.Is(err, ErrEpochKeysDigestMismatch) {
 			t.Fatalf("a %d octet digest is refused with %v, want ErrEpochKeysDigestMismatch", len(truncated), err)
 		}
 	}
-	if CheckEpochKeysDigest(nil, writeKey, readKey) == nil {
+	if CheckEpochKeysDigest(attachmentVectorGroupId(), nil, writeKey, readKey) == nil {
 		t.Fatal("no body at all checks out")
 	}
 	t.Logf("%d alterations of the two keys refused, every one of them as a mismatch", mismatches)
@@ -3062,7 +3185,7 @@ func TestAnEpochDigestBuiltHereSurvivesItsDoorAndChecksOut(t *testing.T) {
 	for _, entry := range epochDigestWalkCorpus(t) {
 		public := *entry.attachment.EpochDigest
 		public.EpochKeysDigest = nil
-		built, err := NewEpochDigestAttachment(public, writeKey, readKey)
+		built, err := NewEpochDigestAttachment(attachmentVectorGroupId(), public, writeKey, readKey)
 		if err != nil {
 			t.Fatalf("%s: the constructor refused a corpus body: %v", entry.name, err)
 		}
@@ -3074,7 +3197,7 @@ func TestAnEpochDigestBuiltHereSurvivesItsDoorAndChecksOut(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: the door refused its own octets back: %v", entry.name, err)
 		}
-		if err := CheckEpochKeysDigest(parsed, writeKey, readKey); err != nil {
+		if err := CheckEpochKeysDigest(attachmentVectorGroupId(), parsed, writeKey, readKey); err != nil {
 			t.Fatalf("%s: a body that went out through the door does not check out coming back: %v", entry.name, err)
 		}
 		// and the record slot carries it: the same octets ParseRecord reads back

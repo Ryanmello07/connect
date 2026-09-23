@@ -30,8 +30,15 @@
 //	                 ‖ u32(durable_ttl_seconds) ‖ LP(group_context_hash)
 //	                 ‖ u32(expected_wrap_count) ‖ LP(H(epoch_keys))
 //
-//	epoch_keys      := "URmessage/v1/epochkeys" ‖ u64(opens_epoch) ‖ LP(write_key)
-//	                 ‖ LP(read_key)
+//	epoch_keys      := "URmessage/v1/epochkeys" ‖ LP(group_id) ‖ u64(opens_epoch)
+//	                 ‖ LP(write_key) ‖ LP(read_key)
+//
+// LP(group_id) IS WHERE IT IS BECAUSE THAT IS WHERE EVERY SIBLING PREIMAGE IN THIS SYSTEM
+// PUTS IT: aad_body and aad_head carry LP(group_id) ahead of every number they commit to,
+// write_auth carries it directly after the connection's LP(server_nonce), and section
+// 4.3.4's attestation carries it directly after LP(server_id) — the scope first, the
+// position inside the scope second. It is LP framed rather than raw for codec.go's rule,
+// the same rule that frames the two keys.
 //
 // codec.go states the rule that generated a layout and it holds here too: a field whose
 // width is fixed by its go type encodes raw at that width, and a field whose length varies
@@ -364,12 +371,25 @@ type EpochDigestAttachment struct {
 	ExpectedWrapCount uint32
 	// H(epoch_keys), exactly 32 octets: SHA-256 over
 	//
-	//	"URmessage/v1/epochkeys" ‖ u64(opens_epoch) ‖ LP(write_key) ‖ LP(read_key)
+	//	"URmessage/v1/epochkeys" ‖ LP(group_id) ‖ u64(opens_epoch)
+	//	  ‖ LP(write_key) ‖ LP(read_key)
 	//
 	// and EpochKeysDigest is the one function in this package that computes it. The two
 	// keys are LP framed inside the preimage, so no choice of one key's octets can move a
-	// boundary into the other's, and opens_epoch is inside it so that one epoch's pair
-	// cannot be replayed as another's.
+	// boundary into the other's; opens_epoch is inside it so that one epoch's pair cannot
+	// be replayed as another's; and group_id is inside it — ruling 34 — so that the pair
+	// is an epoch OF A GROUP and not a number. Without the group term the preimage commits
+	// to an epoch index and two keys, and epoch 1 of every group in the world is the same
+	// index: the same digest verifies the same two keys under any group_id a request cares
+	// to name, and this structure alone can no longer say which group it is about.
+	//
+	// The group is NOT a field of this type, and that is the same ruling read the other
+	// way. This package already has one wire-visible group_id per record, in the header,
+	// where AAD_head and the write_auth preimage both commit to it; a second copy here
+	// would be a second group this attachment could disagree with its own record about,
+	// which is a new instance of exactly the defect NewEpochDigestAttachment exists to
+	// close, in a place this package cannot see both halves of. So the group is a
+	// parameter of the three functions below and a field of nothing.
 	//
 	// The server does not learn the keys from this. It is handed them beside the record and
 	// recomputes this value, which the write_auth mac already covers by way of
@@ -405,16 +425,30 @@ type EpochDigestAttachment struct {
 // which is a copy and not a construction. Refused rather than overwritten: overwriting it
 // would silently discard a value its author believed in.
 //
+// THE GROUP GETS THE SAME TREATMENT BY A DIFFERENT ROUTE, and the route matters. Ruling 34
+// put LP(group_id) in the preimage, and the way to keep a caller from naming a group that
+// disagrees with something is to leave it nothing to disagree WITH: the group is not a
+// field of EpochDigestAttachment, is not a second parameter of the checker, and has exactly
+// one home in a record — the header's own GroupId, which AAD_head and the write_auth
+// preimage already commit to. It is typed [32]byte here, that header field's own type, so
+// the only value a caller can hand over is a whole 32 octet group id, at the width the
+// preimage frames, taken from the one place the record keeps it. It also cannot be
+// transposed with either key: [32]byte and []byte do not convert, so the swap that would
+// hash a key as the group and the group as a key is a compile error rather than a digest
+// nothing else reproduces.
+//
 // Everything it returns has been through checkEpochDigestAttachment, so a body this answers
 // is a body the sixth kind's door will encode.
-func NewEpochDigestAttachment(public EpochDigestAttachment, writeKey []byte, readKey []byte) (*EpochDigestAttachment, error) {
+func NewEpochDigestAttachment(groupId [32]byte, public EpochDigestAttachment, writeKey []byte, readKey []byte) (*EpochDigestAttachment, error) {
 	if 0 < len(public.EpochKeysDigest) {
 		return nil, fmt.Errorf("%w: epoch_keys_digest arrived already filled, at %d octets, and it is this function's to compute from the epoch beside it",
 			ErrEpochKeysDigestPresence, len(public.EpochKeysDigest))
 	}
 	// the ONE place the epoch is read for the preimage, and it is the field of the body this
-	// is building. There is no parameter here that could name a different one.
-	digest, err := EpochKeysDigest(public.Epoch, writeKey, readKey)
+	// is building. There is no parameter here that could name a different one. The group is
+	// the opposite arrangement to the same end: it is a parameter and a field of nothing, so
+	// there is no second group here either.
+	digest, err := EpochKeysDigest(groupId, public.Epoch, writeKey, readKey)
 	if err != nil {
 		return nil, err
 	}
@@ -445,14 +479,22 @@ func NewEpochDigestAttachment(public EpochDigestAttachment, writeKey []byte, rea
 // and is still not asked here; this function asks only whether the digest matches the keys,
 // at the epoch the digest itself claims.
 //
+// THE GROUP IS A PARAMETER AND THE EPOCH IS NOT, and the asymmetry is the point rather than
+// an inconsistency. The epoch has a home in the body, so taking one here would be offering a
+// second answer to a question the body already answers. The group has no home in the body
+// and must not get one — see EpochKeysDigest — so the only place it can come from is the
+// caller, and the caller that reaches here is the server, which holds the group_id the
+// request named and has already verified the record against it. It is the group of the
+// group, not of the attachment: the [32]byte that came off the wire once.
+//
 // It answers an error rather than a bool so that a mismatch and a malformed key are
 // different sentinels at the call site: the second is a caller that looked a key up and got
 // nothing back, and answering "no" to that would report an attacker where there is a bug.
-func CheckEpochKeysDigest(d *EpochDigestAttachment, writeKey []byte, readKey []byte) error {
+func CheckEpochKeysDigest(groupId [32]byte, d *EpochDigestAttachment, writeKey []byte, readKey []byte) error {
 	if d == nil {
 		return fmt.Errorf("%w: kind 0x%04x carries no body", ErrServerAttachmentBody, uint16(AttachmentEpochDigest))
 	}
-	computed, err := EpochKeysDigest(d.Epoch, writeKey, readKey)
+	computed, err := EpochKeysDigest(groupId, d.Epoch, writeKey, readKey)
 	if err != nil {
 		return err
 	}
@@ -468,7 +510,12 @@ func CheckEpochKeysDigest(d *EpochDigestAttachment, writeKey []byte, readKey []b
 // EpochKeysDigest is H(epoch_keys): the one value an EpochDigestAttachment carries about
 // the two keys it does not carry.
 //
-//	epoch_keys := "URmessage/v1/epochkeys" ‖ u64(opens_epoch) ‖ LP(write_key) ‖ LP(read_key)
+//	epoch_keys := "URmessage/v1/epochkeys" ‖ LP(group_id) ‖ u64(opens_epoch)
+//	                ‖ LP(write_key) ‖ LP(read_key)
+//
+// LP(group_id) is ruling 34 and it sits where the file comment argues it sits: ahead of
+// every number, because that is where aad_body, aad_head, write_auth and section 4.3.4's
+// attestation each put the group they are about.
 //
 // H is SHA-256, per master section 0's notation line, and the answer is its thirty two
 // octets. It is exported because both ends compute it: the committer to fill the field, and
@@ -481,8 +528,8 @@ func CheckEpochKeysDigest(d *EpochDigestAttachment, writeKey []byte, readKey []b
 // over a short key is a digest nothing else reproduces, and the one caller that could get
 // here with one is a caller that looked a key up and got nothing back — which is the empty
 // key writeauth.go's ErrAuthKeyLength exists to keep out of a mac, met one layer further out.
-func EpochKeysDigest(opensEpoch uint64, writeKey []byte, readKey []byte) ([]byte, error) {
-	preimage, err := epochKeysPreimage(opensEpoch, writeKey, readKey)
+func EpochKeysDigest(groupId [32]byte, opensEpoch uint64, writeKey []byte, readKey []byte) ([]byte, error) {
+	preimage, err := epochKeysPreimage(groupId, opensEpoch, writeKey, readKey)
 	if err != nil {
 		return nil, err
 	}
@@ -500,7 +547,7 @@ func EpochKeysDigest(opensEpoch uint64, writeKey []byte, readKey []byte) ([]byte
 // The label is raw ascii and is NOT length prefixed, exactly as the four labels in aad.go
 // and writeauth.go are, so a reader of the bytes meets twenty two label octets and then the
 // first field. What separates this preimage from those four is the bytes of the label alone.
-func epochKeysPreimage(opensEpoch uint64, writeKey []byte, readKey []byte) ([]byte, error) {
+func epochKeysPreimage(groupId [32]byte, opensEpoch uint64, writeKey []byte, readKey []byte) ([]byte, error) {
 	if err := checkAttachmentWidth("write_key", writeKey, epochWriteKeyBytes); err != nil {
 		return nil, err
 	}
@@ -509,6 +556,10 @@ func epochKeysPreimage(opensEpoch uint64, writeKey []byte, readKey []byte) ([]by
 	}
 	writer := syntax.NewWriter()
 	writer.WriteRaw([]byte(epochKeysLabel))
+	// the group before the epoch, which is the order of all four sibling preimages: aad.go's
+	// two write LP(group_id) ahead of every number, and writeauth.go's two write it directly
+	// after the scope above the group — the connection's nonce, the server's id
+	writer.WriteOpaqueLP(groupId[:])
 	writer.WriteUint64(opensEpoch)
 	writer.WriteOpaqueLP(writeKey)
 	writer.WriteOpaqueLP(readKey)
