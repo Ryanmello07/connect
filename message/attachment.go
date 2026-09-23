@@ -978,6 +978,17 @@ func checkServerAttachment(a *ServerAttachment) error {
 // wrong window. The two refusals mean different things to a caller — "nobody defines this"
 // against "this door does not serve it yet" — so they are two sentinels and this one is
 // reached only for a kind that is well formed and defined.
+//
+// EACH OF THE THREE CALLS TO THIS FUNCTION HAS A WITNESS, and it is written down here
+// because for one commit two of them had none. When section 5.1 check 3's door was
+// widened to every kind this package defines, its complement went empty — and every test
+// that could see a served check was written over the kinds a door REFUSES, so it visited no
+// pair at that door. Both of its calls, in EncodeServerAttachment and ParseServerAttachment,
+// could then be deleted outright with this package, messagegroup and protocol green. What
+// holds them now is TestEachDoorsServedMapIsConsultedByTheEntryPointsWrittenDownForIt, which
+// does not read the complement: it deletes one entry from a door's map, in process, and
+// requires the door to refuse that kind and to go on serving the rest. A door that stopped
+// asking its map — including one that answered correctly from a hardcoded switch — fails it.
 func checkAttachmentKindServed(kind ServerAttachmentKind, served map[ServerAttachmentKind]bool, door string) error {
 	if !serverAttachmentKindKnown[kind] || served[kind] {
 		return nil

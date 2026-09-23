@@ -466,6 +466,63 @@ func unservedAttachmentCodes(t testing.TB, door string) []int {
 	return codes
 }
 
+// The package's own served map per door, keyed by door name, with the two ways that
+// correspondence can go wrong asserted HERE and asserted once.
+//
+// It is a function rather than a literal at each call site because there are now two call
+// sites — the test that compares each map's CONTENTS against the disposition, and the test
+// that narrows each map to witness its CALL SITES — and a second literal would be a second
+// place for a door to go missing from.
+func attachmentServedMaps(t testing.TB) map[string]map[ServerAttachmentKind]bool {
+	t.Helper()
+	answer := map[string]map[ServerAttachmentKind]bool{
+		serverAttachmentDoorName: serverAttachmentKindServed,
+		epochDigestDoorName:      epochDigestKindServed,
+	}
+	if len(answer) != len(attachmentDoorServes) {
+		t.Fatalf("the package has %d served maps and %d doors are written down", len(answer), len(attachmentDoorServes))
+	}
+	for _, door := range attachmentDoorNames() {
+		if _, wired := answer[door]; !wired {
+			t.Fatalf("door %q is written down and no map of this package answers for it", door)
+		}
+	}
+	return answer
+}
+
+// The two halves of a door: the entry point that WRITES an attachment and the one that READS
+// one. Named rather than spelled as string literals at each of the five places they appear.
+const (
+	attachmentEncodeHalf = "encode"
+	attachmentParseHalf  = "parse"
+)
+
+// WHICH OF EACH DOOR'S ENTRY POINTS ASK ITS SERVED MAP AT RUN TIME, as a DISPOSITION, and
+// the asymmetry in it is the content.
+//
+// Section 5.1 check 3's door has BOTH halves, and it has to: EncodeServerAttachment takes a
+// whole ServerAttachment and ParseServerAttachment takes whole octets, so in each case a kind
+// the door does not serve is a value the door can be HANDED, and the only thing that can
+// refuse it is a run time check against the map. Those are the two call sites that were
+// witnessed by nothing until this test.
+//
+// The epoch digest door has the PARSE half only. That is not an omission and it is not a
+// weaker door — it is a stronger one. EncodeEpochDigestAttachment takes the BODY,
+// *EpochDigestAttachment, so an unserved kind cannot be SPELLED at it and its refusal is the
+// compiler's rather than a map lookup's. Its parse half has no such luxury: octets carry
+// their own kind, so ParseEpochDigestAttachment must ask.
+//
+// BOTH DIRECTIONS ARE ASSERTED, which is what makes this a disposition rather than a note. A
+// half listed here must REFUSE while the map is narrowed; a half not listed must SUCCEED. So
+// a served check added to EncodeEpochDigestAttachment fails here until someone writes it
+// down, and a served check deleted from either half of section 5.1 check 3's door fails here
+// too — which is the whole point, because on 2026-09-23 either one could be deleted outright
+// with this package, messagegroup and protocol all green.
+var attachmentDoorRuntimeHalves = map[string][]string{
+	serverAttachmentDoorName: {attachmentEncodeHalf, attachmentParseHalf},
+	epochDigestDoorName:      {attachmentParseHalf},
+}
+
 // One encoding offered to the door NAMED, rather than to the door that serves its kind, with
 // whatever that door parsed rebuilt into the one shape the comparisons in this file take.
 //
@@ -1088,13 +1145,7 @@ func encodableKindCodes(t testing.TB) []int {
 // refuses a defined kind at all and the mechanism the next test gates has nothing to hold
 // over.
 func TestEachDoorServesExactlyTheKindsWrittenDownForIt(t *testing.T) {
-	packageAnswer := map[string]map[ServerAttachmentKind]bool{
-		serverAttachmentDoorName: serverAttachmentKindServed,
-		epochDigestDoorName:      epochDigestKindServed,
-	}
-	if len(packageAnswer) != len(attachmentDoorServes) {
-		t.Fatalf("the package has %d served maps and %d doors are written down", len(packageAnswer), len(attachmentDoorServes))
-	}
+	packageAnswer := attachmentServedMaps(t)
 	unservedSomewhere := 0
 	for _, door := range attachmentDoorNames() {
 		served, wired := packageAnswer[door]
@@ -1133,6 +1184,246 @@ func TestEachDoorServesExactlyTheKindsWrittenDownForIt(t *testing.T) {
 		t.Errorf("%s serves %v and ruling 27 defines %v", epochDigestDoorName,
 			servedAttachmentCodes(t, epochDigestDoorName), want)
 	}
+}
+
+// EVERY DOOR'S SERVED MAP IS CONSULTED BY THE ENTRY POINTS WRITTEN DOWN FOR IT, MEASURED BY
+// NARROWING THE MAP AND WATCHING THE DOOR.
+//
+// WHAT THIS TEST IS FOR, AND WHY THE TEST ABOVE IS NOT IT. The test above pins the CONTENTS
+// of serverAttachmentKindServed and epochDigestKindServed against the written down
+// disposition. Nothing pinned the CALL SITES that consult them. Those are two different
+// properties and the difference had teeth as of 2026-09-23: with section 5.1 check 3's door
+// widened to every kind this package defines, unservedAttachmentCodes for that door is the
+// empty slice, so TestARecordCarriesAKindADoorRefusesByName's refusal arm visits ZERO pairs
+// at that door and only its acceptance arm runs there. Measured on the tree this test landed
+// on: deleting the three line checkAttachmentKindServed block from EncodeServerAttachment
+// left `ok message 6.843s`, `ok messagegroup 9.440s` — SURVIVING — and deleting the same
+// block from ParseServerAttachment left `ok message 6.754s`, `ok messagegroup 9.157s`. The
+// inline positive control, deleting the same block from ParseEpochDigestAttachment, reddened
+// seven tests, so the suite CAN see a deleted served check; it simply could not see one at
+// the door whose complement had just gone empty. One commit earlier, at 241b9000, each of
+// those two deletions reddened four tests. That is a gate that got NARROWER while its commit
+// message said it had got wider, and this test is the replacement that is actually stronger:
+// it does not depend on any complement being non-empty, because it MAKES one.
+//
+// HOW. For each (door, kind) pair the disposition table says is served, the kind is deleted
+// from that door's package map for the length of one closure and the door is asked to encode
+// and to parse it. The refusal has to come back by sentinel, naming the kind and naming the
+// door. Then the entry is restored and the same two calls have to succeed again, against the
+// octets captured before the narrowing — so the assertion fails in BOTH directions: a call
+// site that stops consulting the map fails the narrowed half, and a door that refuses what
+// its map holds fails the restored half.
+//
+// THE HALVES ARE A DISPOSITION AND THE COMPLEMENT IS ASSERTED, NOT PRINTED. Not every door
+// has both halves, and the asymmetry is real rather than an omission — see
+// attachmentDoorRuntimeHalves. A half the table does NOT list is required to SUCCEED while
+// the map is narrowed, which is what keeps the table honest: adding a served check to
+// EncodeEpochDigestAttachment without writing it down fails here, and so does a table entry
+// for a half that does not consult the map.
+//
+// THE POSITIVE HALF RUNS INSIDE THE SAME NARROWING, because a door that refused everything
+// while the map was narrowed would satisfy every refusal above and say nothing about the
+// map. It is taken two ways and at least one is required to exist for every pair: another
+// kind THIS door still serves, and the same kind at ANOTHER door whose map was not touched.
+func TestEachDoorsServedMapIsConsultedByTheEntryPointsWrittenDownForIt(t *testing.T) {
+	byKind := validAttachmentsByKind(t)
+	servedMaps := attachmentServedMaps(t)
+
+	// THE HALVES TABLE AGAINST THE DOOR TABLE, BOTH DIRECTIONS, before anything is narrowed:
+	// a door with no entry is a door whose call sites nothing below would witness, and an
+	// entry for a door that is gone is a sentence about this package that has stopped being
+	// true.
+	for _, door := range attachmentDoorNames() {
+		halves, written := attachmentDoorRuntimeHalves[door]
+		if !written {
+			t.Fatalf("door %q is written down in attachmentDoorServes and attachmentDoorRuntimeHalves "+
+				"says nothing about which of its entry points consult its served map, so this test "+
+				"would witness none of them", door)
+		}
+		if len(halves) == 0 {
+			t.Fatalf("attachmentDoorRuntimeHalves gives %q no half at all; a door none of whose entry "+
+				"points asks its served map is a door whose map is decoration", door)
+		}
+	}
+	for door := range attachmentDoorRuntimeHalves {
+		if _, known := attachmentDoorServes[door]; !known {
+			t.Errorf("attachmentDoorRuntimeHalves names %q and no such door is written down in "+
+				"attachmentDoorServes", door)
+		}
+	}
+
+	witnessed, unwitnessed := 0, 0
+	for _, door := range attachmentDoorNames() {
+		served := servedMaps[door]
+		codes := servedAttachmentCodes(t, door)
+		for _, code := range codes {
+			kind := ServerAttachmentKind(code)
+			// the octets this kind's OWN door writes, captured before the narrowing, so the
+			// parse half has something to offer the narrowed door and the restored half has
+			// something exact to compare against. encodeAtItsDoor is used rather than
+			// encodeAtDoor because the door under narrowing is about to refuse.
+			slot, err := encodeAtItsDoor(byKind[kind])
+			if err != nil {
+				t.Fatalf("kind 0x%04x does not encode at its own door before any narrowing: %v", code, err)
+			}
+
+			// the positive half's two forms, decided before the narrowing and required to
+			// have found at least one between them
+			otherKindAtThisDoor := -1
+			for _, other := range codes {
+				if other != code {
+					otherKindAtThisDoor = other
+					break
+				}
+			}
+			otherDoorsServingThisKind := []string{}
+			for _, other := range attachmentDoorsServing(t, code) {
+				if other != door {
+					otherDoorsServingThisKind = append(otherDoorsServingThisKind, other)
+				}
+			}
+			if otherKindAtThisDoor < 0 && len(otherDoorsServingThisKind) == 0 {
+				t.Fatalf("narrowing kind 0x%04x out of %s leaves nothing in the same run that must "+
+					"still be served, so the refusals below would be indistinguishable from a door "+
+					"that had stopped working altogether", code, door)
+			}
+
+			func() {
+				was, present := served[kind]
+				defer func() {
+					if present {
+						served[kind] = was
+					} else {
+						delete(served, kind)
+					}
+				}()
+				delete(served, kind)
+
+				for _, half := range []string{attachmentEncodeHalf, attachmentParseHalf} {
+					var answerErr error
+					switch half {
+					case attachmentEncodeHalf:
+						_, answerErr = encodeAtDoor(t, door, byKind[kind])
+					case attachmentParseHalf:
+						_, answerErr = parseAtDoor(t, door, slot)
+					}
+					if !slices.Contains(attachmentDoorRuntimeHalves[door], half) {
+						// THE COMPLEMENT, ASSERTED. This half is written down as NOT asking the
+						// map, so narrowing the map may not change its answer. The epoch digest
+						// door's encode half is the whole of this today: it takes the BODY, so a
+						// kind it does not serve cannot be spelled at it.
+						if answerErr != nil {
+							t.Errorf("attachmentDoorRuntimeHalves says the %s half of %s does not "+
+								"consult its served map, and with kind 0x%04x deleted from that map "+
+								"it refused: %v. Either it consults the map now and the table has to "+
+								"say so, or something else broke.", half, door, code, answerErr)
+						}
+						unwitnessed++
+						continue
+					}
+					if answerErr == nil {
+						t.Errorf("kind 0x%04x was deleted from %s's served map and the %s half served "+
+							"it anyway, so nothing in that entry point asks the map and deleting the "+
+							"checkAttachmentKindServed call from it would change no test's answer. "+
+							"This is the exact regression of 2026-09-23: the map's CONTENTS are pinned "+
+							"by TestEachDoorServesExactlyTheKindsWrittenDownForIt and its CALL SITES "+
+							"were pinned by nothing.", code, door, half)
+						continue
+					}
+					if !errors.Is(answerErr, ErrServerAttachmentKindNotServed) {
+						t.Errorf("the %s half of %s refused the narrowed kind 0x%04x with %v, want "+
+							"ErrServerAttachmentKindNotServed; a different sentinel means the refusal "+
+							"came from somewhere other than the served check", half, door, code, answerErr)
+						continue
+					}
+					if named := fmt.Sprintf("0x%04x", code); !strings.Contains(answerErr.Error(), named) {
+						t.Errorf("the %s half of %s refused the narrowed kind %s with %q, which does "+
+							"not name the kind", half, door, named, answerErr.Error())
+					}
+					if !strings.Contains(answerErr.Error(), door) {
+						t.Errorf("the %s half of %s refused the narrowed kind 0x%04x with %q, which "+
+							"does not name the door that answered", half, door, code, answerErr.Error())
+					}
+					witnessed++
+				}
+
+				// THE POSITIVE HALF, INSIDE THE NARROWING. What is still in the map is still
+				// served, at this door and at any other door that serves this kind, so the
+				// refusals above are about the one entry that was deleted.
+				if otherKindAtThisDoor >= 0 {
+					other := ServerAttachmentKind(otherKindAtThisDoor)
+					otherSlot, err := encodeAtItsDoor(byKind[other])
+					if err != nil {
+						t.Fatalf("kind 0x%04x does not encode at its own door: %v", otherKindAtThisDoor, err)
+					}
+					if _, err := parseAtDoor(t, door, otherSlot); err != nil {
+						t.Errorf("with kind 0x%04x deleted from %s's served map, that door also refused "+
+							"kind 0x%04x, which is still in it: %v. The refusals above are then about "+
+							"the door being broken and not about the narrowing.",
+							code, door, otherKindAtThisDoor, err)
+					}
+				}
+				for _, other := range otherDoorsServingThisKind {
+					if _, err := parseAtDoor(t, other, slot); err != nil {
+						t.Errorf("kind 0x%04x was deleted from %s's served map and %s — a different "+
+							"door, whose map was not touched — refused it too: %v. One door's map is "+
+							"then not one door's map.", code, door, other, err)
+					}
+				}
+			}()
+
+			// AND THE RESTORED HALF, WHICH IS THE OTHER DIRECTION: the entry is back and the
+			// door serves the kind again, by value and by octet. Without this the whole test
+			// would be satisfied by a door that refused everything.
+			if !served[kind] {
+				t.Fatalf("kind 0x%04x was not restored to %s's served map, so every assertion after "+
+					"this one runs against a package this test broke", code, door)
+			}
+			if slices.Contains(attachmentDoorRuntimeHalves[door], attachmentEncodeHalf) {
+				again, err := encodeAtDoor(t, door, byKind[kind])
+				if err != nil {
+					t.Errorf("%s refused to encode kind 0x%04x after its map entry was restored: %v", door, code, err)
+				} else if !bytes.Equal(again, slot) {
+					t.Errorf("%s encoded kind 0x%04x differently after its map entry was restored: %s",
+						door, code, firstOctetDifference(slot, again))
+				}
+			}
+			parsed, err := parseAtDoor(t, door, slot)
+			if err != nil {
+				t.Errorf("%s refused to parse kind 0x%04x after its map entry was restored: %v", door, code, err)
+			} else if difference := attachmentDifference(byKind[kind], parsed); difference != "" {
+				t.Errorf("%s parsed kind 0x%04x after its map entry was restored and handed back an "+
+					"attachment whose %s differs", door, code, difference)
+			}
+		}
+	}
+
+	// THE COUNT IS DERIVED FROM THE TWO TABLES AND COMPARED, rather than logged. A walk that
+	// silently stopped visiting a door — the failure this whole test exists to catch, one
+	// level up — would leave the loop green and the number short.
+	wantWitnessed, wantUnwitnessed := 0, 0
+	for _, door := range attachmentDoorNames() {
+		for range servedAttachmentCodes(t, door) {
+			for _, half := range []string{attachmentEncodeHalf, attachmentParseHalf} {
+				if slices.Contains(attachmentDoorRuntimeHalves[door], half) {
+					wantWitnessed++
+				} else {
+					wantUnwitnessed++
+				}
+			}
+		}
+	}
+	if witnessed != wantWitnessed || unwitnessed != wantUnwitnessed {
+		t.Errorf("this walk witnessed %d served-map refusals and %d unaffected halves, and the tables "+
+			"say there are %d and %d; the difference is (door, kind, half) triples nothing here asked about",
+			witnessed, unwitnessed, wantWitnessed, wantUnwitnessed)
+	}
+	if witnessed == 0 {
+		t.Fatal("no served map was witnessed being consulted at all, so every checkAttachmentKindServed " +
+			"call site in this package could be deleted with this test still green")
+	}
+	t.Logf("%d (door, kind, half) triples refused a narrowed served map by name and %d halves are "+
+		"written down as not consulting one, over %d doors", witnessed, unwitnessed, len(attachmentDoorNames()))
 }
 
 // The alphabet, encode side: the encoder writes exactly the codes section 5.1 check 3's door

@@ -125,6 +125,7 @@ package protocol_test
 // commit earlier than catching it at the reference.
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -1496,4 +1497,443 @@ func TestTheKeyCheckWalkDescendsAndSkipsOnlyMapEntries(t *testing.T) {
 			"this gate until 2026-09-22; if it is not found here, the repair is not in the code path "+
 			"the served side uses.", controlKey)
 	}
+}
+
+// ── the served closure's OPAQUE fields ──────────────────────────────────────────────
+
+// THE SECOND NET, AND WHY namesAKey COULD NOT BE THE ONLY ONE.
+//
+// Every key check above this line keys on a NAME — the field's own (namesAKey) or the
+// names a field's TYPE declares (declaresAKeyField). Both are narrowings, both have their
+// complements written down and asserted, and both are blind in exactly the same place: a
+// field whose name says nothing. Reproduced on 2026-09-23, protoc 35.1, inside
+// `message FetchResponse`:
+//
+//	bytes wk = 20;
+//	bytes rk = 21;
+//
+//	-> ok github.com/urnetwork/connect/protocol 0.404s
+//
+// That is item 244's own defect on the served fetch answer — the next epoch's write and
+// read key, in raw octets, handed to a removed member forever — with every gate in this
+// file green. `wk` contains no "key", so it is outside namesAKey AND outside
+// narrowedAwayOnPurpose, which only ever enumerates the names that DO contain "key": a
+// narrowing whose complement is itself narrowed by the same predicate is a narrowing
+// nobody is measuring. The NESTED form of the same mutant IS caught, by nestedServedTypes,
+// which is the repair of the commit before this one; one level up it walked past
+// everything.
+//
+// SO THE SERVED CLOSURE'S OPAQUE FIELDS ARE ENUMERATED FROM THE DESCRIPTOR AND EACH ONE IS
+// DISPOSITIONED BY NAME, in both directions: an opaque field with no entry in
+// servedOpaqueFields is a refusal, and an entry the walk no longer finds is a refusal. A
+// NAME is then no longer what stands between a served message and the epoch keys — a
+// DECISION is, written down beside the field, and adding an opaque field to anything the
+// server hands back costs whoever adds it one sentence saying what is in it.
+//
+// It is a SECOND net and not a replacement. namesAKey keeps catching `read_key` on a
+// uint64, on a message type, on anything at all, which no enumeration of opaque fields
+// would see; this one catches `wk`, which no name predicate will ever see. Neither
+// subsumes the other and both are asserted.
+
+// opaqueServedFields returns every field in this walk whose value is a string of octets
+// this file gives no structure to — `bytes`, `string`, their repeated forms, and a map
+// field whose VALUE is one of the two — keyed by full name, with the spelling of the
+// carrier as the value.
+//
+// STRING IS IN THE CLASS AND NOT IN THE COMPLEMENT. A proto3 `string` is UTF-8 validated,
+// so 32 raw key octets cannot simply be assigned to one — but base64 or hex can, and the
+// re-encoding is four lines. The class costs five more entries in the table below over
+// this file, which is cheap enough that excluding it would be a narrowing taken for
+// convenience rather than for a reason.
+//
+// MAP VALUES ARE READ THROUGH f.MapValue(), for the reason keyTypedFields gives at length:
+// a map field's own Kind() is the synthetic entry's, so a check that asked f.Kind() alone
+// would answer "message" for `map<uint64, bytes>` and never fire.
+//
+// The second return is THE COMPLEMENT, BY KIND: every field the same walk saw that this
+// narrowing removed, gathered under the spelling that removed it, so "which fields is this
+// gate not looking at" is a value this file prints and asserts rather than a property a
+// reader has to infer from the predicate.
+func opaqueServedFields(t *testing.T, w typeWalk) (opaque map[string]string, complementByKind map[string][]string) {
+	t.Helper()
+	isOpaque := func(k protoreflect.Kind) bool {
+		return k == protoreflect.BytesKind || k == protoreflect.StringKind
+	}
+	opaque = map[string]string{}
+	complementByKind = map[string][]string{}
+	for _, message := range sortedKeys(w.checked) {
+		fields := w.checked[message].Fields()
+		for i := 0; i < fields.Len(); i++ {
+			f := fields.Get(i)
+			full := string(f.FullName())
+			switch {
+			case f.IsMap():
+				spelling := fmt.Sprintf("map<%s, %s>", f.MapKey().Kind(), f.MapValue().Kind())
+				if isOpaque(f.MapValue().Kind()) {
+					opaque[full] = spelling
+				} else {
+					complementByKind[spelling] = append(complementByKind[spelling], full)
+				}
+			case isOpaque(f.Kind()):
+				if f.IsList() {
+					opaque[full] = "repeated " + f.Kind().String()
+				} else {
+					opaque[full] = f.Kind().String()
+				}
+			default:
+				spelling := f.Kind().String()
+				if f.IsList() {
+					spelling = "repeated " + spelling
+				}
+				complementByKind[spelling] = append(complementByKind[spelling], full)
+			}
+		}
+	}
+	return opaque, complementByKind
+}
+
+// EVERY OPAQUE FIELD THE SERVER HANDS BACK, name -> what is in it.
+//
+// This is a DISPOSITION and not an exemption list: the entries here are not holes punched
+// in a gate, they are the answers to the question the gate asks. `bytes` is the shape epoch
+// key material has in this protocol — EpochKeyDelivery.write_key and .read_key are `bytes`,
+// spec A §5.11's write_key and read_key are 32 raw octets — so the rule is that a
+// server→client field of that shape says what it carries, in one sentence, next to its
+// name.
+//
+// EACH SENTENCE IS TAKEN FROM message.proto OR FROM THE SPEC SECTION IT CITES, not invented
+// here. Where the file says nothing about a field, the entry says what the file's shape
+// says and no more.
+//
+// Both halves are asserted by the test below. An undispositioned field is a refusal —
+// including one added under a name no predicate in this file recognises, which is the hole
+// this map closes. A dispositioned field the walk no longer finds is also a refusal,
+// because a sentence about a field that has moved is a sentence nobody is reading.
+var servedOpaqueFields = map[string]string{
+	// ── the record, and the projections of it the server indexes ──
+	"bringyour.Record.record_bytes": "the canonical connect/message encoding of the whole " +
+		"record, AUTHORITATIVE for every other field of Record: ct_head, ct_body, " +
+		"server_attachment and write_auth. Ciphertext and macs. The attachment inside it is " +
+		"where item 244 lived, and kind 0x0005 is the repair — LP(H(epoch_keys)) in place of " +
+		"the two keys, with the keys themselves on the request (ruling 33).",
+	"bringyour.Record.sender_handle": "16 B. A server-indexed PROJECTION of record_bytes, " +
+		"which the server verifies equals the corresponding field of ParseRecord(record_bytes). " +
+		"Record's own comment argues why no key can be a projection: a key is by construction " +
+		"not implied by the record's octets.",
+	"bringyour.Record.body_hash":          "32 B. A projection of record_bytes, verified equal by the server. A hash.",
+	"bringyour.Record.blob_id":            "32 B, present iff size_bucket == 5. A projection of record_bytes, verified equal.",
+	"bringyour.Record.wrap_target_handle": "16 B, from the server_attachment WrapTag, absent otherwise. A projection, verified equal.",
+	"bringyour.Record.recovery_handle":    "16 B, from the server_attachment RecoveryTag, absent otherwise. A projection, verified equal.",
+
+	// ── group ids: the routing identifier the client itself named ──
+	"bringyour.Backpressure.group_id":    "the group this pause is about — the id the client itself named when it subscribed.",
+	"bringyour.GroupRecords.group_id":    "the group these recovery-fetch records belong to. §4.3.7 scopes that arm by the recovery_handle.",
+	"bringyour.RecordPush.group_id":      "the group these pushed records belong to.",
+	"bringyour.SubscriptionAck.group_id": "the group being acknowledged — the id carried by the Subscription that asked.",
+	"bringyour.TransientPush.group_id":   "the group these transient records belong to.",
+	"bringyour.FetchAttestation.group_id": "the group the attestation is over, and the second " +
+		"length-prefixed term of §4.3.4's preimage. An echo of FetchRequest.group_id.",
+
+	// ── the fetch attestation ──
+	"bringyour.FetchAttestation.server_id": "the fleet server's identity, the first " +
+		"length-prefixed term of §4.3.4's preimage. Matches HelloResponse.server_id.",
+	"bringyour.FetchAttestation.sig": "Ed25519 over §4.3.4's preimage, transcribed in this " +
+		"file beside the field. A SIGNATURE, not a key — and nothing in this repository " +
+		"computes or verifies it, which TestNothingHereComputesTheAttestationPreimage states " +
+		"as a measurement with its own controls.",
+
+	// ── the fleet's public signing keys and the handshake ──
+	"bringyour.ServerKey.pub": "Ed25519 PUBLIC, 32 B. Publishing it is the point of the type: " +
+		"a client cannot verify a server signature without it. This is the same set " +
+		"keyNameExemptions exempts under HelloResponse.server_keys, one level down.",
+	"bringyour.ServerKey.sig_by_previous": "Ed25519 by the OUTGOING key over this key's " +
+		"certification body — a signature in the rotation chain.",
+	"bringyour.ServerKey.sig_by_root":   "Ed25519 by the FLEET ROOT key over the same. A signature.",
+	"bringyour.HelloResponse.server_id": "16 B, stable per fleet, as the field's own comment says.",
+	"bringyour.HelloResponse.server_nonce": "32 B, as the field's own comment says. A " +
+		"server-chosen nonce for this connection; it is 32 octets and it is NOT secret — it is " +
+		"published to whoever connects.",
+
+	// ── key transparency gossip: roots and one signature ──
+	"bringyour.KtGossip.root_hash":    "the current signed-tree-head root hash of the key transparency log.",
+	"bringyour.KtGossip.prev_root":    "the previous STH's root hash, which is how a client chains two gossips.",
+	"bringyour.KtGossip.history_root": "the log's history root. A hash.",
+	"bringyour.KtGossip.sth_sig":      "the signature over the signed tree head. A signature, verified under ServerKey.pub.",
+
+	// ── blobs ──
+	"bringyour.BlobEndpoint.tls_spki_sha256": "repeated: SHA-256 of the blob endpoint's TLS " +
+		"SubjectPublicKeyInfo, current plus one announced successor, as the field's own comment " +
+		"says. A PIN over a certificate that is already public to anyone who opens the connection.",
+	"bringyour.BlobGrantResponse.grant_token": "an opaque bearer capability, §8.2. It IS a " +
+		"secret — and it is a BLOB capability: server-minted, scoped to one blob, and expiring " +
+		"at the expires_ms beside it. It is not epoch key material and it opens no record.",
+	"bringyour.BlobGrantResponse.chunk_mask": "which chunks the server already holds, for " +
+		"resume, as the field's own comment says. A bitmask.",
+
+	// ── rendezvous ──
+	"bringyour.RendezvousPush.rendezvous_id": "the mailbox this push is about — the id the caller registered.",
+	"bringyour.RendezvousDeposit.deposit_ct": "the deposited CIPHERTEXT, exactly " +
+		"Capabilities.rendezvous_deposit_bytes wide. Opaque to the server, which is the point of " +
+		"the arm; it is handed back to the collector who holds the key, and this file carries no key for it.",
+	"bringyour.RendezvousOpenResponse.card_xwing_pub": "an X-Wing PUBLIC key. Publishing it is " +
+		"what opening a rendezvous card IS: the depositor encrypts to it.",
+
+	// ── transport framing ──
+	"bringyour.MessageServerFragment.part": "one slice of a fragmented envelope's own octets, " +
+		"reassembled by index and count. Transport framing — whatever the envelope carried, " +
+		"which is every other type in this walk.",
+
+	// ── the five `string` fields ──
+	"bringyour.BlobEndpoint.host":                 "the blob endpoint's hostname. A host.",
+	"bringyour.BlobEndpoint.path_prefix":          "the path prefix blob URLs are built under.",
+	"bringyour.BlobGrantResponse.path":            "the path this grant is for, under that prefix.",
+	"bringyour.Capabilities.operator_host":        "the operator's hostname, as advertised.",
+	"bringyour.Capabilities.hosting_jurisdiction": "the jurisdiction the operator declares it hosts in.",
+}
+
+// THE KINDS THAT ARE NOT OPAQUE, dispositioned as a CLASS.
+//
+// The narrowing above is "the field's value is a string of octets or characters this file
+// gives no structure to", and the complement is every other proto kind. It is dispositioned
+// by kind rather than by field because the argument is the same sentence for every field of
+// a kind and repeating it 41 times would be noise nobody reads — but it is asserted in BOTH
+// directions all the same: a kind that turns up in the served closure and is not written
+// down here is a refusal, and a kind written down that the walk no longer finds is a
+// refusal. The class narrowing cannot widen quietly.
+//
+// WHAT THIS CLASS DOES NOT CLAIM, and the limit is stated because the alternative is a
+// sentence no measurement supports. It does not claim key material cannot be SPELLED in
+// these kinds. Four uint64s are 32 octets. What it claims is narrower and is the whole of
+// what is claimed anywhere in this file: none of these kinds is the SHAPE the epoch keys
+// have in this protocol, so a key smuggled through one would have to be split and
+// reassembled at both ends — which is a change to a server's and a client's code, not a
+// field added to a proto, and it is the class of defect the SDK's dataflow gate and
+// connect/message's width checks are the answer to. namesAKey and declaresAKeyField still
+// run over every field of every one of these kinds.
+var servedFieldKindsThatAreNotOpaque = map[string]string{
+	"message": "a message-typed field is not a leaf and is not narrowed away at all: walkFrom " +
+		"DESCENDS into it, so its own opaque fields are in the enumeration above under their " +
+		"own names. This entry is here because the kind appears in the complement, and what it " +
+		"records is that the complement is a leaf classification, not a boundary of the walk.",
+	"repeated message": "the same, through the repeated form. FetchResponse.records is here, " +
+		"and Record's six opaque fields are dispositioned above.",
+	"uint64": "a 64 bit unsigned integer: record ids, epochs, cursors, millisecond clocks. " +
+		"Not an octet string.",
+	"uint32":          "a 32 bit unsigned integer: byte and record ceilings, ttl seconds, class masks, indices.",
+	"repeated uint64": "a list of 64 bit integers — FetchAttestation.record_ids, the ids §4.3.4 attests to.",
+	"repeated uint32": "a list of 32 bit integers — the eph and size bucket edges Capabilities advertises.",
+	"bool":            "one bit.",
+	"enum":            "a closed set of named integers — the Reason codes this file declares.",
+}
+
+// EVERY OPAQUE FIELD THE SERVED CLOSURE CARRIES IS DISPOSITIONED, AND THE NARROWING THAT
+// DECIDED WHICH FIELDS THOSE ARE IS ASSERTED FROM BOTH ENDS.
+func TestEveryOpaqueFieldTheServerServesIsDispositioned(t *testing.T) {
+	_, submitted, servedSet := servedAndSubmitted(t)
+	w := walkOfNames(t, servedSet)
+
+	opaque, complementByKind := opaqueServedFields(t, w)
+	narrowedAwayCount := 0
+	for _, fields := range complementByKind {
+		narrowedAwayCount += len(fields)
+	}
+	t.Logf("the served walk checks %d types; %d of their fields are opaque and %d fields across "+
+		"%d proto kinds were narrowed away", len(w.checked), len(opaque), narrowedAwayCount,
+		len(complementByKind))
+	for _, full := range sortedKeys(opaque) {
+		t.Logf("  OPAQUE %-16s %s", opaque[full], full)
+	}
+	for _, kind := range sortedKeys(complementByKind) {
+		t.Logf("  NARROWED AWAY — %d fields of kind %s: %v", len(complementByKind[kind]), kind,
+			complementByKind[kind])
+	}
+	if len(opaque) == 0 {
+		t.Fatal("the served closure carries no opaque field at all, so this gate is a walk over an " +
+			"empty set and every refusal below is vacuous")
+	}
+
+	// THE DISPOSITION, BOTH DIRECTIONS.
+	for _, full := range sortedKeys(opaque) {
+		if _, dispositioned := servedOpaqueFields[full]; !dispositioned {
+			t.Errorf("%s is a %s field of a type the server hands back, and no entry in "+
+				"servedOpaqueFields says what is in it. An opaque field on a served message is the "+
+				"shape item 244 IS: `bytes wk = 20; bytes rk = 21;` on FetchResponse is the next "+
+				"epoch's two keys handed to a removed member forever, under names no name predicate "+
+				"in this file recognises — measured green against every other gate here on "+
+				"2026-09-23. Write down what this field carries, or take it off the served side.",
+				full, opaque[full])
+		}
+	}
+	for full := range servedOpaqueFields {
+		if _, still := opaque[full]; !still {
+			t.Errorf("servedOpaqueFields says what %s carries and the walk does not find it among the "+
+				"served closure's opaque fields any more — it was renamed, retyped, or is gone. A "+
+				"disposition nothing needs is a sentence about this file that has stopped being true.",
+				full)
+		}
+	}
+
+	// THE CLASS NARROWING, BOTH DIRECTIONS.
+	for kind := range complementByKind {
+		if _, dispositioned := servedFieldKindsThatAreNotOpaque[kind]; !dispositioned {
+			t.Errorf("the served closure carries %d fields of kind %s and "+
+				"servedFieldKindsThatAreNotOpaque does not say why that kind is outside this gate. A "+
+				"narrowing whose complement nobody enumerates is how a gate stops covering the thing "+
+				"it is named for — which is what namesAKey's own complement did by only ever "+
+				"enumerating names that already contained \"key\".", len(complementByKind[kind]), kind)
+		}
+	}
+	for kind := range servedFieldKindsThatAreNotOpaque {
+		if _, still := complementByKind[kind]; !still {
+			t.Errorf("servedFieldKindsThatAreNotOpaque disposes of kind %s and the served closure has "+
+				"no field of that kind any more, so this entry narrows nothing", kind)
+		}
+	}
+
+	// THE FAILING DIRECTION, IN THE SAME QUERY — part one: the identical enumerator over the
+	// submitted-only side must find the two keys ruling 33 put on the request. If it does
+	// not, this enumerator answers "no opaque fields anywhere" and the refusals above are a
+	// walk over an empty set rather than a file that carries nothing undispositioned.
+	submittedOnly := map[string]bool{}
+	for name := range submitted {
+		if !servedSet[name] {
+			submittedOnly[name] = true
+		}
+	}
+	control, _ := opaqueServedFields(t, walkOfNames(t, submittedOnly))
+	t.Logf("CONTROL — submitted-only opaque fields (%d): %v", len(control), sortedKeys(control))
+	for _, want := range []string{
+		"bringyour.EpochKeyDelivery.write_key",
+		"bringyour.EpochKeyDelivery.read_key",
+	} {
+		if _, found := control[want]; !found {
+			t.Errorf("the control did not find %s, which is the epoch key itself and is `bytes`. This "+
+				"enumerator is then not finding opaque fields and the refusals above prove nothing.",
+				want)
+		}
+	}
+
+	// AND PART TWO, WHICH IS THE WHOLE REASON THIS GATE EXISTS: the same enumerator beside
+	// namesAKey, over one built descriptor, showing that this net catches the field the name
+	// net cannot see. `wk` is what walked past every gate in this file on 2026-09-23.
+	outer := opaqueControlFile(t).Messages().Get(0)
+	cw := walkFrom([]protoreflect.MessageDescriptor{outer})
+	builtOpaque, builtComplement := opaqueServedFields(t, cw)
+	builtNamed, _ := keyNamedFields(t, cw)
+	t.Logf("CONTROL — over the built descriptor, the opaque net flags %v and the name net flags %v",
+		sortedKeys(builtOpaque), sortedKeys(builtNamed))
+	const (
+		controlUnnamedKey = "opaquegatecontrol.Served.wk"
+		controlNamedKey   = "opaquegatecontrol.Served.write_key"
+		controlNotOpaque  = "opaquegatecontrol.Served.record_id"
+	)
+	if _, found := builtOpaque[controlUnnamedKey]; !found {
+		t.Errorf("control: the opaque net did not flag %s. That is a `bytes` field on a served "+
+			"message under a name no predicate in this file recognises — the exact mutant that was "+
+			"green on 2026-09-23 — so if it is not found here the repair is not in the code path the "+
+			"served side uses.", controlUnnamedKey)
+	}
+	if _, found := builtNamed[controlUnnamedKey]; found {
+		t.Errorf("control: namesAKey flagged %s. It does not contain \"key\", so if it is flagged the "+
+			"name predicate has changed and the two nets are no longer the two different nets this "+
+			"test compares.", controlUnnamedKey)
+	}
+	if _, found := builtNamed[controlNamedKey]; !found {
+		t.Errorf("control: namesAKey did not flag %s, so the name net is matching nothing in the same "+
+			"run and the comparison above says nothing", controlNamedKey)
+	}
+	if _, found := builtOpaque[controlNamedKey]; !found {
+		t.Errorf("control: the opaque net did not flag %s, which is `bytes`; the two nets are "+
+			"supposed to overlap on a field that is both", controlNamedKey)
+	}
+	if !containsString(builtComplement["uint64"], controlNotOpaque) {
+		t.Errorf("control: %s is a uint64 and the opaque net's complement does not hold it under "+
+			"\"uint64\"; the complement asserted over the real file above is then built by something "+
+			"other than the kind it names", controlNotOpaque)
+	}
+	// AND THE MAP BRANCH, which the real file cannot exercise because it declares no map
+	// field. Without this the IsMap arm above is a mechanism no run measures — and reading
+	// f.Kind() instead of f.MapValue().Kind() is a shipped defect in this file's history, not
+	// a hypothetical.
+	const controlMapKey = "opaquegatecontrol.Served.bag"
+	if spelling := builtOpaque[controlMapKey]; spelling != "map<uint64, bytes>" {
+		t.Errorf("control: the opaque net answers %q for %s, want \"map<uint64, bytes>\". A map field's "+
+			"own Kind() is its synthetic entry's, so a check that asked f.Kind() alone would file this "+
+			"under \"message\" and never look at the octets in it.", spelling, controlMapKey)
+	}
+}
+
+// opaqueControlFile is the POSITIVE CONTROL FOR THE OPAQUE NET, BUILT, and it is built for
+// the same reason controlFile is: message.proto cannot supply the comparison. The thing to
+// be shown is that the opaque net catches an opaque field the NAME net does not, and
+// message.proto has no such field — because if it had one, this gate would be red.
+//
+// It assembles, with no .proto and no codegen:
+//
+//	message Served {
+//	    bytes  wk                 = 1;   // opaque, name says nothing -> opaque net only
+//	    bytes  write_key          = 2;   // opaque, name says key     -> both nets
+//	    uint64 record_id          = 3;   // not opaque                -> neither, and in the complement
+//	    map<uint64, bytes> bag    = 4;   // opaque THROUGH f.MapValue()
+//	}
+//
+// THE MAP FIELD IS HERE BECAUSE message.proto HAS NO MAP FIELD AT ALL. The IsMap branch of
+// opaqueServedFields exists because a map field's own Kind() is the synthetic entry's — the
+// defect keyTypedFields records having shipped — and over the real file that branch is
+// exercised by nothing. Two mechanisms tested against a file that cannot make one of them
+// fire is the empty search this file's own header is the record of.
+func opaqueControlFile(t *testing.T) protoreflect.FileDescriptor {
+	t.Helper()
+	optional := descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL
+	repeated := descriptorpb.FieldDescriptorProto_LABEL_REPEATED
+	bytesKind := descriptorpb.FieldDescriptorProto_TYPE_BYTES
+	uint64Kind := descriptorpb.FieldDescriptorProto_TYPE_UINT64
+	messageKind := descriptorpb.FieldDescriptorProto_TYPE_MESSAGE
+	const bagEntry = ".opaquegatecontrol.Served.BagEntry"
+	fd := &descriptorpb.FileDescriptorProto{
+		Name:    proto.String("opaque_gate_control.proto"),
+		Package: proto.String("opaquegatecontrol"),
+		Syntax:  proto.String("proto3"),
+		MessageType: []*descriptorpb.DescriptorProto{{
+			Name: proto.String("Served"),
+			NestedType: []*descriptorpb.DescriptorProto{{
+				Name:    proto.String("BagEntry"),
+				Options: &descriptorpb.MessageOptions{MapEntry: proto.Bool(true)},
+				Field: []*descriptorpb.FieldDescriptorProto{
+					{
+						Name: proto.String("key"), Number: proto.Int32(1),
+						Label: &optional, Type: &uint64Kind, JsonName: proto.String("key"),
+					},
+					{
+						Name: proto.String("value"), Number: proto.Int32(2),
+						Label: &optional, Type: &bytesKind, JsonName: proto.String("value"),
+					},
+				},
+			}},
+			Field: []*descriptorpb.FieldDescriptorProto{
+				{
+					Name: proto.String("wk"), Number: proto.Int32(1),
+					Label: &optional, Type: &bytesKind, JsonName: proto.String("wk"),
+				},
+				{
+					Name: proto.String("write_key"), Number: proto.Int32(2),
+					Label: &optional, Type: &bytesKind, JsonName: proto.String("writeKey"),
+				},
+				{
+					Name: proto.String("record_id"), Number: proto.Int32(3),
+					Label: &optional, Type: &uint64Kind, JsonName: proto.String("recordId"),
+				},
+				{
+					Name: proto.String("bag"), Number: proto.Int32(4),
+					Label: &repeated, Type: &messageKind, TypeName: proto.String(bagEntry),
+					JsonName: proto.String("bag"),
+				},
+			},
+		}},
+	}
+	file, err := protodesc.NewFile(fd, nil)
+	if err != nil {
+		t.Fatalf("the opaque net's control descriptor does not build, so there is no control: %v", err)
+	}
+	return file
 }
