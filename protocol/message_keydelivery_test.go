@@ -499,24 +499,71 @@ func servedAndSubmitted(t *testing.T) (served, submitted, servedSet map[string]b
 		t.Fatalf("%s is not in the served set, so the walk is not reaching the served records and "+
 			"the refusals below are vacuous", recordMessage)
 	}
-	// and the complement of "top level", WHICH IS NO LONGER AN EXEMPTION. This loop used
-	// to require every member of the served closure to be a top-level message and excused
-	// anything whose simple name ended in "Entry" — and since all three key checks
-	// iterated topLevelMessages, that one loop was the WHOLE of the coverage of nested
-	// types. It excused nothing that exists (TestTheKeyCheckWalkDescendsAndSkipsOnlyMapEntries
-	// measures the file's map entries and its *Entry names at zero) while a KeyBagEntry
+	// and the complement of "top level", WHICH IS NO LONGER AN EXEMPTION AND IS STILL
+	// ASSERTED. This loop used to require every member of the served closure to be a
+	// top-level message and excused anything whose simple name ended in "Entry" — and
+	// since all three key checks iterated topLevelMessages, that one loop was the WHOLE
+	// of the coverage of nested types. It excused nothing that exists while a KeyBagEntry
 	// two levels down inside FetchResponse carried write_key and read_key through every
-	// gate green. The checks now walk nested types directly, so what is left here is the
-	// partition PRINTED: the day message.proto grows its first nested served type, the log
-	// says so instead of a suffix deciding it.
+	// gate green. The checks now walk nested types directly, so the suffix is gone.
+	//
+	// WHAT REPLACED IT WAS A t.Logf, AND THAT WAS THE DEFECT. For one commit this
+	// partition was printed and nothing asserted it, on the reasoning that the walk below
+	// now covers what the guard used to. It does — for a nested type whose fields are
+	// NAMED like keys. A nested served type carrying the two keys under any other field
+	// names (`message NextEpochBag { bytes wk = 1; bytes rk = 2; }` on FetchResponse) went
+	// green here and was RED under the guard it replaced, and no mutant in that commit's
+	// table could see the loss, because every one of them used key names.
+	//
+	// So: PRINTED IS NOT THE PROPERTY. A narrowing is held by being asserted in BOTH
+	// directions against a written-down disposition — a member with no entry is a refusal,
+	// and an entry nothing needs is a refusal — which is how every other narrowing in this
+	// file is held, and is why the map below is here and is empty.
 	nested := []string{}
 	for _, name := range sortedSet(served) {
 		if _, top := topLevelMessages(t)[name]; !top {
 			nested = append(nested, name)
 		}
 	}
-	t.Logf("served closure members that are NOT top-level (%d): %v", len(nested), nested)
+	t.Logf("served closure members that are NOT top-level (%d): %v — dispositioned: %d",
+		len(nested), nested, len(nestedServedTypes))
+	for _, name := range nested {
+		why, dispositioned := nestedServedTypes[name]
+		if !dispositioned {
+			t.Errorf("%s is in the served closure and is not a top-level message, and no entry in "+
+				"nestedServedTypes says why that is allowed. A nested served type is how item 244's "+
+				"own shape rides back in — the next epoch's two keys, under field names no check "+
+				"recognises. Give it an entry with the reason, or take it off the served side.", name)
+			continue
+		}
+		t.Logf("  nested served type %s is allowed: %s", name, why)
+	}
+	for name := range nestedServedTypes {
+		if !containsString(nested, name) {
+			t.Errorf("nestedServedTypes says %s is an allowed nested served type and the walk does "+
+				"not find it there. A disposition nothing needs is a disposition nobody reads, and "+
+				"it is how this map stops describing the file.", name)
+		}
+	}
 	return served, submitted, servedSet
+}
+
+// The nested types the served closure is allowed to reach, name -> why. EMPTY, and the
+// emptiness is the point: message.proto declares every message at the top level today, so
+// the served closure holds no nested type at all and both halves of the check above are
+// refusals over nothing. The day that changes, the day says so in a FAILURE rather than in
+// a log line -- and whoever adds the first one writes down here why a type the server hands
+// back may be reached only through another type, which is the question the suffix exemption
+// used to answer with a naming convention.
+var nestedServedTypes = map[string]string{}
+
+func containsString(names []string, want string) bool {
+	for _, name := range names {
+		if name == want {
+			return true
+		}
+	}
+	return false
 }
 
 // THE RULING 33 GATE: NO SERVER→CLIENT MESSAGE TRANSITIVELY CARRIES AN EpochKeyDelivery.
