@@ -172,6 +172,31 @@ var (
 	// EpochComplete marker can never match, which leaves the group readable and not
 	// writable with nothing able to close it.
 	ErrExpectedWrapCountZero = errors.New("message: an epoch attachment expects no wraps at all")
+	// Fires when the two keys handed beside a record are not the ones that attachment's
+	// H(epoch_keys) is over. It is the ONE check ruling 27 adds to spec B section 5.1 check
+	// 3, and CheckEpochKeysDigest is the whole of it.
+	//
+	// It is not a shape refusal like the six above it, and the difference matters to a
+	// server deciding what to log: every one of those says a record is malformed, and this
+	// one says a record is well formed and does not bind the keys its submitter sent. Under
+	// spec A section 4.5 both merge into REASON_REJECTED on the wire — the client is told
+	// nothing it could use to probe — but they are different events on the server's side of
+	// that merge, and a server that could not tell them apart would be unable to say whether
+	// it was looking at an old client or at a forgery attempt.
+	//
+	// It is reachable from CheckEpochKeysDigest, which is on the published surface the other
+	// repository calls, so it is owed a line in spec A and spec B section 12.1's refusal
+	// blocks under the rule at the top of this file, beside ErrServerAttachmentKindNotServed
+	// which is owed one for the same reason.
+	ErrEpochKeysDigestMismatch = errors.New("message: the epoch keys handed beside a record do not match the digest its attachment carries")
+	// Fires when NewEpochDigestAttachment is handed a body whose epoch_keys_digest is
+	// already filled. That field is the one of the seven that is not the caller's to choose:
+	// it is computed here from the Epoch of the body being built, which is the whole of why
+	// that constructor exists, and a caller that arrived with one had either computed it at
+	// an epoch of its own — the mismatch the constructor prevents — or is copying a body
+	// that was already built, which is not a construction. Refused rather than overwritten,
+	// because overwriting would discard a value its author believed in and say nothing.
+	ErrEpochKeysDigestPresence = errors.New("message: an epoch digest attachment arrived with its digest already filled")
 	// Fires when AADHead is handed no header at all. The same caller bug ErrRecordNil
 	// names, one layer in, and reported rather than dereferenced for the reason nothing in
 	// this package panics: a preimage builder runs on the seal and the open path alike, and

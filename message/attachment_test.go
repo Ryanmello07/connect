@@ -2701,6 +2701,394 @@ func TestTheEncoderAndTheParserAdmitTheSameEpochDigests(t *testing.T) {
 	t.Logf("%d candidates, %d encoded and %d refused by both halves", len(candidates), encoded, refused)
 }
 
+// ── the two epochs an epoch digest attachment holds, and the one that ties them ──────
+
+// THE FAILING DIRECTION, PINNED AS A VECTOR: the right keys at the wrong epoch.
+//
+// It is the first vector with u64(epoch) moved from 42 to 43 and NOTHING else touched, so
+// its digest is H(epoch_keys) at opens_epoch 42 while the body says it opens 43. The fifteen
+// corpus entries do not cover this direction and could not: every one of them is a question
+// about octets, and this is a question about two values neither of which is wrong on its own.
+//
+// It is a vector and not a constructed value because the number that matters here came from
+// outside this package. A test that built the mismatch by calling EpochKeysDigest at one
+// epoch and setting Epoch to another would move with any edit that changed both, which is
+// exactly the edit the whole amendment has to survive.
+const attachmentEpochDigestWrongEpochVectorHex = "0005" +
+	"0000005e" +
+	"000000000000002b" +
+	"0031" +
+	"00278d00" +
+	"ffffffff" +
+	"00000020" + "c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf" +
+	"000005dd" +
+	"00000020" + attachmentEpochKeysDigestHex
+
+// The two key ramps every vector in this file is over, as the arguments a checker takes.
+func attachmentVectorKeys() ([]byte, []byte) {
+	return aadRamp(0x70, 32), aadRamp(0x90, 32)
+}
+
+// The right keys at the wrong epoch: accepted by every door this package has, and refused by
+// the one check that can see it.
+//
+// This is the whole of what ruling 27 adds to spec B section 5.1 check 3, stated as the pair
+// of facts a second implementation has to reproduce. The codec CANNOT see it — it is never
+// handed the keys — so a well formed body whose two halves disagree about which epoch the
+// keys open round trips byte for byte, and saying so here is what keeps somebody from adding
+// a check to the codec that cannot be written.
+func TestTheRightKeysAtTheWrongEpochAreRefusedByTheOnlyCheckThatCanSeeThem(t *testing.T) {
+	right := mustHex(attachmentEpochDigestVectorHex)
+	wrong := mustHex(attachmentEpochDigestWrongEpochVectorHex)
+
+	// the two vectors differ in ONE octet and it is inside u64(epoch), which is what makes
+	// this the epoch direction and not some other alteration
+	if len(right) != len(wrong) {
+		t.Fatalf("the two vectors are %d and %d octets", len(right), len(wrong))
+	}
+	differing := []int{}
+	for at := range right {
+		if right[at] != wrong[at] {
+			differing = append(differing, at)
+		}
+	}
+	// kind is 2 octets, the LP body prefix 4, and u64(epoch) the 8 after them
+	if len(differing) != 1 || differing[0] < 6 || 14 <= differing[0] {
+		t.Fatalf("the two vectors differ at %v, want exactly one octet inside u64(epoch) at offsets 6..13", differing)
+	}
+
+	parsed, err := ParseEpochDigestAttachment(wrong)
+	if err != nil {
+		t.Fatalf("the door refused the wrong epoch vector: %v; the codec is never handed the keys and cannot see this", err)
+	}
+	if parsed.Epoch != 43 {
+		t.Fatalf("the wrong epoch vector says it opens epoch %d, want 43", parsed.Epoch)
+	}
+	writeKey, readKey := attachmentVectorKeys()
+
+	// the inline positive control, in the same test: the SAME keys against the SAME body at
+	// the epoch its digest is over are accepted. Without it a checker that refused everything
+	// passes the half below.
+	control, err := ParseEpochDigestAttachment(right)
+	if err != nil {
+		t.Fatalf("the door refused the first vector: %v", err)
+	}
+	if err := CheckEpochKeysDigest(control, writeKey, readKey); err != nil {
+		t.Fatalf("control: the first vector's own keys are refused at its own epoch: %v", err)
+	}
+
+	err = CheckEpochKeysDigest(parsed, writeKey, readKey)
+	if err == nil {
+		t.Fatal("the right keys at the wrong epoch were accepted, so nothing ties the digest's epoch to the attachment's")
+	}
+	if !errors.Is(err, ErrEpochKeysDigestMismatch) {
+		t.Fatalf("the wrong epoch is refused with %v, want ErrEpochKeysDigestMismatch", err)
+	}
+
+	// and the OTHER wrong choice at the same call site: a server reaching for the record
+	// header's epoch — the epoch the commit is SEALED at, one below the one it OPENS — lands
+	// on a digest that matches, which is why the epoch is not a parameter of the checker
+	byHand, err := EpochKeysDigest(42, writeKey, readKey)
+	if err != nil {
+		t.Fatalf("EpochKeysDigest refused the two ramps: %v", err)
+	}
+	if !bytes.Equal(byHand, parsed.EpochKeysDigest) {
+		t.Fatal("the wrong epoch vector's digest is not the one at 42, so this test is not measuring what it says")
+	}
+	t.Logf("the wrong epoch vector carries H(epoch_keys) at 42 in a body that opens 43; CheckEpochKeysDigest refuses it and a checker taking the epoch as a parameter would not")
+}
+
+// NewEpochDigestAttachment reads the epoch ONCE, from the body it is building, so the
+// mismatch above is not representable through it.
+//
+// The property is the tie and not the equality: for every epoch in the walk the built digest
+// is the one at THAT epoch, and moving the built body's Epoch to any other epoch in the walk
+// makes the checker refuse it. A constructor that took a second epoch would pass the first
+// half and fail the second on the day a caller passed the wrong one — which is a day no test
+// can schedule, so the constructor is built to have no second epoch instead.
+func TestNewEpochDigestAttachmentReadsTheEpochOnceFromTheBodyItBuilds(t *testing.T) {
+	writeKey, readKey := attachmentVectorKeys()
+	epochs := []uint64{0, 1, 2, 42, 43, 0x100000000, 0xFFFFFFFFFFFFFFFF}
+	built := map[uint64]*EpochDigestAttachment{}
+	for _, epoch := range epochs {
+		one, err := NewEpochDigestAttachment(EpochDigestAttachment{
+			Epoch:             epoch,
+			AlgId:             attachmentAlgIds[AttachmentEpochDigest],
+			MediaTtlSeconds:   2592000,
+			DurableTtlSeconds: 0xFFFFFFFF,
+			GroupContextHash:  aadRamp(0xc0, 32),
+			ExpectedWrapCount: 1501,
+		}, writeKey, readKey)
+		if err != nil {
+			t.Fatalf("epoch %d: the constructor refused a well formed body: %v", epoch, err)
+		}
+		if one.Epoch != epoch {
+			t.Fatalf("epoch %d: the body it built opens %d", epoch, one.Epoch)
+		}
+		if err := CheckEpochKeysDigest(one, writeKey, readKey); err != nil {
+			t.Fatalf("epoch %d: what the constructor built does not check out against the keys it was handed: %v", epoch, err)
+		}
+		built[epoch] = one
+	}
+	crossed := 0
+	for _, mine := range epochs {
+		for _, other := range epochs {
+			if mine == other {
+				continue
+			}
+			moved := *built[mine]
+			moved.Epoch = other
+			err := CheckEpochKeysDigest(&moved, writeKey, readKey)
+			if err == nil {
+				t.Fatalf("the digest built at epoch %d still checks out in a body that opens %d", mine, other)
+			}
+			if !errors.Is(err, ErrEpochKeysDigestMismatch) {
+				t.Fatalf("epoch %d in a body opening %d is refused with %v, want ErrEpochKeysDigestMismatch", mine, other, err)
+			}
+			crossed++
+		}
+	}
+	if crossed == 0 {
+		t.Fatal("no pair of distinct epochs was crossed, so the tie is asserted over nothing")
+	}
+	t.Logf("%d epochs built and checked, %d distinct pairs refused", len(epochs), crossed)
+}
+
+// The digest is the one field of the seven that is not the caller's to fill, and arriving
+// with one is refused rather than overwritten.
+func TestNewEpochDigestAttachmentRefusesADigestItDidNotCompute(t *testing.T) {
+	writeKey, readKey := attachmentVectorKeys()
+	public := EpochDigestAttachment{
+		Epoch:             42,
+		AlgId:             attachmentAlgIds[AttachmentEpochDigest],
+		MediaTtlSeconds:   2592000,
+		DurableTtlSeconds: 0xFFFFFFFF,
+		GroupContextHash:  aadRamp(0xc0, 32),
+		ExpectedWrapCount: 1501,
+	}
+	// the control first: unset, it is built and it is the pinned vector's own digest
+	answer, err := NewEpochDigestAttachment(public, writeKey, readKey)
+	if err != nil {
+		t.Fatalf("control: the constructor refused a body with no digest on it: %v", err)
+	}
+	if hex.EncodeToString(answer.EpochKeysDigest) != attachmentEpochKeysDigestHex {
+		t.Fatalf("the constructor computed %s, want the pinned %s",
+			hex.EncodeToString(answer.EpochKeysDigest), attachmentEpochKeysDigestHex)
+	}
+	// including a digest that is the RIGHT one: the refusal is about who chose the epoch and
+	// not about whether the value happens to agree
+	for _, arriving := range [][]byte{
+		mustHex(attachmentEpochKeysDigestHex),
+		mustHex(attachmentEpochKeysDigestEpochOneHex),
+		aadRamp(0x00, 32),
+		{0x01},
+	} {
+		already := public
+		already.EpochKeysDigest = arriving
+		if _, err := NewEpochDigestAttachment(already, writeKey, readKey); err == nil {
+			t.Fatalf("a body arriving with %d digest octets was accepted", len(arriving))
+		} else if !errors.Is(err, ErrEpochKeysDigestPresence) {
+			t.Fatalf("a body arriving with %d digest octets is refused with %v, want ErrEpochKeysDigestPresence", len(arriving), err)
+		}
+	}
+	// and the body arrives by value, so the digest is not written back into the caller's own
+	// struct: a caller that reused it for the next epoch would otherwise meet its own refusal
+	if public.EpochKeysDigest != nil {
+		t.Fatal("the constructor wrote the digest back into the caller's body")
+	}
+}
+
+// Everything the constructor answers, the sixth kind's door encodes; everything the door
+// would refuse, the constructor refuses first.
+//
+// A constructor that skipped the checks would hand a committer a body that fails at the
+// encoder one call later, with the diagnosis a layer away from the field that is wrong.
+func TestNewEpochDigestAttachmentAnswersNothingItsOwnDoorWouldRefuse(t *testing.T) {
+	writeKey, readKey := attachmentVectorKeys()
+	good := EpochDigestAttachment{
+		Epoch:             42,
+		AlgId:             attachmentAlgIds[AttachmentEpochDigest],
+		MediaTtlSeconds:   2592000,
+		DurableTtlSeconds: 0xFFFFFFFF,
+		GroupContextHash:  aadRamp(0xc0, 32),
+		ExpectedWrapCount: 1501,
+	}
+	accepted := 0
+	refused := 0
+	for _, one := range []struct {
+		name   string
+		public EpochDigestAttachment
+		keys   [2][]byte
+	}{
+		{name: "well formed", public: good, keys: [2][]byte{writeKey, readKey}},
+		{name: "media_ttl at zero", public: func() EpochDigestAttachment { c := good; c.MediaTtlSeconds = 0; return c }(), keys: [2][]byte{writeKey, readKey}},
+		{name: "durable_ttl unset sentinel", public: func() EpochDigestAttachment { c := good; c.DurableTtlSeconds = 0; return c }(), keys: [2][]byte{writeKey, readKey}},
+		{name: "an Ed25519 alg_id", public: func() EpochDigestAttachment { c := good; c.AlgId = 0x0001; return c }(), keys: [2][]byte{writeKey, readKey}},
+		{name: "a 31 octet group_context_hash", public: func() EpochDigestAttachment { c := good; c.GroupContextHash = aadRamp(0xc0, 31); return c }(), keys: [2][]byte{writeKey, readKey}},
+		{name: "no wraps at all", public: func() EpochDigestAttachment { c := good; c.ExpectedWrapCount = 0; return c }(), keys: [2][]byte{writeKey, readKey}},
+		{name: "a 31 octet write_key", public: good, keys: [2][]byte{aadRamp(0x70, 31), readKey}},
+		{name: "an empty read_key", public: good, keys: [2][]byte{writeKey, nil}},
+	} {
+		answer, err := NewEpochDigestAttachment(one.public, one.keys[0], one.keys[1])
+		if err != nil {
+			refused++
+			continue
+		}
+		accepted++
+		if _, err := EncodeEpochDigestAttachment(answer); err != nil {
+			t.Errorf("%s: the constructor answered a body the door then refused: %v", one.name, err)
+		}
+		if err := CheckEpochKeysDigest(answer, one.keys[0], one.keys[1]); err != nil {
+			t.Errorf("%s: the constructor answered a body that does not check out against its own keys: %v", one.name, err)
+		}
+	}
+	if accepted == 0 {
+		t.Fatal("nothing was accepted, so the encode half of this holds vacuously")
+	}
+	if refused == 0 {
+		t.Fatal("nothing was refused, so the constructor checks nothing")
+	}
+	t.Logf("%d accepted and encodable, %d refused before reaching the door", accepted, refused)
+}
+
+// The checker refuses every alteration of either key, and a key of the wrong width is a
+// DIFFERENT sentinel from a key that does not match.
+//
+// The two mean different things to the server holding them: a mismatch is a record whose
+// submitter sent keys the mac does not cover, and a width refusal is a caller that looked a
+// key up and got nothing back. A server that could not tell them apart would report an
+// attacker where there is a bug of its own.
+func TestCheckEpochKeysDigestRefusesEveryAlterationOfEitherKey(t *testing.T) {
+	writeKey, readKey := attachmentVectorKeys()
+	body, err := ParseEpochDigestAttachment(mustHex(attachmentEpochDigestVectorHex))
+	if err != nil {
+		t.Fatalf("the first vector does not parse: %v", err)
+	}
+	// the positive control, first: without it every refusal below is satisfied by a checker
+	// that answers no to everything
+	if err := CheckEpochKeysDigest(body, writeKey, readKey); err != nil {
+		t.Fatalf("control: the vector's own two keys are refused: %v", err)
+	}
+
+	mismatches := 0
+	for at := 0; at < epochWriteKeyBytes; at += 1 {
+		for _, which := range []int{0, 1} {
+			keys := [2][]byte{bytes.Clone(writeKey), bytes.Clone(readKey)}
+			keys[which][at] ^= 0x80
+			err := CheckEpochKeysDigest(body, keys[0], keys[1])
+			if err == nil {
+				t.Fatalf("a bit flipped at octet %d of key %d still checks out", at, which)
+			}
+			if !errors.Is(err, ErrEpochKeysDigestMismatch) {
+				t.Fatalf("a bit flipped at octet %d of key %d is refused with %v, want ErrEpochKeysDigestMismatch", at, which, err)
+			}
+			mismatches += 1
+		}
+	}
+	// the two keys swapped: the same 64 octets in the other order, which an unframed or
+	// order blind preimage would accept
+	if err := CheckEpochKeysDigest(body, readKey, writeKey); err == nil {
+		t.Fatal("the two keys swapped still check out, so the preimage does not distinguish them")
+	} else if !errors.Is(err, ErrEpochKeysDigestMismatch) {
+		t.Fatalf("the two keys swapped are refused with %v, want ErrEpochKeysDigestMismatch", err)
+	}
+	mismatches += 1
+
+	// a key of the wrong width is the width sentinel and not the mismatch one
+	for _, wrong := range [][]byte{nil, {}, aadRamp(0x70, 31), aadRamp(0x70, 33), aadRamp(0x70, 64)} {
+		for _, which := range []int{0, 1} {
+			keys := [2][]byte{writeKey, readKey}
+			keys[which] = wrong
+			err := CheckEpochKeysDigest(body, keys[0], keys[1])
+			if !errors.Is(err, ErrServerAttachmentFieldLength) {
+				t.Fatalf("a %d octet key %d is refused with %v, want ErrServerAttachmentFieldLength", len(wrong), which, err)
+			}
+			if errors.Is(err, ErrEpochKeysDigestMismatch) {
+				t.Fatalf("a %d octet key %d reports a mismatch, which is an attacker where there is a lookup that returned nothing", len(wrong), which)
+			}
+		}
+	}
+
+	// a truncated or absent digest on the body is a mismatch and never a short comparison
+	// that happened to agree
+	for _, truncated := range [][]byte{nil, {}, body.EpochKeysDigest[:16], body.EpochKeysDigest[:31]} {
+		shortened := *body
+		shortened.EpochKeysDigest = truncated
+		if err := CheckEpochKeysDigest(&shortened, writeKey, readKey); !errors.Is(err, ErrEpochKeysDigestMismatch) {
+			t.Fatalf("a %d octet digest is refused with %v, want ErrEpochKeysDigestMismatch", len(truncated), err)
+		}
+	}
+	if CheckEpochKeysDigest(nil, writeKey, readKey) == nil {
+		t.Fatal("no body at all checks out")
+	}
+	t.Logf("%d alterations of the two keys refused, every one of them as a mismatch", mismatches)
+}
+
+// The checker decides its equality in constant time, and it is read out of the source rather
+// than asserted by a comment.
+//
+// CheckEpochKeysDigest is deliberately NOT named Verify, so it is outside the class
+// guardrail G8 derives for the two functions whose answer IS the authentication decision —
+// that decision was already made by VerifyWriteAuth over a preimage covering
+// H(server_attachment), which covers this digest, and naming this one Verify would widen a
+// class whose rule is "nothing outside this package is called at all" to mean "any
+// comparison". Being outside that class is the reason this assertion is written down:
+// TestNoProductionFunctionComparesDataOutsideConstantTime bans the wrong comparator here as
+// it does everywhere, and nothing else requires the right one of THIS function.
+func TestTheEpochKeysDigestCheckerReachesTheConstantTimeComparison(t *testing.T) {
+	scan := mustScanAuthSources(t, authOwnScanDir)
+	if _, declared := scan.decls["CheckEpochKeysDigest"]; !declared {
+		t.Fatalf("the scan of %s does not hold CheckEpochKeysDigest at all, so this gate is reading nothing", authOwnScanDir)
+	}
+	if !authReachesConstantTimeCompare(t, scan, "CheckEpochKeysDigest") {
+		t.Fatalf("CheckEpochKeysDigest does not reach %s; the one check ruling 27 adds decides its equality in variable time",
+			authConstantTimeComparator)
+	}
+	// the inline control on the scan itself: the same walk finds it for the verifier that is
+	// known to reach it, so a walk that answered yes to everything is visible here
+	if !authReachesConstantTimeCompare(t, scan, "VerifyWriteAuth") {
+		t.Fatal("control: the walk cannot see VerifyWriteAuth reach the constant time comparison either, so it is broken")
+	}
+	if authReachesConstantTimeCompare(t, scan, "EncodeEpochDigestAttachment") {
+		t.Fatal("control: the walk claims the encoder reaches a constant time comparison, so it answers yes to everything")
+	}
+}
+
+// End to end at this layer: a body the constructor builds survives its own door and checks
+// out against the keys it was built from, over the corpus rather than over one case.
+func TestAnEpochDigestBuiltHereSurvivesItsDoorAndChecksOut(t *testing.T) {
+	writeKey, readKey := attachmentVectorKeys()
+	walked := 0
+	for _, entry := range epochDigestWalkCorpus(t) {
+		public := *entry.attachment.EpochDigest
+		public.EpochKeysDigest = nil
+		built, err := NewEpochDigestAttachment(public, writeKey, readKey)
+		if err != nil {
+			t.Fatalf("%s: the constructor refused a corpus body: %v", entry.name, err)
+		}
+		bs, err := EncodeEpochDigestAttachment(built)
+		if err != nil {
+			t.Fatalf("%s: the door refused what the constructor built: %v", entry.name, err)
+		}
+		parsed, err := ParseEpochDigestAttachment(bs)
+		if err != nil {
+			t.Fatalf("%s: the door refused its own octets back: %v", entry.name, err)
+		}
+		if err := CheckEpochKeysDigest(parsed, writeKey, readKey); err != nil {
+			t.Fatalf("%s: a body that went out through the door does not check out coming back: %v", entry.name, err)
+		}
+		// and the record slot carries it: the same octets ParseRecord reads back
+		if slot := recordSlotRoundTrip(t, bs); !bytes.Equal(slot, bs) {
+			t.Fatalf("%s: the record slot answered %d octets, want the %d it was given", entry.name, len(slot), len(bs))
+		}
+		walked += 1
+	}
+	if walked == 0 {
+		t.Fatal("the corpus walk reached no body, so this holds vacuously")
+	}
+	t.Logf("%d corpus bodies built, encoded, parsed and checked", walked)
+}
+
 // ── the labels this package composes under ──────────────────────────────────────────
 
 // Every domain separation label this package declares, read out of the SOURCE rather than
@@ -2932,6 +3320,12 @@ func TestTheCheckedInEpochDigestFuzzCorpusIsReadAndSaysSomething(t *testing.T) {
 	pinned := map[string]bool{
 		attachmentEpochDigestVectorHex:       false,
 		attachmentEpochDigestSecondVectorHex: false,
+		// the failing direction ruling 27's own check is about. It belongs on disk with the
+		// other two BECAUSE it is accepted here: the codec is never handed the keys, so the
+		// only thing that can tell it from the first vector is CheckEpochKeysDigest, and an
+		// implementation reading this corpus has to meet one input where the door's yes is
+		// not the whole answer.
+		attachmentEpochDigestWrongEpochVectorHex: false,
 	}
 	for _, entry := range entries {
 		if entry.IsDir() {

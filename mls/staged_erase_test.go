@@ -1190,6 +1190,14 @@ var typesTheEraseClassReachesThatOweNoErase = map[string]string{
 	"EpochAttachment": "the write key and read key a commit DELIVERS TO THE SERVER, inside the record that " +
 		"carries the commit. They are octets the server is being handed on purpose; erasing them here would " +
 		"erase what the message layer exists to send",
+	"EpochDigestAttachment": "what attachment kind 0x0005 carries, and the one row in this family that does " +
+		"NOT have to say 'the server is handed these on purpose'. It is EpochAttachment one row up with " +
+		"write_key and read_key STRUCK, which is the whole of ruling 27 of 2026-09-22: the two fields it does " +
+		"hold are a hash of the group context and H(epoch_keys), both of them served and neither of them " +
+		"invertible to a key. There is nothing here an erase would take from an attacker, because the " +
+		"amendment took it out of the structure instead. THE ROW WAS OWED BY ffda0ab2, which declared the " +
+		"type and did not write one, and this gate has been red since -- measured in a worktree at that " +
+		"commit, where this test fails on this type alone and the drop-site gate beside it passes at 52 sites",
 	"EpochSecrets": "the key schedule's own storage, grouped. Exactly one production declaration holds one -- " +
 		"KeySchedule.secrets -- and (*KeySchedule).Zeroize erases every one of its nine fields by name, which " +
 		"this reading checks rather than infers: the key schedule is read here like every other member, an " +

@@ -126,24 +126,62 @@
 // against a value the mac already authenticated. No new preimage term, no new mac call
 // site, no format_version bump, no flag day.
 //
-// THE TWO DOORS, WHICH ARE THE ROLLOUT AND NOT A MODE. EncodeServerAttachment and
-// ParseServerAttachment are spec B section 5.1 check 3's door and they serve exactly the
-// five kinds section 5.11 defines; EncodeEpochDigestAttachment and
-// ParseEpochDigestAttachment are the sixth kind's door. The codec, the body table and
-// checkServerAttachment are ONE set of code behind both, so the two doors cannot come to
-// disagree about what an attachment is — what differs is only which kinds each one serves,
-// and that is serverAttachmentKindServed, one map, one line.
+// THE TWO DOORS. EncodeServerAttachment and ParseServerAttachment are spec B section 5.1
+// check 3's door and they serve exactly the five kinds section 5.11 defines;
+// EncodeEpochDigestAttachment and ParseEpochDigestAttachment are the sixth kind's door. The
+// codec, the body table and checkServerAttachment are ONE set of code behind both, so the
+// two doors cannot come to disagree about what an attachment is — what differs is only
+// which kinds each one serves, and that is serverAttachmentKindServed.
 //
-// THE PROPERTY THAT LINE BUYS is the reason the sixth kind can ship before anything else
+// THE PROPERTY THAT SPLIT BUYS is the reason the sixth kind can ship before anything else
 // does. A record carrying a kind 0x0005 attachment encodes, ParseRecords back with
 // is_commit set and the attachment slot byte intact, while ParseServerAttachment refuses
 // the same octets BY NAME with the kind in the message. So a STALE SERVER — one that has
-// not learned to carry the keys as request fields, which is every server today — refuses
+// not learned to carry the keys beside the record, which is every server today — refuses
 // the commit loudly at check 3 instead of installing an epoch whose keys it was never
 // handed, while a STALE RECEIVER follows the commit correctly, because no receive path in
 // connect or sdk reads a single field of an EpochAttachment: it hashes the octets and
-// nothing more. The rollout is then server-serves-both, then clients-emit-0x0005, then
-// server-stops-serving-0x0001, and each step is that one map.
+// nothing more.
+//
+// ── WHAT serverAttachmentKindServed IS AND IS NOT: A LIBRARY VERSION GATE ────────────
+//
+// This paragraph replaces one that said "the rollout is then server-serves-both, then
+// clients-emit-0x0005, then server-stops-serving-0x0001, and each step is that one map".
+// That sentence is wrong in two independent ways, both measured, so it is corrected here
+// rather than softened.
+//
+// FIRST, THE MAP IS NOT PER ROLE. serverAttachmentKindServed governs BOTH halves of section
+// 5.1 check 3's door — ParseServerAttachment, which is the server's check 3, the server's
+// serve path AND the client's own submit projection, and EncodeServerAttachment, which is
+// the client sealer's only encoder by way of connect/messagegroup. One flag, both roles,
+// one build: widening it makes a client emit what it makes a server accept, in the same
+// library version. TestTheEncoderAndTheParserAdmitTheSameAttachments actively ENFORCES that
+// the two sets are identical, and that is the property being kept rather than a coincidence
+// to work around. So "servers first, then clients" is operator discipline about which
+// BINARIES are deployed when — real, ordinary, and the thing that belongs in a runbook —
+// and it is not a property this map can express on its own. Calling it a rollout step made
+// it sound as though the library could hold the two roles apart. It cannot, and a reader
+// who believed it would ship the client half early.
+//
+// SECOND, THE SERVER HALF IS NOT ONE LINE. Widening this map alone yields a server that
+// passes the kind at check 3 and then refuses the same commit further in — or, worse,
+// accepts a commit and installs no epoch keys at all. The message server's F3′ half is, by
+// name, measured against that repository rather than recalled: its "an EpochAttachment iff
+// is_commit" clause, which exists in THREE copies (the api submit pass and both store
+// implementations) and which today also ADMITS a kind 0x0005 attachment on a NON commit
+// record, because 0x0005 is not AttachmentEpoch and false != false passes; its founding
+// commit check, which requires the founding attachment to be kind 0x0001 outright; its
+// wellFormedEpochAttachment, which asks for AttachmentEpoch and for two 32 octet keys on
+// the body; that repository's own attachment kind enum in its store contract; and its epoch
+// key INSTALL path, which is where the keys have to arrive from somewhere else now. Those
+// land with the protocol key fields and with this map, atomically, or the group cannot
+// rekey. They are that repository's to write, and they are named here because the sentence
+// this paragraph replaces implied they did not exist.
+//
+// WHAT IS STILL TRUE, and it is the part worth keeping: this package refuses kind 0x0005 at
+// check 3's door today, by name, and that refusal is the interlock. A server built from a
+// library that has not been widened cannot be talked into installing an epoch whose keys it
+// was never handed, whatever a client sends it.
 //
 // 0x0001 IS FROZEN AND STAYS READABLE. Nothing above changes one octet of it, and the
 // vectors that pin it are the ones that were there before this kind existed.
@@ -151,6 +189,7 @@ package message
 
 import (
 	"crypto/sha256"
+	"crypto/subtle"
 	"fmt"
 
 	"github.com/urnetwork/connect/mls/syntax"
@@ -191,8 +230,18 @@ var serverAttachmentKindKnown = map[ServerAttachmentKind]bool{
 // is a map rather than a bound: a kind added later is given an answer here instead of
 // inheriting one. Today it is the five kinds section 5.11 defines, and kind 0x0005 is
 // deliberately absent — a server that accepted it would install an epoch whose two keys it
-// was never handed, because the fields those keys ride in do not exist yet. The day they
-// do, AttachmentEpochDigest joins this map and ParseServerAttachment serves six.
+// was never handed, because the fields those keys ride in do not exist yet.
+//
+// WIDENING IT IS NOT A STEP THIS FILE CAN TAKE ALONE, and the file comment's "a library
+// version gate" paragraph is the long form. Two things follow from the one line below.
+// Adding AttachmentEpochDigest here makes ParseServerAttachment serve six AND makes
+// EncodeServerAttachment emit six, in one build, because both doors ask this one map — so
+// it cannot express "the server serves both while clients still emit 0x0001", which is a
+// statement about deployed binaries. And it is a third of the edit at best: the message
+// server's iff-is_commit clause, its founding commit check, its wellFormedEpochAttachment,
+// its own kind enum and its epoch key install path all refuse or mishandle a well formed
+// 0x0005 commit today, and the keys still have nowhere to ride. This map moves when those
+// move and the protocol fields exist, in one atomic change across the three repositories.
 var serverAttachmentKindServed = map[ServerAttachmentKind]bool{
 	AttachmentNone:     true,
 	AttachmentEpoch:    true,
@@ -326,6 +375,94 @@ type EpochDigestAttachment struct {
 	// recomputes this value, which the write_auth mac already covers by way of
 	// H(server_attachment) — so the digest is a binding and never a delivery.
 	EpochKeysDigest []byte
+}
+
+// NewEpochDigestAttachment builds the sixth kind's body from its six public fields and the
+// two keys the epoch opens with, and is the way a committer should build one.
+//
+// IT EXISTS BECAUSE THE MISMATCH IT PREVENTS IS OTHERWISE REPRESENTABLE AND SILENT. An
+// EpochDigestAttachment has an epoch in two places — its own Epoch field, and the
+// opens_epoch term inside the preimage its digest is over — and nothing in the encoding can
+// relate the two: the codec is never handed the keys, so it cannot recompute the digest, and
+// a body whose Epoch is 43 and whose digest is H over opens_epoch 42 encodes, parses back
+// and re-encodes byte for byte. It is not exploitable on its own, because the check it
+// eventually fails is a comparison that fails closed — but a server that reached for the
+// RECORD HEADER's epoch instead of the attachment's would compute the matching digest and
+// accept it, and there are three epoch values live at that call site: the header's, the
+// attachment's, and the server's own current_epoch + 1. A wrong choice among them type
+// checks. So the epoch is taken ONCE here, from the attachment being built, and the caller
+// is given no second one to disagree with it.
+//
+// It takes the body by value, its own declared type rather than a parallel argument list,
+// for two reasons. A field added to EpochDigestAttachment later is carried through this
+// constructor without a signature change and without arriving silently zero. And there is
+// no run of same typed positional arguments for a caller to transpose — media_ttl_seconds
+// and durable_ttl_seconds are both u32 and mean opposite things to a retention policy.
+//
+// public.EpochKeysDigest MUST be unset. It is the one field of the six-plus-one that is not
+// the caller's to choose, and a caller that filled it in has either computed it at an epoch
+// of its own — the whole defect above — or is round-tripping a body that was already built,
+// which is a copy and not a construction. Refused rather than overwritten: overwriting it
+// would silently discard a value its author believed in.
+//
+// Everything it returns has been through checkEpochDigestAttachment, so a body this answers
+// is a body the sixth kind's door will encode.
+func NewEpochDigestAttachment(public EpochDigestAttachment, writeKey []byte, readKey []byte) (*EpochDigestAttachment, error) {
+	if 0 < len(public.EpochKeysDigest) {
+		return nil, fmt.Errorf("%w: epoch_keys_digest arrived already filled, at %d octets, and it is this function's to compute from the epoch beside it",
+			ErrEpochKeysDigestPresence, len(public.EpochKeysDigest))
+	}
+	// the ONE place the epoch is read for the preimage, and it is the field of the body this
+	// is building. There is no parameter here that could name a different one.
+	digest, err := EpochKeysDigest(public.Epoch, writeKey, readKey)
+	if err != nil {
+		return nil, err
+	}
+	public.EpochKeysDigest = digest
+	if err := checkEpochDigestAttachment(&public); err != nil {
+		return nil, err
+	}
+	return &public, nil
+}
+
+// CheckEpochKeysDigest answers the one question spec B section 5.1 check 3 gains under
+// ruling 27: are these two keys the ones this attachment's digest is over?
+//
+// It is the server's half of the amendment and it lives here, beside the function that
+// computes the digest, for the rule attachment.go's file comment already states of check 3 —
+// everything the check asks of an attachment's own contents is answered in this package so
+// the server asks rather than re-derives, which is spec B section 12.1 A-2. A server that
+// wrote this itself would be choosing, on its own, which of the three epochs in scope at its
+// call site goes into the preimage and whether the comparison is constant time. Neither is a
+// choice another repository should be making about this construction, so neither is offered:
+// the epoch is d.Epoch and the comparison is subtle.ConstantTimeCompare.
+//
+// THE EPOCH IS THE ATTACHMENT'S OWN AND NOT A PARAMETER. Taking one would reintroduce
+// exactly what NewEpochDigestAttachment exists to prevent, one layer further on, and the
+// caller with the wrong answer to hand is the same caller: the record header's epoch is the
+// epoch the commit is SEALED at, and the attachment's is the epoch it OPENS, which is one
+// higher. "epoch == current_epoch + 1" is still the server's own clause over its own state
+// and is still not asked here; this function asks only whether the digest matches the keys,
+// at the epoch the digest itself claims.
+//
+// It answers an error rather than a bool so that a mismatch and a malformed key are
+// different sentinels at the call site: the second is a caller that looked a key up and got
+// nothing back, and answering "no" to that would report an attacker where there is a bug.
+func CheckEpochKeysDigest(d *EpochDigestAttachment, writeKey []byte, readKey []byte) error {
+	if d == nil {
+		return fmt.Errorf("%w: kind 0x%04x carries no body", ErrServerAttachmentBody, uint16(AttachmentEpochDigest))
+	}
+	computed, err := EpochKeysDigest(d.Epoch, writeKey, readKey)
+	if err != nil {
+		return err
+	}
+	// ConstantTimeCompare answers 0 for a length mismatch as well, so a truncated or absent
+	// digest is a mismatch here and never a short comparison that happened to agree.
+	if subtle.ConstantTimeCompare(computed, d.EpochKeysDigest) != 1 {
+		return fmt.Errorf("%w: the two keys handed beside this record are not the ones H(epoch_keys) at opens_epoch %d is over",
+			ErrEpochKeysDigestMismatch, d.Epoch)
+	}
+	return nil
 }
 
 // EpochKeysDigest is H(epoch_keys): the one value an EpochDigestAttachment carries about
