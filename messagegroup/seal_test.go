@@ -1217,6 +1217,136 @@ func TestTheAttachmentTheSealerEncodesIsTheOneBothPreimagesCover(t *testing.T) {
 	}
 }
 
+// THE SEAL DOOR PRODUCES A KIND 0x0005 COMMIT END TO END, and the two keys are not in it.
+//
+// This is ledger item 244 measured at the only seal door in the tree. SealRecord encodes
+// through message.EncodeServerAttachment, which asks serverAttachmentKindServed; until
+// 2026-09-23 that map excluded AttachmentEpochDigest and this call was refused BY NAME, so
+// no committer anywhere could produce the record the amendment exists to produce. Measured
+// then, with the control in the same call: EncodeEpochDigestAttachment answered 100 octets
+// and nil while EncodeServerAttachment on the same body was refused, and a kind 0x0001 body
+// answered 136 octets.
+//
+// WHAT IS ASSERTED IS THE PROPERTY AND NOT THE COUNT. The record seals, ParseRecord answers
+// is_commit with the attachment slot identical to the octets that went in, the slot parses
+// at spec B section 5.1 check 3's door as kind 0x0005, and CheckEpochKeysDigest binds the
+// digest to the two keys the REQUEST would carry (ruling 33) under the record header's own
+// group id. Then the thing item 244 is about: the sealed record's octets DO NOT CONTAIN
+// either key, and the kind 0x0001 control sealed by the same call in the same test DOES
+// contain both. A removed member who can fetch the commit that removed them learns nothing
+// from the first record and learns the next epoch's read and write keys from the second.
+func TestTheSealDoorProducesAnEpochDigestCommitThatCarriesNeitherKey(t *testing.T) {
+	fixture := newTestSession(t, "epoch-digest-seal")
+	fixture.trackOwn(t)
+
+	var groupId [32]byte
+	copy(groupId[:], fixture.handle.GroupId())
+	writeKey := fillKeyBytes(0x40)
+	readKey := fillKeyBytes(0x80)
+	const opensEpoch = 2
+
+	public := message.EpochDigestAttachment{
+		Epoch:             opensEpoch,
+		AlgId:             0x0031,
+		MediaTtlSeconds:   2592000,
+		DurableTtlSeconds: 0xFFFFFFFF,
+		GroupContextHash:  fillKeyBytes(0xC0),
+		ExpectedWrapCount: 3,
+	}
+	digest, err := message.NewEpochDigestAttachment(groupId, public, writeKey, readKey)
+	if err != nil {
+		t.Fatalf("NewEpochDigestAttachment: %v", err)
+	}
+	sealed, err := fixture.session.SealRecord(message.RetentionDurable, 0, true, []byte("head"), []byte("body"), 0,
+		&message.ServerAttachment{Kind: message.AttachmentEpochDigest, EpochDigest: digest})
+	if err != nil {
+		t.Fatalf("SealRecord refused a kind 0x0005 commit, which is the whole of what this test is for: %v", err)
+	}
+
+	// the record round trip, and the two properties a commit is refused for losing
+	bs, err := message.EncodeRecord(sealed)
+	if err != nil {
+		t.Fatalf("the sealed kind 0x0005 commit does not encode: %v", err)
+	}
+	parsed, err := message.ParseRecord(bs)
+	if err != nil {
+		t.Fatalf("the sealed kind 0x0005 commit does not parse back: %v", err)
+	}
+	if !parsed.Header.IsCommit {
+		t.Error("the kind 0x0005 record came back with is_commit clear")
+	}
+	if !bytes.Equal(parsed.Header.ServerAttachment, sealed.Header.ServerAttachment) {
+		t.Errorf("the attachment slot came back as %d octets and was sealed as %d",
+			len(parsed.Header.ServerAttachment), len(sealed.Header.ServerAttachment))
+	}
+
+	// the slot parses at section 5.1 check 3's door -- which is what the server runs -- and
+	// the digest it carries is the one the two keys hash to under this record's own group
+	attachment, err := message.ParseServerAttachment(parsed.Header.ServerAttachment)
+	if err != nil {
+		t.Fatalf("section 5.1 check 3's door refused the sealed attachment: %v", err)
+	}
+	if attachment.Kind != message.AttachmentEpochDigest {
+		t.Fatalf("the sealed attachment parses as kind 0x%04x, want the digest kind", uint16(attachment.Kind))
+	}
+	if err := message.CheckEpochKeysDigest(parsed.Header.GroupId, attachment.EpochDigest, writeKey, readKey); err != nil {
+		t.Errorf("the digest in the sealed record is not over the two keys the request carries: %v", err)
+	}
+
+	// THE INLINE CONTROL: the same call, the same session, kind 0x0001
+	control := &message.ServerAttachment{Kind: message.AttachmentEpoch, Epoch: &message.EpochAttachment{
+		Epoch:             opensEpoch,
+		AlgId:             0x0031,
+		WriteKey:          writeKey,
+		ReadKey:           readKey,
+		MediaTtlSeconds:   public.MediaTtlSeconds,
+		DurableTtlSeconds: public.DurableTtlSeconds,
+		GroupContextHash:  public.GroupContextHash,
+		ExpectedWrapCount: public.ExpectedWrapCount,
+	}}
+	controlRecord, err := fixture.session.SealRecord(message.RetentionDurable, 0, true, []byte("head"), []byte("body"), 0, control)
+	if err != nil {
+		t.Fatalf("SealRecord refused the kind 0x0001 control, so the seal above says nothing about the kind: %v", err)
+	}
+	controlBytes, err := message.EncodeRecord(controlRecord)
+	if err != nil {
+		t.Fatalf("the sealed kind 0x0001 control does not encode: %v", err)
+	}
+	if !controlRecord.Header.IsCommit {
+		t.Error("the kind 0x0001 control came back with is_commit clear")
+	}
+
+	// ITEM 244, AS A PROPERTY OF THE OCTETS ON THE WIRE. The keys are searched for in the
+	// WHOLE record and not in the attachment slot alone, because the question is what a
+	// party who fetched this record can read out of it, not where this package put it.
+	for _, key := range []struct {
+		name string
+		key  []byte
+	}{{"write_key", writeKey}, {"read_key", readKey}} {
+		if bytes.Contains(bs, key.key) {
+			t.Errorf("the kind 0x0005 commit's %d octets contain %s, and the amendment is that they do not",
+				len(bs), key.name)
+		}
+		if !bytes.Contains(controlBytes, key.key) {
+			t.Errorf("the kind 0x0001 control's %d octets do NOT contain %s, so the search above proves nothing",
+				len(controlBytes), key.name)
+		}
+	}
+	t.Logf("kind 0x0005: %d record octets carrying a %d octet attachment and neither key; "+
+		"kind 0x0001 control: %d record octets carrying a %d octet attachment and both keys",
+		len(bs), len(sealed.Header.ServerAttachment), len(controlBytes), len(controlRecord.Header.ServerAttachment))
+}
+
+// One 32 octet key value whose every octet is distinct from every other key's in this file,
+// so a test that found one key where it expected the other would say so.
+func fillKeyBytes(tag byte) []byte {
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = tag + byte(i)
+	}
+	return key
+}
+
 // expire_at is a clock read and the clock is injected, which is what keeps this package free of a
 // timing sensitive test.
 func TestAnExpireAtThatHasAlreadyPassedIsRefused(t *testing.T) {

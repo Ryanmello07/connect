@@ -361,11 +361,99 @@ func definedAttachmentCodes() []int {
 	return codes
 }
 
-// The codes ruling 27 defines and section 5.11's door does not serve, sorted. Derived by
-// subtracting one written down table from the other rather than listed a third time.
+// The codes RULED since section 5.11 was published, sorted. Derived by subtracting one
+// written down table from the other rather than listed a third time.
+//
+// IT IS A PROVENANCE SET AND IT IS NOT A DOOR'S REACH, and the two were the same set until
+// 2026-09-23. This function used to be named for the second meaning — "the codes section
+// 5.11's door does not serve" — and four properties in this file walked specAttachmentCodes
+// as though THAT meant "served". It did, for exactly as long as the two coincided. When
+// ruling 33 put the epoch keys on the request and section 5.1 check 3's door was widened to
+// the sixth kind, the coincidence ended: the provenance split did not move at all, and
+// three of those four walks would have gone on holding over the five that were already here
+// while saying nothing about the sixth. Which kinds a DOOR serves is attachmentDoorServes,
+// below, and nothing in this file may read this function for that.
 func ruledAttachmentCodes() []int {
-	served := map[int]bool{}
+	published := map[int]bool{}
 	for _, code := range specAttachmentCodes() {
+		published[code] = true
+	}
+	codes := []int{}
+	for _, code := range definedAttachmentCodes() {
+		if !published[code] {
+			codes = append(codes, code)
+		}
+	}
+	slices.Sort(codes)
+	return codes
+}
+
+// ── which kinds each DOOR serves, written down ──────────────────────────────────────
+
+// The kinds each of this package's two doors serves, as a DISPOSITION: what a reader of
+// this file has decided, against which the package's own two maps are held.
+//
+// It is a third written down table rather than a fourth derivation, and its subject is what
+// distinguishes it from the two above. Those are about PROVENANCE — which document ruled
+// each code — and they do not move when a door widens. This one is about REACH, and it
+// moved on 2026-09-23: section 5.1 check 3's door gained AttachmentEpochDigest when ruling
+// 33 put write_key[n+1] and read_key[n+1] on the REQUEST, so that a server accepting the
+// kind is a server that was handed the keys.
+//
+// THE COMPLEMENT MOVED WITH IT, and naming it is the whole reason this table exists rather
+// than a boolean somewhere. Before that date the door with a non-empty complement was
+// section 5.1 check 3's, which refused one defined kind; after it, that door's complement is
+// EMPTY and the epoch digest door carries the whole of it, refusing five. The mechanism
+// under test — a door names the kind it will not serve instead of parsing it into something
+// — is the same mechanism over the other door, and TestARecordCarriesAKindADoorRefusesByName
+// is written over both so that it cannot quietly come to hold over neither.
+var attachmentDoorServes = map[string][]ServerAttachmentKind{
+	serverAttachmentDoorName: {
+		AttachmentNone,
+		AttachmentEpoch,
+		AttachmentRecovery,
+		AttachmentWrap,
+		AttachmentComplete,
+		AttachmentEpochDigest,
+	},
+	epochDigestDoorName: {AttachmentEpochDigest},
+}
+
+// The door names, sorted, so every walk over the doors runs in one order.
+func attachmentDoorNames() []string {
+	names := make([]string, 0, len(attachmentDoorServes))
+	for name := range attachmentDoorServes {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	return names
+}
+
+// The codes the named door is written down as serving, sorted.
+func servedAttachmentCodes(t testing.TB, door string) []int {
+	t.Helper()
+	kinds, named := attachmentDoorServes[door]
+	if !named {
+		t.Fatalf("no door is written down under %q, so this walk would run over nothing", door)
+	}
+	codes := make([]int, 0, len(kinds))
+	for _, kind := range kinds {
+		codes = append(codes, int(kind))
+	}
+	slices.Sort(codes)
+	return codes
+}
+
+// THE COMPLEMENT, PRINTED AS A VALUE: the codes this package defines that the named door is
+// written down as NOT serving, sorted.
+//
+// Derived by subtraction rather than listed, so it cannot come to disagree with the table
+// above, and it is allowed to be empty — section 5.1 check 3's is, since 2026-09-23. What
+// is not allowed is for EVERY door's to be empty, and that is asserted rather than assumed.
+func unservedAttachmentCodes(t testing.TB, door string) []int {
+	t.Helper()
+	served := map[int]bool{}
+	for _, code := range servedAttachmentCodes(t, door) {
 		served[code] = true
 	}
 	codes := []int{}
@@ -376,6 +464,24 @@ func ruledAttachmentCodes() []int {
 	}
 	slices.Sort(codes)
 	return codes
+}
+
+// One encoding offered to the door NAMED, rather than to the door that serves its kind.
+//
+// It is the counterpart of parseAtItsDoor and it exists for the opposite purpose: that one
+// asks a kind's own door to read it, and this one asks a door that may well refuse.
+func parseAtDoor(t testing.TB, door string, bs []byte) error {
+	t.Helper()
+	switch door {
+	case serverAttachmentDoorName:
+		_, err := ParseServerAttachment(bs)
+		return err
+	case epochDigestDoorName:
+		_, err := ParseEpochDigestAttachment(bs)
+		return err
+	}
+	t.Fatalf("no parse entry point is wired for door %q, so a door could be added to the table and gated by nothing", door)
+	return nil
 }
 
 // ── the doors ───────────────────────────────────────────────────────────────────────
@@ -872,15 +978,95 @@ func encodableKindCodes(t testing.TB) []int {
 	return codes
 }
 
-// The alphabet, encode side: the encoder writes exactly the five codes section 5.11 defines.
-func TestTheEncoderWritesExactlyTheFiveKindsSectionFiveElevenDefines(t *testing.T) {
-	codes := encodableKindCodes(t)
-	want := specAttachmentCodes()
-	if len(want) != 5 {
-		t.Fatalf("the written down table names %d codes, want the 5 of section 5.11", len(want))
+// Each door serves exactly the kinds written down for it, and the two answers are compared
+// in BOTH directions.
+//
+// This is the disposition assertion the rest of the door walks rest on: attachmentDoorServes
+// is what a reader decided, serverAttachmentKindServed and epochDigestKindServed are what the
+// package does, and either one moving without the other is a failure here rather than a
+// silent widening found later. A kind served but not written down is a door that grew reach
+// nobody recorded; a kind written down but not served is a table that describes a build that
+// does not exist.
+//
+// THE COMPLEMENTS ARE PRINTED AND THEIR UNION IS ASSERTED NON-EMPTY. Section 5.1 check 3's
+// complement is empty as of 2026-09-23, which is legitimate and is the whole of what this
+// commit did; every complement being empty is not, because then no door in this package
+// refuses a defined kind at all and the mechanism the next test gates has nothing to hold
+// over.
+func TestEachDoorServesExactlyTheKindsWrittenDownForIt(t *testing.T) {
+	packageAnswer := map[string]map[ServerAttachmentKind]bool{
+		serverAttachmentDoorName: serverAttachmentKindServed,
+		epochDigestDoorName:      epochDigestKindServed,
 	}
+	if len(packageAnswer) != len(attachmentDoorServes) {
+		t.Fatalf("the package has %d served maps and %d doors are written down", len(packageAnswer), len(attachmentDoorServes))
+	}
+	unservedSomewhere := 0
+	for _, door := range attachmentDoorNames() {
+		served, wired := packageAnswer[door]
+		if !wired {
+			t.Fatalf("door %q is written down and no map of this package answers for it", door)
+		}
+		written := map[int]bool{}
+		for _, code := range servedAttachmentCodes(t, door) {
+			written[code] = true
+		}
+		for _, code := range definedAttachmentCodes() {
+			kind := ServerAttachmentKind(code)
+			if served[kind] && !written[code] {
+				t.Errorf("%s serves kind 0x%04x and nothing writes that down", door, code)
+			}
+			if written[code] && !served[kind] {
+				t.Errorf("%s is written down as serving kind 0x%04x and its map does not", door, code)
+			}
+		}
+		complement := unservedAttachmentCodes(t, door)
+		unservedSomewhere += len(complement)
+		t.Logf("%s serves %v and refuses %v of the kinds this package defines", door, servedAttachmentCodes(t, door), complement)
+	}
+	if unservedSomewhere == 0 {
+		t.Fatal("no door refuses any kind this package defines, so the by-name refusal is gated over nothing")
+	}
+	// and the reach of section 5.1 check 3's door, said against provenance rather than
+	// against itself: it serves every code this package defines, which is section 5.11's
+	// five plus ruling 27's sixth. This is the line that fails if a seventh kind is defined
+	// and nobody decides whether that door serves it.
+	if want := definedAttachmentCodes(); !slices.Equal(servedAttachmentCodes(t, serverAttachmentDoorName), want) {
+		t.Errorf("%s serves %v and this package defines %v", serverAttachmentDoorName,
+			servedAttachmentCodes(t, serverAttachmentDoorName), want)
+	}
+	if want := ruledAttachmentCodes(); !slices.Equal(servedAttachmentCodes(t, epochDigestDoorName), want) {
+		t.Errorf("%s serves %v and ruling 27 defines %v", epochDigestDoorName,
+			servedAttachmentCodes(t, epochDigestDoorName), want)
+	}
+}
+
+// The alphabet, encode side: the encoder writes exactly the codes section 5.1 check 3's door
+// is written down as serving.
+//
+// It was "exactly the five codes section 5.11 defines" and the number was pinned at five. The
+// number is not the property — the door's reach is — and pinning it was what would have made
+// this test the thing that had to be edited rather than the thing that reported the edit. It
+// now names the door, and the five/six question is asked once, against provenance, in
+// TestEachDoorServesExactlyTheKindsWrittenDownForIt.
+func TestTheEncoderWritesExactlyTheKindsItsDoorServes(t *testing.T) {
+	codes := encodableKindCodes(t)
+	want := servedAttachmentCodes(t, serverAttachmentDoorName)
 	if !slices.Equal(codes, want) {
-		t.Errorf("the encoder writes %v, want exactly %v; every other u16 is a kind nothing defines", codes, want)
+		t.Errorf("the encoder writes %v, want exactly %v; every other u16 is a kind this door does not write", codes, want)
+	}
+	// the complement, in the same test rather than inferred from the equality: what the
+	// encoder REFUSES of the codes this package defines
+	refused := []int{}
+	byKind := validAttachmentsByKind(t)
+	for _, code := range definedAttachmentCodes() {
+		if _, err := EncodeServerAttachment(byKind[ServerAttachmentKind(code)]); err != nil {
+			refused = append(refused, code)
+		}
+	}
+	if !slices.Equal(refused, unservedAttachmentCodes(t, serverAttachmentDoorName)) {
+		t.Errorf("the encoder refuses %v of the defined codes and %s is written down as refusing %v",
+			refused, serverAttachmentDoorName, unservedAttachmentCodes(t, serverAttachmentDoorName))
 	}
 }
 
@@ -892,10 +1078,14 @@ func TestTheEncoderWritesExactlyTheFiveKindsSectionFiveElevenDefines(t *testing.
 // catches — a parser that read the body first and the kind afterwards, or one that fell back
 // to a default kind — and so is a kind silently ignored, which spec B section 5.1 check 3
 // cannot survive: an attachment the server cannot parse is one it cannot check.
+//
+// The walk is over the kinds this DOOR serves and not over section 5.11's five. It read the
+// latter, which meant the same set until 2026-09-23 and then silently stopped covering the
+// sixth kind at the door that had just been widened to it.
 func TestAnEncodingParsesUnderItsOwnKindAndNoOther(t *testing.T) {
 	byKind := validAttachmentsByKind(t)
 	tried := 0
-	for _, kind := range specAttachmentCodes() {
+	for _, kind := range servedAttachmentCodes(t, serverAttachmentDoorName) {
 		attachment := byKind[ServerAttachmentKind(kind)]
 		if attachment == nil || attachment.Kind == AttachmentNone {
 			continue
@@ -1290,14 +1480,30 @@ func TestEveryKindThatCarriesABodyHasAGoldenVector(t *testing.T) {
 			want = append(want, code)
 		}
 	}
-	// the kinds section 5.11's door does not serve carry bodies too, and a vector is owed
-	// for each of them for the same reason: the door they ARE served at is the one that
+	// the kinds section 5.1 check 3's door does not serve carry bodies too, and a vector is
+	// owed for each of them for the same reason: the door they ARE served at is the one that
 	// writes them, and a kind pinned by nothing is a kind every other property in this file
-	// goes on holding around
-	want = append(want, ruledAttachmentCodes()...)
+	// goes on holding around. This set is EMPTY as of 2026-09-23 and the append is kept
+	// rather than deleted, because it is what pins a seventh kind that is ruled before its
+	// door widens — the situation 0x0005 was in for the whole of steps 1 to 3.
+	want = append(want, unservedAttachmentCodes(t, serverAttachmentDoorName)...)
 	slices.Sort(want)
+	want = slices.Compact(want)
 	if !slices.Equal(pinned, want) {
 		t.Errorf("the vectors pin %v and the doors write bodies for %v", pinned, want)
+	}
+	// THE STATEMENT THAT DOES NOT GO VACUOUS WHEN THE APPEND ABOVE IS EMPTY: every kind this
+	// package defines except the absent one carries a body and is pinned. Derived from the
+	// kind table rather than from the encoder, so "the encoder stopped writing one" and "a
+	// vector went missing" are both failures here instead of cancelling out.
+	owed := []int{}
+	for _, code := range definedAttachmentCodes() {
+		if ServerAttachmentKind(code) != AttachmentNone {
+			owed = append(owed, code)
+		}
+	}
+	if !slices.Equal(pinned, owed) {
+		t.Errorf("the vectors pin %v and this package defines %v kinds that carry a body", pinned, owed)
 	}
 }
 
@@ -1738,27 +1944,56 @@ func TestAnUnknownKindIsADecodeError(t *testing.T) {
 	t.Logf("%d undefined kinds refused on both sides", refusals)
 
 	// THE COMPLEMENT THIS LOOP REMOVED, named rather than left implicit. The walk above is
-	// about codes NOTHING defines, and it now skips six rather than five — so the reader is
-	// owed, in the same test, what the sixth one does instead of being refused here. It is
-	// refused too, at section 5.11's door, and under a DIFFERENT sentinel: "nobody defines
-	// this" and "this door does not serve this" are two facts, and a caller that could not
-	// tell them apart would read a conforming implementation's commit as a corrupt one.
-	for _, code := range ruledAttachmentCodes() {
-		kind := ServerAttachmentKind(code)
-		valid := validAttachmentsByKind(t)[kind]
-		bs, err := encodeAtItsDoor(valid)
-		if err != nil {
-			t.Fatalf("kind 0x%04x does not encode at its own door: %v", code, err)
-		}
-		if _, err := ParseServerAttachment(bs); !errors.Is(err, ErrServerAttachmentKindNotServed) {
-			t.Errorf("section 5.11's door refused kind 0x%04x with %v, want ErrServerAttachmentKindNotServed", code, err)
-		}
-		if _, err := EncodeServerAttachment(valid); !errors.Is(err, ErrServerAttachmentKindNotServed) {
-			t.Errorf("section 5.11's encoder refused kind 0x%04x with %v, want ErrServerAttachmentKindNotServed", code, err)
+	// about codes NOTHING defines, and it skips six — so the reader is owed, in the same
+	// test, what those six do instead of being refused here.
+	//
+	// THIS BLOCK USED TO BE THE SIXTH KIND ALONE, walked over ruledAttachmentCodes and
+	// asserting it was refused at section 5.11's door. That set is a PROVENANCE set: it is
+	// still exactly [5] after 2026-09-23, and the loop over it would have gone on running,
+	// asserting a refusal that had just become an acceptance — which is the one shape a
+	// complement paragraph must not have. It is now written per door, over the two answers
+	// a defined kind can get, and it is the DIFFERENCE BETWEEN THE TWO SENTINELS that is
+	// under assertion: "nobody defines this" and "this door does not serve this" are two
+	// facts, and a caller that could not tell them apart would read a conforming
+	// implementation's commit as a corrupt one.
+	served, notServed := 0, 0
+	byKind := validAttachmentsByKind(t)
+	for _, door := range attachmentDoorNames() {
+		for _, code := range definedAttachmentCodes() {
+			kind := ServerAttachmentKind(code)
+			if kind == AttachmentNone {
+				continue
+			}
+			bs, err := encodeAtItsDoor(byKind[kind])
+			if err != nil {
+				t.Fatalf("kind 0x%04x does not encode at its own door: %v", code, err)
+			}
+			parseErr := parseAtDoor(t, door, bs)
+			if slices.Contains(servedAttachmentCodes(t, door), code) {
+				if parseErr != nil {
+					t.Errorf("%s is written down as serving kind 0x%04x and refused it with %v", door, code, parseErr)
+					continue
+				}
+				served++
+				continue
+			}
+			// the refusal is the OTHER sentinel, never the undefined one the walk above uses
+			if !errors.Is(parseErr, ErrServerAttachmentKindNotServed) {
+				t.Errorf("%s refused kind 0x%04x with %v, want ErrServerAttachmentKindNotServed", door, code, parseErr)
+				continue
+			}
+			if errors.Is(parseErr, ErrServerAttachmentKindUnknown) {
+				t.Errorf("%s refused defined kind 0x%04x as an UNDEFINED one, and the two sentinels are the distinction", door, code)
+			}
+			notServed++
 		}
 	}
-	t.Logf("%d ruled kinds refused at section 5.11's door under ErrServerAttachmentKindNotServed: %v",
-		len(ruledAttachmentCodes()), ruledAttachmentCodes())
+	if served == 0 || notServed == 0 {
+		t.Fatalf("the defined kinds produced %d acceptances and %d not-served refusals across the doors, and the "+
+			"distinction between the two sentinels needs one of each", served, notServed)
+	}
+	t.Logf("across the doors, the %d defined kinds gave %d acceptances and %d ErrServerAttachmentKindNotServed refusals, "+
+		"against %d ErrServerAttachmentKindUnknown", len(defined), served, notServed, refusals)
 }
 
 // A kind and a body that disagree are refused rather than resolved.
@@ -2009,7 +2244,10 @@ func TestTheEncoderAndTheParserAdmitTheSameAttachments(t *testing.T) {
 			attachment *ServerAttachment
 		}{name: name, attachment: a})
 	}
-	for _, code := range specAttachmentCodes() {
+	// the kinds THIS DOOR serves, and not section 5.11's five: on 2026-09-23 the two stopped
+	// being the same set, and the five would have left the agreement unasserted over exactly
+	// the kind the door had just been widened to
+	for _, code := range servedAttachmentCodes(t, serverAttachmentDoorName) {
 		kind := ServerAttachmentKind(code)
 		add(specAttachmentKindNames[kind], byKind[kind])
 	}
@@ -2415,80 +2653,107 @@ func TestTheSecondEpochDigestVectorIsPinnedToItsExactBytes(t *testing.T) {
 	}
 }
 
-// THE ROLLOUT PROPERTY, and it is the whole of why the sixth kind can land before the field
-// pair that carries the keys does.
+// A DOOR REFUSES A KIND IT DOES NOT SERVE BY NAME, rather than parsing it into something,
+// and a record carries that kind's octets through regardless.
 //
-// A record carrying a kind this door does not serve ENCODES, ParseRecords back with
-// is_commit still set and its attachment slot byte intact, while ParseServerAttachment
-// refuses the same octets BY NAME with the kind in the message. So a server that has not
-// learned to carry the epoch keys beside the record refuses the commit loudly at spec B
-// section 5.1 check 3, and a receiver — which never reads a field of the attachment, only
-// hashes its octets — follows the commit correctly.
+// ── WHICH ASSERTION CHANGED MEANING HERE, AND WHY THAT IS THE ROLLOUT ────────────────
 //
-// It is written over the kinds this package defines and section 5.11's door does not serve,
-// derived, rather than over 0x0005 written down: the property is about the RELATION between
-// the two doors and it has to keep its meaning when the field list of the body moves or a
-// seventh kind is ruled. The positive control is in the same test and is a real kind 0x0001
-// attachment on the same record shape, because a door that refused everything would satisfy
-// the first half of this on its own.
-func TestARecordCarriesAKindTheServersDoorRefusesByName(t *testing.T) {
+// This test was TestARecordCarriesAKindTheServersDoorRefusesByName and it asserted that
+// ParseServerAttachment REFUSES kind 0x0005 by name. That was the STALE-SERVER half of
+// spec B section 5.4's acceptance window: a server built before the keys could travel
+// beside the record refuses such a commit loudly at check 3 instead of installing an epoch
+// whose keys it was never handed, and a stale receiver follows the commit anyway because no
+// receive path reads a field of an epoch attachment. It is what made the window a rollout
+// instead of a flag day, and it was true of every build up to the one before this commit.
+//
+// IT CANNOT BE TRUE OF THIS BUILD, because this commit is the widening: section 5.1 check
+// 3's door serves 0x0005 here, which is the window's step 1. The stale half is now held by
+// binaries, not by this package, and a test that went on asserting it would be asserting
+// that the change this commit makes had not been made.
+//
+// SO THE ASSERTION IS RE-EXPRESSED RATHER THAN DELETED, AND IT IS WIDER THAN IT WAS. The
+// mechanism — a door naming the kind it will not serve, instead of parsing those octets
+// into something, while the RECORD carries them through untouched — is the thing that made
+// the rollout legible, and it is a relation between a door and a kind rather than a fact
+// about 0x0005. It is now walked over EVERY (door, kind) pair this package defines, from
+// the written down attachmentDoorServes table: one door × one unserved kind before, two
+// doors × six kinds now. Today the pairs that refuse are the five section 5.11 kinds at the
+// epoch digest door, and that door refusing kind 0x0001 is not a leftover — it is the epoch
+// key install path NOT being reachable through the function that exists to take the keys
+// out of it.
+//
+// The positive control is in the same test and is per door, because a door that refused
+// everything would satisfy the refusal half on its own, and because with the complement of
+// one door now empty the controls are what keep that door under this test at all.
+func TestARecordCarriesAKindADoorRefusesByName(t *testing.T) {
 	byKind := validAttachmentsByKind(t)
-	refused := 0
-	for _, code := range ruledAttachmentCodes() {
-		kind := ServerAttachmentKind(code)
-		attachment, err := encodeAtItsDoor(byKind[kind])
-		if err != nil {
-			t.Fatalf("kind 0x%04x does not encode at its own door: %v", code, err)
+	refused, accepted := 0, 0
+	for _, door := range attachmentDoorNames() {
+		doorRefused, doorAccepted := 0, 0
+		for _, code := range definedAttachmentCodes() {
+			kind := ServerAttachmentKind(code)
+			// the absent attachment has no octets for a record to carry, and its two
+			// spellings are asserted by the absent/empty tests of their own
+			if kind == AttachmentNone {
+				continue
+			}
+			attachment, err := encodeAtItsDoor(byKind[kind])
+			if err != nil {
+				t.Fatalf("kind 0x%04x does not encode at its own door: %v", code, err)
+			}
+			// THE RECORD HALF, run for served and unserved kinds alike: the octets encode,
+			// ParseRecord brings them back with is_commit still set and the attachment slot
+			// identical. recordSlotRoundTrip asserts all three.
+			slot := recordSlotRoundTrip(t, attachment)
+			parseErr := parseAtDoor(t, door, slot)
+			if slices.Contains(servedAttachmentCodes(t, door), code) {
+				if parseErr != nil {
+					t.Fatalf("%s is written down as serving kind 0x%04x and refused it after the record round trip: %v",
+						door, code, parseErr)
+				}
+				doorAccepted++
+				continue
+			}
+			// THE REFUSAL, by sentinel and with the kind in the message
+			if parseErr == nil {
+				t.Fatalf("%s accepted kind 0x%04x, which it is written down as not serving", door, code)
+			}
+			if !errors.Is(parseErr, ErrServerAttachmentKindNotServed) {
+				t.Fatalf("%s refused kind 0x%04x with %v, want ErrServerAttachmentKindNotServed", door, code, parseErr)
+			}
+			if named := fmt.Sprintf("0x%04x", code); !strings.Contains(parseErr.Error(), named) {
+				t.Errorf("%s's refusal of kind %s reads %q and does not name the kind", door, named, parseErr.Error())
+			}
+			if !strings.Contains(parseErr.Error(), door) {
+				t.Errorf("the refusal of kind 0x%04x reads %q and does not name the door that answered", code, parseErr.Error())
+			}
+			// and the same octets still parse at the door that DOES serve them, so what the
+			// record carried is an attachment and not a malformed field
+			if _, err := parseAtItsDoor(kind, slot); err != nil {
+				t.Fatalf("kind 0x%04x does not parse at its own door after the record round trip: %v", code, err)
+			}
+			doorRefused++
 		}
-		slot := recordSlotRoundTrip(t, attachment)
-		// the parser's refusal, by sentinel and with the kind in the message
-		_, parseErr := ParseServerAttachment(slot)
-		if parseErr == nil {
-			t.Fatalf("section 5.11's door accepted kind 0x%04x, and a server that accepts it installs an epoch whose keys it was never handed", code)
+		// THE CONTROL IS PER DOOR AND IS REQUIRED OF EVERY DOOR. A door that answered no to
+		// everything would satisfy the refusal half above and say nothing.
+		if doorAccepted == 0 {
+			t.Errorf("%s accepted no kind at all, so its refusals say nothing about the door", door)
 		}
-		if !errors.Is(parseErr, ErrServerAttachmentKindNotServed) {
-			t.Fatalf("section 5.11's door refused kind 0x%04x with %v, want ErrServerAttachmentKindNotServed", code, parseErr)
-		}
-		if named := fmt.Sprintf("0x%04x", code); !strings.Contains(parseErr.Error(), named) {
-			t.Errorf("the refusal of kind %s reads %q and does not name the kind", named, parseErr.Error())
-		}
-		// and the same octets still parse at the door that does serve them, so what the
-		// record carried is an attachment and not a malformed field
-		if _, err := parseAtItsDoor(kind, slot); err != nil {
-			t.Fatalf("kind 0x%04x does not parse at its own door after the record round trip: %v", code, err)
-		}
-		refused++
+		t.Logf("%s: %d kinds refused by name, %d accepted, through the identical record", door, doorRefused, doorAccepted)
+		refused += doorRefused
+		accepted += doorAccepted
 	}
+	// THE VACUITY GUARD, and it is about the WHOLE product rather than about one door: with
+	// section 5.1 check 3's complement empty since 2026-09-23, a walk keyed on that door
+	// alone would now cover nothing at all and pass.
 	if refused == 0 {
-		t.Fatal("no kind is defined and unserved, so this property held over nothing")
-	}
-
-	// THE POSITIVE CONTROL, in the same test: every kind section 5.11's door does serve goes
-	// through the identical record round trip and is ACCEPTED there.
-	accepted := 0
-	for _, code := range specAttachmentCodes() {
-		kind := ServerAttachmentKind(code)
-		if kind == AttachmentNone {
-			continue
-		}
-		attachment, err := EncodeServerAttachment(byKind[kind])
-		if err != nil {
-			t.Fatalf("kind 0x%04x does not encode: %v", code, err)
-		}
-		slot := recordSlotRoundTrip(t, attachment)
-		parsed, err := ParseServerAttachment(slot)
-		if err != nil {
-			t.Fatalf("section 5.11's door refused kind 0x%04x after the record round trip: %v", code, err)
-		}
-		if difference := attachmentDifference(byKind[kind], parsed); difference != "" {
-			t.Errorf("kind 0x%04x did not survive the record: %s differs", code, difference)
-		}
-		accepted++
+		t.Fatal("no door refused any kind this package defines, so the by-name refusal held over nothing")
 	}
 	if accepted == 0 {
-		t.Fatal("the control accepted nothing, so the refusals above say nothing about the door")
+		t.Fatal("no door accepted anything, so the refusals above say nothing about any door")
 	}
-	t.Logf("%d kinds refused by name at section 5.11's door and %d accepted, through the identical record", refused, accepted)
+	t.Logf("%d (door, kind) pairs refused by name and %d accepted, over %d doors and %d defined kinds",
+		refused, accepted, len(attachmentDoorNames()), len(definedAttachmentCodes()))
 }
 
 // One commit record carrying these attachment octets, encoded, parsed back, and its

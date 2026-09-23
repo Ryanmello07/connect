@@ -1064,7 +1064,17 @@ func TestTheEpochKeyDeliveriesAlignWithTheRecordsTheySubmit(t *testing.T) {
 		t.Errorf("SubmitResponse.results is %v; it is the pattern SubmitRequest.epoch_keys follows", results)
 	}
 
-	block := flatten(t, submitRequestSource(t), "and so is a commit with no entry")
+	// THE CLAUSE LIST GREW WHEN THE RULE STOPPED BEING KIND-FREE, and the growth is the
+	// repair rather than a decoration on it. The clause this list used to pin read "and so
+	// is a commit with no entry" — kind-free, and therefore a rule that refuses every
+	// conforming kind 0x0001 commit for as long as Spec B §5.4's acceptance window is open.
+	// Deleting that clause without replacing it would leave this gate weaker than it was, so
+	// the one sentence is replaced by SEVEN: which kind the no-entry refusal is about, the
+	// opposite refusal that exists only during the window, the admission that the kind-free
+	// form was the AFTER form, and the two dates that bound it. A gate that pinned the
+	// corrected sentence and not its boundary would go on passing over a comment that had
+	// quietly reverted to a rule true on one side of a date only.
+	block := flatten(t, submitRequestSource(t), "while Spec B §5.4's acceptance window is open")
 	for _, clause := range []struct {
 		what   string
 		phrase string
@@ -1073,11 +1083,18 @@ func TestTheEpochKeyDeliveriesAlignWithTheRecordsTheySubmit(t *testing.T) {
 		{"the field it aligns with", "`records`"},
 		{"the length rule", "EMPTY, OR EXACTLY AS LONG AS `records`"},
 		{"what an entry against a non-commit means", "is_commit = 0 IS REASON_REJECTED"},
-		{"what a commit with no entry means", "and so is a commit with no entry"},
-		{"the batch rule the three clauses rest on", "A batch containing a commit MUST contain exactly one record."},
+		{"that the commit arm turns on the attachment kind", "THE RULE IS KEYED ON THE ATTACHMENT KIND"},
+		{"which kind a commit with no entry is refused for", "a kind 0x0005 commit with NO entry → REASON_REJECTED"},
+		{"the refusal that exists only while the window is open", "a kind 0x0001 commit WITH an entry → REASON_REJECTED"},
+		{"that the kind-free form was the one for after the window", "THAT FORM IS TRUE ONLY AFTER THE WINDOW CLOSES"},
+		{"the date the window opened", "from 2026-09-22 a server accepts EITHER kind on a commit"},
+		{"the date it closes and the earlier bound on it", "from 2026-11-03 — OR the day the Remove arm first ships, WHICHEVER IS EARLIER"},
+		{"the batch rule the clauses rest on", "A batch containing a commit MUST contain exactly one record."},
 		{"the empty case", "EMPTY when `records` carries no commit"},
-		{"the one-entry case", "EXACTLY ONE ENTRY when `records` is a single commit"},
+		{"the second empty case the window adds", "when `records` is a single kind 0x0001 commit"},
+		{"the one-entry case", "EXACTLY ONE ENTRY when `records` is a single kind 0x0005 commit"},
 		{"that a mixed batch has no valid value at all", "UNSATISFIABLE"},
+		{"which kind that unsatisfiability is scoped to", "for a mixed batch carrying a 0x0005 commit"},
 		{"what relaxing the batch rule would cost", "would need explicit presence"},
 	} {
 		if !strings.Contains(block, clause.phrase) {
@@ -1134,13 +1151,24 @@ func TestTheCreateGroupEpochKeysCarryAPresenceRule(t *testing.T) {
 			"REQUIRED here and merely aligned on SubmitRequest", commit)
 	}
 
+	// THE SAME REPAIR AS SubmitRequest's, on the carrier Spec B §4.3.2 names alongside it:
+	// this block's rule was UNCONDITIONAL ("PRESENCE: REQUIRED"), which is the form that
+	// becomes true when §5.4's window closes and is false for every conforming kind 0x0001
+	// founding commit while it is open. The one clause that pinned the unconditional wording
+	// is replaced by FIVE — the kind each arm is keyed on, the admission that the old form
+	// was the after form, and both dates — so the gate is stronger where it was narrowed.
 	block := flatten(t, createGroupRequestSource(t), "AN ABSENT epoch_keys IS REASON_REJECTED")
 	for _, clause := range []struct {
 		what   string
 		phrase string
 	}{
-		{"that the delivery is required", "PRESENCE: REQUIRED."},
+		{"that presence turns on the attachment kind", "PRESENCE IS KEYED ON THE ATTACHMENT KIND"},
+		{"which kind requires the delivery", "REQUIRED under kind 0x0005"},
 		{"what an absent delivery means", "AN ABSENT epoch_keys IS REASON_REJECTED"},
+		{"which kind forbids the delivery", "MUST BE ABSENT under kind 0x0001, where PRESENT IS REASON_REJECTED"},
+		{"that the unconditional form was the one for after the window", "THAT FORM IS TRUE ONLY AFTER THE WINDOW CLOSES"},
+		{"the date the window opened", "from 2026-09-22 this server takes either kind on the founding commit"},
+		{"the date it closes and the earlier bound on it", "from 2026-11-03 — OR the day the Remove arm first ships, WHICHEVER IS EARLIER"},
 		{"the hazard it shares with SubmitRequest", "an epoch the server would install without having been handed what opens it"},
 		{"that absence is representable here and is not on the other carrier", "AND HERE ABSENCE IS REPRESENTABLE"},
 		{"that a zero delivery is not an absence", "is two EMPTY KEYS and not an absence"},

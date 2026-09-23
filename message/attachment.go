@@ -19,12 +19,13 @@
 //	WrapTag         := LP(wrap_target_handle) ‖ u64(epoch)
 //	EpochComplete   := u64(epoch) ‖ u32(wrap_count)
 //
-// A SIXTH KIND is defined here that section 5.11 does not carry yet, and THE SIXTH KIND
-// below says why, what refuses it, and what that refusal buys:
+// A SIXTH KIND, which section 5.11 now carries too — ruling 27 of 2026-09-22 amended it,
+// and THE SIXTH KIND below says what that amendment is for:
 //
 //	  kind 0x0005  EpochDigest     what 0x0001 becomes: the six PUBLIC fields of an
 //	                               EpochAttachment, and the DIGEST of its two keys in
-//	                               place of the keys themselves
+//	                               place of the keys themselves. Carried by, and only by,
+//	                               a record with is_commit = 1, exactly as 0x0001 is.
 //
 //	EpochDigest     := u64(epoch) ‖ u16(alg_id) ‖ u32(media_ttl_seconds)
 //	                 ‖ u32(durable_ttl_seconds) ‖ LP(group_context_hash)
@@ -134,21 +135,30 @@
 // site, no format_version bump, no flag day.
 //
 // THE TWO DOORS. EncodeServerAttachment and ParseServerAttachment are spec B section 5.1
-// check 3's door and they serve exactly the five kinds section 5.11 defines;
-// EncodeEpochDigestAttachment and ParseEpochDigestAttachment are the sixth kind's door. The
-// codec, the body table and checkServerAttachment are ONE set of code behind both, so the
-// two doors cannot come to disagree about what an attachment is — what differs is only
-// which kinds each one serves, and that is serverAttachmentKindServed.
+// check 3's door and they serve every kind section 5.11 defines, which since ruling 27 and
+// this commit is all six; EncodeEpochDigestAttachment and ParseEpochDigestAttachment are the
+// sixth kind's own door and serve that one kind and no other. The codec, the body table and
+// checkServerAttachment are ONE set of code behind both, so the two doors cannot come to
+// disagree about what an attachment is — what differs is only which kinds each one serves,
+// and that is serverAttachmentKindServed against epochDigestKindServed.
 //
-// THE PROPERTY THAT SPLIT BUYS is the reason the sixth kind can ship before anything else
-// does. A record carrying a kind 0x0005 attachment encodes, ParseRecords back with
-// is_commit set and the attachment slot byte intact, while ParseServerAttachment refuses
-// the same octets BY NAME with the kind in the message. So a STALE SERVER — one that has
-// not learned to carry the keys beside the record, which is every server today — refuses
-// the commit loudly at check 3 instead of installing an epoch whose keys it was never
-// handed, while a STALE RECEIVER follows the commit correctly, because no receive path in
-// connect or sdk reads a single field of an EpochAttachment: it hashes the octets and
-// nothing more.
+// THE PROPERTY THAT SPLIT BOUGHT, and it is a property of a BUILD rather than of this text,
+// so read the tense. A record carrying a kind 0x0005 attachment encodes, ParseRecords back
+// with is_commit set and the attachment slot byte intact, while a door that does not serve
+// that kind refuses the same octets BY NAME with the kind in the message. On every build
+// made before this commit, section 5.1 check 3's door was such a door, and that is what let
+// the sixth kind ship ahead of the fields that carry its keys: a STALE SERVER refused the
+// commit loudly at check 3 instead of installing an epoch whose keys it was never handed,
+// and a STALE RECEIVER followed the commit correctly, because no receive path in connect or
+// sdk reads a single field of an epoch attachment — it hashes the octets and nothing more.
+// THIS BUILD IS NOT THAT BUILD. Section 5.1 check 3's door serves 0x0005 here, which is
+// spec B section 5.4's acceptance window step 1, dated 2026-09-22: from that date a server
+// accepts a commit carrying EITHER kind. The stale half of the window is held by the
+// binaries that predate this commit and cannot be held by this one; what this package still
+// holds is the MECHANISM — a door refuses a kind it does not serve by name, rather than
+// parsing it into something — and it holds it over the epoch digest door, which serves one
+// kind and refuses the other five. attachment_test.go's
+// TestARecordCarriesAKindADoorRefusesByName is that property, written over both doors.
 //
 // ── WHAT serverAttachmentKindServed IS AND IS NOT: A LIBRARY VERSION GATE ────────────
 //
@@ -170,25 +180,33 @@
 // it sound as though the library could hold the two roles apart. It cannot, and a reader
 // who believed it would ship the client half early.
 //
-// SECOND, THE SERVER HALF IS NOT ONE LINE. Widening this map alone yields a server that
-// passes the kind at check 3 and then refuses the same commit further in — or, worse,
-// accepts a commit and installs no epoch keys at all. The message server's F3′ half is, by
-// name, measured against that repository rather than recalled: its "an EpochAttachment iff
-// is_commit" clause, which exists in THREE copies (the api submit pass and both store
-// implementations) and which today also ADMITS a kind 0x0005 attachment on a NON commit
-// record, because 0x0005 is not AttachmentEpoch and false != false passes; its founding
-// commit check, which requires the founding attachment to be kind 0x0001 outright; its
-// wellFormedEpochAttachment, which asks for AttachmentEpoch and for two 32 octet keys on
+// SECOND, THE SERVER HALF IS NOT ONE LINE, AND IT LANDED FIRST. Widening this map alone
+// would have yielded a server that passes the kind at check 3 and then refuses the same
+// commit further in — or, worse, accepts a commit and installs no epoch keys at all. The
+// message server's F3′ half was named here, by name, when none of it existed: its "an
+// EpochAttachment iff is_commit" clause, in THREE copies (the api submit pass and both
+// store implementations), which ADMITTED a kind 0x0005 attachment on a NON commit record
+// because 0x0005 is not AttachmentEpoch and false != false passes; its founding commit
+// check, which required the founding attachment to be kind 0x0001 outright; its
+// wellFormedEpochAttachment, which asked for AttachmentEpoch and for two 32 octet keys on
 // the body; that repository's own attachment kind enum in its store contract; and its epoch
-// key INSTALL path, which is where the keys have to arrive from somewhere else now. Those
-// land with the protocol key fields and with this map, atomically, or the group cannot
-// rekey. They are that repository's to write, and they are named here because the sentence
-// this paragraph replaces implied they did not exist.
+// key INSTALL path, which is where the keys have to arrive from somewhere else now. Every
+// one of those is written, and this map moves BEHIND them rather than in front: the message
+// server repository holds the disjunction at section 5.1 check 3, parses 0x0005 at
+// ParseEpochDigestAttachment, recomputes the digest through CheckEpochKeysDigest over the
+// request's keys, installs them through the vault KEK, and carries migration 012 for the
+// column. The order was the safe one — a server that accepts more than any client emits is
+// a server with nothing to accept.
 //
-// WHAT IS STILL TRUE, and it is the part worth keeping: this package refuses kind 0x0005 at
-// check 3's door today, by name, and that refusal is the interlock. A server built from a
-// library that has not been widened cannot be talked into installing an epoch whose keys it
-// was never handed, whatever a client sends it.
+// WHAT WAS THE INTERLOCK, AND WHAT REPLACED IT. This package refused kind 0x0005 at check
+// 3's door until this commit, by name, and that refusal was the interlock: a server built
+// from a library that had not been widened could not be talked into installing an epoch
+// whose keys it was never handed, whatever a client sent it. The interlock is gone from
+// THIS build because the thing it guarded against is gone: the keys now arrive on the
+// request (ruling 33) and CheckEpochKeysDigest binds them to the attachment the mac covers.
+// An old binary keeps the old refusal — that is what makes the window a rollout — and the
+// mechanism that made the refusal legible, a door naming the kind it will not serve rather
+// than parsing it into something, is still asserted here, over the epoch digest door.
 //
 // 0x0001 IS FROZEN AND STAYS READABLE. Nothing above changes one octet of it, and the
 // vectors that pin it are the ones that were there before this kind existed.
@@ -205,7 +223,8 @@ import (
 // The kind discriminator, u16 on the wire.
 type ServerAttachmentKind uint16
 
-// The five kinds spec A section 5.11 defines, and the sixth ruling 27 defines. The codes
+// The six kinds spec A section 5.11 defines: the five it was published with, and the sixth
+// ruling 27 of 2026-09-22 amended it to carry. The codes
 // are the spec's; nothing here may renumber them, because they reach the write_auth mac and
 // both aeads by way of H(server_attachment) and a renumbering is a record every other
 // implementation refuses.
@@ -230,35 +249,59 @@ var serverAttachmentKindKnown = map[ServerAttachmentKind]bool{
 	AttachmentEpochDigest: true,
 }
 
-// The kinds spec B section 5.1 check 3's door serves, which is a SMALLER set than the one
-// above and is the whole of the rollout the file comment describes.
+// The kinds spec B section 5.1 check 3's door serves. As of this commit that is every kind
+// section 5.11 defines, all six of them.
 //
-// It is a map of its own rather than a subtraction, for the reason serverAttachmentKindKnown
-// is a map rather than a bound: a kind added later is given an answer here instead of
-// inheriting one. Today it is the five kinds section 5.11 defines, and kind 0x0005 is
-// deliberately absent — a server that accepted it would install an epoch whose two keys it
-// was never handed, because the fields those keys ride in do not exist yet.
+// It is a map of its own rather than a subtraction from serverAttachmentKindKnown, and it
+// stays one now that the two sets agree: a kind added later is given an answer HERE instead
+// of inheriting one, and "= the known map" would be the inheritance written down. The two
+// agreeing is a fact about today, not a definition.
 //
-// WIDENING IT IS NOT A STEP THIS FILE CAN TAKE ALONE, and the file comment's "a library
-// version gate" paragraph is the long form. Two things follow from the one line below.
-// Adding AttachmentEpochDigest here makes ParseServerAttachment serve six AND makes
-// EncodeServerAttachment emit six, in one build, because both doors ask this one map — so
+// ── WHY 0x0005 WAS HELD OUT OF THIS MAP, AND WHAT DISCHARGED THAT REASON ─────────────
+//
+// This paragraph used to read: "kind 0x0005 is deliberately absent — a server that accepted
+// it would install an epoch whose two keys it was never handed, because the fields those
+// keys ride in do not exist yet." That was step 1's author's reason, it was the right
+// refusal on the day it was written, and it is not being waived or outweighed here. THE
+// FACT IT RESTED ON STOPPED BEING TRUE. Ruling 33 of 2026-09-22 put the two keys on the
+// REQUEST rather than in the served structure: connect/protocol's SubmitRequest.epoch_keys,
+// positionally aligned with `records`, and CreateGroupRequest.epoch_keys, singular — both
+// EpochKeyDelivery, both carrying write_key[n+1] and read_key[n+1], and neither of them a
+// field of Record or of anything the server serves back. A server accepting a kind 0x0005
+// commit today IS handed the two keys, beside the record, and CheckEpochKeysDigest below is
+// the comparison that says they are the pair this attachment's digest is over — a digest
+// the write_auth mac already covers by way of LP(H(server_attachment)). So the sentence
+// "installs an epoch whose two keys it was never handed" no longer describes anything that
+// can happen, and the reason it justified is discharged.
+//
+// WHAT WIDENING IT DOES, which is unchanged and is why it was never one line. Adding
+// AttachmentEpochDigest here makes ParseServerAttachment serve six AND makes
+// EncodeServerAttachment emit six, in ONE build, because both doors ask this one map — so
 // it cannot express "the server serves both while clients still emit 0x0001", which is a
-// statement about deployed binaries. And it is a third of the edit at best: the message
-// server's iff-is_commit clause, its founding commit check, its wellFormedEpochAttachment,
-// its own kind enum and its epoch key install path all refuse or mishandle a well formed
-// 0x0005 commit today, and the keys still have nowhere to ride. This map moves when those
-// move and the protocol fields exist, in one atomic change across the three repositories.
+// statement about deployed binaries and belongs in a runbook. Spec B section 5.4's
+// acceptance window says that in dates: from 2026-09-22 a server accepts either kind, from
+// 2026-10-06 a conforming client emits only 0x0005, and from 2026-11-03 — or the day the
+// Remove arm first ships, whichever is EARLIER — the server refuses 0x0001 on a new commit
+// and the window closes. Steps 2 and 3 are the operator's; this map is step 1's library
+// half, and the message server's half of step 1 landed before it.
 var serverAttachmentKindServed = map[ServerAttachmentKind]bool{
-	AttachmentNone:     true,
-	AttachmentEpoch:    true,
-	AttachmentRecovery: true,
-	AttachmentWrap:     true,
-	AttachmentComplete: true,
+	AttachmentNone:        true,
+	AttachmentEpoch:       true,
+	AttachmentRecovery:    true,
+	AttachmentWrap:        true,
+	AttachmentComplete:    true,
+	AttachmentEpochDigest: true,
 }
 
 // The one kind the epoch digest door serves. Written as the same shape as the map above so
 // that "which kinds does this door serve" is one question with one answer per door.
+//
+// SINCE THIS COMMIT IT IS THE NARROW ONE. The map above serves every kind this package
+// defines, so the complement it once had is empty and this one carries the whole of it:
+// five defined kinds that a door refuses by name rather than parsing into something. That
+// is not a leftover — it is what keeps the digest door a door. Accepting kind 0x0001 here
+// would be the epoch key install path reached through the function that exists to take the
+// keys out of it, which is what ParseEpochDigestAttachment's own comment says at length.
 var epochDigestKindServed = map[ServerAttachmentKind]bool{
 	AttachmentEpochDigest: true,
 }
@@ -672,9 +715,13 @@ func EncodeServerAttachment(a *ServerAttachment) ([]byte, error) {
 // interface to it.
 //
 // It takes the body rather than a ServerAttachment because a door that serves one kind has
-// no discriminator left for a caller to get wrong, and because the mistake this replaces —
-// building a ServerAttachment, setting Kind to the digest kind, and reaching
-// EncodeServerAttachment's refusal — is one a type can prevent instead of report.
+// no discriminator left for a caller to get wrong. (It also used to be the only way to
+// encode this kind at all, and the mistake it prevented was building a ServerAttachment,
+// setting Kind to the digest kind, and reaching EncodeServerAttachment's refusal. That
+// refusal is gone — the served map moved with ruling 33 — so EncodeServerAttachment now
+// writes this kind too, and the two produce THE SAME OCTETS because the framing and the
+// body table are one set of code behind both. What this door still buys is the typed one:
+// the caller with a body and no discriminator to get wrong.)
 //
 // Everything it refuses, it refuses through the same checkServerAttachment the other door
 // runs, so there is no attachment one door will write and the other will fail to read.

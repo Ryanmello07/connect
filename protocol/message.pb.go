@@ -1777,28 +1777,61 @@ type SubmitRequest struct {
 	// short `epoch_keys` silently re-aims every later entry at the wrong record, and what
 	// it re-aims is a key.
 	//
-	// AN ENTRY AGAINST A RECORD WITH is_commit = 0 IS REASON_REJECTED, and so is a commit
-	// with no entry. Refusal, and not an empty entry: every field of EpochKeyDelivery has
-	// implicit presence, so a zero entry decodes as two EMPTY KEYS rather than as an
-	// absence — the REASON_OK = 0 hazard recorded at the foot of this file, one message
-	// over — and a commit whose keys never arrived is an epoch the server would install
-	// without having been handed what opens it. Both refusals are decided on values the
-	// server has already verified: `is_commit` is a projection field it checks against
-	// ParseRecord(record_bytes) before it gets here.
+	// AN ENTRY AGAINST A RECORD WITH is_commit = 0 IS REASON_REJECTED, whatever kind of
+	// attachment anything in the batch carries and on every date. Refusal, and not an empty
+	// entry: every field of EpochKeyDelivery has implicit presence, so a zero entry decodes
+	// as two EMPTY KEYS rather than as an absence — the REASON_OK = 0 hazard recorded at the
+	// foot of this file, one message over. It is decided on a value the server has already
+	// verified: `is_commit` is a projection field it checks against ParseRecord(record_bytes)
+	// before it gets here.
 	//
-	// WHAT THOSE THREE CLAUSES ADMIT, ENUMERATED — because they admit exactly two values
-	// and not a general batch. Spec B §4.3.3: "A batch containing a commit MUST contain
-	// exactly one record." So `epoch_keys` is EMPTY when `records` carries no commit, and
-	// holds EXACTLY ONE ENTRY when `records` is a single commit. There is no third value.
+	// AGAINST A COMMIT, THE RULE IS KEYED ON THE ATTACHMENT KIND, and it has to be while Spec
+	// B §5.4's acceptance window is open.
+	//
+	//	a kind 0x0005 commit with NO entry   → REASON_REJECTED. It is an epoch the server
+	//	                                       would install without having been handed what
+	//	                                       opens it.
+	//	a kind 0x0001 commit WITH an entry   → REASON_REJECTED. Its keys are in the
+	//	                                       attachment, so a delivery beside it is a field
+	//	                                       the server would not read and that can
+	//	                                       disagree with the one the write_auth MAC
+	//	                                       covers.
+	//
+	// THIS COMMENT READ "and so is a commit with no entry", KIND-FREE, AND THAT FORM IS TRUE
+	// ONLY AFTER THE WINDOW CLOSES. During the window a kind 0x0001 commit legitimately
+	// carries NO delivery — its keys are inside the attachment the MAC covers — so the
+	// kind-free sentence rejects every conforming 0x0001 commit there is. Spec B §4.3.3 names
+	// the divergence from the other side and this is connect's half of closing it.
+	//
+	// THE DATED BOUNDARY, WRITTEN OUT RATHER THAN IMPLIED (Spec B §5.4's acceptance window):
+	// from 2026-09-22 a server accepts EITHER kind on a commit, so both rows above are live;
+	// from 2026-10-06 a conforming client emits only 0x0005; and from 2026-11-03 — OR the day
+	// the Remove arm first ships, WHICHEVER IS EARLIER, which is the binding constraint
+	// because a member removed under a 0x0001 commit holds the chained keys forever — the
+	// server refuses 0x0001 on a new commit and the window is CLOSED. Only then is the second
+	// row unreachable and the kind-free sentence true. `0x0001` stays readable for every
+	// record already stored; what ends is its acceptance on a new commit.
+	//
+	// WHAT THOSE CLAUSES ADMIT, ENUMERATED — because they admit exactly two lengths and not a
+	// general batch. Spec B §4.3.3: "A batch containing a commit MUST contain exactly one
+	// record." So `epoch_keys` is EMPTY when `records` carries no commit AND when `records`
+	// is a single kind 0x0001 commit, and holds EXACTLY ONE ENTRY when `records` is a single
+	// kind 0x0005 commit. There is no third length. There are TWO ways to be empty while the
+	// window is open and ONE after it closes, and that is the whole of what the window
+	// changes here.
 	//
 	// AND THIS ALIGNMENT RESTS ON THAT BATCH RULE. Said plainly, because the opposite was
-	// written here first and it was false: take records = [commit, ordinary]. Length 0
-	// leaves the commit with no entry — refused. Length 2 puts an entry against a record
-	// with is_commit = 0 — refused. Any other length is refused by the length clause. No
-	// value satisfies the three clauses, so for a mixed batch this field is not
-	// under-specified, it is UNSATISFIABLE. The clause that removes the one encoding a
-	// mixed batch could have had is the same clause that has to be there: an "absent"
-	// entry would be a zero entry, and a zero entry is two empty keys.
+	// written here first and it was false: take records = [kind 0x0005 commit, ordinary].
+	// Length 0 leaves the commit with no entry — refused. Length 2 puts an entry against a
+	// record with is_commit = 0 — refused. Any other length is refused by the length clause.
+	// No value satisfies the clauses, so for a mixed batch carrying a 0x0005 commit this
+	// field is not under-specified, it is UNSATISFIABLE. (Scoped to that kind deliberately:
+	// for a mixed batch carrying a 0x0001 commit, length 0 satisfies THIS field and §4.3.3's
+	// one-record rule refuses the batch anyway. It is the 0x0005 arm that makes the cost
+	// below a wire change, and after the window closes every commit is that arm.) The clause
+	// that removes the one encoding a mixed batch could have had is the same clause that has
+	// to be there: an "absent" entry would be a zero entry, and a zero entry is two empty
+	// keys.
 	//
 	// SO A RELAXATION OF §4.3.3 COSTS A WIRE CHANGE HERE, and naming the cost now is
 	// cheaper than discovering it. An entry would need explicit presence — a `bool

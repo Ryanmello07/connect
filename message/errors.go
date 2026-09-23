@@ -117,21 +117,30 @@ var (
 	// the wrap index past every question check 3 asks of them.
 	ErrServerAttachmentKindUnknown = errors.New("message: server attachment kind is not one spec A section 5.11 defines")
 	// Fires when a door is handed a kind this package DOES define and that door does not
-	// serve, in both directions of that one rule: kind 0x0005 at spec B section 5.1 check
-	// 3's door, and any of section 5.11's five at the epoch digest door. One sentinel
-	// because it is one rule — a door serves the kinds it serves — and a caller that told
-	// the two directions apart would be acting on a distinction the wire does not carry.
-	// The door is named in the message, for the reader who has to know which of the two
-	// answered.
+	// serve. One sentinel because it is one rule — a door serves the kinds it serves — and
+	// a caller that told one door's refusal from the other's would be acting on a
+	// distinction the wire does not carry. The door is named in the message, for the reader
+	// who has to know which one answered.
+	//
+	// WHICH PAIRS REACH IT, AND THE DATE THE ANSWER MOVED. This read "kind 0x0005 at spec B
+	// section 5.1 check 3's door, and any of section 5.11's five at the epoch digest door",
+	// which was both directions of the rule until 2026-09-23. On that date ruling 33 put the
+	// epoch keys on the request and section 5.1 check 3's door was widened to kind 0x0005,
+	// so its complement is now EMPTY and the pairs that reach this sentinel are the five
+	// section 5.11 kinds at the epoch digest door alone. attachment_test.go's
+	// TestARecordCarriesAKindADoorRefusesByName walks the whole (door, kind) product and
+	// fails if no pair reaches here at all.
 	//
 	// It is NOT ErrServerAttachmentKindUnknown, and the difference is the whole of ruling
 	// 27's rollout. "Nobody defines this code" is a record no conforming implementation
-	// ever wrote. "This door does not serve this code yet" is a record a conforming
-	// implementation writes on purpose, and this refusal is what makes a server that has
-	// not learned to carry the epoch keys beside the record refuse such a commit loudly at
-	// check 3 rather than install an epoch whose keys it was never handed. A caller matches
-	// the sentinel and never the message text, which is guardrail G7 of spec A section 5.9
-	// and the reason this is a sentinel at all.
+	// ever wrote. "This door does not serve this code" is a record a conforming
+	// implementation writes on purpose. Until this package was widened, that is what made a
+	// server which had not learned to carry the epoch keys beside the record refuse such a
+	// commit loudly at check 3 rather than install an epoch whose keys it was never handed —
+	// the stale half of spec B section 5.4's acceptance window, which is now held by
+	// binaries built before that date and not by this one. A caller matches the sentinel and
+	// never the message text, which is guardrail G7 of spec A section 5.9 and the reason
+	// this is a sentinel at all.
 	//
 	// It is owed a line in spec A and spec B section 12.1's refusal blocks under the rule
 	// the comment at the top of this file states, exactly as the six before it are: it is
