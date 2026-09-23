@@ -72,6 +72,57 @@ package protocol_test
 // derivation induces is PRINTED — what a narrowing removed is the thing a narrowed
 // gate stops seeing, and an enumeration whose complement nobody looks at is an empty
 // search that passes silently.
+//
+// AND THE SAME CLASS AGAIN, ONE COMMIT LATER, IN THIS FILE'S ONE UNPRINTED NARROWING.
+//
+// The four repairs above left keyNamedFields, keyTypedFields and carriersOf all
+// iterating topLevelMessages — and declaresAKeyField is reached only through
+// keyTypedFields — so a key on a NESTED type was covered by nothing but a complement
+// loop in servedAndSubmitted
+// — and that loop excused any simple name ending in "Entry". Reproduced, protoc 35.1,
+// inside `message FetchResponse {`:
+//
+//	message ShimEntry   { KeyBagEntry bag = 1; }
+//	message KeyBagEntry { bytes write_key = 1; bytes read_key = 2; }
+//	ShimEntry shim = 20;
+//
+//	-> ok github.com/urnetwork/connect/protocol 0.379s
+//
+// Item 244's own defect for the second time in two commits, with all four key gates
+// green. TWO MORE REPAIRS, and neither is a wider name match:
+//
+//	5. the key checks and carriersOf walk types AT ANY DEPTH — walkFrom descends by
+//	   REFERENCE and by DECLARATION — instead of topLevelMessages
+//	6. the exemption is md.IsMapEntry() and not a name suffix, with its complement
+//	   printed and asserted against the map fields that produce it, both ways
+//
+// WHAT EACH REPAIR CATCHES, MEASURED AND NOT ASSUMED. Mutant M3 is the block above; M4
+// is `message Extra { EpochKeyDelivery k = 1; } Extra extra = 20;` inside SubmitRequest,
+// a THIRD carrier of the delivery type at depth 1 on the SUBMITTED side, where no served
+// check looks at all.
+//
+//	M3 before repair 5  -> ok 0.379s, every gate green
+//	M3 after            -> FAIL TestNoServedMessageCarriesAKeyByName (on
+//	                       bringyour.FetchResponse.KeyBagEntry.write_key and .read_key)
+//	                       FAIL TestNoServedMessageCarriesATypeThatDeclaresAKey
+//	M4 with the descent in carriersOf undone and everything else repaired -> ok 0.404s
+//	M4 after            -> FAIL TestTheEpochKeysAreCarriedByExactlyTheTwoRequests, and
+//	                       that gate ALONE: the third carrier is on the submitted side
+//
+// So the descent in carriersOf is individually necessary for M4, measured by undoing it
+// rather than by reasoning about it.
+//
+// WHAT NO MUTANT HERE SHOWS, said rather than left as an implication. (a) Repair 6 is
+// not exercised by message.proto: the file declares no map field, so IsMapEntry and the
+// old suffix agree on every type in it — which is why
+// TestTheKeyCheckWalkDescendsAndSkipsOnlyMapEntries BUILDS a descriptor that has one,
+// and the predicate is measured there or nowhere. (b) M3 is reached by walkFrom's
+// REFERENCE descent; its DECLARATION descent is reached by no mutant, because a type
+// nothing references is not on the wire and a mutant of it would be a finding about an
+// unwritten line. It is kept anyway and the reason is WHEN: the only finding it can
+// produce is a key-named field declared inside a served type, which ruling 33 forbids
+// whether or not a field points at it yet, and catching that at the declaration is one
+// commit earlier than catching it at the reference.
 
 import (
 	"os"
@@ -80,7 +131,10 @@ import (
 	"strings"
 	"testing"
 
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/types/descriptorpb"
 
 	"github.com/urnetwork/connect/protocol"
 )
@@ -202,6 +256,123 @@ func sortedSet(m map[string]bool) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// allMessageTypes returns every message message.proto declares AT ANY DEPTH, keyed by
+// FULL name. topLevelMessages is the file's outermost layer; this is the file.
+func allMessageTypes(t *testing.T) map[string]protoreflect.MessageDescriptor {
+	t.Helper()
+	out := map[string]protoreflect.MessageDescriptor{}
+	var visit func(msgs protoreflect.MessageDescriptors)
+	visit = func(msgs protoreflect.MessageDescriptors) {
+		for i := 0; i < msgs.Len(); i++ {
+			md := msgs.Get(i)
+			out[string(md.FullName())] = md
+			visit(md.Messages())
+		}
+	}
+	visit(messageFile().Messages())
+	if len(out) == 0 {
+		t.Fatal("message.proto declares no message at all; this walk is reading the wrong file descriptor")
+	}
+	return out
+}
+
+// isTopLevel answers from the name rather than from pointer identity: a top-level
+// message's full name has the file's package as its parent, a nested one has its
+// enclosing message.
+func isTopLevel(md protoreflect.MessageDescriptor) bool {
+	return md.FullName().Parent() == messageFile().Package()
+}
+
+// typeWalk is what a set of root messages expands to for the key checks below: every
+// message type reachable from a root BY REFERENCE and every message type DECLARED inside
+// any of those, recursively — partitioned into the types the checks WALK and the
+// synthetic map entries they SKIP, with the map fields that produced those entries kept
+// so the skip can be asserted from both ends.
+//
+// KEYED BY FULL NAME, and the map entries are the reason: protoc names a synthetic entry
+// after its FIELD, so two messages that each declare a map field called `foo` declare two
+// different types both simply named `FooEntry`. A walk keyed on simple names would hold
+// one of them and drop the other with nothing to notice.
+//
+// DECLARATION AS WELL AS REFERENCE, because a type declared inside a served message and
+// not yet referenced by any field is one line away from being served and is invisible to
+// a reachability walk.
+type typeWalk struct {
+	checked    map[string]protoreflect.MessageDescriptor
+	mapEntries map[string]protoreflect.MessageDescriptor
+	mapFields  map[string]string // map field full name -> its synthetic entry's full name
+}
+
+// walkFrom is the walk, and THE ONE NARROWING IN IT IS md.IsMapEntry().
+//
+// A synthetic map entry declares fields literally named `key` and `value`, so checking
+// one would make every map field a finding about protoc rather than about this file. The
+// predicate is the descriptor's own answer — true of synthetic entries and of nothing
+// else — and NOT `strings.HasSuffix(name, "Entry")`, which is what stood here until
+// 2026-09-22 and which the header records riding straight through. A skipped entry's
+// VALUE type is still reached, by the IsMap branch below.
+func walkFrom(roots []protoreflect.MessageDescriptor) typeWalk {
+	w := typeWalk{
+		checked:    map[string]protoreflect.MessageDescriptor{},
+		mapEntries: map[string]protoreflect.MessageDescriptor{},
+		mapFields:  map[string]string{},
+	}
+	seen := map[string]bool{}
+	var visit func(md protoreflect.MessageDescriptor)
+	visit = func(md protoreflect.MessageDescriptor) {
+		full := string(md.FullName())
+		if seen[full] {
+			return
+		}
+		seen[full] = true
+		if md.IsMapEntry() {
+			w.mapEntries[full] = md
+		} else {
+			w.checked[full] = md
+		}
+		fields := md.Fields()
+		for i := 0; i < fields.Len(); i++ {
+			f := fields.Get(i)
+			if sub := f.Message(); sub != nil {
+				if f.IsMap() {
+					w.mapFields[string(f.FullName())] = string(sub.FullName())
+				}
+				visit(sub)
+			}
+			if f.IsMap() {
+				if sub := f.MapValue().Message(); sub != nil {
+					visit(sub)
+				}
+			}
+		}
+		nested := md.Messages()
+		for i := 0; i < nested.Len(); i++ {
+			visit(nested.Get(i))
+		}
+	}
+	for _, root := range roots {
+		visit(root)
+	}
+	return w
+}
+
+// walkOfNames expands these TOP-LEVEL message names into the walk above.
+func walkOfNames(t *testing.T, names map[string]bool) typeWalk {
+	t.Helper()
+	all := topLevelMessages(t)
+	roots := []protoreflect.MessageDescriptor{}
+	for _, name := range sortedKeys(all) {
+		if names[name] {
+			roots = append(roots, all[name])
+		}
+	}
+	if len(roots) == 0 {
+		t.Fatal("no root message was named, so the walk below covers nothing and every check over " +
+			"it is a search across an empty set")
+	}
+	return walkFrom(roots)
 }
 
 // TestTheEnvelopeDirectionDerivationFindsAllThree is the floor under every set in
@@ -328,16 +499,23 @@ func servedAndSubmitted(t *testing.T) (served, submitted, servedSet map[string]b
 		t.Fatalf("%s is not in the served set, so the walk is not reaching the served records and "+
 			"the refusals below are vacuous", recordMessage)
 	}
-	// and the complement of "top level": every non-synthetic type the closures reached
-	// must BE a top-level message, because the key checks iterate top-level messages. A
-	// type nested inside another would be in the closure and outside every check.
-	for name := range served {
-		if _, top := topLevelMessages(t)[name]; top || strings.HasSuffix(name, "Entry") {
-			continue
+	// and the complement of "top level", WHICH IS NO LONGER AN EXEMPTION. This loop used
+	// to require every member of the served closure to be a top-level message and excused
+	// anything whose simple name ended in "Entry" — and since all three key checks
+	// iterated topLevelMessages, that one loop was the WHOLE of the coverage of nested
+	// types. It excused nothing that exists (TestTheKeyCheckWalkDescendsAndSkipsOnlyMapEntries
+	// measures the file's map entries and its *Entry names at zero) while a KeyBagEntry
+	// two levels down inside FetchResponse carried write_key and read_key through every
+	// gate green. The checks now walk nested types directly, so what is left here is the
+	// partition PRINTED: the day message.proto grows its first nested served type, the log
+	// says so instead of a suffix deciding it.
+	nested := []string{}
+	for _, name := range sortedSet(served) {
+		if _, top := topLevelMessages(t)[name]; !top {
+			nested = append(nested, name)
 		}
-		t.Errorf("%s is in the served closure and is not a top-level message, so the key checks "+
-			"below — which walk top-level messages — do not look at it", name)
 	}
+	t.Logf("served closure members that are NOT top-level (%d): %v", len(nested), nested)
 	return served, submitted, servedSet
 }
 
@@ -396,18 +574,18 @@ var keyNameExemptions = map[string]string{
 	"bringyour.CapabilityChange.server_keys": "the same set, re-served on rotation. Same argument.",
 }
 
-// keyNamedFields returns the fields of these messages that namesAKey flags, and, as
-// the complement, the ones whose name merely CONTAINS "key" and that it did not.
-func keyNamedFields(t *testing.T, names map[string]bool) (flagged, narrowedAway map[string]string) {
+// keyNamedFields returns the fields of every message in this walk that namesAKey flags,
+// and, as the complement, the ones whose name merely CONTAINS "key" and that it did not.
+//
+// IT TAKES THE WALK AND NOT A SET OF TOP-LEVEL NAMES. Until 2026-09-22 it iterated
+// topLevelMessages, so a key on a NESTED type was outside it — reproduced, and recorded
+// in the header with its protoc output.
+func keyNamedFields(t *testing.T, w typeWalk) (flagged, narrowedAway map[string]string) {
 	t.Helper()
 	flagged = map[string]string{}
 	narrowedAway = map[string]string{}
-	all := topLevelMessages(t)
-	for _, message := range sortedKeys(all) {
-		if !names[message] {
-			continue
-		}
-		fields := all[message].Fields()
+	for _, message := range sortedKeys(w.checked) {
+		fields := w.checked[message].Fields()
 		for i := 0; i < fields.Len(); i++ {
 			f := fields.Get(i)
 			name := string(f.Name())
@@ -432,7 +610,10 @@ func keyNamedFields(t *testing.T, names map[string]bool) (flagged, narrowedAway 
 func TestNoServedMessageCarriesAKeyByName(t *testing.T) {
 	_, submitted, servedSet := servedAndSubmitted(t)
 
-	flagged, narrowedAway := keyNamedFields(t, servedSet)
+	w := walkOfNames(t, servedSet)
+	t.Logf("the key checks walk %d served types (%d of them nested) and skip %d synthetic map entries",
+		len(w.checked), len(w.checked)-countTopLevel(w.checked), len(w.mapEntries))
+	flagged, narrowedAway := keyNamedFields(t, w)
 	t.Logf("served fields whose name names a key (%d): %v", len(flagged), sortedKeys(flagged))
 	t.Logf("served fields containing \"key\" that the SUFFIX predicate narrowed away (%d): %v",
 		len(narrowedAway), sortedKeys(narrowedAway))
@@ -466,10 +647,13 @@ func TestNoServedMessageCarriesAKeyByName(t *testing.T) {
 			usedExemption[full] = true
 			continue
 		}
-		t.Errorf("%s is a field of %s, which the server can hand a client, and its name names a key. "+
-			"Item 244 IS this shape — the served commit carrying read_key[n+1] and write_key[n+1] — "+
-			"and ruling 33 is that nothing served carries one. If it is not key material, exempt it "+
-			"in keyNameExemptions with the argument; do not rename it past the predicate.",
+		t.Errorf("%s is a field of %s — a type a server→client envelope reaches, or one DECLARED "+
+			"inside such a type and one field reference away from being reached — and its name names "+
+			"a key. Item 244 IS this shape: the served commit carrying read_key[n+1] and "+
+			"write_key[n+1]. Ruling 33 is that nothing served carries one, and a key declared inside "+
+			"a served type is not exempt from it for as long as no field happens to point at it. If "+
+			"it is not key material, exempt it in keyNameExemptions with the argument; do not rename "+
+			"it past the predicate.",
 			full, flagged[full])
 	}
 	for full := range keyNameExemptions {
@@ -491,7 +675,7 @@ func TestNoServedMessageCarriesAKeyByName(t *testing.T) {
 			submittedOnly[name] = true
 		}
 	}
-	control, _ := keyNamedFields(t, submittedOnly)
+	control, _ := keyNamedFields(t, walkOfNames(t, submittedOnly))
 	t.Logf("CONTROL — submitted-only fields that name a key (%d): %v", len(control), sortedKeys(control))
 	for _, want := range []string{
 		"bringyour.SubmitRequest.epoch_keys",
@@ -527,17 +711,15 @@ func declaresAKeyField(md protoreflect.MessageDescriptor) []string {
 	return out
 }
 
-// keyTypedFields returns the fields of these messages whose MESSAGE TYPE declares a
-// key, descending into map values.
-func keyTypedFields(t *testing.T, names map[string]bool) map[string][]string {
+// keyTypedFields returns the fields of every message in this walk whose MESSAGE TYPE
+// declares a key, descending into map values.
+//
+// IT TAKES THE WALK, for the reason keyNamedFields gives.
+func keyTypedFields(t *testing.T, w typeWalk) map[string][]string {
 	t.Helper()
 	out := map[string][]string{}
-	all := topLevelMessages(t)
-	for _, message := range sortedKeys(all) {
-		if !names[message] {
-			continue
-		}
-		fields := all[message].Fields()
+	for _, message := range sortedKeys(w.checked) {
+		fields := w.checked[message].Fields()
 		for i := 0; i < fields.Len(); i++ {
 			f := fields.Get(i)
 			sub := f.Message()
@@ -583,12 +765,13 @@ func TestNoServedMessageCarriesATypeThatDeclaresAKey(t *testing.T) {
 	}
 	t.Logf("CONTROL — %s declares key fields %v", keyDeliveryMessage, declared)
 
-	carried := keyTypedFields(t, servedSet)
+	carried := keyTypedFields(t, walkOfNames(t, servedSet))
 	t.Logf("served fields whose type declares a key (%d): %v", len(carried), sortedKeys(carried))
 	for _, full := range sortedKeys(carried) {
 		t.Errorf("%s has a type that declares %v. A served field does not have to NAME a key to carry "+
-			"one: ruling 33 is that nothing the server hands back reaches key material at any depth. "+
-			"Put the keys on a request.", full, carried[full])
+			"one: ruling 33 is that nothing the server hands back reaches key material at any depth, "+
+			"and the walk that found this covers types DECLARED inside a served message as well as "+
+			"types it references. Put the keys on a request.", full, carried[full])
 	}
 
 	// THE FAILING DIRECTION, IN THE SAME QUERY: the identical walk over the submitted
@@ -599,7 +782,7 @@ func TestNoServedMessageCarriesATypeThatDeclaresAKey(t *testing.T) {
 			submittedOnly[name] = true
 		}
 	}
-	found := keyTypedFields(t, submittedOnly)
+	found := keyTypedFields(t, walkOfNames(t, submittedOnly))
 	t.Logf("CONTROL — submitted-only fields whose type declares a key (%d): %v", len(found), sortedKeys(found))
 	for _, want := range []string{
 		"bringyour.SubmitRequest.epoch_keys",
@@ -612,18 +795,31 @@ func TestNoServedMessageCarriesATypeThatDeclaresAKey(t *testing.T) {
 	}
 }
 
-// carriersOf returns the top-level messages with a field whose type is this message,
-// with the field name each one carries it under.
+// carriersOf returns every message message.proto declares — AT ANY DEPTH — with a field
+// whose type is this message, keyed by the carrier's FULL name, with the field name each
+// one carries it under.
+//
+// AT ANY DEPTH, for the reason the key checks now walk nested types. A carrier nested
+// inside a request is a third place the keys can be forgotten, and a walk over top-level
+// messages answers "exactly the two requests" for a file that has three. Measured, with
+// the top-level walk still in place: `message Extra { EpochKeyDelivery k = 1; }` nested
+// inside SubmitRequest with an `Extra extra = 20;` beside it left this gate green.
 //
 // MAP VALUES COUNT, for the reason keyTypedFields gives: without the IsMap branch
 // this answered "no carrier" for a message that is carried as a map value, measured
-// with the mutant green.
+// with the mutant green. SYNTHETIC MAP ENTRIES ARE NOT THEMSELVES CARRIERS: the entry of
+// `map<k, EpochKeyDelivery>` has a `value` field of that type, and reporting the entry
+// would name the type protoc wrote instead of the field a person did — which is the
+// carrying message the IsMap branch already reports.
 func carriersOf(t *testing.T, typeName string) map[string][]string {
 	t.Helper()
 	out := map[string][]string{}
-	all := topLevelMessages(t)
+	all := allMessageTypes(t)
 	for _, name := range sortedKeys(all) {
 		md := all[name]
+		if md.IsMapEntry() {
+			continue
+		}
 		fields := md.Fields()
 		for i := 0; i < fields.Len(); i++ {
 			f := fields.Get(i)
@@ -637,6 +833,18 @@ func carriersOf(t *testing.T, typeName string) map[string][]string {
 		}
 	}
 	return out
+}
+
+// countTopLevel is the printed half of the walk's coverage: how many of these types are
+// message.proto's outermost layer, so the nested count is visible as the difference.
+func countTopLevel(types map[string]protoreflect.MessageDescriptor) int {
+	n := 0
+	for _, md := range types {
+		if isTopLevel(md) {
+			n++
+		}
+	}
+	return n
 }
 
 // The key delivery is carried by exactly the two request messages ruling 33 names,
@@ -657,9 +865,12 @@ func TestTheEpochKeysAreCarriedByExactlyTheTwoRequests(t *testing.T) {
 		t.Fatalf("the control found no carrier of %s at all, so this query is reading nothing", recordMessage)
 	}
 
+	// FULL NAMES, because carriersOf now walks every depth: a carrier nested inside one of
+	// these two would be a different type with the same tail, and ruling 33 names the
+	// top-level requests and not whatever is declared inside them.
 	wantDelivery := map[string]string{
-		"SubmitRequest":      "epoch_keys",
-		"CreateGroupRequest": "epoch_keys",
+		"bringyour.SubmitRequest":      "epoch_keys",
+		"bringyour.CreateGroupRequest": "epoch_keys",
 	}
 	for name, field := range wantDelivery {
 		fields, carried := delivery[name]
@@ -682,10 +893,16 @@ func TestTheEpochKeysAreCarriedByExactlyTheTwoRequests(t *testing.T) {
 	// and the ruling's own measurement, re-derived here rather than taken from the
 	// ledger: Record is the server→client type in six places against two client→server
 	// carriers, which is why a key pair on it would have been six serve paths.
+	//
+	// SERVED-NESS IS TAKEN FROM THE WALK AND NOT FROM servedSet, because carriersOf keys
+	// by full name and can now answer with a nested type. servedSet is top-level simple
+	// names; a nested carrier looked up in it would miss and be counted as submitted,
+	// which is the ratio silently answering the wrong question.
 	_, _, servedSet := servedAndSubmitted(t)
+	servedTypes := walkOfNames(t, servedSet).checked
 	servedFields, submittedFields := 0, 0
 	for name, fields := range records {
-		if servedSet[name] {
+		if _, isServed := servedTypes[name]; isServed {
 			servedFields += len(fields)
 		} else {
 			submittedFields += len(fields)
@@ -995,4 +1212,213 @@ func createGroupRequestSource(t *testing.T) string {
 			len(block), block[:min(120, len(block))])
 	}
 	return block
+}
+
+// controlFile is the POSITIVE CONTROL FOR THE WALK, BUILT, because message.proto cannot
+// supply one: it declares no nested message and no map field, so over this file the
+// descent is exercised by nothing and md.IsMapEntry() is false of everything. Two
+// mechanisms tested against a file that cannot make either of them fire is an empty
+// search reported as a clean bill, and this file's own header is the record of what an
+// unmeasured narrowing costs.
+//
+// It assembles, with no .proto and no codegen:
+//
+//	message Outer {
+//	    message Inner { bytes write_key = 1; }
+//	    Inner inner = 1;
+//	    map<uint64, Inner> bag = 2;
+//	}
+//
+// `Inner` is nested and is NOT a map entry; `BagEntry` is the entry protoc would
+// synthesise for `bag` and IS one. The SAME walkFrom and the SAME namesAKey run over it.
+func controlFile(t *testing.T) protoreflect.FileDescriptor {
+	t.Helper()
+	optional := descriptorpb.FieldDescriptorProto_LABEL_OPTIONAL
+	repeated := descriptorpb.FieldDescriptorProto_LABEL_REPEATED
+	bytesKind := descriptorpb.FieldDescriptorProto_TYPE_BYTES
+	uint64Kind := descriptorpb.FieldDescriptorProto_TYPE_UINT64
+	messageKind := descriptorpb.FieldDescriptorProto_TYPE_MESSAGE
+	const inner = ".keydeliverygatecontrol.Outer.Inner"
+	const entry = ".keydeliverygatecontrol.Outer.BagEntry"
+	fd := &descriptorpb.FileDescriptorProto{
+		Name:    proto.String("keydelivery_gate_control.proto"),
+		Package: proto.String("keydeliverygatecontrol"),
+		Syntax:  proto.String("proto3"),
+		MessageType: []*descriptorpb.DescriptorProto{{
+			Name: proto.String("Outer"),
+			NestedType: []*descriptorpb.DescriptorProto{
+				{
+					Name: proto.String("Inner"),
+					Field: []*descriptorpb.FieldDescriptorProto{{
+						Name: proto.String("write_key"), Number: proto.Int32(1),
+						Label: &optional, Type: &bytesKind, JsonName: proto.String("writeKey"),
+					}},
+				},
+				{
+					Name:    proto.String("BagEntry"),
+					Options: &descriptorpb.MessageOptions{MapEntry: proto.Bool(true)},
+					Field: []*descriptorpb.FieldDescriptorProto{
+						{
+							Name: proto.String("key"), Number: proto.Int32(1),
+							Label: &optional, Type: &uint64Kind, JsonName: proto.String("key"),
+						},
+						{
+							Name: proto.String("value"), Number: proto.Int32(2),
+							Label: &optional, Type: &messageKind, TypeName: proto.String(inner),
+							JsonName: proto.String("value"),
+						},
+					},
+				},
+			},
+			Field: []*descriptorpb.FieldDescriptorProto{
+				{
+					Name: proto.String("inner"), Number: proto.Int32(1),
+					Label: &optional, Type: &messageKind, TypeName: proto.String(inner),
+					JsonName: proto.String("inner"),
+				},
+				{
+					Name: proto.String("bag"), Number: proto.Int32(2),
+					Label: &repeated, Type: &messageKind, TypeName: proto.String(entry),
+					JsonName: proto.String("bag"),
+				},
+			},
+		}},
+	}
+	file, err := protodesc.NewFile(fd, nil)
+	if err != nil {
+		t.Fatalf("the control descriptor does not build, so there is no control: %v", err)
+	}
+	return file
+}
+
+// THE SCOPE OF THE KEY CHECKS, PRINTED, AND THE ONE NARROWING IN IT ASSERTED FROM BOTH
+// ENDS.
+//
+// Until 2026-09-22 keyNamedFields, keyTypedFields and declaresAKeyField's caller all
+// iterated topLevelMessages, and the only thing standing between a NESTED type and those
+// three checks was one loop in servedAndSubmitted that excused any simple name ending in
+// "Entry". Reproduced, protoc 35.1, inside `message FetchResponse {`:
+//
+//	message ShimEntry   { KeyBagEntry bag = 1; }
+//	message KeyBagEntry { bytes write_key = 1; bytes read_key = 2; }
+//	ShimEntry shim = 20;
+//
+//	-> ok github.com/urnetwork/connect/protocol 0.379s
+//
+// That is item 244's own defect again — the next epoch's write and read key, under those
+// exact names, on the served fetch answer — with all four key gates green. ISOLATED IN
+// THE SAME QUERY: renaming the two containers to Shim/KeyBag and changing nothing else
+// reddens all four, so the "Entry" suffix at depth >= 2 was the whole of the escape.
+//
+// AND THE EXEMPTION EXCUSED NOTHING THAT EXISTS, which is why it was invisible. The
+// counts it was narrowing over are printed below rather than recited. The repair is that
+// the checks walk nested types directly and the exemption is md.IsMapEntry() — the
+// descriptor's own answer, true of synthetic entries and of nothing else — with its
+// complement asserted against the map fields that produce it.
+func TestTheKeyCheckWalkDescendsAndSkipsOnlyMapEntries(t *testing.T) {
+	all := allMessageTypes(t)
+	nestedInFile, entriesInFile, suffixInFile := []string{}, []string{}, []string{}
+	for _, full := range sortedKeys(all) {
+		md := all[full]
+		if !isTopLevel(md) {
+			nestedInFile = append(nestedInFile, full)
+		}
+		if md.IsMapEntry() {
+			entriesInFile = append(entriesInFile, full)
+		}
+		if strings.HasSuffix(string(md.Name()), "Entry") {
+			suffixInFile = append(suffixInFile, full)
+		}
+	}
+	t.Logf("message.proto declares %d message types at all depths: %d nested, %d map entries, "+
+		"%d with a simple name ending in \"Entry\" (the exemption that stood here until 2026-09-22)",
+		len(all), len(nestedInFile), len(entriesInFile), len(suffixInFile))
+	t.Logf("nested (%d): %v", len(nestedInFile), nestedInFile)
+	t.Logf("map entries (%d): %v", len(entriesInFile), entriesInFile)
+	t.Logf("simple name ends in \"Entry\" (%d): %v", len(suffixInFile), suffixInFile)
+	if len(all) != len(topLevelMessages(t))+len(nestedInFile) {
+		t.Fatalf("the depth walk found %d types, %d of them nested, against %d top-level; the three "+
+			"do not add up, so allMessageTypes and topLevelMessages are not reading the same file",
+			len(all), len(nestedInFile), len(topLevelMessages(t)))
+	}
+
+	// THE SKIP, FROM BOTH ENDS. Every type the walk skipped is the synthetic entry of a
+	// map field the same walk found, and every map field the walk found has its entry in
+	// the skipped set. Today both sides are EMPTY, and that is printed rather than left
+	// implicit: an exemption whose complement nobody enumerates is exactly the shape the
+	// "Entry" suffix had for as long as it stood.
+	_, _, servedSet := servedAndSubmitted(t)
+	w := walkOfNames(t, servedSet)
+	t.Logf("the served walk checks %d types (%d top-level, %d nested) and skips %d synthetic map "+
+		"entries, produced by %d map fields: %v",
+		len(w.checked), countTopLevel(w.checked), len(w.checked)-countTopLevel(w.checked),
+		len(w.mapEntries), len(w.mapFields), sortedKeys(w.mapFields))
+	byEntry := map[string]string{}
+	for field, produced := range w.mapFields {
+		byEntry[produced] = field
+	}
+	for skipped := range w.mapEntries {
+		if _, produced := byEntry[skipped]; !produced {
+			t.Errorf("%s was skipped as a map entry and no map field in the same walk produces it, "+
+				"so the skip is excusing a type nobody asked it to excuse", skipped)
+		}
+	}
+	for produced, field := range byEntry {
+		if _, skipped := w.mapEntries[produced]; !skipped {
+			t.Errorf("%s is the synthetic entry of the map field %s and the walk did not skip it, so "+
+				"the key checks are about to report protoc's own `key` field as key material",
+				produced, field)
+		}
+	}
+
+	// THE POSITIVE CONTROL, and it is the whole reason this test is not a pair of zeroes.
+	// The same walkFrom and the same keyNamedFields, over a descriptor that HAS a nested
+	// message and HAS a map field.
+	outer := controlFile(t).Messages().Get(0)
+	cw := walkFrom([]protoreflect.MessageDescriptor{outer})
+	const (
+		controlOuter = "keydeliverygatecontrol.Outer"
+		controlInner = "keydeliverygatecontrol.Outer.Inner"
+		controlEntry = "keydeliverygatecontrol.Outer.BagEntry"
+		controlField = "keydeliverygatecontrol.Outer.bag"
+		controlKey   = "keydeliverygatecontrol.Outer.Inner.write_key"
+	)
+	t.Logf("CONTROL — the built walk checks %v and skips %v",
+		sortedKeys(cw.checked), sortedKeys(cw.mapEntries))
+	for _, want := range []string{controlOuter, controlInner} {
+		if _, ok := cw.checked[want]; !ok {
+			t.Errorf("control: the walk does not check %s, so it is not descending and the served "+
+				"walk above covers only what it happens to find at the top level", want)
+		}
+	}
+	if _, ok := cw.checked[controlEntry]; ok {
+		t.Errorf("control: %s is a synthetic map entry and the walk checked it; every entry declares "+
+			"a field literally named `key`, so this would make every map field a finding about protoc",
+			controlEntry)
+	}
+	if _, ok := cw.mapEntries[controlEntry]; !ok {
+		t.Errorf("control: %s was not recognised as a map entry, so md.IsMapEntry() answers false for "+
+			"a real one and the skip above is a predicate that fires on nothing", controlEntry)
+	}
+	if got := cw.mapFields[controlField]; got != controlEntry {
+		t.Errorf("control: the walk records the map field %s as producing %q, want %s; the both-ends "+
+			"assertion above compares against that map", controlField, got, controlEntry)
+	}
+	if nested := outer.Messages().ByName("Inner"); nested == nil || nested.IsMapEntry() {
+		t.Error("control: the nested message Inner reports IsMapEntry() true, so the predicate does " +
+			"not separate a nested message from a synthetic entry and the skip is not a narrowing " +
+			"but a hole")
+	}
+
+	// AND END TO END: namesAKey, run over the built walk by the same helper the served
+	// side uses, finds the key on the NESTED type. That is the escape of 2026-09-22
+	// caught by the repaired mechanism, in-process and with no proto to regenerate.
+	flagged, _ := keyNamedFields(t, cw)
+	t.Logf("CONTROL — the key-name check over the built walk flags %v", sortedKeys(flagged))
+	if _, found := flagged[controlKey]; !found {
+		t.Errorf("control: keyNamedFields did not flag %s. That field is a `write_key` on a type "+
+			"nested inside the message the walk was rooted at, which is exactly what rode through "+
+			"this gate until 2026-09-22; if it is not found here, the repair is not in the code path "+
+			"the served side uses.", controlKey)
+	}
 }

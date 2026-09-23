@@ -383,29 +383,226 @@ func TestNothingHereComputesTheAttestationPreimage(t *testing.T) {
 	t.Logf("the %s exemption was %s", exempt, map[bool]string{true: "USED", false: "not used — protoc-gen-go carries only the first line of the trailing comment"}[exemptUsed])
 }
 
-// THE KEYLESS HALF OF THE CEILING, SAID OUT LOUD AT THE FIELD.
+// keylessComparableFields is the set of attestation fields a caller can check with NO
+// KEY AT ALL, DERIVED and not listed.
+//
+// A keyless check is a comparison against a value the caller itself sent, so the set is
+// exactly the intersection of FetchRequest's field names with FetchAttestation's.
+// Everything outside it — until_record_id, record_ids, high_water_record_id,
+// server_time_ms, server_id — is a value the caller holds no independent copy of and can
+// only believe, and `sig` is the thing that is unbuilt. The intersection is printed by
+// the test that uses it, because it is the whole scope of what "checkable without the
+// signature" can possibly mean.
+func keylessComparableFields(t *testing.T) []string {
+	t.Helper()
+	request := (*protocol.FetchRequest)(nil).ProtoReflect().Descriptor().Fields()
+	attestation := (*protocol.FetchAttestation)(nil).ProtoReflect().Descriptor().Fields()
+	sent := map[string]bool{}
+	for i := 0; i < request.Len(); i++ {
+		sent[string(request.Get(i).Name())] = true
+	}
+	out := []string{}
+	for i := 0; i < attestation.Len(); i++ {
+		if name := string(attestation.Get(i).Name()); sent[name] {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	if len(out) == 0 {
+		t.Fatal("FetchRequest and FetchAttestation share no field name, so there is no keyless " +
+			"comparison at all and the measurement below is a statement about nothing")
+	}
+	return out
+}
+
+// attestationDiff names the fields on which two attestations disagree. The field list is
+// the descriptor's and not a hand-written one, so a field added to the message joins the
+// comparison without anybody editing this file.
+func attestationDiff(a, b *protocol.FetchAttestation) []string {
+	fields := a.ProtoReflect().Descriptor().Fields()
+	out := []string{}
+	for i := 0; i < fields.Len(); i++ {
+		fd := fields.Get(i)
+		if !a.ProtoReflect().Get(fd).Equal(b.ProtoReflect().Get(fd)) {
+			out = append(out, string(fd.Name()))
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// WHAT THE KEYLESS COMPARISON CATCHES AND WHAT IT DOES NOT — MEASURED, because the
+// paragraph at FetchAttestation.read_epoch claims both halves and a comment is not a
+// measurement.
+//
+// This file said the other thing until 2026-09-22. The paragraph claimed the keyless
+// comparison caught "exactly the withholding measured above", and a commit hand-off
+// repeated that to the sdk owner as the argument for building the check. It is false,
+// and the reason is one line long: `read_epoch` on the RESPONSE is a value the SERVER
+// chooses, and ruling 32's adversary is the server. A clamping server names the ceiling
+// the caller asked for and serves the shorter page under it.
+//
+// Ruling 32's own scenario, at the shapes this repository owns: a caller authenticated
+// at read_epoch 3; an honest answer of 12 records with a ceiling-relative high water of
+// 12; and a server clamping every reader to epoch 1, which has 5 records to serve. The
+// two clamping servers differ only in what they put in this field:
+//
+//	the TRUTHFUL clamp names read_epoch = 1 -> refused, and by that field ALONE
+//	the LYING clamp names read_epoch = 3    -> accepted, with 7 records and two whole
+//	                                          epochs withheld
+//
+// The truthful clamp is the inline positive control: without it, "the lying clamp is
+// accepted" would be a comparison that accepts everything. Neither result is an argument
+// against ruling 32 — Spec B §5.1.1 puts read_epoch in the PREIMAGE for exactly this
+// reason — they are an argument against the sentence that read as though the preimage
+// were optional.
+func TestTheKeylessCheckRefusesATruthfulClampAndNotALyingOne(t *testing.T) {
+	const asked = 3
+	group := []byte("group-id-thirty-two-octets-long!")
+
+	// served is an answer of n records with the ceiling-relative high water that implies,
+	// naming `ceiling` as the epoch it was served under. Everything a caller cannot check
+	// independently moves with n; everything it can check is held identical on purpose,
+	// because the question is which of those separates the three answers.
+	served := func(n int, ceiling uint64) *protocol.FetchAttestation {
+		ids := make([]uint64, 0, n)
+		for i := 1; i <= n; i++ {
+			ids = append(ids, uint64(i))
+		}
+		return &protocol.FetchAttestation{
+			GroupId:           group,
+			SinceRecordId:     0,
+			UntilRecordId:     uint64(n),
+			RecordIds:         ids,
+			HighWaterRecordId: uint64(n),
+			ServerTimeMs:      1758499200000,
+			ServerId:          []byte("server-id-16-b!!"),
+			ClassMask:         0,
+			HeadsOnly:         false,
+			ReadEpoch:         ceiling,
+		}
+	}
+	honest := served(12, asked)
+	truthful := served(5, 1)
+	lying := served(5, asked)
+
+	request := &protocol.FetchRequest{GroupId: group, SinceRecordId: 0, ReadEpoch: asked}
+	keyless := keylessComparableFields(t)
+	t.Logf("fields a caller can compare with NO KEY (%d): %v — the intersection of FetchRequest's "+
+		"field names with FetchAttestation's", len(keyless), keyless)
+	if len(keyless) < 2 {
+		t.Fatalf("only %v is comparable without a key; the partition below is not a partition", keyless)
+	}
+
+	// the keyless check itself, over the derived set: every shared field of the
+	// attestation compared against the same-named field of the request the caller sent.
+	refusesOn := func(a *protocol.FetchAttestation) []string {
+		bad := []string{}
+		am, rm := a.ProtoReflect(), request.ProtoReflect()
+		for _, name := range keyless {
+			af := am.Descriptor().Fields().ByName(protoreflect.Name(name))
+			rf := rm.Descriptor().Fields().ByName(protoreflect.Name(name))
+			if af == nil || rf == nil {
+				t.Fatalf("%q is in the derived intersection and is missing from one of the two "+
+					"messages, so the derivation and the lookup disagree", name)
+			}
+			if !am.Get(af).Equal(rm.Get(rf)) {
+				bad = append(bad, name)
+			}
+		}
+		return bad
+	}
+
+	if bad := refusesOn(honest); len(bad) != 0 {
+		t.Errorf("CONTROL: the honest answer at the ceiling the caller asked for is refused on %v. "+
+			"A check that refuses the honest answer is not a check.", bad)
+	}
+	if bad := refusesOn(truthful); len(bad) != 1 || bad[0] != "read_epoch" {
+		t.Errorf("CONTROL: the truthful clamp — an answer that says it was served at ceiling 1 to a "+
+			"caller that authenticated at ceiling %d — is refused on %v, want exactly [read_epoch]. "+
+			"If it is refused on nothing, the comparison accepts everything and the result below "+
+			"proves nothing; if on more, something other than the ceiling is doing the work.",
+			asked, bad)
+	}
+	if bad := refusesOn(lying); len(bad) != 0 {
+		t.Errorf("the lying clamp is refused on %v. If the keyless comparison has become able to "+
+			"catch a server that names the ceiling it was asked for and serves less, the paragraph "+
+			"at FetchAttestation.read_epoch now UNDERstates what this field buys, and it should be "+
+			"rewritten to whatever made that true.", bad)
+	}
+	t.Logf("keyless verdicts — honest: %v, truthful clamp: %v, lying clamp: %v",
+		refusesOn(honest), refusesOn(truthful), refusesOn(lying))
+
+	// AND WHAT WAS ACCEPTED IS A WITHHOLDING, not a smaller honest page: the lying clamp
+	// serves strictly fewer records and names a strictly smaller high water, which is the
+	// reader's only omission detector.
+	if len(lying.GetRecordIds()) >= len(honest.GetRecordIds()) ||
+		lying.GetHighWaterRecordId() >= honest.GetHighWaterRecordId() {
+		t.Fatalf("the clamping answer serves %d records with high water %d against the honest %d and "+
+			"%d; it withholds nothing and this measurement is about nothing",
+			len(lying.GetRecordIds()), lying.GetHighWaterRecordId(),
+			len(honest.GetRecordIds()), honest.GetHighWaterRecordId())
+	}
+	t.Logf("the ACCEPTED answer withholds %d of %d records and names high water %d against %d",
+		len(honest.GetRecordIds())-len(lying.GetRecordIds()), len(honest.GetRecordIds()),
+		lying.GetHighWaterRecordId(), honest.GetHighWaterRecordId())
+
+	// THE PARTITION, IN BOTH DIRECTIONS, which is the property the three verdicts above
+	// are instances of: the fields that separate the honest answer from the LYING one are
+	// DISJOINT from the fields a caller can check without a key, and the fields that
+	// separate it from the TRUTHFUL one meet that set in exactly `read_epoch`.
+	lyingDiff := attestationDiff(honest, lying)
+	truthfulDiff := attestationDiff(honest, truthful)
+	t.Logf("honest vs lying clamp differ on %v; honest vs truthful clamp differ on %v",
+		lyingDiff, truthfulDiff)
+	if len(lyingDiff) == 0 {
+		t.Fatal("the honest answer and the lying clamp are identical in every field, so the two " +
+			"servers are not doing different things and the disjointness below is vacuous")
+	}
+	comparable := map[string]bool{}
+	for _, name := range keyless {
+		comparable[name] = true
+	}
+	for _, name := range lyingDiff {
+		if comparable[name] {
+			t.Errorf("the honest answer and the lying clamp differ on %q, which a caller CAN compare "+
+				"without a key. That would make ruling 32's withholding refusable unsigned, and the "+
+				"paragraph at FetchAttestation.read_epoch says it is not.", name)
+		}
+	}
+	met := []string{}
+	for _, name := range truthfulDiff {
+		if comparable[name] {
+			met = append(met, name)
+		}
+	}
+	if len(met) != 1 || met[0] != "read_epoch" {
+		t.Errorf("the truthful clamp is separated from the honest answer, among the keyless fields, "+
+			"by %v; want exactly [read_epoch]. That intersection IS the keyless half of ruling 32, "+
+			"and if it is empty the check catches nothing at all.", met)
+	}
+}
+
+// THE KEYLESS HALF OF THE CEILING, SAID OUT LOUD AT THE FIELD — AND ITS LIMIT SAID IN
+// THE SAME BREATH.
 //
 // Ruling 32 put read_epoch in the attestation and in the signing preimage, and that
-// preimage is unbuilt here — true, and measured by the test above. Read alone it
-// invites the wrong conclusion: that the field buys nothing until §9.4's fleet key
-// exists. That does not follow. `group_id` and `since_record_id` are compared against
-// the request the caller itself sent, with no key at all, and `read_epoch` is the same
-// kind of term — FetchRequest.read_epoch is field 14 of that request, so the ceiling an
-// answer NAMES and the ceiling a request AUTHENTICATED UNDER are both in the caller's
-// hands. An answer naming a ceiling the caller did not ask for is refusable today.
+// preimage is unbuilt here — true, and measured by
+// TestNothingHereComputesTheAttestationPreimage. Read alone, that invites the conclusion
+// that the field buys nothing until §9.4's fleet key exists, and that is wrong: the
+// caller holds its own read_epoch and can compare. But the correction was itself
+// overstated here until 2026-09-22 — the block claimed the keyless comparison caught
+// "exactly the withholding measured above" — and
+// TestTheKeylessCheckRefusesATruthfulClampAndNotALyingOne measures that it does not. So
+// the clause list below pins BOTH halves, because either half read alone is an
+// instruction to build the wrong thing.
 //
-// The distinction decides whether a consumer that ALREADY SENDS the value bothers to
-// compare it, which is the difference between ruling 32's measured withholding being
-// detectable now and being detectable when a PKI ships. It is pinned here because it
-// lives in one sentence in one file, and a sentence is the cheapest thing in this
-// corpus to lose.
-//
-// WHAT IT DOES NOT SAY, deliberately: anything about what any particular consumer does
-// today. A comment in this repository asserting the state of another repository's code
-// is the stale-disclosure class item 248 exists to catch — it would be true on the day
-// it was written and false on the day somebody acted on it. The shape property is
+// WHAT IT STILL DOES NOT SAY, deliberately: anything about what any particular consumer
+// does today. A comment in this repository asserting the state of another repository's
+// code is the stale-disclosure class item 248 exists to catch — it would be true on the
+// day it was written and false on the day somebody acted on it. The shape property is
 // permanent; the survey belongs in the commit that measured it.
-func TestTheReadEpochIsSaidToBeCheckableWithoutTheSignature(t *testing.T) {
+func TestTheReadEpochSaysWhatTheKeylessCheckCatchesAndWhatItDoesNot(t *testing.T) {
 	md := (*protocol.FetchAttestation)(nil).ProtoReflect().Descriptor()
 	if md.Fields().ByName("read_epoch") == nil {
 		t.Fatal("FetchAttestation has no read_epoch; the clauses below are about that field")
@@ -425,21 +622,29 @@ func TestTheReadEpochIsSaidToBeCheckableWithoutTheSignature(t *testing.T) {
 	}
 
 	block := flatten(t, messageBlock(t, "FetchAttestation"),
-		"AND THIS FIELD IS CHECKABLE WITHOUT THE SIGNATURE. Read the paragraph below")
+		"AND THIS FIELD IS CHECKABLE WITHOUT THE SIGNATURE, BUT WHAT THE KEYLESS")
 	for _, clause := range []struct {
 		what   string
 		phrase string
 	}{
-		{"that the field does not wait for the signature", "AND THIS FIELD IS CHECKABLE WITHOUT THE SIGNATURE."},
+		{"that the field does not wait for the signature", "AND THIS FIELD IS CHECKABLE WITHOUT THE SIGNATURE,"},
+		{"that the keyless check is narrower than the withholding", "BUT WHAT THE KEYLESS CHECK CATCHES IS NARROWER THAN THE WITHHOLDING ABOVE"},
 		{"the terms it is like", "`group_id` and `since_record_id` above are already comparable with"},
 		{"where the caller's own copy comes from", "FetchRequest.read_epoch is field 14 of that"},
-		{"that it catches the measured withholding today", "is refusable TODAY, with no fleet key"},
-		{"what the signature actually adds", "What the signature adds"},
+		{"which server the keyless check actually refuses", "TRUTHFULLY names a ceiling below the one the caller asked for is refusable TODAY"},
+		{"that it does NOT refuse the one ruling 32 measured", "IT DOES NOT CATCH THE WITHHOLDING MEASURED ABOVE."},
+		{"why not — the field is the server's to choose", "This field is SERVER-CHOSEN"},
+		{"the measurement, by name", "TestTheKeylessCheckRefusesATruthfulClampAndNotALyingOne"},
+		{"Spec B §5.1.1 agreeing in its own words", "byte-indistinguishable from an honest one unless `read_epoch` is in the attestation preimage"},
+		{"what the signature actually adds", "SO WHAT THE SIGNATURE ADDS IS THE BINDING"},
+		{"that the C-4 mechanism is cited and not measured here", "CITED HERE AND NOT MEASURED"},
 	} {
 		if !strings.Contains(block, clause.phrase) {
-			t.Errorf("FetchAttestation.read_epoch does not state %s. The phrase %q is gone, and "+
-				"without it this block reads as though the field were inert until §9.4's fleet key "+
-				"exists — the reading that leaves the keyless comparison unbuilt in every consumer.",
+			t.Errorf("FetchAttestation.read_epoch does not state %s. The phrase %q is gone. Either "+
+				"half of this paragraph read alone is an instruction to build the wrong thing: "+
+				"without the first a reader leaves the free comparison unbuilt, and without the "+
+				"second a reader builds it believing it closes ruling 32's withholding, which "+
+				"TestTheKeylessCheckRefusesATruthfulClampAndNotALyingOne measures that it does not.",
 				clause.what, clause.phrase)
 		}
 	}

@@ -2351,23 +2351,65 @@ type FetchAttestation struct {
 	// buys is not the value; it is the server's
 	// attributable commitment to having used it.
 	//
-	// AND THIS FIELD IS CHECKABLE WITHOUT THE SIGNATURE.
-	// Read the paragraph below about the unbuilt §9.4
-	// fleet key as being about ATTRIBUTION and not about
-	// this field being inert: `group_id` and
-	// `since_record_id` above are already comparable with
-	// no key at all, against the FetchRequest the receiver
-	// itself sent, and `read_epoch` is the same kind of
-	// term — FetchRequest.read_epoch is field 14 of that
+	// AND THIS FIELD IS CHECKABLE WITHOUT THE SIGNATURE,
+	// BUT WHAT THE KEYLESS CHECK CATCHES IS NARROWER THAN
+	// THE WITHHOLDING ABOVE. Both halves are written down
+	// because the first was written alone first, and
+	// alone it is an overclaim an implementer would act
+	// on.
+	//
+	// THE CHECK. `group_id` and `since_record_id` above
+	// are already comparable with no key at all, against
+	// the FetchRequest the receiver itself sent, and
+	// `read_epoch` is the same kind of term —
+	// FetchRequest.read_epoch is field 14 of that
 	// request, so "the ceiling this answer was served
 	// under" and "the ceiling this request authenticated
 	// under" are both in the hands of whoever made the
-	// call. An answer naming a ceiling the caller did not
-	// ask for is refusable TODAY, with no fleet key, no
-	// signature and no PKI — and it is exactly the
-	// withholding measured above. What the signature adds
-	// is that the caller can then prove it to a third
-	// party instead of only declining the page.
+	// call. A server that TRUTHFULLY names a ceiling
+	// below the one the caller asked for is refusable
+	// TODAY, with no fleet key, no signature and no PKI.
+	// That refusal is real, it is free, and it is worth
+	// building.
+	//
+	// IT DOES NOT CATCH THE WITHHOLDING MEASURED ABOVE.
+	// This field is SERVER-CHOSEN, and ruling 32's
+	// adversary IS the server, so the transport's own
+	// authentication of the response says nothing about
+	// it: a clamping server writes the ceiling the caller
+	// ASKED FOR into this field and serves the shorter
+	// page underneath it, and the comparison passes.
+	// Measured on ruling 32's own scenario by
+	// TestTheKeylessCheckRefusesATruthfulClampAndNotALyingOne
+	// beside this file: of the fields a caller can
+	// compare with no key — derived there as the
+	// intersection of FetchRequest's field names with
+	// this message's — the truthful clamp differs in
+	// exactly `read_epoch` and is refused, and the lying
+	// clamp differs in NONE and is accepted while
+	// withholding 7 of 12 records. Spec B §5.1.1 says the
+	// same of its own ceiling: "a server claiming a
+	// shorter ceiling than the request named is
+	// byte-indistinguishable from an honest one unless
+	// `read_epoch` is in the attestation preimage, which
+	// is why it is."
+	//
+	// SO WHAT THE SIGNATURE ADDS IS THE BINDING, and not
+	// third-party provability of a refusal the caller
+	// could already make. Signed, `read_epoch` becomes a
+	// statement the server is attributably committed to,
+	// which is what lets Spec B C-4 pin an attestation
+	// and compare it against others taken under an
+	// IDENTICAL (class_mask, heads_only, read_epoch)
+	// filter: a server that answered high water 5 at
+	// ceiling 3 and later answers 12 at ceiling 3 has
+	// signed two statements that cannot both be true.
+	// Unsigned, it can always say the two answers were
+	// taken at different ceilings. That mechanism is
+	// CITED HERE AND NOT MEASURED: no Go file in this
+	// repository computes this signature, which
+	// TestNothingHereComputesTheAttestationPreimage
+	// states as a measurement with its own controls.
 	//
 	// 11, and 11 is free: this message has never had an
 	// eleventh field. NOT 10, because `sig` landed at 10
