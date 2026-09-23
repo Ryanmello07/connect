@@ -466,22 +466,88 @@ func unservedAttachmentCodes(t testing.TB, door string) []int {
 	return codes
 }
 
-// One encoding offered to the door NAMED, rather than to the door that serves its kind.
+// One encoding offered to the door NAMED, rather than to the door that serves its kind, with
+// whatever that door parsed rebuilt into the one shape the comparisons in this file take.
 //
 // It is the counterpart of parseAtItsDoor and it exists for the opposite purpose: that one
 // asks a kind's own door to read it, and this one asks a door that may well refuse.
-func parseAtDoor(t testing.TB, door string, bs []byte) error {
+//
+// IT ANSWERS THE ATTACHMENT AND NOT ONLY THE ERROR. It answered the error alone in the single
+// commit it existed in before this one — the commit that widened section 5.1 check 3's door
+// to the sixth kind — so every walk written over it could assert that a served door said yes
+// and nothing about WHAT it handed back, which is half a round trip. A parse arm that zeroed
+// two fields of the kind that door had just been widened to satisfied every one of those
+// walks, with this package, messagegroup and protocol all green under `go test -run 'Test'`;
+// the property was left to FuzzParseServerAttachment's seed corpus, which that filter does
+// not run. The second return value is what lets the caller assert it.
+func parseAtDoor(t testing.TB, door string, bs []byte) (*ServerAttachment, error) {
 	t.Helper()
 	switch door {
 	case serverAttachmentDoorName:
-		_, err := ParseServerAttachment(bs)
-		return err
+		return ParseServerAttachment(bs)
 	case epochDigestDoorName:
-		_, err := ParseEpochDigestAttachment(bs)
-		return err
+		digest, err := ParseEpochDigestAttachment(bs)
+		if err != nil {
+			return nil, err
+		}
+		return &ServerAttachment{Kind: AttachmentEpochDigest, EpochDigest: digest}, nil
 	}
 	t.Fatalf("no parse entry point is wired for door %q, so a door could be added to the table and gated by nothing", door)
-	return nil
+	return nil, nil
+}
+
+// One attachment offered to the ENCODE entry point of the door NAMED, the counterpart of the
+// parse helper above and of encodeAtItsDoor below.
+//
+// ITS DOMAIN IS THE PAIRS THE TABLE SAYS ARE SERVED, which is the only place it is called
+// from, and the asymmetry is worth stating rather than hiding: section 5.1 check 3's door
+// takes a whole ServerAttachment and refuses an unserved kind with a runtime sentinel, while
+// the epoch digest door takes the body alone, so an unserved kind cannot be SPELLED at it and
+// its refusal is the compiler's. A loop that tried to walk the unserved pairs here would have
+// to invent the second door's refusal, and an invented answer is not the package's.
+func encodeAtDoor(t testing.TB, door string, a *ServerAttachment) ([]byte, error) {
+	t.Helper()
+	switch door {
+	case serverAttachmentDoorName:
+		return EncodeServerAttachment(a)
+	case epochDigestDoorName:
+		if a.EpochDigest == nil {
+			t.Fatalf("the epoch digest door was handed a kind 0x%04x attachment, which its signature cannot express", uint16(a.Kind))
+		}
+		return EncodeEpochDigestAttachment(a.EpochDigest)
+	}
+	t.Fatalf("no encode entry point is wired for door %q, so a door could be added to the table and gated by nothing", door)
+	return nil, nil
+}
+
+// WHERE TWO ENCODINGS FIRST DIFFER, as a phrase for a failure message.
+//
+// A message that reports two LENGTHS says nothing when the two are equal, and equal is the
+// usual case: the mistakes that put one kind on the wire twice — a field written from the
+// wrong member, two fields swapped, a constant written in place of a value — all keep the
+// width. So the offset and the two octets at it are what this answers.
+func firstOctetDifference(left []byte, right []byte) string {
+	for i := 0; i < len(left) && i < len(right); i++ {
+		if left[i] != right[i] {
+			return fmt.Sprintf("first differing octet at offset %d: 0x%02x against 0x%02x", i, left[i], right[i])
+		}
+	}
+	if len(left) != len(right) {
+		return fmt.Sprintf("identical for %d octets and then %d octets against %d", min(len(left), len(right)), len(left), len(right))
+	}
+	return ""
+}
+
+// The doors written down as serving the code named, sorted, derived from the one table.
+func attachmentDoorsServing(t testing.TB, code int) []string {
+	t.Helper()
+	doors := []string{}
+	for _, door := range attachmentDoorNames() {
+		if slices.Contains(servedAttachmentCodes(t, door), code) {
+			doors = append(doors, door)
+		}
+	}
+	return doors
 }
 
 // ── the doors ───────────────────────────────────────────────────────────────────────
@@ -725,8 +791,36 @@ func attachmentCorpus(t testing.TB) []attachmentCorpusEntry {
 	for _, entry := range entries {
 		kinds[entry.attachment.Kind] = true
 	}
-	if len(kinds) != len(specAttachmentKindCodes) {
-		t.Fatalf("the corpus covers %d kinds and section 5.11 defines %d", len(kinds), len(specAttachmentKindCodes))
+	// THE SET AND NOT THE COUNT. This compared two numbers, and five kinds is also what a
+	// corpus covering four of them and one of them twice would report.
+	covered := []int{}
+	for kind := range kinds {
+		covered = append(covered, int(kind))
+	}
+	slices.Sort(covered)
+	if !slices.Equal(covered, specAttachmentCodes()) {
+		t.Fatalf("the corpus covers %v and section 5.11 defines %v", covered, specAttachmentCodes())
+	}
+	// AND THE COMPLEMENT, ASSERTED RATHER THAN LEFT TO THE READER: the kinds section 5.1
+	// check 3's door serves that this cross product does NOT carry.
+	//
+	// It was empty until 2026-09-23, and holding this corpus against the PROVENANCE table
+	// alone went on passing after the door was widened while the sixth kind sat outside every
+	// walk written over it — which is how kind 0x0005's only value-level coverage at that door
+	// came to be a fuzz seed. The kind is covered by epochDigestCorpus, the same cross product
+	// over its own axes, and TestAKindTwoDoorsServeHasOneEncodingAtBoth is what carries that
+	// corpus through THIS door. Naming it here fails in both directions: add the sixth kind to
+	// this corpus, or narrow the door back, and this line asks for the disposition to be
+	// rewritten rather than quietly agreeing.
+	missing := []int{}
+	for _, code := range servedAttachmentCodes(t, serverAttachmentDoorName) {
+		if !kinds[ServerAttachmentKind(code)] {
+			missing = append(missing, code)
+		}
+	}
+	if !slices.Equal(missing, ruledAttachmentCodes()) {
+		t.Fatalf("this corpus omits %v of the kinds %s serves, and the kinds covered by epochDigestCorpus instead are %v",
+			missing, serverAttachmentDoorName, ruledAttachmentCodes())
 	}
 	return entries
 }
@@ -1968,10 +2062,17 @@ func TestAnUnknownKindIsADecodeError(t *testing.T) {
 			if err != nil {
 				t.Fatalf("kind 0x%04x does not encode at its own door: %v", code, err)
 			}
-			parseErr := parseAtDoor(t, door, bs)
+			parsed, parseErr := parseAtDoor(t, door, bs)
 			if slices.Contains(servedAttachmentCodes(t, door), code) {
 				if parseErr != nil {
 					t.Errorf("%s is written down as serving kind 0x%04x and refused it with %v", door, code, parseErr)
+					continue
+				}
+				// an acceptance is only the other sentinel's counterpart if what came back
+				// is the attachment that went in; a door that answered a zeroed body would
+				// otherwise count here as the positive half of the distinction
+				if difference := attachmentDifference(byKind[kind], parsed); difference != "" {
+					t.Errorf("%s accepted kind 0x%04x and handed back an attachment whose %s differs", door, code, difference)
 					continue
 				}
 				served++
@@ -2664,12 +2765,12 @@ func TestTheSecondEpochDigestVectorIsPinnedToItsExactBytes(t *testing.T) {
 // beside the record refuses such a commit loudly at check 3 instead of installing an epoch
 // whose keys it was never handed, and a stale receiver follows the commit anyway because no
 // receive path reads a field of an epoch attachment. It is what made the window a rollout
-// instead of a flag day, and it was true of every build up to the one before this commit.
+// instead of a flag day, and it was true of every build up to the one that widened the door.
 //
-// IT CANNOT BE TRUE OF THIS BUILD, because this commit is the widening: section 5.1 check
-// 3's door serves 0x0005 here, which is the window's step 1. The stale half is now held by
-// binaries, not by this package, and a test that went on asserting it would be asserting
-// that the change this commit makes had not been made.
+// IT CANNOT BE TRUE OF THIS BUILD, because this build is past the widening: section 5.1
+// check 3's door serves 0x0005 here, which is the window's step 1. The stale half is now
+// held by binaries, not by this package, and a test that went on asserting it would be
+// asserting that the change had not been made.
 //
 // SO THE ASSERTION IS RE-EXPRESSED RATHER THAN DELETED, AND IT IS WIDER THAN IT WAS. The
 // mechanism — a door naming the kind it will not serve, instead of parsing those octets
@@ -2685,6 +2786,19 @@ func TestTheSecondEpochDigestVectorIsPinnedToItsExactBytes(t *testing.T) {
 // The positive control is in the same test and is per door, because a door that refused
 // everything would satisfy the refusal half on its own, and because with the complement of
 // one door now empty the controls are what keep that door under this test at all.
+//
+// THE CONTROL COMPARES VALUES AND OCTETS, WHICH THE FIRST RE-EXPRESSION DROPPED. The test
+// this replaced asserted, in its control loop, that the attachment the door handed back was
+// the one that went in; the re-expression kept only "it did not refuse", and so did every
+// other walk over parseAtDoor. In the commit that widened the door, NOTHING Test-named in
+// this package compared a value or an octet of the newly served kind through section 5.1
+// check 3's door: two mutants that forked its wire format — one zeroing two fields on the way
+// in, one on the way out — were green on this package, on messagegroup and on protocol under
+// `go test -run 'Test'`, and red only in FuzzParseServerAttachment's seed corpus, which that
+// filter — the one every command in that commit's evidence used — never ran. Dropping an
+// assertion while calling the replacement wider is the failure; restoring it here makes the
+// claim true, because the old control covered five kinds at one door and this covers six
+// kinds at one and one at the other, by value AND by octet, with the record still in the loop.
 func TestARecordCarriesAKindADoorRefusesByName(t *testing.T) {
 	byKind := validAttachmentsByKind(t)
 	refused, accepted := 0, 0
@@ -2705,11 +2819,33 @@ func TestARecordCarriesAKindADoorRefusesByName(t *testing.T) {
 			// ParseRecord brings them back with is_commit still set and the attachment slot
 			// identical. recordSlotRoundTrip asserts all three.
 			slot := recordSlotRoundTrip(t, attachment)
-			parseErr := parseAtDoor(t, door, slot)
+			parsed, parseErr := parseAtDoor(t, door, slot)
 			if slices.Contains(servedAttachmentCodes(t, door), code) {
 				if parseErr != nil {
 					t.Fatalf("%s is written down as serving kind 0x%04x and refused it after the record round trip: %v",
 						door, code, parseErr)
+				}
+				// WHAT THE DOOR HANDED BACK, and not merely that it said yes. This is the
+				// assertion the old test made in its positive control and the re-expression
+				// dropped, and it is restored WIDER than it was: the old one compared values
+				// for the five section 5.11 kinds at one door, this compares them for every
+				// served (door, kind) pair the table names.
+				if difference := attachmentDifference(byKind[kind], parsed); difference != "" {
+					t.Errorf("%s accepted kind 0x%04x after the record round trip and handed back an attachment whose %s differs",
+						door, code, difference)
+				}
+				// AND THE OCTETS IT WRITES FOR WHAT IT JUST READ are the octets it read. The
+				// comparison above passes an encode arm and a parse arm that agree with each
+				// other and with nobody else, which at a door two of them serve is a fork in
+				// the wire format of a kind — and H(server_attachment) reaches the write_auth
+				// mac and both aeads, so the fork is visible only at a mac nobody can see into.
+				again, err := encodeAtDoor(t, door, parsed)
+				if err != nil {
+					t.Fatalf("%s parsed kind 0x%04x out of the record and then refused to re-encode it: %v", door, code, err)
+				}
+				if !bytes.Equal(again, slot) {
+					t.Errorf("%s read kind 0x%04x out of the record and wrote different octets back, so this kind has two encodings: %s",
+						door, code, firstOctetDifference(slot, again))
 				}
 				doorAccepted++
 				continue
@@ -2868,6 +3004,102 @@ func TestEveryEpochDigestRoundTripsByteExactAndIsTheStatedLayout(t *testing.T) {
 		}
 	}
 	t.Logf("%d epoch digest attachments round tripped byte exact", len(entries))
+}
+
+// The corpus of one kind, whichever of this file's two cross products that kind's axes live
+// in. Derived by filtering both, so a kind whose corpus moves stays covered, and fatal on an
+// empty answer so a walk over it cannot hold vacuously.
+func corpusOfKind(t testing.TB, kind ServerAttachmentKind) []attachmentCorpusEntry {
+	t.Helper()
+	entries := []attachmentCorpusEntry{}
+	for _, entry := range append(attachmentCorpus(t), epochDigestCorpus(t)...) {
+		if entry.attachment.Kind == kind {
+			entries = append(entries, entry)
+		}
+	}
+	if len(entries) == 0 {
+		t.Fatalf("no corpus entry carries kind 0x%04x, so a property walked over it would hold over nothing", uint16(kind))
+	}
+	return entries
+}
+
+// A KIND TWO DOORS SERVE HAS ONE ENCODING AT BOTH, and both read it back to the attachment
+// that went in.
+//
+// attachment.go says this in its own voice, at EncodeEpochDigestAttachment: the two doors
+// "produce THE SAME OCTETS because the framing and the body table are one set of code behind
+// both". That sentence became sayable on 2026-09-23, when section 5.1 check 3's door was
+// widened to the sixth kind, and nothing measured it — every walk in this file ran one door,
+// or asked the other only whether it said yes. An encode arm that wrote two fields of the
+// digest body differently at one door is a fork in the wire format of the only kind two doors
+// serve, and it passed `go test -run 'Test'` on this package, on messagegroup and on
+// protocol; H(server_attachment) reaches the write_auth mac and both aeads, so on the wire
+// that fork surfaces as a mac nobody can see into.
+//
+// IT IS WRITTEN OVER THE SET OF KINDS TWO DOORS SERVE, not over 0x0005, and it is derived
+// from attachmentDoorServes rather than listed: the day a seventh kind is served at a second
+// door it is under this walk with nobody remembering it. Today that set is exactly one kind,
+// and the guard at the bottom is what says so out loud instead of passing quietly if it
+// empties.
+func TestAKindTwoDoorsServeHasOneEncodingAtBoth(t *testing.T) {
+	compared := 0
+	kinds := []ServerAttachmentKind{}
+	for _, code := range definedAttachmentCodes() {
+		kind := ServerAttachmentKind(code)
+		// the absent attachment's encoding is no octets at all, and both its spellings are
+		// asserted by the absent/empty tests of their own
+		if kind == AttachmentNone {
+			continue
+		}
+		doors := attachmentDoorsServing(t, code)
+		if len(doors) < 2 {
+			continue
+		}
+		kinds = append(kinds, kind)
+		for _, entry := range corpusOfKind(t, kind) {
+			written := map[string][]byte{}
+			for _, door := range doors {
+				bs, err := encodeAtDoor(t, door, entry.attachment)
+				if err != nil {
+					t.Fatalf("%s: %s is written down as serving kind 0x%04x and refused to encode it: %v",
+						entry.name, door, code, err)
+				}
+				written[door] = bs
+			}
+			// THE OCTETS, every door's against the first door's, so a disagreement names both
+			first := doors[0]
+			for _, door := range doors[1:] {
+				if !bytes.Equal(written[door], written[first]) {
+					t.Fatalf("%s: %s and %s write different octets for kind 0x%04x, so this kind has two encodings on the wire: %s",
+						entry.name, first, door, code, firstOctetDifference(written[first], written[door]))
+				}
+			}
+			// THE VALUES, every door reading every door's octets. This is the half the octet
+			// comparison cannot see: two parse arms that drop the same field agree with each
+			// other perfectly and hand the caller an attachment that is not the one written.
+			for _, writer := range doors {
+				for _, reader := range doors {
+					parsed, err := parseAtDoor(t, reader, written[writer])
+					if err != nil {
+						t.Fatalf("%s: %s refused the octets %s wrote for kind 0x%04x: %v", entry.name, reader, writer, code, err)
+					}
+					if difference := attachmentDifference(entry.attachment, parsed); difference != "" {
+						t.Fatalf("%s: %s read what %s wrote for kind 0x%04x and its %s differs",
+							entry.name, reader, writer, code, difference)
+					}
+				}
+			}
+			compared++
+		}
+	}
+	// THE VACUITY GUARD, over the SET this walk runs on rather than over one door: narrow
+	// either door back and this test would have nothing left to compare and would pass.
+	if compared == 0 {
+		t.Fatalf("no kind this package defines is served at two doors, so the one-encoding property held over nothing; the table reads %v",
+			attachmentDoorServes)
+	}
+	t.Logf("%d corpus entries compared across both doors, over the %d kind(s) two doors serve: %v",
+		compared, len(kinds), kinds)
 }
 
 // Nothing malformed is silently accepted and changed: every single octet truncation is
@@ -3599,10 +3831,27 @@ const attachmentFuzzCorpusDir = "testdata/fuzz/FuzzParseServerAttachment"
 // The property itself is asserted here as well, over exactly the bytes the fuzz target would
 // see, so a corpus entry that violates it fails an ordinary go test rather than waiting for
 // somebody to pass -fuzz.
+//
+// AND EVERY KIND THIS DOOR SERVES HAS ITS VECTOR HERE, derived from the door table rather
+// than from a list. These are this door's interop vectors on disk — the digest door's corpus
+// asserts its own the same way, and an implementer checking a section 5.1 check 3 parser
+// reads THIS directory. It carried four of the five vectors this file pins, which was all of
+// them for the kinds the door served, until the door was widened on 2026-09-23: after that
+// the only kind 0x0005 entry here was a malformed one (an EpochComplete body under the digest
+// kind, kept because it is a near miss the byte walks do not produce), so the newly served
+// kind had no valid octets on disk at all and nothing said so.
 func TestTheCheckedInAttachmentFuzzCorpusIsReadAndSaysSomething(t *testing.T) {
 	entries, err := os.ReadDir(attachmentFuzzCorpusDir)
 	if err != nil {
 		t.Fatalf("the checked-in fuzz corpus is unreadable at %s: %v", attachmentFuzzCorpusDir, err)
+	}
+	// the vectors this door's kinds are pinned to, each marked when an entry carries it
+	onDisk := map[ServerAttachmentKind]bool{}
+	for _, code := range servedAttachmentCodes(t, serverAttachmentDoorName) {
+		kind := ServerAttachmentKind(code)
+		if _, pinned := attachmentGoldenVectors[kind]; pinned {
+			onDisk[kind] = false
+		}
 	}
 	accepted := 0
 	refused := 0
@@ -3611,6 +3860,11 @@ func TestTheCheckedInAttachmentFuzzCorpusIsReadAndSaysSomething(t *testing.T) {
 			continue
 		}
 		bs := fuzzCorpusEntry(t, filepath.Join(attachmentFuzzCorpusDir, entry.Name()))
+		for kind := range onDisk {
+			if hex.EncodeToString(bs) == attachmentGoldenVectors[kind] {
+				onDisk[kind] = true
+			}
+		}
 		attachment, err := ParseServerAttachment(bs)
 		if err != nil {
 			refused++
@@ -3622,7 +3876,8 @@ func TestTheCheckedInAttachmentFuzzCorpusIsReadAndSaysSomething(t *testing.T) {
 			t.Fatalf("%s: parsed and then refused to re-encode: %v", entry.Name(), err)
 		}
 		if !bytes.Equal(again, bs) {
-			t.Fatalf("%s: parsed and re-encoded to %d different octets, so this attachment has two encodings", entry.Name(), len(again))
+			t.Fatalf("%s: parsed and re-encoded to different octets, so this attachment has two encodings: %s",
+				entry.Name(), firstOctetDifference(bs, again))
 		}
 	}
 	if accepted+refused == 0 {
@@ -3634,7 +3889,21 @@ func TestTheCheckedInAttachmentFuzzCorpusIsReadAndSaysSomething(t *testing.T) {
 	if refused == 0 {
 		t.Fatalf("%s: all %d entries are accepted, so the malformed inputs it exists to carry are gone", attachmentFuzzCorpusDir, accepted)
 	}
-	t.Logf("%d corpus entries, %d accepted and %d refused", accepted+refused, accepted, refused)
+	if len(onDisk) == 0 {
+		t.Fatalf("no kind %s serves is pinned to a vector, so the on-disk check below held over nothing", serverAttachmentDoorName)
+	}
+	carried := 0
+	for kind, found := range onDisk {
+		if !found {
+			t.Errorf("%s is pinned to a vector in this file, %s serves it, and no entry of %s carries those octets — "+
+				"so an implementation reading this directory has no example of the kind",
+				specAttachmentKindNames[kind], serverAttachmentDoorName, attachmentFuzzCorpusDir)
+			continue
+		}
+		carried++
+	}
+	t.Logf("%d corpus entries, %d accepted and %d refused; %d of the %d served kinds pinned to a vector have it on disk",
+		accepted+refused, accepted, refused, carried, len(onDisk))
 }
 
 // The one property that has to hold over bytes nobody chose: an input is refused, or it
@@ -3642,48 +3911,137 @@ func TestTheCheckedInAttachmentFuzzCorpusIsReadAndSaysSomething(t *testing.T) {
 // H(server_attachment) — which reaches the write_auth mac and both aeads — is over exactly
 // one of them.
 //
-// The seeds this function adds are well formed, because a mutator wants a valid attachment to
-// work outward from. The malformed inputs live in testdata/fuzz/FuzzParseServerAttachment,
-// checked in, which is what makes a plain go test replay them: the absent attachment spelled
-// out, a kind nothing defines, a key one octet short, a body region longer than the fields
-// inside it. Those are edits no single octet walk in this file produces, and having them on
+// The seeds this target adds are mostly well formed, because a mutator wants a valid
+// attachment to work outward from. The malformed inputs live in
+// testdata/fuzz/FuzzParseServerAttachment, checked in, which is what makes a plain go test
+// replay them: the absent attachment spelled out, a kind nothing defines, a key one octet
+// short, a body region longer than the fields inside it, an EpochComplete body under the
+// digest kind. Those are edits no single octet walk in this file produces, and having them on
 // disk is also what gives a finding from an explicit -fuzz run somewhere to land.
+//
+// NOTHING HERE IS REACHABLE ONLY FROM A Fuzz NAME. The seeds and the property are each their
+// own function, and TestEveryAttachmentFuzzSeedIsRefusedOrReEncodesToItself walks them under
+// a name `-run 'Test'` matches — because this target's name is not one, and that filter is
+// the one the evidence tables for this package have been written with.
 func FuzzParseServerAttachment(f *testing.F) {
-	for _, entry := range attachmentWalkCorpus(f) {
+	for _, bs := range attachmentFuzzSeeds(f) {
+		f.Add(bs)
+	}
+	f.Fuzz(func(t *testing.T, bs []byte) {
+		attachmentParsePropertyHolds(t, fmt.Sprintf("%d octets", len(bs)), bs)
+	})
+}
+
+// The seeds the target above starts from, as ONE function read by the target and by the test
+// below, so neither can drift from the other.
+//
+// The golden vectors are walked in kind order rather than over the map, so the seed list is
+// the same list in the same order every run and a failing seed index names the same input
+// twice running.
+func attachmentFuzzSeeds(t testing.TB) [][]byte {
+	t.Helper()
+	seeds := [][]byte{}
+	for _, entry := range attachmentWalkCorpus(t) {
 		bs, err := EncodeServerAttachment(entry.attachment)
 		if err != nil {
-			f.Fatalf("%s: EncodeServerAttachment refused a corpus attachment: %v", entry.name, err)
+			t.Fatalf("%s: EncodeServerAttachment refused a corpus attachment: %v", entry.name, err)
 		}
-		f.Add(bs)
+		seeds = append(seeds, bs)
 	}
-	for _, vector := range attachmentGoldenVectors {
+	for _, code := range definedAttachmentCodes() {
+		vector, pinned := attachmentGoldenVectors[ServerAttachmentKind(code)]
+		if !pinned {
+			continue
+		}
 		bs, err := hex.DecodeString(vector)
 		if err != nil {
-			f.Fatalf("a golden vector is not hexadecimal: %v", err)
+			t.Fatalf("the kind 0x%04x golden vector is not hexadecimal: %v", code, err)
 		}
-		f.Add(bs)
+		seeds = append(seeds, bs)
 	}
-	f.Add([]byte{})
-	f.Add([]byte{0x00})
-	f.Add([]byte{0x00, 0x01})
+	seeds = append(seeds, []byte{}, []byte{0x00}, []byte{0x00, 0x01})
+	if len(seeds) == 0 {
+		t.Fatal("the seed list is empty, so the target starts from nothing and the test below walks nothing")
+	}
+	return seeds
+}
 
-	f.Fuzz(func(t *testing.T, bs []byte) {
-		attachment, err := ParseServerAttachment(bs)
-		if err != nil {
-			return
+// The property itself, over one input, as ONE function read by the target and by the test
+// below. Answers whether the door accepted the input, so a caller walking a fixed set can
+// assert that some of it reached the re-encode half at all.
+func attachmentParsePropertyHolds(t *testing.T, what string, bs []byte) bool {
+	t.Helper()
+	attachment, err := ParseServerAttachment(bs)
+	if err != nil {
+		return false
+	}
+	if carried, set := attachment.bodyKind(); carried != attachment.Kind || 1 < set {
+		t.Fatalf("%s: accepted an attachment of kind 0x%04x carrying %d bodies, the last of them kind 0x%04x",
+			what, uint16(attachment.Kind), set, uint16(carried))
+	}
+	again, err := EncodeServerAttachment(attachment)
+	if err != nil {
+		t.Fatalf("%s: accepted %d octets and then refused to re-encode them: %v", what, len(bs), err)
+	}
+	if !bytes.Equal(again, bs) {
+		t.Fatalf("%s: accepted %d octets and re-encoded to different ones, so this attachment has two encodings: %s",
+			what, len(bs), firstOctetDifference(bs, again))
+	}
+	return true
+}
+
+// EVERY SEED THE FUZZ TARGET STARTS FROM, UNDER AN ORDINARY go test.
+//
+// ── WHY THIS TEST EXISTS, AND IT IS ABOUT THE FILTER RATHER THAN ABOUT THE PARSER ────
+//
+// `go test -run 'Test'` does not run a Fuzz target, not even its seeds: "FuzzParseServer-
+// Attachment" contains no "Test", so the filter never matches it. Every command in the
+// evidence for the commit that widened section 5.1 check 3's door — its results table and its
+// six-mutant table alike — used that filter or a narrower list of Test names, so a property
+// asserted only inside f.Fuzz was invisible to all of it, and a surviving mutant is first a
+// claim about the query. Two mutants that forked the sixth kind's wire format at that door
+// were measured green that way; under `-run 'Test|Fuzz'` each failed in this target's seed
+// corpus and nowhere else.
+//
+// So the seeds and the property are each one function, and this Test walks them. It is not a
+// second copy of the fuzz body — it calls the same one — and it is the reason a -run 'Test'
+// table can no longer pass over this property. The controls are the two directions the walk
+// could go quiet in: a seed list all of whose entries are refused never reaches the re-encode
+// half, and one all of whose entries are accepted has lost the malformed inputs it carries.
+func TestEveryAttachmentFuzzSeedIsRefusedOrReEncodesToItself(t *testing.T) {
+	seeds := attachmentFuzzSeeds(t)
+	accepted, refused := 0, 0
+	for i, bs := range seeds {
+		if attachmentParsePropertyHolds(t, fmt.Sprintf("seed %d", i), bs) {
+			accepted++
+			continue
 		}
-		if carried, set := attachment.bodyKind(); carried != attachment.Kind || 1 < set {
-			t.Fatalf("accepted an attachment of kind 0x%04x carrying %d bodies, the last of them kind 0x%04x",
-				uint16(attachment.Kind), set, uint16(carried))
+		refused++
+	}
+	if accepted == 0 {
+		t.Fatalf("all %d seeds are refused, so no seed ever reaches the re-encode half of the property", refused)
+	}
+	if refused == 0 {
+		t.Fatalf("all %d seeds are accepted, so the malformed seeds the target starts from are gone", accepted)
+	}
+	// AND THE SEED LIST REACHES THE KIND THE DOOR WAS WIDENED TO, asserted rather than
+	// assumed: this test is worth nothing here if the one kind whose coverage was fuzz-only
+	// is not among the octets it walks.
+	digest, err := hex.DecodeString(attachmentEpochDigestVectorHex)
+	if err != nil {
+		t.Fatalf("the epoch digest vector is not hexadecimal: %v", err)
+	}
+	carried := false
+	for _, bs := range seeds {
+		if bytes.Equal(bs, digest) {
+			carried = true
 		}
-		again, err := EncodeServerAttachment(attachment)
-		if err != nil {
-			t.Fatalf("accepted %d octets and then refused to re-encode them: %v", len(bs), err)
-		}
-		if !bytes.Equal(again, bs) {
-			t.Fatalf("accepted %d octets and re-encoded to %d different ones, so this attachment has two encodings", len(bs), len(again))
-		}
-	})
+	}
+	if !carried {
+		t.Fatalf("no seed is the kind 0x%04x golden vector, so this walk says nothing about the kind section 5.1 check 3's door was widened to",
+			ruledAttachmentKindCodes[AttachmentEpochDigest])
+	}
+	t.Logf("%d seeds, %d accepted and re-encoded to themselves, %d refused", len(seeds), accepted, refused)
 }
 
 // ── the sixth kind's fuzz target ────────────────────────────────────────────────────
@@ -3734,7 +4092,8 @@ func TestTheCheckedInEpochDigestFuzzCorpusIsReadAndSaysSomething(t *testing.T) {
 			t.Fatalf("%s: parsed and then refused to re-encode: %v", entry.Name(), err)
 		}
 		if !bytes.Equal(again, bs) {
-			t.Fatalf("%s: parsed and re-encoded to %d different octets, so this attachment has two encodings", entry.Name(), len(again))
+			t.Fatalf("%s: parsed and re-encoded to different octets, so this attachment has two encodings: %s",
+				entry.Name(), firstOctetDifference(bs, again))
 		}
 	}
 	if accepted+refused == 0 {
@@ -3759,37 +4118,84 @@ func TestTheCheckedInEpochDigestFuzzCorpusIsReadAndSaysSomething(t *testing.T) {
 // The one property that has to hold over bytes nobody chose, at the sixth kind's door: an
 // input is refused, or it re-encodes to itself exactly.
 func FuzzParseEpochDigestAttachment(f *testing.F) {
-	for _, entry := range epochDigestWalkCorpus(f) {
+	for _, bs := range epochDigestFuzzSeeds(f) {
+		f.Add(bs)
+	}
+	f.Fuzz(func(t *testing.T, bs []byte) {
+		epochDigestParsePropertyHolds(t, fmt.Sprintf("%d octets", len(bs)), bs)
+	})
+}
+
+// The seeds the target above starts from, as one function, for the reason its sibling has
+// one: `go test -run 'Test'` never runs a Fuzz target, so a seed set only the target reads is
+// a seed set the filter this package's evidence is written with never reaches.
+//
+// The kind 0x0001 vector is among them and it is the one that must be REFUSED here, which is
+// what makes the refused count below a number rather than a formality.
+func epochDigestFuzzSeeds(t testing.TB) [][]byte {
+	t.Helper()
+	seeds := [][]byte{}
+	for _, entry := range epochDigestWalkCorpus(t) {
 		bs, err := EncodeEpochDigestAttachment(entry.attachment.EpochDigest)
 		if err != nil {
-			f.Fatalf("%s: the door refused a corpus attachment: %v", entry.name, err)
+			t.Fatalf("%s: the door refused a corpus attachment: %v", entry.name, err)
 		}
-		f.Add(bs)
+		seeds = append(seeds, bs)
 	}
 	for _, vector := range []string{attachmentEpochDigestVectorHex, attachmentEpochDigestSecondVectorHex, attachmentEpochVectorHex} {
 		bs, err := hex.DecodeString(vector)
 		if err != nil {
-			f.Fatalf("a pinned vector is not hexadecimal: %v", err)
+			t.Fatalf("a pinned vector is not hexadecimal: %v", err)
 		}
-		f.Add(bs)
+		seeds = append(seeds, bs)
 	}
-	f.Add([]byte{})
-	f.Add([]byte{0x00, 0x05})
+	seeds = append(seeds, []byte{}, []byte{0x00, 0x05})
+	if len(seeds) == 0 {
+		t.Fatal("the seed list is empty, so the target starts from nothing and the test below walks nothing")
+	}
+	return seeds
+}
 
-	f.Fuzz(func(t *testing.T, bs []byte) {
-		digest, err := ParseEpochDigestAttachment(bs)
-		if err != nil {
-			return
+// The property itself, over one input, as one function read by the target and by the test
+// below. Answers whether this door accepted the input.
+func epochDigestParsePropertyHolds(t *testing.T, what string, bs []byte) bool {
+	t.Helper()
+	digest, err := ParseEpochDigestAttachment(bs)
+	if err != nil {
+		return false
+	}
+	if digest == nil {
+		t.Fatalf("%s: accepted %d octets and answered no attachment at all", what, len(bs))
+	}
+	again, err := EncodeEpochDigestAttachment(digest)
+	if err != nil {
+		t.Fatalf("%s: accepted %d octets and then refused to re-encode them: %v", what, len(bs), err)
+	}
+	if !bytes.Equal(again, bs) {
+		t.Fatalf("%s: accepted %d octets and re-encoded to different ones, so this attachment has two encodings: %s",
+			what, len(bs), firstOctetDifference(bs, again))
+	}
+	return true
+}
+
+// Every seed the sixth kind's target starts from, under an ordinary go test, for the reason
+// its sibling above has such a test: the filter every evidence table here uses cannot reach a
+// Fuzz name.
+func TestEveryEpochDigestFuzzSeedIsRefusedOrReEncodesToItself(t *testing.T) {
+	seeds := epochDigestFuzzSeeds(t)
+	accepted, refused := 0, 0
+	for i, bs := range seeds {
+		if epochDigestParsePropertyHolds(t, fmt.Sprintf("seed %d", i), bs) {
+			accepted++
+			continue
 		}
-		if digest == nil {
-			t.Fatalf("accepted %d octets and answered no attachment at all", len(bs))
-		}
-		again, err := EncodeEpochDigestAttachment(digest)
-		if err != nil {
-			t.Fatalf("accepted %d octets and then refused to re-encode them: %v", len(bs), err)
-		}
-		if !bytes.Equal(again, bs) {
-			t.Fatalf("accepted %d octets and re-encoded to %d different ones, so this attachment has two encodings", len(bs), len(again))
-		}
-	})
+		refused++
+	}
+	if accepted == 0 {
+		t.Fatalf("all %d seeds are refused, so no seed ever reaches the re-encode half of the property", refused)
+	}
+	if refused == 0 {
+		t.Fatalf("all %d seeds are accepted, so the kind 0x0001 vector this door must refuse by name is no longer among them", accepted)
+	}
+	t.Logf("%d seeds, %d accepted and re-encoded to themselves, %d refused", len(seeds), accepted, refused)
 }

@@ -723,6 +723,13 @@ func EncodeServerAttachment(a *ServerAttachment) ([]byte, error) {
 // body table are one set of code behind both. What this door still buys is the typed one:
 // the caller with a body and no discriminator to get wrong.)
 //
+// THE SAME-OCTETS SENTENCE IS A CLAIM, and it is measured rather than argued from the shared
+// code: TestAKindTwoDoorsServeHasOneEncodingAtBoth writes every entry of this kind's corpus
+// at both doors, compares the octets, and reads each door's octets back at both. It was true
+// and unasserted from the day the served map moved, and an encode arm that wrote two of this
+// body's fields differently at one door passed this package's, messagegroup's and protocol's
+// tests under `go test -run 'Test'`.
+//
 // Everything it refuses, it refuses through the same checkServerAttachment the other door
 // runs, so there is no attachment one door will write and the other will fail to read.
 func EncodeEpochDigestAttachment(d *EpochDigestAttachment) ([]byte, error) {
