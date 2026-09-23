@@ -382,3 +382,65 @@ func TestNothingHereComputesTheAttestationPreimage(t *testing.T) {
 		"Capabilities.attestation_supported is the flag that says so on the wire", walked)
 	t.Logf("the %s exemption was %s", exempt, map[bool]string{true: "USED", false: "not used — protoc-gen-go carries only the first line of the trailing comment"}[exemptUsed])
 }
+
+// THE KEYLESS HALF OF THE CEILING, SAID OUT LOUD AT THE FIELD.
+//
+// Ruling 32 put read_epoch in the attestation and in the signing preimage, and that
+// preimage is unbuilt here — true, and measured by the test above. Read alone it
+// invites the wrong conclusion: that the field buys nothing until §9.4's fleet key
+// exists. That does not follow. `group_id` and `since_record_id` are compared against
+// the request the caller itself sent, with no key at all, and `read_epoch` is the same
+// kind of term — FetchRequest.read_epoch is field 14 of that request, so the ceiling an
+// answer NAMES and the ceiling a request AUTHENTICATED UNDER are both in the caller's
+// hands. An answer naming a ceiling the caller did not ask for is refusable today.
+//
+// The distinction decides whether a consumer that ALREADY SENDS the value bothers to
+// compare it, which is the difference between ruling 32's measured withholding being
+// detectable now and being detectable when a PKI ships. It is pinned here because it
+// lives in one sentence in one file, and a sentence is the cheapest thing in this
+// corpus to lose.
+//
+// WHAT IT DOES NOT SAY, deliberately: anything about what any particular consumer does
+// today. A comment in this repository asserting the state of another repository's code
+// is the stale-disclosure class item 248 exists to catch — it would be true on the day
+// it was written and false on the day somebody acted on it. The shape property is
+// permanent; the survey belongs in the commit that measured it.
+func TestTheReadEpochIsSaidToBeCheckableWithoutTheSignature(t *testing.T) {
+	md := (*protocol.FetchAttestation)(nil).ProtoReflect().Descriptor()
+	if md.Fields().ByName("read_epoch") == nil {
+		t.Fatal("FetchAttestation has no read_epoch; the clauses below are about that field")
+	}
+	// the shape the sentence rests on, checked rather than recited: the REQUEST carries
+	// the value the answer is compared against. Without that field the comparison the
+	// clauses describe would be impossible and the sentence would be false.
+	request := (*protocol.FetchRequest)(nil).ProtoReflect().Descriptor()
+	asked := request.Fields().ByName("read_epoch")
+	if asked == nil {
+		t.Fatal("FetchRequest has no read_epoch, so a caller holds no ceiling to compare the " +
+			"attestation's against and the keyless check below is available to nobody")
+	}
+	if asked.Number() != 14 {
+		t.Errorf("FetchRequest.read_epoch is field %d; the comment says 14, and §4.3.8 reserves 14 "+
+			"on the request messages", asked.Number())
+	}
+
+	block := flatten(t, messageBlock(t, "FetchAttestation"),
+		"AND THIS FIELD IS CHECKABLE WITHOUT THE SIGNATURE. Read the paragraph below")
+	for _, clause := range []struct {
+		what   string
+		phrase string
+	}{
+		{"that the field does not wait for the signature", "AND THIS FIELD IS CHECKABLE WITHOUT THE SIGNATURE."},
+		{"the terms it is like", "`group_id` and `since_record_id` above are already comparable with"},
+		{"where the caller's own copy comes from", "FetchRequest.read_epoch is field 14 of that"},
+		{"that it catches the measured withholding today", "is refusable TODAY, with no fleet key"},
+		{"what the signature actually adds", "What the signature adds"},
+	} {
+		if !strings.Contains(block, clause.phrase) {
+			t.Errorf("FetchAttestation.read_epoch does not state %s. The phrase %q is gone, and "+
+				"without it this block reads as though the field were inert until §9.4's fleet key "+
+				"exists — the reading that leaves the keyless comparison unbuilt in every consumer.",
+				clause.what, clause.phrase)
+		}
+	}
+}

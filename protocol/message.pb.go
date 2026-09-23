@@ -1786,10 +1786,26 @@ type SubmitRequest struct {
 	// server has already verified: `is_commit` is a projection field it checks against
 	// ParseRecord(record_bytes) before it gets here.
 	//
-	// In practice this list is empty or holds exactly one entry. §4.3.3 requires that a
-	// batch containing a commit contain exactly one record, and only a commit opens an
-	// epoch; the general rule is written as the general rule anyway, because the batch
-	// rule is Spec B's to relax and this alignment is not.
+	// WHAT THOSE THREE CLAUSES ADMIT, ENUMERATED — because they admit exactly two values
+	// and not a general batch. Spec B §4.3.3: "A batch containing a commit MUST contain
+	// exactly one record." So `epoch_keys` is EMPTY when `records` carries no commit, and
+	// holds EXACTLY ONE ENTRY when `records` is a single commit. There is no third value.
+	//
+	// AND THIS ALIGNMENT RESTS ON THAT BATCH RULE. Said plainly, because the opposite was
+	// written here first and it was false: take records = [commit, ordinary]. Length 0
+	// leaves the commit with no entry — refused. Length 2 puts an entry against a record
+	// with is_commit = 0 — refused. Any other length is refused by the length clause. No
+	// value satisfies the three clauses, so for a mixed batch this field is not
+	// under-specified, it is UNSATISFIABLE. The clause that removes the one encoding a
+	// mixed batch could have had is the same clause that has to be there: an "absent"
+	// entry would be a zero entry, and a zero entry is two empty keys.
+	//
+	// SO A RELAXATION OF §4.3.3 COSTS A WIRE CHANGE HERE, and naming the cost now is
+	// cheaper than discovering it. An entry would need explicit presence — a `bool
+	// present` on EpochKeyDelivery, or this list becoming map<uint32, EpochKeyDelivery>
+	// keyed by record index — and the REASON_OK = 0 hazard would have to be re-argued
+	// against whichever shape, since that hazard is the whole reason an empty entry is
+	// refused rather than read as "no keys for this record".
 	EpochKeys     []*EpochKeyDelivery `protobuf:"bytes,3,rep,name=epoch_keys,json=epochKeys,proto3" json:"epoch_keys,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -2211,9 +2227,23 @@ type FetchResponse struct {
 	state             protoimpl.MessageState `protogen:"open.v1"`
 	Records           []*Record              `protobuf:"bytes,1,rep,name=records,proto3" json:"records,omitempty"`
 	NextRecordId      uint64                 `protobuf:"varint,2,opt,name=next_record_id,json=nextRecordId,proto3" json:"next_record_id,omitempty"`
-	HighWaterRecordId uint64                 `protobuf:"varint,3,opt,name=high_water_record_id,json=highWaterRecordId,proto3" json:"high_water_record_id,omitempty"` // the group's max at read time
-	Complete          bool                   `protobuf:"varint,4,opt,name=complete,proto3" json:"complete,omitempty"`                                                // false when truncated by limit OR by
-	// max_response_bytes; both are NORMAL
+	HighWaterRecordId uint64                 `protobuf:"varint,3,opt,name=high_water_record_id,json=highWaterRecordId,proto3" json:"high_water_record_id,omitempty"` // the group's max AT OR BELOW read_epoch — the epoch
+	// ceiling of §5.1.1, not the group's absolute max.
+	// (It read "the group's max at read time" until
+	// 2026-09-22; the ceiling landed and this line did
+	// not move. Spec B §4.3.4 amended itself the same
+	// day and this file is the copy a second
+	// implementation reads.)
+	Complete bool `protobuf:"varint,4,opt,name=complete,proto3" json:"complete,omitempty"` // false when truncated by limit OR by
+	// max_response_bytes; both are NORMAL. NOT false for
+	// the ceiling: a page the ceiling ends is complete,
+	// because what was asked for is bounded by the epoch
+	// the request authenticated. complete = false is how
+	// a client re-asks from the cursor it holds, so a
+	// reader that has ingested the record at its ceiling
+	// would otherwise re-ask, be served nothing, and
+	// raise a no-progress error against a server that
+	// did exactly what it was asked.
 	Attestation   *FetchAttestation `protobuf:"bytes,5,opt,name=attestation,proto3" json:"attestation,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -2290,12 +2320,19 @@ type FetchAttestation struct {
 	SinceRecordId     uint64                 `protobuf:"varint,2,opt,name=since_record_id,json=sinceRecordId,proto3" json:"since_record_id,omitempty"`
 	UntilRecordId     uint64                 `protobuf:"varint,3,opt,name=until_record_id,json=untilRecordId,proto3" json:"until_record_id,omitempty"`
 	RecordIds         []uint64               `protobuf:"varint,4,rep,packed,name=record_ids,json=recordIds,proto3" json:"record_ids,omitempty"`
-	HighWaterRecordId uint64                 `protobuf:"varint,5,opt,name=high_water_record_id,json=highWaterRecordId,proto3" json:"high_water_record_id,omitempty"`
-	ServerTimeMs      uint64                 `protobuf:"varint,6,opt,name=server_time_ms,json=serverTimeMs,proto3" json:"server_time_ms,omitempty"`
-	ServerId          []byte                 `protobuf:"bytes,7,opt,name=server_id,json=serverId,proto3" json:"server_id,omitempty"`
-	ClassMask         uint32                 `protobuf:"varint,8,opt,name=class_mask,json=classMask,proto3" json:"class_mask,omitempty"`
-	HeadsOnly         bool                   `protobuf:"varint,9,opt,name=heads_only,json=headsOnly,proto3" json:"heads_only,omitempty"`
-	ReadEpoch         uint64                 `protobuf:"varint,11,opt,name=read_epoch,json=readEpoch,proto3" json:"read_epoch,omitempty"` // §4.3.4, ruling 32. The epoch ceiling this answer
+	HighWaterRecordId uint64                 `protobuf:"varint,5,opt,name=high_water_record_id,json=highWaterRecordId,proto3" json:"high_water_record_id,omitempty"` // the attested copy of FetchResponse.high_water_record_id
+	// above, and CEILING-RELATIVE exactly as that one is.
+	// Spec B C-4: compare attestations only within an
+	// identical (class_mask, heads_only, read_epoch)
+	// filter, because two HONEST answers taken at
+	// different read_epochs name different high waters,
+	// and reading that as a contradiction convicts a
+	// correct server.
+	ServerTimeMs uint64 `protobuf:"varint,6,opt,name=server_time_ms,json=serverTimeMs,proto3" json:"server_time_ms,omitempty"`
+	ServerId     []byte `protobuf:"bytes,7,opt,name=server_id,json=serverId,proto3" json:"server_id,omitempty"`
+	ClassMask    uint32 `protobuf:"varint,8,opt,name=class_mask,json=classMask,proto3" json:"class_mask,omitempty"`
+	HeadsOnly    bool   `protobuf:"varint,9,opt,name=heads_only,json=headsOnly,proto3" json:"heads_only,omitempty"`
+	ReadEpoch    uint64 `protobuf:"varint,11,opt,name=read_epoch,json=readEpoch,proto3" json:"read_epoch,omitempty"` // §4.3.4, ruling 32. The epoch ceiling this answer
 	// was served under. §5.1.1's ceiling made
 	// high_water_record_id relative to the reader's own
 	// epoch, so a server applying a SHORTER ceiling than
@@ -2313,6 +2350,24 @@ type FetchAttestation struct {
 	// holds too, and they are signed. What a signature
 	// buys is not the value; it is the server's
 	// attributable commitment to having used it.
+	//
+	// AND THIS FIELD IS CHECKABLE WITHOUT THE SIGNATURE.
+	// Read the paragraph below about the unbuilt §9.4
+	// fleet key as being about ATTRIBUTION and not about
+	// this field being inert: `group_id` and
+	// `since_record_id` above are already comparable with
+	// no key at all, against the FetchRequest the receiver
+	// itself sent, and `read_epoch` is the same kind of
+	// term — FetchRequest.read_epoch is field 14 of that
+	// request, so "the ceiling this answer was served
+	// under" and "the ceiling this request authenticated
+	// under" are both in the hands of whoever made the
+	// call. An answer naming a ceiling the caller did not
+	// ask for is refusable TODAY, with no fleet key, no
+	// signature and no PKI — and it is exactly the
+	// withholding measured above. What the signature adds
+	// is that the caller can then prove it to a third
+	// party instead of only declining the page.
 	//
 	// 11, and 11 is free: this message has never had an
 	// eleventh field. NOT 10, because `sig` landed at 10
@@ -2605,8 +2660,8 @@ func (x *SubscribeResponse) GetAcks() []*SubscriptionAck {
 type RecordPush struct {
 	state             protoimpl.MessageState `protogen:"open.v1"`
 	GroupId           []byte                 `protobuf:"bytes,1,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`
-	Records           []*Record              `protobuf:"bytes,2,rep,name=records,proto3" json:"records,omitempty"` // always contiguous in record_id
-	HighWaterRecordId uint64                 `protobuf:"varint,3,opt,name=high_water_record_id,json=highWaterRecordId,proto3" json:"high_water_record_id,omitempty"`
+	Records           []*Record              `protobuf:"bytes,2,rep,name=records,proto3" json:"records,omitempty"`                                                   // always contiguous in record_id
+	HighWaterRecordId uint64                 `protobuf:"varint,3,opt,name=high_water_record_id,json=highWaterRecordId,proto3" json:"high_water_record_id,omitempty"` // §5.1.1's epoch ceiling applies to this arm too: a
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -3277,13 +3332,27 @@ func (x *GroupStatusRequest) GetReqAuth() []byte {
 type GroupStatusResponse struct {
 	state             protoimpl.MessageState `protogen:"open.v1"`
 	CurrentEpoch      uint64                 `protobuf:"varint,1,opt,name=current_epoch,json=currentEpoch,proto3" json:"current_epoch,omitempty"`
-	HighWaterRecordId uint64                 `protobuf:"varint,2,opt,name=high_water_record_id,json=highWaterRecordId,proto3" json:"high_water_record_id,omitempty"`
-	EpochComplete     bool                   `protobuf:"varint,3,opt,name=epoch_complete,json=epochComplete,proto3" json:"epoch_complete,omitempty"` // §6.1 epoch publication step 3
-	Closed            bool                   `protobuf:"varint,4,opt,name=closed,proto3" json:"closed,omitempty"`
-	Applied           *RetentionApplied      `protobuf:"bytes,5,opt,name=applied,proto3" json:"applied,omitempty"`
-	OldestReadEpoch   uint64                 `protobuf:"varint,6,opt,name=oldest_read_epoch,json=oldestReadEpoch,proto3" json:"oldest_read_epoch,omitempty"` // the oldest epoch whose read key this server still
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	HighWaterRecordId uint64                 `protobuf:"varint,2,opt,name=high_water_record_id,json=highWaterRecordId,proto3" json:"high_water_record_id,omitempty"` // ABSOLUTE, and NOT bounded by §5.1.1's epoch ceiling —
+	// this arm and `current_epoch` above are the one place
+	// the ceiling does not reach. §5.1.1: GroupStatus
+	// "serves no records, so the rule as written does not
+	// reach it". What the two absolute counters leak is
+	// OPEN, filed as ledger item 248: a party stuck at
+	// epoch n — which, after Remove ships, is an ex-member
+	// — polls this and watches both numbers climb. It is
+	// NOT fixed by clamping them, because §5.3's argument
+	// for the ninety-day read-key window names this arm
+	// first as the route out of a stale epoch, and the
+	// server cannot tell a removed member from a member
+	// who was away. Unbuilt on both sides; the decision is
+	// the lead's and must be taken before this arm is
+	// served, not by whoever serves it first.
+	EpochComplete   bool              `protobuf:"varint,3,opt,name=epoch_complete,json=epochComplete,proto3" json:"epoch_complete,omitempty"` // §6.1 epoch publication step 3
+	Closed          bool              `protobuf:"varint,4,opt,name=closed,proto3" json:"closed,omitempty"`
+	Applied         *RetentionApplied `protobuf:"bytes,5,opt,name=applied,proto3" json:"applied,omitempty"`
+	OldestReadEpoch uint64            `protobuf:"varint,6,opt,name=oldest_read_epoch,json=oldestReadEpoch,proto3" json:"oldest_read_epoch,omitempty"` // the oldest epoch whose read key this server still
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *GroupStatusResponse) Reset() {
@@ -3526,10 +3595,23 @@ type GroupRecords struct {
 	state             protoimpl.MessageState `protogen:"open.v1"`
 	GroupId           []byte                 `protobuf:"bytes,1,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`
 	Records           []*Record              `protobuf:"bytes,2,rep,name=records,proto3" json:"records,omitempty"`
-	HighWaterRecordId uint64                 `protobuf:"varint,3,opt,name=high_water_record_id,json=highWaterRecordId,proto3" json:"high_water_record_id,omitempty"`
-	Complete          bool                   `protobuf:"varint,4,opt,name=complete,proto3" json:"complete,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	HighWaterRecordId uint64                 `protobuf:"varint,3,opt,name=high_water_record_id,json=highWaterRecordId,proto3" json:"high_water_record_id,omitempty"` // ABSOLUTE, and NOT ceiling-relative, unlike §4.3.4's
+	// and §4.3.5's. This type is carried by exactly one
+	// field in this file — RecoveryFetchResponse.groups —
+	// and §5.1.1 puts that arm "outside it entirely":
+	// §4.3.7 authorizes RecoveryFetch by the Ed25519
+	// recovery proof and not by req_auth, so a seed-only
+	// restorer holds no read key and NAMES NO EPOCH, and
+	// there is nothing for a ceiling to compare against.
+	// Its scope is the recovery_handle.
+	//
+	// Written down because the inheritance is the reader's
+	// obvious guess and it is wrong here: the three served
+	// high waters in this file do not agree, and which one
+	// a field is depends on how its arm is AUTHORIZED.
+	Complete      bool `protobuf:"varint,4,opt,name=complete,proto3" json:"complete,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *GroupRecords) Reset() {

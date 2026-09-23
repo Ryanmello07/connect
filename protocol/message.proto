@@ -224,6 +224,31 @@ message CreateGroupRequest {
                                       // and nothing else, and 14/15 are the file-wide
                                       // read_epoch/req_auth slots, which §4.3.8 exempts this
                                       // arm from and which it does not carry.
+                                      //
+                                      // PRESENCE: REQUIRED. AN ABSENT epoch_keys IS
+                                      // REASON_REJECTED, for the reason a commit with no
+                                      // entry is on SubmitRequest — a commit whose keys never
+                                      // arrived is an epoch the server would install without
+                                      // having been handed what opens it — and here there is
+                                      // no empty case to leave room for, because this
+                                      // request's one record is always a commit
+                                      // (initial_commit, is_commit = 1, epoch = 0) and that
+                                      // commit always opens epoch 1.
+                                      //
+                                      // AND HERE ABSENCE IS REPRESENTABLE, which it is not
+                                      // on SubmitRequest. This is a SINGULAR message field,
+                                      // so GetEpochKeys() answers nil for a request that
+                                      // omitted it and the server can tell that apart from a
+                                      // request that sent a zero delivery. Both are refused,
+                                      // and they are refused as DIFFERENT THINGS: a
+                                      // present-but-zero delivery is two EMPTY KEYS and not
+                                      // an absence — the REASON_OK = 0 hazard recorded at the
+                                      // foot of this file — so it is rejected as a malformed
+                                      // delivery and is never read as "no keys were sent".
+                                      // The two carriers state the same rule because the same
+                                      // hazard reaches both; stating it on one only is how
+                                      // the second one gets implemented by analogy and then
+                                      // by guess.
     // initial_commit's server_attachment is a kind 0x0005 EpochDigest carrying
     // LP(H(epoch_keys)) over the pair above. (It read "an EpochAttachment carrying
     // write_key[1]" until ruling 27 took the two keys out of the served structure; the
@@ -321,10 +346,26 @@ message SubmitRequest {
     // server has already verified: `is_commit` is a projection field it checks against
     // ParseRecord(record_bytes) before it gets here.
     //
-    // In practice this list is empty or holds exactly one entry. §4.3.3 requires that a
-    // batch containing a commit contain exactly one record, and only a commit opens an
-    // epoch; the general rule is written as the general rule anyway, because the batch
-    // rule is Spec B's to relax and this alignment is not.
+    // WHAT THOSE THREE CLAUSES ADMIT, ENUMERATED — because they admit exactly two values
+    // and not a general batch. Spec B §4.3.3: "A batch containing a commit MUST contain
+    // exactly one record." So `epoch_keys` is EMPTY when `records` carries no commit, and
+    // holds EXACTLY ONE ENTRY when `records` is a single commit. There is no third value.
+    //
+    // AND THIS ALIGNMENT RESTS ON THAT BATCH RULE. Said plainly, because the opposite was
+    // written here first and it was false: take records = [commit, ordinary]. Length 0
+    // leaves the commit with no entry — refused. Length 2 puts an entry against a record
+    // with is_commit = 0 — refused. Any other length is refused by the length clause. No
+    // value satisfies the three clauses, so for a mixed batch this field is not
+    // under-specified, it is UNSATISFIABLE. The clause that removes the one encoding a
+    // mixed batch could have had is the same clause that has to be there: an "absent"
+    // entry would be a zero entry, and a zero entry is two empty keys.
+    //
+    // SO A RELAXATION OF §4.3.3 COSTS A WIRE CHANGE HERE, and naming the cost now is
+    // cheaper than discovering it. An entry would need explicit presence — a `bool
+    // present` on EpochKeyDelivery, or this list becoming map<uint32, EpochKeyDelivery>
+    // keyed by record index — and the REASON_OK = 0 hazard would have to be re-argued
+    // against whichever shape, since that hazard is the whole reason an empty entry is
+    // refused rather than read as "no keys for this record".
     repeated EpochKeyDelivery epoch_keys = 3;
 }
 
@@ -397,9 +438,23 @@ message FetchRequest {
 message FetchResponse {
     repeated Record records       = 1;
     uint64 next_record_id         = 2;
-    uint64 high_water_record_id   = 3;   // the group's max at read time
+    uint64 high_water_record_id   = 3;   // the group's max AT OR BELOW read_epoch — the epoch
+                                         // ceiling of §5.1.1, not the group's absolute max.
+                                         // (It read "the group's max at read time" until
+                                         // 2026-09-22; the ceiling landed and this line did
+                                         // not move. Spec B §4.3.4 amended itself the same
+                                         // day and this file is the copy a second
+                                         // implementation reads.)
     bool   complete               = 4;   // false when truncated by limit OR by
-                                         // max_response_bytes; both are NORMAL
+                                         // max_response_bytes; both are NORMAL. NOT false for
+                                         // the ceiling: a page the ceiling ends is complete,
+                                         // because what was asked for is bounded by the epoch
+                                         // the request authenticated. complete = false is how
+                                         // a client re-asks from the cursor it holds, so a
+                                         // reader that has ingested the record at its ceiling
+                                         // would otherwise re-ask, be served nothing, and
+                                         // raise a no-progress error against a server that
+                                         // did exactly what it was asked.
     FetchAttestation attestation  = 5;
 }
 message FetchAttestation {
@@ -407,7 +462,14 @@ message FetchAttestation {
     uint64 since_record_id      = 2;
     uint64 until_record_id      = 3;
     repeated uint64 record_ids  = 4;
-    uint64 high_water_record_id = 5;
+    uint64 high_water_record_id = 5;    // the attested copy of FetchResponse.high_water_record_id
+                                        // above, and CEILING-RELATIVE exactly as that one is.
+                                        // Spec B C-4: compare attestations only within an
+                                        // identical (class_mask, heads_only, read_epoch)
+                                        // filter, because two HONEST answers taken at
+                                        // different read_epochs name different high waters,
+                                        // and reading that as a contradiction convicts a
+                                        // correct server.
     uint64 server_time_ms       = 6;
     bytes  server_id            = 7;
     uint32 class_mask           = 8;
@@ -430,6 +492,24 @@ message FetchAttestation {
                                         // holds too, and they are signed. What a signature
                                         // buys is not the value; it is the server's
                                         // attributable commitment to having used it.
+                                        //
+                                        // AND THIS FIELD IS CHECKABLE WITHOUT THE SIGNATURE.
+                                        // Read the paragraph below about the unbuilt §9.4
+                                        // fleet key as being about ATTRIBUTION and not about
+                                        // this field being inert: `group_id` and
+                                        // `since_record_id` above are already comparable with
+                                        // no key at all, against the FetchRequest the receiver
+                                        // itself sent, and `read_epoch` is the same kind of
+                                        // term — FetchRequest.read_epoch is field 14 of that
+                                        // request, so "the ceiling this answer was served
+                                        // under" and "the ceiling this request authenticated
+                                        // under" are both in the hands of whoever made the
+                                        // call. An answer naming a ceiling the caller did not
+                                        // ask for is refusable TODAY, with no fleet key, no
+                                        // signature and no PKI — and it is exactly the
+                                        // withholding measured above. What the signature adds
+                                        // is that the caller can then prove it to a third
+                                        // party instead of only declining the page.
                                         //
                                         // 11, and 11 is free: this message has never had an
                                         // eleventh field. NOT 10, because `sig` landed at 10
@@ -489,7 +569,12 @@ message SubscribeResponse {
 message RecordPush {
     bytes  group_id = 1;
     repeated Record records = 2;        // always contiguous in record_id
-    uint64 high_water_record_id = 3;
+    uint64 high_water_record_id = 3;    // §5.1.1's epoch ceiling applies to this arm too: a
+                                        // subscription serves no record above the read_epoch
+                                        // its req_auth was computed under, and this field is
+                                        // relative to that ceiling exactly as §4.3.4's is.
+                                        // UNIMPLEMENTED — Subscribe is unbuilt, and this line
+                                        // is the decision it INHERITS rather than re-takes.
 }
 message TransientPush {                 // EPH(0) — receipts, typing. Never touches disk.
     bytes  group_id = 1;
@@ -593,7 +678,21 @@ enum Direction { DIRECTION_UNSPECIFIED = 0; DIRECTION_UPLOAD = 1; DIRECTION_DOWN
 message GroupStatusRequest  { bytes group_id = 1; uint64 read_epoch = 14; bytes req_auth = 15; }
 message GroupStatusResponse {
     uint64 current_epoch        = 1;
-    uint64 high_water_record_id = 2;
+    uint64 high_water_record_id = 2;   // ABSOLUTE, and NOT bounded by §5.1.1's epoch ceiling —
+                                       // this arm and `current_epoch` above are the one place
+                                       // the ceiling does not reach. §5.1.1: GroupStatus
+                                       // "serves no records, so the rule as written does not
+                                       // reach it". What the two absolute counters leak is
+                                       // OPEN, filed as ledger item 248: a party stuck at
+                                       // epoch n — which, after Remove ships, is an ex-member
+                                       // — polls this and watches both numbers climb. It is
+                                       // NOT fixed by clamping them, because §5.3's argument
+                                       // for the ninety-day read-key window names this arm
+                                       // first as the route out of a stale epoch, and the
+                                       // server cannot tell a removed member from a member
+                                       // who was away. Unbuilt on both sides; the decision is
+                                       // the lead's and must be taken before this arm is
+                                       // served, not by whoever serves it first.
     bool   epoch_complete       = 3;   // §6.1 epoch publication step 3
     bool   closed               = 4;
     RetentionApplied applied    = 5;
@@ -606,8 +705,25 @@ message CapabilityChange { Capabilities capabilities = 1; uint64 capability_vers
                            repeated ServerKey server_keys = 3; BlobEndpoint blob_endpoint = 4; }
 message Backpressure     { bytes group_id = 1; uint64 resume_from_record_id = 2; }
 message Drain            { uint32 reconnect_after_ms = 1; }
-message GroupRecords     { bytes group_id = 1; repeated Record records = 2;
-                           uint64 high_water_record_id = 3; bool complete = 4; }
+message GroupRecords {
+    bytes  group_id             = 1;
+    repeated Record records     = 2;
+    uint64 high_water_record_id = 3;   // ABSOLUTE, and NOT ceiling-relative, unlike §4.3.4's
+                                       // and §4.3.5's. This type is carried by exactly one
+                                       // field in this file — RecoveryFetchResponse.groups —
+                                       // and §5.1.1 puts that arm "outside it entirely":
+                                       // §4.3.7 authorizes RecoveryFetch by the Ed25519
+                                       // recovery proof and not by req_auth, so a seed-only
+                                       // restorer holds no read key and NAMES NO EPOCH, and
+                                       // there is nothing for a ceiling to compare against.
+                                       // Its scope is the recovery_handle.
+                                       //
+                                       // Written down because the inheritance is the reader's
+                                       // obvious guess and it is wrong here: the three served
+                                       // high waters in this file do not agree, and which one
+                                       // a field is depends on how its arm is AUTHORIZED.
+    bool   complete             = 4;
+}
 message SubscriptionAck  { bytes group_id = 1; uint64 snapshot_record_id = 2; Reason reason = 3; }
 message KtGossip         { uint64 kt_epoch = 1; bytes root_hash = 2; bytes prev_root = 3;
                            bytes history_root = 4; uint64 leaf_count = 5;
