@@ -465,6 +465,18 @@ func (self *GroupSession) EpochKeys() (*EpochKeys, error) {
 // nowhere else on the ordinary path. A session that was not running when the rotation happened
 // observes nothing, which pqsecret.go's header names as the residual and its two doors answer.
 //
+// AND IT REFUSES TO OVERWRITE A SECRET THAT IS ALREADY THERE, which is new and which is the one
+// thing this method could do that nothing could diagnose. Ruling 37 has the wrap carrying
+// pq_secret[n+1] opened at epoch n, BEFORE the merge, so under item 243's step 4 the table already
+// holds the authority for the epoch this call is entering; this parameter is the caller's own
+// account of the same value. It used to erase the entry and file the argument over the top with no
+// comparison -- and both of sdk's call sites pass the group lifetime scalar -- so the wrap's
+// secret was destroyed here, the session derived epoch n+1's whole schedule from the wrong half,
+// every other member derived it from the right one, and the only symptom anywhere was an AEAD tag.
+// That is ruling 38's both-directions blackout arriving through the seam built to prevent it.
+// A differing value is now ErrPqSecretEpochConflict and NOTHING is filed or erased; the deliberate
+// supersede is InstallPqSecret, which erases what it replaces and says so.
+//
 // GROUP_HANDLE_KEY DOES NOT MOVE. It was expanded from the epoch zero root ONCE, and what this
 // session has held since construction is that answer rather than the root -- so there is nothing
 // here to re-expand and the field is handed straight back to the install. The whole reason it is
@@ -495,6 +507,12 @@ func (self *GroupSession) AdvanceEpoch(pqSecret []byte) error {
 				ErrPqSecretLength, len(pqSecret))
 			return
 		}
+		// THE CONFLICT IS REFUSED BEFORE ANYTHING IS TOUCHED, so a refused advance leaves the
+		// table exactly as it found it and the secret a wrap filed for this epoch survives the
+		// mistake. pqsecret.go owns the rule for the same reason it owns the window bound.
+		if err = self.refusePqSecretConflictOnLoop(self.handle.Epoch(), pqSecret); err != nil {
+			return
+		}
 		// AT THE EPOCH THE HANDLE IS NOW AT, read here rather than after the install, because
 		// the install is what asks the table for the secret of the epoch it is opening and a
 		// value filed afterwards would be a value the install could not see.
@@ -502,9 +520,12 @@ func (self *GroupSession) AdvanceEpoch(pqSecret []byte) error {
 		// AN INSTALL THAT FAILS BELOW LEAVES THE ENTRY FILED, and that is the safe direction
 		// rather than an oversight: the entry sits ABOVE this session's epoch, so the window
 		// drop's `epoch < self.epoch` guard never reaches it, nothing derives from an epoch the
-		// session did not enter, and a caller that retries the advance finds its own secret
-		// already there and files it again over an erase. The alternative -- filing after the
-		// install -- is the one that cannot work, because the install is the reader.
+		// session did not enter, and a caller that retries the advance with the SAME secret
+		// finds its own value already there and files it again over an erase. A retry with a
+		// different secret meets the refusal above, which is the answer two different values for
+		// one epoch should get from a path that did not ask to replace anything. The
+		// alternative -- filing after the install -- is the one that cannot work, because the
+		// install is the reader.
 		self.installPqSecretOnLoop(self.handle.Epoch(), pqSecret)
 		err = self.installEpochOnLoop(self.groupHandleKey)
 	}); postErr != nil {

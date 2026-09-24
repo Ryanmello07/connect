@@ -847,8 +847,20 @@ var recordKeyOneWayProbes = map[string]func(secret []byte) [][]byte{
 			return nil
 		}
 		defer fixture.session.Close()
-		// the rung arrives as the NEW epoch's pq_secret, so everything the session produces
-		// afterwards is produced from it.
+		// THE HANDLE MOVES FIRST, and this row used to skip that. It called AdvanceEpoch on a
+		// handle still standing at epoch zero -- so the "new" epoch was the epoch the session was
+		// already at, the rung landed on top of pq_secret[0], and the whole key schedule was
+		// re-derived in place from it. That is not what AdvanceEpoch is, and it is the shape
+		// ErrPqSecretEpochConflict now refuses: two different values for one epoch, arriving on
+		// the path that did not ask to replace anything. The row still hands the rung in as the
+		// new epoch's pq_secret and still reads what the session produces from it; it just does
+		// it at an epoch the session has actually entered.
+		if _, _, _, err := fixture.handle.Commit(nil); err != nil {
+			return nil
+		}
+		if err := fixture.handle.MergePendingCommit(); err != nil {
+			return nil
+		}
 		if err := fixture.session.AdvanceEpoch(secret); err != nil {
 			return nil
 		}

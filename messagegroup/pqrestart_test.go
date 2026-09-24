@@ -21,6 +21,8 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"go/ast"
+	"slices"
 	"testing"
 
 	"github.com/urnetwork/connect/message"
@@ -241,11 +243,17 @@ func TestInstallPqSecretFilesRefutesOnTheOctetsAndRefusesWhatItCannotServe(t *te
 	pair := newPastEpochPair(t, "pq-restart-door")
 	pair.advanceOpenerWith(t, rotatedTestPqSecret())
 	restarted := restartOpener(t, pair, rotatedTestPqSecret())
+	var at uint64
+	if err := restarted.do(func() { at = restarted.epoch }); err != nil {
+		t.Fatalf("do: %v", err)
+	}
 
 	// FILING TODAY'S OWN SECRET AGAIN REFUTES NOTHING. The control for the refutation: same door,
-	// same epoch arithmetic, octets that match, premise intact.
-	if err := restarted.InstallPqSecret(2, rotatedTestPqSecret()); err != nil {
-		t.Fatalf("InstallPqSecret(2, the secret it already holds): %v", err)
+	// octets that match, premise intact. It files at the epoch ABOVE this session's own -- ruling
+	// 37's epoch, and the one this door exists for. It used to file AT this session's own epoch,
+	// and that acceptance was itself a defect, measured two blocks down.
+	if err := restarted.InstallPqSecret(at+1, rotatedTestPqSecret()); err != nil {
+		t.Fatalf("InstallPqSecret(%d, the secret it already holds): %v", at+1, err)
 	}
 	var premise bool
 	if err := restarted.do(func() { premise = restarted.pqLifetime }); err != nil {
@@ -304,12 +312,35 @@ func TestInstallPqSecretFilesRefutesOnTheOctetsAndRefusesWhatItCannotServe(t *te
 	// AND AN EPOCH ABOVE THIS SESSION'S OWN IS ACCEPTED, which is not an oversight: ruling 37 has
 	// the wraps for epoch n+1 submitted AT epoch n, staged and pre-merge, so the secret of an
 	// epoch this session has not yet entered is a value that legitimately arrives early.
-	var at uint64
-	if err := restarted.do(func() { at = restarted.epoch }); err != nil {
-		t.Fatalf("do: %v", err)
-	}
+	//
+	// WHAT THIS BLOCK USED TO BE was `err != nil` and nothing else, and that was the whole of the
+	// measurement under a capability the ledger report called "asserted, not incidental". err ==
+	// nil says the call was not refused; it says nothing about whether the value survives, and it
+	// did not -- the very next AdvanceEpoch erased it and filed its own argument over the top.
+	// Case 3c is that assertion, over the sequence ruling 37 actually specifies.
 	if err := restarted.InstallPqSecret(at+1, replacement); err != nil {
 		t.Errorf("InstallPqSecret at epoch %d, one above this session's %d, answered %v; ruling 37 has that secret arriving before the merge that opens its epoch", at+1, at, err)
+	}
+
+	// AND THE SESSION'S OWN EPOCH IS REFUSED, one epoch away from the acceptance above so the two
+	// fail in opposite directions off one session. This door FILES AND DOES NOT RE-DERIVE: a
+	// value accepted here would move pq_secret[at] while self.storageRoot stayed extracted from
+	// the octets installEpochOnLoop was handed, and one advance later pastEpochOnLoop would
+	// rebuild epoch `at` out of the TABLE and every record of it would stop opening at the AEAD
+	// tag -- ruling 40's own defect arriving through the door added to close it. Reproduced
+	// before it was repaired; case 6 holds the invariant the refusal protects.
+	if err := restarted.InstallPqSecret(at, replacement); !errors.Is(err, ErrPqSecretEpochIsCurrent) {
+		t.Errorf("InstallPqSecret at epoch %d, the epoch this session is STANDING at, answered %v, want ErrPqSecretEpochIsCurrent; this door's own doc says it files for an epoch this session did not stand at, and it files without re-deriving", at, err)
+	}
+	// and the refusal FILED NOTHING, which is the half a sentinel check cannot see. The value
+	// offered above is the one that DIFFERS from what stands at `at`, so a door that filed it
+	// would be visible here.
+	var untouched []byte
+	if err := restarted.do(func() { untouched = append([]byte(nil), restarted.pqSecrets[at]...) }); err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	if bytes.Equal(untouched, replacement) || !bytes.Equal(untouched, rotatedTestPqSecret()) {
+		t.Errorf("pq_secret[%d] moved under a refused call; a refusal that files is a refusal in the error only", at)
 	}
 
 	// AND A CLOSED SESSION'S DOORS ARE SHUT. Both of them, because two doors onto one field with
@@ -371,6 +402,275 @@ func TestInstallPqSecretRefusesAnEpochPastTheWindowAndAcceptsTheOneAtTheEdge(t *
 	}
 	if heldBelow {
 		t.Errorf("the refused epoch %d was filed anyway; a refusal that files is a refusal with a side effect", edge-1)
+	}
+}
+
+// candidateClassKeysAt is epochOneCandidateKeys for any epoch and any two candidates: the class
+// keys one epoch yields under two different pq_secrets, ASSERTED UNEQUAL before either of them is
+// compared against anything. Without it every reading below is one number photographed twice.
+func candidateClassKeysAt(t *testing.T, pair *pastEpochPair, epoch uint64, a []byte, b []byte) (*ClassKeys, *ClassKeys) {
+	t.Helper()
+	handle, err := pair.chain.b.engine.LoadGroup(pair.chain.joined.GroupId(), epoch)
+	if err != nil {
+		t.Fatalf("LoadGroup(epoch %d): %v", epoch, err)
+	}
+	defer handle.Close()
+	mlsSecret, err := handle.Export(mlsSecretLabel, nil, mlsSecretBytes)
+	if err != nil {
+		t.Fatalf("Export at epoch %d: %v", epoch, err)
+	}
+	defer zeroize(mlsSecret)
+	rootA := StorageRoot(mlsSecret, a)
+	defer zeroize(rootA)
+	rootB := StorageRoot(mlsSecret, b)
+	defer zeroize(rootB)
+	keysA := DeriveClassKeys(rootA)
+	keysB := DeriveClassKeys(rootB)
+	if classKeysEqual(keysA, keysB) {
+		t.Fatalf("CONTROL FAILED: the two candidate class-key sets for epoch %d are equal, so nothing in this case can tell an answer from a wrong answer", epoch)
+	}
+	return keysA, keysB
+}
+
+// liveClassKeysOf reads the class keys the session is ACTUALLY sealing and opening under, off the
+// loop, copied so nothing here aliases the schedule.
+func liveClassKeysOf(t *testing.T, session *GroupSession) *ClassKeys {
+	t.Helper()
+	var keys *ClassKeys
+	if err := session.do(func() {
+		keys = &ClassKeys{
+			Perm:    append([]byte(nil), session.classKeys.Perm...),
+			Durable: append([]byte(nil), session.classKeys.Durable...),
+			Media:   append([]byte(nil), session.classKeys.Media...),
+		}
+	}); err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	return keys
+}
+
+// ── 3c. RULING 37's OWN SEQUENCE, WHICH THE ERR==NIL ASSERTION DID NOT MEASURE ──────────────────
+//
+// InstallPqSecret(n+1) then AdvanceEpoch, which is what the wrap delivers: the wraps carrying
+// pq_secret[n+1] are submitted at epoch n and opened BEFORE the merge, so the table holds that
+// epoch's authority when the advance runs. What this case asserts is that the filed value SURVIVES
+// the advance and is what the epoch's own schedule is derived from.
+//
+// IT DID NOT. The install compared the arriving value against the entry at the epoch being LEFT
+// and never against the entry it was about to ERASE, so AdvanceEpoch blanked the wrap's secret,
+// filed its own argument over the top and answered nil -- and both production call sites in sdk
+// hand in the group lifetime scalar. The session then ran epoch n+1 on one secret while every
+// other member ran it on another, and the only symptom anywhere was an AEAD tag: ruling 38's
+// undiagnosable both-directions blackout, produced by the seam built to prevent it. The whole of
+// the measurement under that capability was `err != nil`, which says a call was not refused and
+// says nothing about whether its effect lasted one line.
+//
+// THE MIS-WIRED CALLER IS THE OTHER HALF, in the same pass and off the same session: an advance
+// carrying a DIFFERENT secret for that epoch is ErrPqSecretEpochConflict, it files nothing, it
+// erases nothing, and the wrap's value is still there afterwards. A case with only the happy arm
+// would be satisfied by a session that ignored its advance parameter entirely.
+func TestAWrapsSecretForTheNextEpochSurvivesTheAdvanceAndIsWhatThatEpochDerivesFrom(t *testing.T) {
+	pair := newPastEpochPair(t, "pq-restart-ruling37")
+	wrapSecret := rotatedTestPqSecret()
+	scalar := pair.chain.pqSecret
+
+	// THE COMMIT THAT OPENS THE NEXT EPOCH, merged at the handle while the SESSION still stands
+	// at epoch n -- which is exactly the window ruling 37 puts the wrap in.
+	if _, _, _, err := pair.chain.joined.Commit(nil); err != nil {
+		t.Fatalf("Commit(nil): %v", err)
+	}
+	if err := pair.chain.joined.MergePendingCommit(); err != nil {
+		t.Fatalf("MergePendingCommit: %v", err)
+	}
+	next := pair.chain.joined.Epoch()
+	wrapKeys, scalarKeys := candidateClassKeysAt(t, pair, next, wrapSecret, scalar)
+
+	var standing uint64
+	if err := pair.opener.do(func() { standing = pair.opener.epoch }); err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	if standing >= next {
+		t.Fatalf("the session stands at epoch %d and the new epoch is %d; this case is about a secret filed for an epoch the session has NOT entered", standing, next)
+	}
+	if err := pair.opener.InstallPqSecret(next, wrapSecret); err != nil {
+		t.Fatalf("InstallPqSecret(%d, the wrap's secret) while standing at %d: %v", next, standing, err)
+	}
+
+	// THE MIS-WIRED ADVANCE, FIRST, so that the happy arm below cannot be read as "the parameter
+	// was ignored". sdk/urmessage/group.go's committer and receiver both hand in the lifetime
+	// scalar today, and that is this call.
+	if err := pair.opener.AdvanceEpoch(scalar); !errors.Is(err, ErrPqSecretEpochConflict) {
+		t.Fatalf("AdvanceEpoch with a secret differing from the one already filed for epoch %d answered %v, want ErrPqSecretEpochConflict; silently replacing it is ruling 38's blackout and it answered nil before this refusal existed", next, err)
+	}
+	var survived []byte
+	if err := pair.opener.do(func() { survived = append([]byte(nil), pair.opener.pqSecrets[next]...) }); err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	if !bytes.Equal(survived, wrapSecret) {
+		t.Fatalf("the refused advance moved pq_secret[%d] anyway; nothing may be filed or erased on the path that refuses", next)
+	}
+	if !containsNonZero(survived) {
+		t.Fatalf("pq_secret[%d] is all zero after the refused advance; the entry was erased by a call that filed nothing in its place", next)
+	}
+
+	// AND THE ADVANCE THAT AGREES WITH THE WRAP GOES THROUGH, and the epoch's LIVE schedule is
+	// the wrap's and not the scalar's. This is the assertion `err != nil` stood in for.
+	if err := pair.opener.AdvanceEpoch(wrapSecret); err != nil {
+		t.Fatalf("AdvanceEpoch with the secret already filed for epoch %d: %v", next, err)
+	}
+	var after []byte
+	var now uint64
+	if err := pair.opener.do(func() {
+		after = append([]byte(nil), pair.opener.pqSecrets[next]...)
+		now = pair.opener.epoch
+	}); err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	if now != next {
+		t.Fatalf("the session stands at epoch %d after an advance into %d", now, next)
+	}
+	if !bytes.Equal(after, wrapSecret) {
+		t.Errorf("pq_secret[%d] is not the wrap's secret after the advance; the filed value is the one the epoch ran on", next)
+	}
+	live := liveClassKeysOf(t, pair.opener)
+	if !classKeysEqual(live, wrapKeys) || classKeysEqual(live, scalarKeys) {
+		t.Errorf("epoch %d's live class keys are the wrap's: %t, the scalar's: %t; want true/false. The table holding the right octets while the schedule was derived from the wrong ones is the same defect one field further in",
+			next, classKeysEqual(live, wrapKeys), classKeysEqual(live, scalarKeys))
+	}
+	// AND THE SEALING PATH AGREES WITH THE SCHEDULE, so this is not a reading of one field: a
+	// record sealed here is sealed under the root the table's octets extract to.
+	if _, err := pair.opener.SealRecord(message.RetentionDurable, 0, false,
+		[]byte("head"), []byte("sealed at the wrap's epoch"), 0, nil); err != nil {
+		t.Errorf("SealRecord at the advanced epoch: %v", err)
+	}
+}
+
+// ── 3d. THE INVARIANT THE TWO REFUSALS PROTECT ──────────────────────────────────────────────────
+//
+// THE TABLE AND THE LIVE KEY SCHEDULE MAY NOT DISAGREE ABOUT self.epoch. self.storageRoot was
+// extracted ONCE, by installEpochOnLoop, from pq_secret[self.epoch] as the table held it then;
+// everything this session seals and opens at its own epoch hangs off it, and pastEpochOnLoop
+// rebuilds that epoch from the TABLE the moment the session moves on. Two answers to one question
+// is a session that works today and opens nothing tomorrow, with an AEAD tag for a diagnosis.
+//
+// IT IS ASSERTED OVER EVERY DOOR THAT COULD BREAK IT AND IT FAILS BOTH WAYS. The doors are walked
+// first -- construct, install a past epoch, install the next epoch, declare, advance -- and the
+// invariant is held after each; then the disagreement is PLANTED on the loop, because no door can
+// produce it any more, and the same check is required to catch it. Without the planted half this
+// case would be satisfied by a check that compared a value against itself.
+func TestTheTableAndTheLiveScheduleCannotDisagreeAboutTheSessionsOwnEpoch(t *testing.T) {
+	pair := newPastEpochPair(t, "pq-restart-invariant")
+	session := restartOpenerOnTheChain(t, pair, pair.chain.pqSecret)
+
+	// agrees re-derives self.epoch's storage root from the TABLE's own octets and compares it
+	// against the root the session is actually using. It answers the comparison rather than
+	// asserting, so the planted half below can require it to say false.
+	agrees := func() bool {
+		t.Helper()
+		var epoch uint64
+		var fromTable []byte
+		var live []byte
+		if err := session.do(func() {
+			epoch = session.epoch
+			fromTable = append([]byte(nil), session.pqSecrets[session.epoch]...)
+			live = append([]byte(nil), session.storageRoot...)
+		}); err != nil {
+			t.Fatalf("do: %v", err)
+		}
+		if len(fromTable) == 0 {
+			t.Fatalf("the table holds no entry at this session's own epoch %d, so the invariant is being read over nothing", epoch)
+		}
+		if !containsNonZero(live) {
+			t.Fatalf("this session's storage_root is all zero, so the comparison below would hold over two blanks")
+		}
+		handle, err := pair.chain.b.engine.LoadGroup(pair.chain.joined.GroupId(), epoch)
+		if err != nil {
+			t.Fatalf("LoadGroup(epoch %d): %v", epoch, err)
+		}
+		defer handle.Close()
+		mlsSecret, err := handle.Export(mlsSecretLabel, nil, mlsSecretBytes)
+		if err != nil {
+			t.Fatalf("Export at epoch %d: %v", epoch, err)
+		}
+		defer zeroize(mlsSecret)
+		rebuilt := StorageRoot(mlsSecret, fromTable)
+		defer zeroize(rebuilt)
+		return bytes.Equal(rebuilt, live)
+	}
+
+	if !agrees() {
+		t.Fatalf("the invariant does not hold at construction, so nothing below is measuring a door")
+	}
+
+	other := make([]byte, PqSecretBytes)
+	for i := range other {
+		other[i] = byte(0x9B ^ (i * 3))
+	}
+	var built uint64
+	if err := session.do(func() { built = session.epoch }); err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	if built == 0 {
+		t.Fatalf("this session was built at epoch 0 and the past-epoch door below has no epoch to file at")
+	}
+	if err := session.InstallPqSecret(built-1, other); err != nil {
+		t.Fatalf("InstallPqSecret(%d, a past epoch's own secret): %v", built-1, err)
+	}
+	if !agrees() {
+		t.Errorf("filing a PAST epoch's secret moved this session's own epoch out of agreement with the table; that door files at the epoch it was given and nowhere else")
+	}
+	if err := session.InstallPqSecret(built+1, other); err != nil {
+		t.Fatalf("InstallPqSecret(%d, the next epoch's secret): %v", built+1, err)
+	}
+	if !agrees() {
+		t.Errorf("filing the NEXT epoch's secret moved this session's own epoch out of agreement with the table")
+	}
+	if err := session.DeclarePqSecretRotated(); err != nil {
+		t.Fatalf("DeclarePqSecretRotated: %v", err)
+	}
+	if !agrees() {
+		t.Errorf("the declaration moved this session's own epoch out of agreement with the table; it states a fact and files nothing")
+	}
+	// and the advance, which is the one path that moves BOTH and must move them together.
+	if _, _, _, err := pair.chain.joined.Commit(nil); err != nil {
+		t.Fatalf("Commit(nil): %v", err)
+	}
+	if err := pair.chain.joined.MergePendingCommit(); err != nil {
+		t.Fatalf("MergePendingCommit: %v", err)
+	}
+	if err := session.AdvanceEpoch(other); err != nil {
+		t.Fatalf("AdvanceEpoch into the epoch whose secret was already filed: %v", err)
+	}
+	if !agrees() {
+		t.Errorf("an advance left the table and the live schedule disagreeing about the epoch it entered; AdvanceEpoch files AND re-derives, and that is the whole reason InstallPqSecret refuses this session's own epoch")
+	}
+
+	// AND THE PLANTED DISAGREEMENT, because a check that cannot say false is not a check. No door
+	// can produce this state -- InstallPqSecret refuses self.epoch with ErrPqSecretEpochIsCurrent
+	// and AdvanceEpoch refuses a conflicting value with ErrPqSecretEpochConflict -- so it is
+	// written straight onto the loop, which is what those two refusals are for.
+	var saved []byte
+	if err := session.do(func() {
+		saved = append([]byte(nil), session.pqSecrets[session.epoch]...)
+		zeroize(session.pqSecrets[session.epoch])
+		session.pqSecrets[session.epoch] = append([]byte(nil), pair.chain.pqSecret...)
+	}); err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	if bytes.Equal(saved, pair.chain.pqSecret) {
+		t.Fatalf("the planted value equals the one already at this session's epoch, so the disagreement below was never planted")
+	}
+	if agrees() {
+		t.Errorf("the table was made to disagree with the live schedule about epoch's own secret and the invariant still held; this check cannot catch what the two refusals exist to prevent, so every reading above it is vacuous")
+	}
+	if err := session.do(func() {
+		zeroize(session.pqSecrets[session.epoch])
+		session.pqSecrets[session.epoch] = saved
+	}); err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	if !agrees() {
+		t.Errorf("the planted value was put back and the invariant did not return, so the reading above was not the plant")
 	}
 }
 
@@ -539,11 +839,12 @@ func TestThePremiseAnswersExactlyTheEpochsBelowTheOneTheSessionWasBuiltAt(t *tes
 //
 // A mutant that puts the PREMISE arm first survives this package's whole suite, and after the
 // query was checked that turned out to be a fact about the code rather than a hole in the reading.
-// installPqSecretOnLoop is the ONLY writer of the table -- five reaches of self.pqSecrets[...] in
-// the production source, one of them a store -- and it drops the premise the moment a value
-// arrives that differs from the one at this session's epoch. So WHILE THE PREMISE STANDS EVERY
-// ENTRY IN THE TABLE IS THE SAME OCTETS, the two arms return equal values for every epoch, and no
-// reading of the live doors can tell the order apart. The mutant is equivalent, today.
+// installPqSecretOnLoop is the ONLY writer of an ENTRY of the table -- case 5b walks every
+// production source and asserts that, rather than this paragraph counting greps -- and it drops
+// the premise the moment a value arrives that differs from the one already there. So WHILE THE
+// PREMISE STANDS EVERY ENTRY IN THE TABLE IS THE SAME OCTETS, the two arms return equal values for
+// every epoch, and no reading of the live doors can tell the order apart. The mutant is
+// equivalent, today.
 //
 // TODAY IS THE WHOLE OF THAT SENTENCE. The invariant is exactly what item 243's step 4 removes: a
 // device wrap delivers pq_secret[k] per epoch, the table starts holding different values, and the
@@ -644,5 +945,190 @@ func TestWhileThePremiseStandsTheTableHoldsOneValueAndTheTableArmStillAnswersFir
 		}
 	}); err != nil {
 		t.Fatalf("do: %v", err)
+	}
+}
+
+// ── 5b. WHO MAY WRITE THE TABLE, ASSERTED OVER EVERY PRODUCTION SOURCE ──────────────────────────
+//
+// CASE 5's ARGUMENT RESTS ON THIS AND IT WAS A GREP IN A COMMENT. "installPqSecretOnLoop is the
+// only writer, so while the premise stands every entry is the same octets, so the arm order is
+// unobservable" is the sentence that decided a surviving mutant was equivalent rather than
+// escaped. A sentence load-bearing enough to dispose of a mutant is load-bearing enough to be
+// measured, and the same sentence is now doing the same job for the refutation against the entry
+// being REPLACED: that comparison is equivalent today for exactly this reason and will stop being
+// so the day a wrap files a differing value.
+//
+// IT IS A CLASS AND NOT A FILE. Every non-test source of this package is parsed and every write of
+// the pqSecrets field is reported with the function it is in -- the entry store, the two deletes,
+// the whole-field assignment and the constructor's literal -- and the set is held against a
+// disposition written down here. A gate that opened pqsecret.go by name would be scoped to the
+// address this table has today, which is the blindness ledger item 253 names twice.
+//
+// THE POSITIVE CONTROL IS INLINE AND IT FIRES FOR ITS OWN REASON: installPqSecretOnLoop's store
+// must be in the reading before the reading's zero means anything, and a run that stopped finding
+// the field at all reports the same clean set as a complete one.
+func TestOnlyOneFunctionOfThisPackageWritesAnEntryOfThePqSecretTable(t *testing.T) {
+	fileSet, sources := messagegroupProductionSources(t)
+
+	type tableWrite struct {
+		where string
+		kind  string
+		at    string
+	}
+	// isTable answers whether an expression is the pqSecrets FIELD, by shape and not by the
+	// receiver's spelling, so a body that renamed its receiver is still read.
+	isTable := func(node ast.Expr) bool {
+		selector, isSelector := node.(*ast.SelectorExpr)
+		return isSelector && selector.Sel != nil && selector.Sel.Name == "pqSecrets"
+	}
+	writes := []tableWrite{}
+	for _, source := range sources {
+		enclosing := ""
+		ast.Inspect(source.parsed, func(node ast.Node) bool {
+			switch typed := node.(type) {
+			case *ast.FuncDecl:
+				if typed.Name != nil {
+					enclosing = typed.Name.Name
+				}
+			case *ast.AssignStmt:
+				for _, target := range typed.Lhs {
+					kind := ""
+					if index, isIndex := target.(*ast.IndexExpr); isIndex && isTable(index.X) {
+						kind = "entry"
+					}
+					if isTable(target) {
+						kind = "whole field"
+					}
+					if kind != "" {
+						writes = append(writes, tableWrite{where: enclosing, kind: kind,
+							at: fileSet.Position(target.Pos()).String()})
+					}
+				}
+			case *ast.CallExpr:
+				name, isName := typed.Fun.(*ast.Ident)
+				if isName && name.Name == "delete" && 0 < len(typed.Args) && isTable(typed.Args[0]) {
+					writes = append(writes, tableWrite{where: enclosing, kind: "delete",
+						at: fileSet.Position(typed.Pos()).String()})
+				}
+			case *ast.KeyValueExpr:
+				key, isKey := typed.Key.(*ast.Ident)
+				if isKey && key.Name == "pqSecrets" {
+					writes = append(writes, tableWrite{where: enclosing, kind: "literal",
+						at: fileSet.Position(typed.Pos()).String()})
+				}
+			}
+			return true
+		})
+	}
+
+	reported := []string{}
+	for _, one := range writes {
+		reported = append(reported, one.where+" ("+one.kind+")")
+	}
+	slices.Sort(reported)
+	t.Logf("%d write(s) of the pq_secret table in this package's production source: %v", len(writes), reported)
+
+	// THE CONTROL, in the same reading: the one store this whole argument is about.
+	foundStore := false
+	for _, one := range writes {
+		if one.where == "installPqSecretOnLoop" && one.kind == "entry" {
+			foundStore = true
+		}
+	}
+	if !foundStore {
+		t.Fatalf("this reading finds no entry store in installPqSecretOnLoop, so it is not reading the shape it exists for and the disposition below would be satisfied by an empty walk. It read: %v", reported)
+	}
+
+	// THE DISPOSITION, WRITTEN DOWN AS A SET RATHER THAN AS A COUNT, so a write that moves house
+	// says which house it moved to.
+	//
+	//   installPqSecretOnLoop      entry      the ONE writer of an entry; case 5's argument is
+	//                                         this row and nothing else
+	//   dropPqSecretsBelowWindowOnLoop delete the window bound, which forgets and erases together
+	//   zeroizeOnLoop              delete     Close, which empties the table entry by entry
+	//   zeroizeOnLoop              whole field  and then drops the emptied map
+	//   NewGroupSession            literal    the empty table a session starts with
+	//
+	// A SECOND `entry` ROW IS THE ONE THAT MATTERS. It would mean some other body can put octets
+	// under an epoch, and with it case 5's "every entry is the same octets while the premise
+	// stands" stops being true -- so the arm-order mutant it disposed of, and the
+	// replace-refutation this file measures on planted state, both stop being equivalent and
+	// start being escaped. Whoever adds one moves case 5's paragraph in the same commit.
+	want := []string{
+		"NewGroupSession (literal)",
+		"dropPqSecretsBelowWindowOnLoop (delete)",
+		"installPqSecretOnLoop (entry)",
+		"zeroizeOnLoop (delete)",
+		"zeroizeOnLoop (whole field)",
+	}
+	if !slices.Equal(reported, want) {
+		t.Errorf("the writers of the pq_secret table are\n  %v\nand the disposition is\n  %v\nEvery difference is a body that can now put octets under an epoch, or one that stopped being able to; case 5's equivalence argument and the replace-refutation of installPqSecretOnLoop both rest on there being exactly one entry writer",
+			reported, want)
+	}
+}
+
+// ── 5c. THE REFUTATION AGAINST THE ENTRY BEING REPLACED, IN THE STATE THAT MAKES IT LOAD-BEARING ─
+//
+// installPqSecretOnLoop makes TWO comparisons and one of them is equivalent to the other today,
+// for case 5b's reason: while the premise stands every entry is the same octets, so "differs from
+// the entry at self.epoch" and "differs from the entry being replaced" fire together. Saying that
+// out loud is the difference between a comparison that is redundant and one that is unmeasured --
+// the previous pass through this file found a surviving mutant that turned out to be equivalent,
+// and the lesson recorded was to assert BOTH the invariant and the thing it makes unobservable.
+//
+// SO THE STATE IS PLANTED, because no door produces it: a table holding two different values with
+// the premise still standing is exactly what step 4's wrap creates and what nothing today can. In
+// it, a value arriving for the epoch whose entry differs must drop the premise, and a session that
+// compared only against its own epoch's entry would keep it -- and would then answer every past
+// epoch out of today's octets, which is ruling 40's defect with the right answer already in hand.
+//
+// THE CONTROL IS IN THE SAME PASS AND IT FIRES FOR ITS OWN REASON: the arriving value EQUALS the
+// entry at self.epoch, so the first comparison provably cannot be what drops the premise.
+func TestTheInstallRefutesAgainstTheEntryItIsAboutToReplaceAndNotOnlyAgainstItsOwnEpoch(t *testing.T) {
+	pair := newPastEpochPair(t, "pq-restart-replace-refutation")
+	session := restartOpenerOnTheChain(t, pair, pair.chain.pqSecret)
+
+	other := make([]byte, PqSecretBytes)
+	for i := range other {
+		other[i] = byte(0x47 ^ (i * 13))
+	}
+	var at uint64
+	if err := session.do(func() { at = session.epoch }); err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	if at == 0 {
+		t.Fatalf("this session was built at epoch 0 and the plant below needs an epoch beside its own")
+	}
+	below := at - 1
+
+	var premise bool
+	var standingEqualsArriving bool
+	if err := session.do(func() {
+		// THE PLANT: a differing entry at another epoch, premise left standing. No door can do
+		// this -- filing a differing value is what drops the premise -- which is the whole reason
+		// it is written here and the whole reason the comparison under test is unobservable
+		// through the doors today.
+		if held, isHeld := session.pqSecrets[below]; isHeld {
+			zeroize(held)
+		}
+		session.pqSecrets[below] = append([]byte(nil), other...)
+		session.pqLifetime = true
+		// THE CONTROL: what arrives equals the entry at this session's OWN epoch, so the
+		// comparison this file used to make cannot be what fires below.
+		arriving := append([]byte(nil), session.pqSecrets[at]...)
+		standingEqualsArriving = bytes.Equal(arriving, session.pqSecrets[at])
+		if bytes.Equal(arriving, session.pqSecrets[below]) {
+			t.Fatalf("the planted entry equals the arriving value, so nothing below differs from anything")
+		}
+		session.installPqSecretOnLoop(below, arriving)
+		premise = session.pqLifetime
+	}); err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	if !standingEqualsArriving {
+		t.Fatalf("the control did not hold: the arriving value is not the entry at this session's own epoch, so the refutation below could have come from either comparison")
+	}
+	if premise {
+		t.Errorf("a value replaced an entry holding DIFFERENT octets and the group-lifetime premise survived; the install compared only against the entry at this session's own epoch, never against the one it was about to erase, and that is the reading under which an advance destroyed a wrap's pq_secret without a word")
 	}
 }

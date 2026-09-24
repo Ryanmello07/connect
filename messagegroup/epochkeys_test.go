@@ -944,20 +944,31 @@ func TestTheEpochKeysDoorJoinsTheDerivedClassOfGroupSessionMethods(t *testing.T)
 	if !slices.Contains(all, "EpochKeys") {
 		t.Fatal("no method named EpochKeys is declared on *GroupSession, so the door this file tests is not in the class the loop gate holds")
 	}
-	if len(all) != 43 {
-		t.Errorf("%d methods are declared on *GroupSession and ledger item 251's ruling 40 makes it 43 -- 38 under item 242's R4, which was 35 after item 241's multi-epoch open (30 after MASTER section 8.4's second pass, which was 24 after the 2026-09-13 seal lift plus frameBodyOnLoop and unframeBodyOnLoop for the inner frame plus refuseFrameBindingsOnLoop, OpenCeremonyRecord, openRecordThroughDoor and MessageIdOf for the arm split and the id door, plus the five of pastepoch.go: InstallPastEpochLoader, TrackSenderAt and trackSenderAtOnLoop, scheduleForOnLoop and pastEpochOnLoop), plus R4's three: RoleAt, roleAtOnLoop and roleTableOnLoop -- plus the FIVE of pqsecret.go: installPqSecretOnLoop, pqSecretForOnLoop and dropPqSecretsBelowWindowOnLoop for the table, and InstallPqSecret and DeclarePqSecretRotated for the fact a restarted session cannot observe for itself; the number moves by one per method, and a method that arrived without moving it arrived without a thought about which file it belongs in",
+	if len(all) != 44 {
+		t.Errorf("%d methods are declared on *GroupSession and ledger item 251's ruling 40 makes it 44 -- 38 under item 242's R4, which was 35 after item 241's multi-epoch open (30 after MASTER section 8.4's second pass, which was 24 after the 2026-09-13 seal lift plus frameBodyOnLoop and unframeBodyOnLoop for the inner frame plus refuseFrameBindingsOnLoop, OpenCeremonyRecord, openRecordThroughDoor and MessageIdOf for the arm split and the id door, plus the five of pastepoch.go: InstallPastEpochLoader, TrackSenderAt and trackSenderAtOnLoop, scheduleForOnLoop and pastEpochOnLoop), plus R4's three: RoleAt, roleAtOnLoop and roleTableOnLoop -- plus the SIX of pqsecret.go: installPqSecretOnLoop, pqSecretForOnLoop, dropPqSecretsBelowWindowOnLoop and refusePqSecretConflictOnLoop for the table, and InstallPqSecret and DeclarePqSecretRotated for the fact a restarted session cannot observe for itself; the number moves by one per method, and a method that arrived without moving it arrived without a thought about which file it belongs in",
 			len(all))
 	}
-	// AND THE FIVE OF THE pq_secret TABLE ARE IN A FILE OF THEIR OWN, which is the same per-file
+	// AND THE SIX OF THE pq_secret TABLE ARE IN A FILE OF THEIR OWN, which is the same per-file
 	// judgement pastepoch.go's five were held to and the same reason. What the table is is not
 	// the session's epoch state: it is the one thing on this struct that SURVIVES an epoch
 	// install, with a bound of its own (PastEpochWindow), an erase discipline of its own, and a
-	// group-lifetime premise that is a paragraph rather than a line. Five methods of that in
-	// session.go would be five methods a reader meets while reading about the epoch that is being
+	// group-lifetime premise that is a paragraph rather than a line. Six methods of that in
+	// session.go would be six methods a reader meets while reading about the epoch that is being
 	// replaced. The DROP is still not a method of the session for pastepoch.go's reason --
 	// connect/mls reads an erase field by field and follows no delegation -- so the whole-table
 	// erase is spelled in zeroizeOnLoop, and what dropPqSecretsBelowWindowOnLoop holds is the
 	// WINDOW, which is arithmetic and not an erase discipline.
+	//
+	// THE SIXTH IS refusePqSecretConflictOnLoop AND THE JUDGEMENT IS THE SAME ONE, made for the
+	// reason this count exists rather than to accommodate it. It is a PREDICATE OVER THE TABLE --
+	// it reads self.pqSecrets and writes nothing anywhere -- and what it decides is which values
+	// may overwrite an entry, which is the table's rule and not the epoch install's. It lives
+	// beside the writer it constrains, in the same way dropPqSecretsBelowWindowOnLoop lives beside
+	// it while being called from installEpochOnLoop, and a reader asking "what can destroy
+	// pq_secret[n]" finds the answer in one file. Written in session.go it would be an advance's
+	// private arithmetic, which is exactly the reading under which the silence it replaces
+	// survived a whole pass: the advance erased the entry a wrap had filed and put its own
+	// argument there, and no gate in this package had a way to ask whether it should have.
 	//
 	// THE TWO PUBLIC ONES ARE HERE AND NOT IN session.go BESIDE InstallEphRoot, and the judgement
 	// is the one this block is for. InstallEphRoot fills a field of the CURRENT epoch and is
@@ -965,8 +976,8 @@ func TestTheEpochKeysDoorJoinsTheDerivedClassOfGroupSessionMethods(t *testing.T)
 	// TABLE and about a premise that survives every install -- and about a fact a restarted
 	// session cannot observe, which is a paragraph only this file carries. A reader who meets
 	// DeclarePqSecretRotated in session.go has no way to learn why a boolean needs a door.
-	if got := len(perFile["pqsecret.go"]); got != 5 {
-		t.Errorf("pqsecret.go declares %d methods on *GroupSession and ledger item 251's ruling 40 makes it 5: the install that files a secret at the epoch it belongs to and decides whether the group-lifetime premise still stands, the lookup every derivation of a storage root goes through, the window bound, and the two doors a restorer states rotation through -- InstallPqSecret and DeclarePqSecretRotated. A sixth here is either a door nothing asked for or a piece of the epoch install that has drifted out of session.go",
+	if got := len(perFile["pqsecret.go"]); got != 6 {
+		t.Errorf("pqsecret.go declares %d methods on *GroupSession and ledger item 251's ruling 40 makes it 6: the install that files a secret at the epoch it belongs to and decides whether the group-lifetime premise still stands, the lookup every derivation of a storage root goes through, the window bound, the refusal that says which values may overwrite an entry, and the two doors a restorer states rotation through -- InstallPqSecret and DeclarePqSecretRotated. A seventh here is either a door nothing asked for or a piece of the epoch install that has drifted out of session.go",
 			got)
 	}
 	if got := len(perFile["pastepoch.go"]); got != 8 {

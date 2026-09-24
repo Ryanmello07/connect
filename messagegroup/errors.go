@@ -304,6 +304,62 @@ var (
 	// cause. That is the defect ruling 40 names, and this refusal is the shape that replaces it.
 	ErrPqSecretUnknownEpoch = errors.New("messagegroup: this session holds no pq_secret for the epoch a derivation asked for")
 
+	// Fires when a value arrives for an epoch this session ALREADY holds a DIFFERENT secret
+	// for, on the path that did not ask to replace anything: AdvanceEpoch's own parameter.
+	//
+	// WHY THERE IS A REFUSAL HERE AT ALL, and it is ruling 37 that makes it necessary. The
+	// wraps that carry pq_secret[n+1] are submitted and opened at epoch n, BEFORE the merge, so
+	// under item 243's step 4 the ordinary sequence is InstallPqSecret(n+1, the wrap's secret)
+	// and THEN AdvanceEpoch, with the table already holding the authority for the epoch the
+	// session is entering. AdvanceEpoch's parameter is the caller's own account of that same
+	// value. When the two disagree one of them is wrong, and the one that was ALREADY FILED is
+	// the one a wrap put there.
+	//
+	// WHAT IT REPLACES IS A SILENCE, which is why it is a typed error and not a refutation.
+	// Before it, the install erased the standing entry and filed the argument over the top
+	// without ever comparing them -- the refutation it did perform was against the entry at the
+	// epoch being LEFT, never against the entry it was about to destroy -- so a pq_secret[n+1]
+	// delivered by a wrap was silently replaced by the next advance, and BOTH production
+	// callers in sdk pass the group lifetime scalar today. The session then derived epoch
+	// n+1's whole schedule from the wrong half, every other member derived it from the right
+	// one, and the only symptom anywhere was an AEAD tag. That is ruling 38's
+	// both-directions blackout produced by the seam built to prevent it, and ruling 38's own
+	// requirement is that it be a TYPED refusal separable from the shapes beside it.
+	//
+	// THE DELIBERATE REPLACE IS A DIFFERENT DOOR AND IS NOT THIS. InstallPqSecret may replace
+	// an entry -- a lost CAS race means the winning commit's secret supersedes the one this
+	// device optimistically filed -- and it erases what it replaces and drops the group
+	// lifetime premise on the difference. So the repair for this refusal is to file the value
+	// through the door whose subject is filing, and then advance with the same octets.
+	ErrPqSecretEpochConflict = errors.New("messagegroup: a different pq_secret is already filed for the epoch this session is entering")
+
+	// Fires when InstallPqSecret is asked to file a secret at the epoch the session is STANDING
+	// at, which that door's own doc excludes and which it used to accept.
+	//
+	// THE TABLE AND THE LIVE SCHEDULE MAY NOT DISAGREE ABOUT self.epoch. Everything this
+	// session seals and opens at its own epoch hangs off self.storageRoot, which
+	// installEpochOnLoop extracted ONCE from pq_secret[self.epoch] as the table held it then.
+	// Filing a different value at that epoch moves the table and does not move the schedule, so
+	// the session is left holding two answers to one question: it keeps sealing under the old
+	// root while the table says that epoch ran on the new secret, and one advance later
+	// pastEpochOnLoop rebuilds that epoch from the TABLE and every record of it stops opening.
+	// That is ruling 40's own defect -- an epoch's root built from a secret that epoch did not
+	// run on -- re-entering through the door added to close it.
+	//
+	// THE ASYMMETRY THAT MAKES IT A DEFECT RATHER THAN A CHOICE, said out loud because it was
+	// neither stated nor asserted before: AdvanceEpoch files AND THEN RE-DERIVES, through
+	// installEpochOnLoop, so its table and its schedule move together. InstallPqSecret files
+	// and does not re-derive, by design -- it is the door for epochs this session is NOT
+	// standing at, where there is no live schedule to move.
+	//
+	// WHY IT IS NOT REPAIRED BY RE-DERIVING INSTEAD. A re-derivation out of this door would
+	// drop and erase every ratchet, every prior epoch's schedule and the role table as a side
+	// effect of filing one secret, which is a blast radius no caller of a method named "install
+	// a secret" would expect, and it would give this package two epoch installs to keep in
+	// agreement. The repair is to build the session with the secret its own epoch ran on, and
+	// the refusal says so. Ruling 37 needs epoch+1 and never epoch.
+	ErrPqSecretEpochIsCurrent = errors.New("messagegroup: this session is standing at that epoch and its key schedule is already derived from the secret it holds")
+
 	// Fires when a session is opened at an epoch after zero with no epoch zero group handle
 	// key. group_handle_key is fixed at group creation and is PERSISTED state; a constructor
 	// that recomputed it from the current epoch would give every epoch a different
