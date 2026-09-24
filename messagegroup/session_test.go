@@ -382,7 +382,11 @@ func TestCloseIsIdempotentStopsTheLoopAndErasesEveryKey(t *testing.T) {
 		fixture.session.storageRoot,
 		fixture.session.writeKey,
 		fixture.session.readKey,
-		fixture.session.pqSecret,
+		// pq_secret is an ENTRY of a table keyed by epoch since ledger item 251's ruling 40, so
+		// what is aliased here is the entry filed at the epoch this session stands at -- for a
+		// fixture that has never advanced, the only one there is. The whole table's erase, over a
+		// session holding one per epoch, is pqepoch_test.go's.
+		fixture.session.pqSecrets[fixture.session.epoch],
 		fixture.session.classKeys.Perm,
 		fixture.session.classKeys.Durable,
 		fixture.session.classKeys.Media,

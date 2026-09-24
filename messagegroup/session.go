@@ -109,11 +109,25 @@ type GroupSession struct {
 	writeKey      []byte
 	readKey       []byte
 	serverNonce   []byte
-	pqSecret      []byte
 	reserver      StreamIndexReserver
 	nowMs         func() int64
 	windowSize    int
 	retainedBound int
+
+	// pq_secret[n], BY EPOCH, and whether this session has ever been handed a second one.
+	//
+	// It was one scalar until ledger item 251's ruling 40, and the line that proves a scalar is
+	// wrong is pastepoch.go's: a PAST epoch's storage root was re-derived from TODAY's secret,
+	// which is right only while nothing ever rotates. pqsecret.go is the whole account of what
+	// is held, for how long, what erases it, and why the session that has never rotated behaves
+	// exactly as it did before this field existed.
+	//
+	// IT IS THE ONE FIELD HERE THAT SURVIVES AN EPOCH INSTALL, and deliberately: every other key
+	// in this struct is re-derived from the epoch the session moved to, and a past epoch's
+	// pq_secret is derivable from nothing at all. What bounds it instead is PastEpochWindow, and
+	// the entries the window leaves behind are erased as they go.
+	pqSecrets map[uint64][]byte
+	pqRotated bool
 
 	// eph_root[n], or nil.
 	//
@@ -243,15 +257,20 @@ func NewGroupSession(handle GroupHandle, pqSecret []byte, groupHandleKeyEpoch0 [
 		reserver:      reserver,
 		nowMs:         nowMs,
 		serverNonce:   append([]byte(nil), serverNonce...),
-		pqSecret:      append([]byte(nil), pqSecret...),
 		windowSize:    DefaultRecordWindowSize,
 		retainedBound: DefaultRetainedRecordKeys,
 		senders:       map[senderLadderKey]*SenderRatchet{},
 		pastEpochs:    map[uint64]*pastEpoch{},
+		pqSecrets:     map[uint64][]byte{},
 	}
 	self.groupId = [32]byte(groupId)
 	self.ownLeaf = handle.OwnLeafIndex()
 	self.epoch = handle.Epoch()
+	// the secret is recorded AT THE EPOCH THE HANDLE IS AT, which is the epoch this session is
+	// about to install, and never at a fixed zero: a device that restarts opens its session at
+	// whatever epoch the group has reached, and an entry filed under epoch zero would be a
+	// secret nothing could look up. self.epoch is set above precisely so this line can read it.
+	self.installPqSecretOnLoop(self.epoch, pqSecret)
 	receivers, err := NewReceiverRatchets(self.retainedBound)
 	if err != nil {
 		return nil, err
@@ -415,7 +434,15 @@ func (self *GroupSession) EpochKeys() (*EpochKeys, error) {
 	return keys, err
 }
 
-// AdvanceEpoch installs the epoch the handle is now at, with a fresh pq_secret.
+// AdvanceEpoch installs the epoch the handle is now at, with THAT EPOCH'S pq_secret.
+//
+// THE PARAMETER IS pq_secret[n+1] AND NOT "the session's pq_secret", which is ledger item 251's
+// ruling 40 and is what this line's own doc used to get wrong: it said "with a fresh pq_secret"
+// while both production callers handed the group lifetime value in, and the session filed it over
+// the one it had. It is now recorded AT THE EPOCH THE HANDLE IS AT, so a past epoch's storage
+// root stays derivable from the secret that epoch actually ran on. pqsecret.go carries the table,
+// the window and the compatibility rule for the session that is never rotated -- which is every
+// group that exists today, and which must behave exactly as it did before this change.
 //
 // GROUP_HANDLE_KEY DOES NOT MOVE. It was expanded from the epoch zero root ONCE, and what this
 // session has held since construction is that answer rather than the root -- so there is nothing
@@ -427,8 +454,8 @@ func (self *GroupSession) EpochKeys() (*EpochKeys, error) {
 // epoch's rungs, which are exactly the octets forward secrecy is about, and the class keys it
 // was built from have moved.
 //
-// The noinline directive is this package's erase helper class: pq_secret is erased here, in this
-// body, before it is overwritten.
+// The noinline directive is this package's erase helper class: the install below erases the entry
+// it replaces, and that store is the receiver's own.
 //
 //go:noinline
 func (self *GroupSession) AdvanceEpoch(pqSecret []byte) error {
@@ -447,10 +474,17 @@ func (self *GroupSession) AdvanceEpoch(pqSecret []byte) error {
 				ErrPqSecretLength, len(pqSecret))
 			return
 		}
-		// erased before it is overwritten, in this body, for installEpochOnLoop's reason.
-		replacement := append([]byte(nil), pqSecret...)
-		zeroize(self.pqSecret)
-		self.pqSecret = replacement
+		// AT THE EPOCH THE HANDLE IS NOW AT, read here rather than after the install, because
+		// the install is what asks the table for the secret of the epoch it is opening and a
+		// value filed afterwards would be a value the install could not see.
+		//
+		// AN INSTALL THAT FAILS BELOW LEAVES THE ENTRY FILED, and that is the safe direction
+		// rather than an oversight: the entry sits ABOVE this session's epoch, so the window
+		// drop's `epoch < self.epoch` guard never reaches it, nothing derives from an epoch the
+		// session did not enter, and a caller that retries the advance finds its own secret
+		// already there and files it again over an erase. The alternative -- filing after the
+		// install -- is the one that cannot work, because the install is the reader.
+		self.installPqSecretOnLoop(self.handle.Epoch(), pqSecret)
 		err = self.installEpochOnLoop(self.groupHandleKey)
 	}); postErr != nil {
 		return postErr
@@ -686,7 +720,24 @@ func (self *GroupSession) installEpochOnLoop(groupHandleKeyEpoch0 []byte) error 
 	defer zeroize(mlsSecret)
 	self.epoch = self.handle.Epoch()
 	self.ownLeaf = self.handle.OwnLeafIndex()
-	root := StorageRoot(mlsSecret, self.pqSecret)
+	// THE SECRET OF THE EPOCH BEING INSTALLED, out of the table, and not the session's latest.
+	// For the current epoch the two are the same value; pastEpochOnLoop's call is the one where
+	// they are not, and both go through this one door so the two derivations cannot come to
+	// disagree about what pq_secret[n] means.
+	//
+	// IT IS THE TABLE'S ARRAY AND IT IS NOT ERASED HERE, which is the one place this body departs
+	// from the discipline every other secret in it is held to. mlsSecret above is erased on the
+	// way out because this call is its only holder; this one belongs to the table, and a
+	// `defer zeroize(pqSecret)` written to match the line above it would blank pq_secret[n] in
+	// place and leave every later derivation of that epoch's root extracting over thirty two
+	// zeros. The table's own erase is at the window and at Close. That defer was written as a
+	// mutant and ELEVEN cases of this package go red on it, pastepoch_test.go's six among them,
+	// so this paragraph is a measurement rather than a warning.
+	pqSecret, err := self.pqSecretForOnLoop(self.epoch)
+	if err != nil {
+		return err
+	}
+	root := StorageRoot(mlsSecret, pqSecret)
 	handleKey := []byte(nil)
 	switch {
 	case 0 < len(groupHandleKeyEpoch0):
@@ -746,6 +797,16 @@ func (self *GroupSession) installEpochOnLoop(groupHandleKeyEpoch0 []byte) error 
 		past.Zeroize()
 	}
 	self.pastEpochs = map[uint64]*pastEpoch{}
+	// AND THE pq_secret TABLE IS THE ONE THING HERE THAT DOES NOT GO, which is stated on the line
+	// that would otherwise be its drop site rather than left to a reader to notice the absence.
+	// Everything above is re-derived from the epoch this session moved to; pq_secret[n] is
+	// derivable from nothing, so erasing it here would destroy the only copy of the value that
+	// makes epoch n's storage root computable and re-introduce ledger item 251 ruling 40's defect
+	// from the other end. What bounds it instead is the WINDOW, and the entries the window has
+	// moved past are erased and dropped one line down -- after self.epoch has moved, because the
+	// window is measured from it. Spelled here and not delegated for the reason above; the loop
+	// it calls is pqsecret.go's because the bound and its guard are that file's subject.
+	self.dropPqSecretsBelowWindowOnLoop()
 	// AND THIS EPOCH'S ROLE TABLE GOES WITH THEM, item 242's ruling 18. It is dropped and not
 	// erased -- a credential identity is published in its own leaf node and a role is a row of a
 	// group context extension the transcript covers, so there is no secret in it -- but it is
@@ -855,20 +916,31 @@ func (self *GroupSession) zeroizeOnLoop() {
 	zeroize(self.writeKey)
 	zeroize(self.readKey)
 	zeroize(self.groupHandleKey)
-	zeroize(self.pqSecret)
 	zeroize(self.ephRoot)
 	for _, past := range self.pastEpochs {
 		past.Zeroize()
+	}
+	// EVERY EPOCH'S pq_secret, and not only the current one. This is the line the scalar made
+	// trivial and the table does not: a closed session that erased one entry of a table of
+	// thirty three would leave thirty two post quantum halves of retired storage roots in the
+	// heap, which is the drop-without-erase this whole change is about, one level up. The loop is
+	// spelled HERE rather than delegated, for the reason this method's own header gives.
+	for epoch, secret := range self.pqSecrets {
+		zeroize(secret)
+		delete(self.pqSecrets, epoch)
 	}
 	self.classKeys = nil
 	self.storageRoot = nil
 	self.writeKey = nil
 	self.readKey = nil
 	self.groupHandleKey = nil
-	self.pqSecret = nil
 	self.ephRoot = nil
 	self.senders = map[senderLadderKey]*SenderRatchet{}
 	self.pastEpochs = map[uint64]*pastEpoch{}
+	// and the table itself goes, emptied above. A closed session holds no epoch, so it holds no
+	// secret for one and pqSecretForOnLoop refuses -- which is the same answer a closed session
+	// gives to every other ask.
+	self.pqSecrets = map[uint64][]byte{}
 	// dropped and not erased, for installEpochOnLoop's reason at the same field: nothing in it is
 	// a secret, and what it must not do is outlive the epoch it describes. A closed session has
 	// no epoch, so it holds no table.

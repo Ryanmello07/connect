@@ -408,10 +408,19 @@ func (self *GroupSession) roleTableOnLoop(epoch uint64) (map[uint32]epochRole, e
 // handle closed, for LoadGroup's own reason: a schedule at the wrong epoch derives a storage root
 // that opens nothing and says nothing about why.
 //
-// The root is derived from the loaded epoch's exporter and THIS SESSION'S pq_secret, which is the
-// group-lifetime value ledger item 243 rules. A build that rotates pq_secret per epoch -- item
-// 243's own condition for shipping removal -- owes this derivation pq_secret[n] and a carrier for
-// it, and the line below is where that lands.
+// The root is derived from the loaded epoch's exporter and THAT EPOCH'S pq_secret, which is
+// ledger item 251's ruling 40 and is the line the ruling names. It read `self.pqSecret` -- the
+// session's one scalar -- until 2026-09-23, and what that meant was that a past epoch's storage
+// root was re-derived from the secret the session holds TODAY: correct only while nothing ever
+// rotates, and wrong at the AEAD tag with no diagnosis the day something does. pqsecret.go is the
+// table and the rule; the carrier that delivers a rotated secret to the other members is the
+// device wrap and is item 243's next step, not this one.
+//
+// THE SECRET IS ASKED FOR BEFORE THE LOADER IS, which is this function's own cost-and-certainty
+// order applied to a refusal that did not exist when the order was written: whether this session
+// holds pq_secret for an epoch is arithmetic over state it already has, and asking the store to
+// rebuild a whole key schedule for an epoch whose root cannot be completed is work spent to reach
+// the same refusal.
 //
 // The caller is the loop goroutine.
 //
@@ -426,6 +435,15 @@ func (self *GroupSession) pastEpochOnLoop(epoch uint64) (*pastEpoch, error) {
 	}
 	if past, isHeld := self.pastEpochs[epoch]; isHeld {
 		return past, nil
+	}
+	// THE TABLE'S OWN ARRAY, and the two defers below are why that is said here. mlsSecret and
+	// root are erased on the way out of this body because it is their only holder; pq_secret[n]
+	// belongs to the session's table, and a third defer written to match them would blank it in
+	// place and leave every later open at this epoch extracting a storage root over thirty two
+	// zeros. pqsecret.go is where that erase lives.
+	pqSecret, err := self.pqSecretForOnLoop(epoch)
+	if err != nil {
+		return nil, err
 	}
 	if self.pastEpochLoader == nil {
 		return nil, fmt.Errorf("%w: epoch %d, and this session has no past epoch loader installed",
@@ -454,7 +472,7 @@ func (self *GroupSession) pastEpochOnLoop(epoch uint64) (*pastEpoch, error) {
 		return nil, fmt.Errorf("%w: epoch %d: its mls_secret could not be exported: %w", ErrPastEpochUnobtainable, epoch, err)
 	}
 	defer zeroize(mlsSecret)
-	root := StorageRoot(mlsSecret, self.pqSecret)
+	root := StorageRoot(mlsSecret, pqSecret)
 	defer zeroize(root)
 	receivers, err := NewReceiverRatchets(self.retainedBound)
 	if err != nil {

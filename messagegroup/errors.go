@@ -279,6 +279,21 @@ var (
 	// clients agree on, and every test in this package stayed green over it.
 	ErrPqSecretLength = errors.New("messagegroup: a pq_secret is not the thirty two octets MASTER section 7 fixes")
 
+	// Fires when a derivation asks for pq_secret at an epoch this session holds no secret for
+	// AND the single-secret compatibility path cannot answer -- which means the session has been
+	// ROTATED, because while it has not, the one secret it holds answers every epoch and this
+	// sentinel is unreachable. Ledger item 251's ruling 40; pqsecret.go carries the rule.
+	//
+	// It is its own sentinel and not ErrEpochOutOfWindow because the two are different facts
+	// with different repairs. Out of window means no device holds a schedule for that epoch and
+	// no re-fetch will change it; this one means this session was never handed the octets that
+	// epoch's storage root was extracted from, and the repair is to supply them -- which is what
+	// the device wrap of item 243's next step delivers. A session that answered instead with the
+	// secret it HAPPENS to hold would derive a well formed storage root that no member of the
+	// group reproduces, and the failure would surface at an AEAD tag with nothing naming the
+	// cause. That is the defect ruling 40 names, and this refusal is the shape that replaces it.
+	ErrPqSecretUnknownEpoch = errors.New("messagegroup: this session holds no pq_secret for the epoch a derivation asked for")
+
 	// Fires when a session is opened at an epoch after zero with no epoch zero group handle
 	// key. group_handle_key is fixed at group creation and is PERSISTED state; a constructor
 	// that recomputed it from the current epoch would give every epoch a different

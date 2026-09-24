@@ -944,9 +944,24 @@ func TestTheEpochKeysDoorJoinsTheDerivedClassOfGroupSessionMethods(t *testing.T)
 	if !slices.Contains(all, "EpochKeys") {
 		t.Fatal("no method named EpochKeys is declared on *GroupSession, so the door this file tests is not in the class the loop gate holds")
 	}
-	if len(all) != 38 {
-		t.Errorf("%d methods are declared on *GroupSession and ledger item 242's R4 makes it 38 -- 35 after item 241's multi-epoch open (30 after MASTER section 8.4's second pass, which was 24 after the 2026-09-13 seal lift plus frameBodyOnLoop and unframeBodyOnLoop for the inner frame plus refuseFrameBindingsOnLoop, OpenCeremonyRecord, openRecordThroughDoor and MessageIdOf for the arm split and the id door, plus the five of pastepoch.go: InstallPastEpochLoader, TrackSenderAt and trackSenderAtOnLoop, scheduleForOnLoop and pastEpochOnLoop), plus the three R4 adds: RoleAt, roleAtOnLoop and roleTableOnLoop; the number moves by one per method, and a method that arrived without moving it arrived without a thought about which file it belongs in",
+	if len(all) != 41 {
+		t.Errorf("%d methods are declared on *GroupSession and ledger item 251's ruling 40 makes it 41 -- 38 under item 242's R4, which was 35 after item 241's multi-epoch open (30 after MASTER section 8.4's second pass, which was 24 after the 2026-09-13 seal lift plus frameBodyOnLoop and unframeBodyOnLoop for the inner frame plus refuseFrameBindingsOnLoop, OpenCeremonyRecord, openRecordThroughDoor and MessageIdOf for the arm split and the id door, plus the five of pastepoch.go: InstallPastEpochLoader, TrackSenderAt and trackSenderAtOnLoop, scheduleForOnLoop and pastEpochOnLoop), plus R4's three: RoleAt, roleAtOnLoop and roleTableOnLoop -- plus the three of pqsecret.go: installPqSecretOnLoop, pqSecretForOnLoop and dropPqSecretsBelowWindowOnLoop; the number moves by one per method, and a method that arrived without moving it arrived without a thought about which file it belongs in",
 			len(all))
+	}
+	// AND THE THREE OF THE pq_secret TABLE ARE IN A FILE OF THEIR OWN, which is the same
+	// per-file judgement pastepoch.go's five were held to and the same reason. What the table is
+	// is not the session's epoch state: it is the one thing on this struct that SURVIVES an epoch
+	// install, with a bound of its own (PastEpochWindow), an erase discipline of its own, and a
+	// compatibility rule for the unrotated session that is a paragraph rather than a line. Three
+	// methods of that in session.go would be three methods a reader meets while reading about the
+	// epoch that is being replaced. The DROP is still not a method of the session for
+	// pastepoch.go's reason -- connect/mls reads an erase field by field and follows no
+	// delegation -- so the whole-table erase is spelled in zeroizeOnLoop, and what
+	// dropPqSecretsBelowWindowOnLoop holds is the WINDOW, which is arithmetic and not an erase
+	// discipline.
+	if got := len(perFile["pqsecret.go"]); got != 3 {
+		t.Errorf("pqsecret.go declares %d methods on *GroupSession and ledger item 251's ruling 40 makes it 3: the install that files a secret at the epoch it belongs to and decides whether this session has rotated, the lookup every derivation of a storage root goes through, and the window bound. A fourth here is either a door nothing asked for or a piece of the epoch install that has drifted out of session.go",
+			got)
 	}
 	if got := len(perFile["pastepoch.go"]); got != 8 {
 		t.Errorf("pastepoch.go declares %d methods on *GroupSession and item 242's R4 makes it 8, which was item 241's 5: a prior epoch's schedule is neither epoch state of the session's own epoch nor a record method, so the door that installs its loader, the track for it, the lookup an open routes through and the build belong in the file that says what one holds -- and so do R4's three, because the whole of what RoleAt is is the SAME lookup an open routes through, asked for a different projection of the same handle, and a role door written in session.go would be one nothing stopped from reading self.handle. The DROP is still not a method, because connect/mls reads an erase field by field and follows no delegation, so it is spelled in installEpochOnLoop and zeroizeOnLoop",
