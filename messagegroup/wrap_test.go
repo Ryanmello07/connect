@@ -22,6 +22,8 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"go/types"
+	"maps"
 	"os"
 	"slices"
 	"strconv"
@@ -339,20 +341,17 @@ func wrapTestGroupId() []byte  { return bytes.Repeat([]byte{0x21}, 32) }
 func wrapTestTargetId() []byte { return bytes.Repeat([]byte{0x71}, 16) }
 
 // wrapTestAuthority stands for an opener whose OWN authority -- the epoch it is restoring and the
-// record kind it asked for -- happens to be what some envelope says.
+// record kind it asked for -- happens to be what some envelope says. It answers the three values
+// in OpenWrapBody's own order, which is MASTER section 7's info order.
 //
 // IT IS A TEST HELPER AND IT IS NOT AN EXPORTED ONE, which is the whole point of OpenWrapBody's
-// expectation argument: a production caller that built its expectation out of the body in front of
-// it would have compared a value against itself, and this package gives it no door to do that
-// through. Here the cases that use it are the ones whose subject is something else -- the KEM, the
-// group binding, which octets the AEAD covers -- and every case whose subject IS the comparison
-// writes its expectation out as a literal instead.
-func wrapTestAuthority(envelope WrapEnvelope) WrapExpectation {
-	return WrapExpectation{
-		TargetType:   envelope.TargetType,
-		PayloadType:  envelope.PayloadType,
-		ContentEpoch: envelope.ContentEpoch,
-	}
+// three expectation arguments: a production caller that built its expectation out of the body in
+// front of it would have compared a value against itself, and this package gives it no door to do
+// that through. Here the cases that use it are the ones whose subject is something else -- the
+// KEM, the group binding, which octets the AEAD covers -- and every case whose subject IS the
+// comparison writes its three values out as literals instead.
+func wrapTestAuthority(envelope WrapEnvelope) (contentEpoch uint64, targetType uint8, payloadType uint8) {
+	return envelope.ContentEpoch, envelope.TargetType, envelope.PayloadType
 }
 
 // wrapTestPayload is a payload of the shape MASTER section 7 puts inside aead_ct --
@@ -390,8 +389,9 @@ func TestAWrapOpensForItsTargetLeafAndForNoOther(t *testing.T) {
 		t.Fatalf("SealWrapBody: %v", err)
 	}
 
-	want := wrapTestAuthority(envelope)
-	gotEnvelope, gotPayload, err := OpenWrapBody(target.priv, wrapTestGroupId(), wrapTestTargetId(), want, body)
+	epoch, targetType, payloadType := wrapTestAuthority(envelope)
+	gotEnvelope, gotPayload, err := OpenWrapBody(target.priv, wrapTestGroupId(), epoch,
+		targetType, wrapTestTargetId(), payloadType, body)
 	if err != nil {
 		t.Fatalf("the target leaf could not open its own wrap: %v", err)
 	}
@@ -414,15 +414,18 @@ func TestAWrapOpensForItsTargetLeafAndForNoOther(t *testing.T) {
 	if len(foreign) != XwingSharedSize {
 		t.Fatalf("a foreign decapsulation answered %d octets, want %d", len(foreign), XwingSharedSize)
 	}
-	if _, _, err := OpenWrapBody(other.priv, wrapTestGroupId(), wrapTestTargetId(), want, body); !errors.Is(err, ErrWrapOpen) {
+	if _, _, err := OpenWrapBody(other.priv, wrapTestGroupId(), epoch,
+		targetType, wrapTestTargetId(), payloadType, body); !errors.Is(err, ErrWrapOpen) {
 		t.Errorf("a second leaf's private half answered %v; want ErrWrapOpen", err)
 	}
 	// and the group and the target are bound too, which is what stops one group's wrap opening
 	// in another and one member's opening at another's handle
-	if _, _, err := OpenWrapBody(target.priv, bytes.Repeat([]byte{0x99}, 32), wrapTestTargetId(), want, body); !errors.Is(err, ErrWrapOpen) {
+	if _, _, err := OpenWrapBody(target.priv, bytes.Repeat([]byte{0x99}, 32), epoch,
+		targetType, wrapTestTargetId(), payloadType, body); !errors.Is(err, ErrWrapOpen) {
 		t.Errorf("a wrap opened under a different group_id: %v", err)
 	}
-	if _, _, err := OpenWrapBody(target.priv, wrapTestGroupId(), bytes.Repeat([]byte{0x99}, 16), want, body); !errors.Is(err, ErrWrapOpen) {
+	if _, _, err := OpenWrapBody(target.priv, wrapTestGroupId(), epoch,
+		targetType, bytes.Repeat([]byte{0x99}, 16), payloadType, body); !errors.Is(err, ErrWrapOpen) {
 		t.Errorf("a wrap opened under a different target_id: %v", err)
 	}
 }
@@ -439,8 +442,8 @@ func TestAWrapOpensForItsTargetLeafAndForNoOther(t *testing.T) {
 // matches its own envelope and the AEAD opens it. Measured on this door before the expectation
 // argument existed: a genuine wrap of content epoch 10 opened and returned its payload byte for
 // byte. The headline of m1 task 14 property 4 is about that wrap, not about the edited one, and it
-// is true here only because OpenWrapBody takes the epoch its opener is honouring and refuses
-// anything else -- see WrapExpectation.
+// is true here only because OpenWrapBody takes the epoch its opener is honouring, as a parameter
+// with no default, and refuses anything else -- see OpenWrapBody.
 //
 // The THIRD is the outer seal: env_key[k] is an epoch's own exporter output, so the record ladder
 // a wrap of epoch n+1 rides is not the ladder a wrap of epoch n rides, and the two are separated
@@ -454,17 +457,21 @@ func TestAWrapSealedAtOneEpochDoesNotOpenAtAnother(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SealWrapBody: %v", err)
 	}
-	atNine := WrapExpectation{TargetType: 0x01, PayloadType: 0x01, ContentEpoch: 9}
-	atEight := WrapExpectation{TargetType: 0x01, PayloadType: 0x01, ContentEpoch: 8}
+	// the three the opener states, written out rather than read off the body: this case's whole
+	// subject is the comparison, and an expectation copied out of the envelope in front of it
+	// would be a value compared against itself.
+	const atNine, atEight uint64 = 9, 8
 	// it opens at its own epoch, which is the control that makes the refusals below mean something
-	if _, _, err := OpenWrapBody(target.priv, wrapTestGroupId(), wrapTestTargetId(), atNine, body); err != nil {
+	if _, _, err := OpenWrapBody(target.priv, wrapTestGroupId(), atNine,
+		0x01, wrapTestTargetId(), 0x01, body); err != nil {
 		t.Fatalf("the wrap does not open at the epoch it was sealed at: %v", err)
 	}
 	// THE GENUINE HALF: the body is untouched and every octet in it is the sealer's. An opener
 	// honouring epoch 8 must not be handed epoch 9's secret, and nothing in the KEM or the AEAD
 	// can tell it so -- the refusal here is the opener's own authority and it is asserted BY NAME,
 	// because an ErrWrapOpen here would mean the key moved and the key does not move.
-	genuineEnvelope, genuinePayload, err := OpenWrapBody(target.priv, wrapTestGroupId(), wrapTestTargetId(), atEight, body)
+	genuineEnvelope, genuinePayload, err := OpenWrapBody(target.priv, wrapTestGroupId(), atEight,
+		0x01, wrapTestTargetId(), 0x01, body)
 	if !errors.Is(err, ErrWrapEnvelopeMismatch) {
 		t.Errorf("a GENUINE wrap of epoch 9 handed to an opener honouring epoch 8 answered %v; want ErrWrapEnvelopeMismatch", err)
 	}
@@ -478,7 +485,8 @@ func TestAWrapSealedAtOneEpochDoesNotOpenAtAnother(t *testing.T) {
 	// and the refusal does not depend on the rest of the body: it is ahead of the KEM, so a body
 	// whose hybrid_ct is destroyed is still refused as the wrong wrap rather than as bad framing.
 	truncated := slices.Clone(body[:WrapEnvelopeBytes+4])
-	if _, _, err := OpenWrapBody(target.priv, wrapTestGroupId(), wrapTestTargetId(), atEight, truncated); !errors.Is(err, ErrWrapEnvelopeMismatch) {
+	if _, _, err := OpenWrapBody(target.priv, wrapTestGroupId(), atEight,
+		0x01, wrapTestTargetId(), 0x01, truncated); !errors.Is(err, ErrWrapEnvelopeMismatch) {
 		t.Errorf("a wrap of the wrong epoch whose hybrid_ct is four octets answered %v; want ErrWrapEnvelopeMismatch, which is what puts the comparison ahead of the KEM", err)
 	}
 	// THE TAMPERED HALF: the same edit made on the wire moves wrap_key, and this is the one the
@@ -492,7 +500,8 @@ func TestAWrapSealedAtOneEpochDoesNotOpenAtAnother(t *testing.T) {
 	}
 	edited.ContentEpoch = 8
 	copy(restated[:WrapEnvelopeBytes], edited.Encode())
-	if _, _, err := OpenWrapBody(target.priv, wrapTestGroupId(), wrapTestTargetId(), atEight, restated); !errors.Is(err, ErrWrapOpen) {
+	if _, _, err := OpenWrapBody(target.priv, wrapTestGroupId(), atEight,
+		0x01, wrapTestTargetId(), 0x01, restated); !errors.Is(err, ErrWrapOpen) {
 		t.Errorf("a wrap whose content epoch was moved from 9 to 8 answered %v; want ErrWrapOpen", err)
 	}
 
@@ -571,8 +580,9 @@ func TestTheEnvelopeOctetsTheWrapKeyBindsAreRefusedAndTheSuiteReportsTheRest(t *
 	if err != nil {
 		t.Fatalf("SealWrapBody: %v", err)
 	}
-	sealed := wrapTestAuthority(envelope)
-	if _, _, err := OpenWrapBody(target.priv, wrapTestGroupId(), wrapTestTargetId(), sealed, body); err != nil {
+	sealedEpoch, sealedTargetType, sealedPayloadType := wrapTestAuthority(envelope)
+	if _, _, err := OpenWrapBody(target.priv, wrapTestGroupId(), sealedEpoch,
+		sealedTargetType, wrapTestTargetId(), sealedPayloadType, body); err != nil {
 		t.Fatalf("the unedited wrap does not open, so every row below is measuring the wrong thing: %v", err)
 	}
 	refused := []int{}
@@ -587,8 +597,9 @@ func TestTheEnvelopeOctetsTheWrapKeyBindsAreRefusedAndTheSuiteReportsTheRest(t *
 		}
 		// COLUMN ONE, the key: the opener's own authority is moved to agree with the edit, so
 		// the comparison passes and the only thing left that can refuse is the tag.
-		_, gotPayload, err := OpenWrapBody(target.priv, wrapTestGroupId(), wrapTestTargetId(),
-			wrapTestAuthority(moved), edited)
+		movedEpoch, movedTargetType, movedPayloadType := wrapTestAuthority(moved)
+		_, gotPayload, err := OpenWrapBody(target.priv, wrapTestGroupId(), movedEpoch,
+			movedTargetType, wrapTestTargetId(), movedPayloadType, edited)
 		switch {
 		case err == nil:
 			accepted = append(accepted, octet)
@@ -606,7 +617,8 @@ func TestTheEnvelopeOctetsTheWrapKeyBindsAreRefusedAndTheSuiteReportsTheRest(t *
 		}
 		// COLUMN TWO, the opener: the authority stays where the sealer put it, so an octet the
 		// expectation covers is refused by name before the KEM is reached.
-		switch _, _, err := OpenWrapBody(target.priv, wrapTestGroupId(), wrapTestTargetId(), sealed, edited); {
+		switch _, _, err := OpenWrapBody(target.priv, wrapTestGroupId(), sealedEpoch,
+			sealedTargetType, wrapTestTargetId(), sealedPayloadType, edited); {
 		case errors.Is(err, ErrWrapEnvelopeMismatch):
 			compared = append(compared, octet)
 		case err == nil || errors.Is(err, ErrWrapOpen):
@@ -639,12 +651,13 @@ func TestTheEnvelopeOctetsTheWrapKeyBindsAreRefusedAndTheSuiteReportsTheRest(t *
 		t.Errorf("the accepted set is %v and the written-down disposition is exactly {0}, u8(wrap_format_version). A LARGER set is an envelope octet nothing authenticates that no document names; a SMALLER one means this door gained an authority over the version octet -- if that is task 14 step 3's signature landing, this clause and open item MG-7 come out together",
 			accepted)
 	}
-	// AND THE SECOND COLUMN, against its own written-down disposition. The opener's expectation
-	// covers exactly the ten octets the info covers -- not by coincidence: WrapExpectation is the
-	// three envelope fields MASTER's info binds and deliberately not the fourth, because ruling
-	// what an opener does with an unrecognised version is M1-54's and not this package's.
+	// AND THE SECOND COLUMN, against its own written-down disposition. The opener's comparison
+	// covers exactly the ten octets the info covers -- not by coincidence: the three values
+	// OpenWrapBody makes a caller state are the three envelope fields MASTER's info binds and
+	// deliberately not the fourth, because ruling what an opener does with an unrecognised version
+	// is M1-54's and not this package's.
 	if !slices.Equal(compared, []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}) {
-		t.Errorf("the opener's comparison refuses %v and the written-down disposition is exactly the ten info-bound octets. A SMALLER set is a field of WrapExpectation that stopped being compared; a LARGER one means it gained the version octet, which is M1-54 being ruled here rather than in MASTER section 7",
+		t.Errorf("the opener's comparison refuses %v and the written-down disposition is exactly the ten info-bound octets. A SMALLER set is one of the three values the opener states that stopped being compared; a LARGER one means it gained the version octet, which is M1-54 being ruled here rather than in MASTER section 7",
 			compared)
 	}
 	// and the complement of the two columns together, which is the sentence MG-7 carries: one
@@ -654,15 +667,23 @@ func TestTheEnvelopeOctetsTheWrapKeyBindsAreRefusedAndTheSuiteReportsTheRest(t *
 	}
 }
 
-// Property: the opener's expectation covers every field of the envelope except the one octet no
-// ruling reaches, and that complement is PRINTED and held against a written-down disposition.
+// Property: the opener NAMES every field of the envelope except the one octet no ruling reaches,
+// and both complements are PRINTED and held against a written-down disposition.
 //
-// THE COMPLEMENT IS THE MEASUREMENT AND THE TYPES ARE WHERE IT IS DECIDABLE. The behavioural case
-// above measures which octets each authority refuses, and it can only measure the fields that
+// THE COMPLEMENT IS THE MEASUREMENT AND THE SIGNATURE IS WHERE IT IS DECIDABLE. The behavioural
+// case above measures which octets each authority refuses, and it can only measure the fields that
 // exist: a twelfth envelope octet added tomorrow would be carried, compared against nothing, and
-// invisible there because no row would name it. This case reads the two struct types out of the
-// source and subtracts one from the other, so a field that arrives on WrapEnvelope without
-// arriving on WrapExpectation fails here on the day it lands.
+// invisible there because no row would name it. This case reads WrapEnvelope's fields and
+// OpenWrapBody's PARAMETER LIST out of the source and subtracts each from the other, so a field
+// that arrives on the envelope without arriving on the door fails here on the day it lands.
+//
+// IT READS THE SIGNATURE AND NOT A STRUCT, AND THAT IS THE REPAIR RATHER THAN A RESTATEMENT. The
+// three values used to arrive as one WrapExpectation argument, and this case read that type's
+// fields. A struct's zero value is a complete value of it, so WrapExpectation{} stated nothing,
+// compiled, and opened a genuine {0x00, 0x00, epoch 0} wrap -- measured -- which is a route no
+// reading of that type could see, because from inside the type the three fields were all present.
+// Read off the signature, "the caller stated it" and "the caller wrote it" are the same sentence:
+// Go supplies no argument nobody wrote. See OpenWrapBody.
 //
 // IT FAILS IN BOTH DIRECTIONS, and the two failures mean opposite things. A complement LARGER than
 // {FormatVersion} is an envelope field an opener cannot ask about -- a value on the wire that
@@ -670,47 +691,192 @@ func TestTheEnvelopeOctetsTheWrapKeyBindsAreRefusedAndTheSuiteReportsTheRest(t *
 // expressible, which is m1 open item M1-54 -- what an opener does with an unrecognised version --
 // being decided in this package instead of in MASTER section 7, and it must arrive with the
 // ruling, with the measurement above, and with MG-7's second half coming out.
-func TestTheOpenerExpectationCoversEveryEnvelopeFieldButTheOneNoRulingReaches(t *testing.T) {
+func TestTheOpenerNamesEveryEnvelopeFieldButTheOneNoRulingReaches(t *testing.T) {
 	_, sources := messagegroupProductionSources(t)
 	envelope := messagegroupStructFields(sources, "WrapEnvelope")
-	expectation := messagegroupStructFields(sources, "WrapExpectation")
-	// THE POSITIVE CONTROL, in the same query and deliberately not a count of the expectation:
-	// the reading sees the four fields MASTER section 7 fixes and sees SOMETHING on the other
-	// side, so an empty complement below cannot be an artefact of having read nothing. How many
-	// fields the expectation has is the disposition's to state and not this control's, or a
-	// field added to it would fail here with "the reading is broken" instead of with what it is.
-	if len(envelope) != 4 || len(expectation) == 0 {
-		t.Fatalf("this reading found %d envelope fields (%v) and %d expectation fields (%v); the envelope MASTER section 7 fixes has four and this reading is not on it",
-			len(envelope), envelope, len(expectation), expectation)
+	door := messagegroupFuncParams(sources, "OpenWrapBody")
+	if len(envelope) != 4 {
+		t.Fatalf("this reading found %d envelope fields (%v); the envelope MASTER section 7 fixes has four and this reading is not on it",
+			len(envelope), envelope)
 	}
+	// the envelope fields the door's signature does not name
 	uncovered := []string{}
 	for name, kind := range envelope {
-		wanted, isCovered := expectation[name]
-		if !isCovered {
+		stated, isStated := door[wrapLowerFirst(name)]
+		if !isStated {
 			uncovered = append(uncovered, name)
 			continue
 		}
-		if wanted != kind {
-			t.Errorf("WrapEnvelope.%s is %s and WrapExpectation.%s is %s; a comparison across two widths is a comparison that can be true of two different wire values",
-				name, kind, name, wanted)
+		if stated != kind {
+			t.Errorf("WrapEnvelope.%s is %s and OpenWrapBody's %s is %s; a comparison across two widths is a comparison that can be true of two different wire values",
+				name, kind, wrapLowerFirst(name), stated)
 		}
 	}
 	slices.Sort(uncovered)
-	unmatched := []string{}
-	for name := range expectation {
-		if _, isCarried := envelope[name]; !isCarried {
-			unmatched = append(unmatched, name)
+	// AND THE OTHER COMPLEMENT, which is this case's positive control as well as its second
+	// assertion: the door's parameters that name no envelope field at all. It cannot be empty --
+	// a wrap is opened with a private half and over a body -- so a reading that had found no
+	// signature reports {} here and fails, rather than reporting a clean {FormatVersion} above
+	// for having read nothing. It is asserted against a written-down set rather than a count.
+	beyond := []string{}
+	for name := range door {
+		if _, isEnvelopeField := envelope[wrapUpperFirst(name)]; !isEnvelopeField {
+			beyond = append(beyond, name)
 		}
 	}
-	slices.Sort(unmatched)
-	t.Logf("the envelope carries %d fields and the opener's expectation covers %d; uncovered %v, and %v of the expectation match no envelope field",
-		len(envelope), len(expectation), uncovered, unmatched)
+	slices.Sort(beyond)
+	t.Logf("the envelope carries %d fields and OpenWrapBody takes %d parameters; envelope fields the door does not name %v, and door parameters that are no envelope field %v",
+		len(envelope), len(door), uncovered, beyond)
 	if !slices.Equal(uncovered, []string{"FormatVersion"}) {
 		t.Errorf("the envelope fields no opener can state an expectation over are %v and the written-down disposition is exactly {FormatVersion}. A LARGER set is a wire value this door compares against nothing; a SMALLER one is m1 open item M1-54 being ruled in this package rather than in MASTER section 7, and it comes with the ruling or not at all",
 			uncovered)
 	}
-	if len(unmatched) != 0 {
-		t.Errorf("%v are fields of WrapExpectation that no envelope field answers, so they are compared against nothing", unmatched)
+	if !slices.Equal(beyond, []string{"body", "groupId", "priv", "targetId"}) {
+		t.Errorf("OpenWrapBody's parameters that name no envelope field are %v and the written-down disposition is exactly {body, groupId, priv, targetId} -- the octets to open, the leaf's own private half, and the two of wrap_key's nine info elements that are not envelope fields. An EMPTY set means this reading did not find the door's signature and everything above it is vacuous; a LARGER one is a value this door takes that nothing in MASTER section 7's info names",
+			beyond)
+	}
+}
+
+// Property: the door's parameters arrive in the order wrap_key's info WRITES them, measured
+// against the encoder rather than against a list copied out of MASTER section 7.
+//
+// WHY THIS IS A CASE AND NOT A COMMENT. OpenWrapBody's paragraph says its parameters are in
+// MASTER section 7's info order, so that a call site reads as the line it is checked against and
+// so that the two u8s are not adjacent -- two uint8 parameters side by side being two the
+// compiler cannot tell apart. That is a claim about an ordering, and an ordering claim nothing
+// reads is one the next edit moves. This case reads WrapInfo's own sequence of writes and the
+// door's own parameter list, restricts each to what they have in common, and compares the two
+// sequences. WrapInfo is where MASTER's order actually lives in this package -- it is the encoder
+// the known answers reproduce bytewise against a second, independent transcription -- so deriving
+// the order from it rather than writing it down here is what keeps this case from agreeing with
+// itself.
+func TestTheOpenersParametersArriveInTheOrderTheWrapKeyInfoWritesThem(t *testing.T) {
+	_, sources := messagegroupProductionSources(t)
+	info := wrapInfoWriteOrder(sources)
+	door := messagegroupFuncParamOrder(sources, "OpenWrapBody")
+	shared := []string{}
+	for _, element := range info {
+		if slices.Contains(door, element) {
+			shared = append(shared, element)
+		}
+	}
+	mirror := []string{}
+	for _, parameter := range door {
+		if slices.Contains(info, parameter) {
+			mirror = append(mirror, parameter)
+		}
+	}
+	t.Logf("wrap_key's info writes %v; OpenWrapBody takes %v; in common, the info writes %v and the door takes %v",
+		info, door, shared, mirror)
+	// THE ANTI-VACUITY CONTROL: an equality between two empty sequences is true of any order at
+	// all, and two empty sequences are what a reading that had found neither function reports.
+	if len(shared) == 0 {
+		t.Fatalf("this reading found no element of wrap_key's info among the door's parameters -- info %v, door %v -- so the comparison below is between two empty sequences and holds of anything",
+			info, door)
+	}
+	if !slices.Equal(shared, mirror) {
+		t.Errorf("wrap_key's info writes %v and OpenWrapBody takes them %v. A call site is checked against MASTER section 7's line, and an order that is not that line is one a reader cannot check that way -- and it is this order that keeps u8(target_type) and u8(payload_type) apart, which is the only thing standing between two adjacent uint8 parameters and a transposition the compiler cannot see",
+			shared, mirror)
+	}
+}
+
+// Property: none of the three values the opener must state can arrive through something Go will
+// fill in for a caller who did not.
+//
+// THIS IS THE FINDING ITSELF, HELD STRUCTURALLY. A struct passed by value has a zero value that is
+// a complete value of the type, so a caller writing WrapExpectation{} -- or a partial literal
+// naming one field -- stated nothing and the compiler supplied 0x00 for the two octets MG-7 says
+// have no code point and 0 for the founding epoch. Measured before the repair: that call opened a
+// genuine {0x00, 0x00, epoch 0} wrap and returned its payload byte for byte. Separate parameters
+// have no such shape, because Go supplies no argument a caller did not write -- which is the only
+// thing this case is about and is the only thing the door's paragraph claims.
+//
+// THE POSITIVE CONTROLS ARE IN THE SAME READING AND ARE TAKEN FROM THE SOURCE, not from memory.
+// The two SEALING doors take a WrapEnvelope by value, deliberately -- it is the wire record being
+// written rather than an authority being stated, and m1 task 14 property 9 requires in as many
+// words that "the sealing side is reachable with an envelope the caller chooses", over all eleven
+// octets including the one an opener may state no expectation over. So the reading that reports an
+// empty set for the opener has to report those two by name, one exported and one not. An absence
+// measured by a query that cannot produce a presence is not a measurement.
+//
+// AND THE SEALER'S ROW IS ASSERTED AND NOT ONLY PRINTED, in both directions: it is the written
+// disposition that the two doors differ ON PURPOSE. A day that scalarises the sealer fails here
+// and has to move property 9's seam with it or say why it need not.
+func TestNoValueTheOpenerMustStateArrivesThroughAZeroValuableAggregate(t *testing.T) {
+	_, sources := messagegroupProductionSources(t)
+	for _, control := range []string{"SealWrapBody", "sealWrapBodyWith"} {
+		carried := messagegroupZeroValuableStructParams(sources, control)
+		if !maps.Equal(carried, map[string]string{"envelope": "WrapEnvelope"}) {
+			t.Fatalf("the control reading answers %v for %s, and that door takes a WrapEnvelope by value for m1 task 14 property 9's reason. An EMPTY answer means this reading cannot see a struct parameter at all and the opener's empty set below would mean nothing; any OTHER answer means the sealing side's shape moved, which moves property 9's seam with it",
+				carried, control)
+		}
+	}
+	aggregates := messagegroupZeroValuableStructParams(sources, "OpenWrapBody")
+	t.Logf("OpenWrapBody carries %v as a struct this package declares that a caller need not write out; the controls see WrapEnvelope on both sealing doors",
+		aggregates)
+	if len(aggregates) != 0 {
+		t.Errorf("OpenWrapBody carries %v. A struct's zero value is a complete value of it and a variadic can be left off the call, so a caller can state that value by writing nothing -- which is how WrapExpectation{} opened a genuine {0x00, 0x00, epoch 0} wrap. The three under-determined values are parameters for that reason; see OpenWrapBody and open item MG-7",
+			aggregates)
+	}
+}
+
+// Property: each of the three values the opener states is compared, AT THE VALUES GO WOULD HAVE
+// SUPPLIED -- and stating them is not the same as omitting them.
+//
+// WHY THE ZEROES ARE THE CASE WORTH WRITING. 0 is the founding epoch, and neither u8(target_type)
+// nor u8(payload_type) has a code point in any document, so 0x00 is as plausible an assignment as
+// any other -- MG-7 and MASTER section 7. A wrap whose envelope is {0x00, 0x00, epoch 0} is
+// therefore a wrap this tree may really carry, and it is exactly the wrap a caller who stated
+// nothing used to open. The repair does not forbid those values; it forbids reaching them by
+// omission. So this case asserts BOTH halves: stated, they open the wrap they name, and each one
+// moved off zero alone is refused by name.
+func TestTheOpenerStatesTheThreeUnderDeterminedValuesRatherThanDefaultingThem(t *testing.T) {
+	target := newWrapTestLeaf(t, 0x0B)
+	envelope := WrapEnvelope{FormatVersion: WrapFormatVersion, TargetType: 0x00, PayloadType: 0x00, ContentEpoch: 0}
+	payload := wrapTestPayload(0x66)
+	body, err := SealWrapBody(rand.Reader, target.pub, envelope, wrapTestGroupId(), wrapTestTargetId(), payload)
+	if err != nil {
+		t.Fatalf("SealWrapBody: %v", err)
+	}
+	// STATED, it opens. An opener honouring the founding epoch and the two octets at 0x00 is a
+	// legitimate opener and this door must not have made it unexpressible.
+	got, gotPayload, err := OpenWrapBody(target.priv, wrapTestGroupId(), 0, 0x00, wrapTestTargetId(), 0x00, body)
+	if err != nil {
+		t.Fatalf("a wrap of {0x00, 0x00, epoch 0} does not open for an opener that states exactly that: %v", err)
+	}
+	if got != envelope || !bytes.Equal(gotPayload, payload) {
+		t.Errorf("the wrap came back as %+v with %d octets of payload, and went in as %+v with %d",
+			got, len(gotPayload), envelope, len(payload))
+	}
+	// AND EACH OF THE THREE MOVED OFF ZERO ALONE IS REFUSED, by name and with the field named in
+	// the diagnostic -- which is what says all three are compared rather than one of them
+	// happening to differ. Before the repair every one of these rows was reachable by a caller
+	// who had written no expectation at all.
+	for _, one := range []struct {
+		name        string
+		epoch       uint64
+		targetType  uint8
+		payloadType uint8
+		names       string
+	}{
+		{name: "the content epoch", epoch: 1, names: "content epoch"},
+		{name: "u8(target_type)", targetType: 0x01, names: "target_type"},
+		{name: "u8(payload_type)", payloadType: 0x01, names: "payload_type"},
+	} {
+		_, refusedPayload, err := OpenWrapBody(target.priv, wrapTestGroupId(), one.epoch,
+			one.targetType, wrapTestTargetId(), one.payloadType, body)
+		if !errors.Is(err, ErrWrapEnvelopeMismatch) {
+			t.Errorf("an opener whose %s alone is not the wrap's answered %v; want ErrWrapEnvelopeMismatch",
+				one.name, err)
+		}
+		if !strings.Contains(fmt.Sprint(err), one.names) {
+			t.Errorf("an opener whose %s alone is not the wrap's was refused with %q, which does not name %s; a diagnostic that names another field is a comparison reading another field",
+				one.name, err, one.names)
+		}
+		if refusedPayload != nil {
+			t.Errorf("an opener whose %s alone is not the wrap's was handed %d octets of payload",
+				one.name, len(refusedPayload))
+		}
 	}
 }
 
@@ -742,6 +908,153 @@ func messagegroupStructFields(sources []messagegroupSource, name string) map[str
 		}
 	}
 	return fields
+}
+
+// messagegroupFuncParams answers one named function's parameters as name -> type, out of this
+// package's production source, with the type written the way the source writes it.
+//
+// It renders through go/types.ExprString and NOT through typeExprName above, which collapses
+// []byte to byte and *XwingPrivateKey to XwingPrivateKey. Those two collapses are harmless where
+// that helper is used and are exactly wrong here: the reading beside this one has to tell a value
+// of a package type from a pointer to one.
+func messagegroupFuncParams(sources []messagegroupSource, name string) map[string]string {
+	params := map[string]string{}
+	for _, source := range sources {
+		for _, declaration := range source.parsed.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || function.Name.Name != name || function.Type.Params == nil {
+				continue
+			}
+			for _, field := range function.Type.Params.List {
+				for _, named := range field.Names {
+					params[named.Name] = types.ExprString(field.Type)
+				}
+			}
+		}
+	}
+	return params
+}
+
+// messagegroupZeroValuableStructParams answers, as parameter name -> the type as the source writes
+// it, the parameters of one function through which a caller can supply a value of a STRUCT this
+// package declares WITHOUT WRITING ONE OUT.
+//
+// TWO SHAPES AND NOT ONE, and the second is why this reading is written as a walk over the type
+// expression rather than as a string test. A struct taken BY VALUE has a zero value that is a
+// complete value of it, so an empty or partial composite literal states nothing and compiles. A
+// VARIADIC of one is weaker still: the argument can be left off the call altogether. A reading
+// that looked only for a bare identifier would report a clean set for
+// `want ...WrapExpectation` -- measured, as a mutant that survived this gate's first draft.
+//
+// WHAT IT DELIBERATELY DOES NOT FLAG, with the reason, because an over-broad gate is one a later
+// commit works around. A POINTER to a struct: its zero value is nil, which is a distinguishable
+// sentinel this door refuses by name rather than a statement it cannot tell from a real one. A
+// SLICE, for the same reason. A DEFINED SCALAR -- type WrapEpoch uint64 -- which has no fields, so
+// there is no literal that omits any of them and a caller still writes the value out. And a
+// qualified type from another package, which this package did not declare and cannot judge.
+func messagegroupZeroValuableStructParams(sources []messagegroupSource, name string) map[string]string {
+	found := map[string]string{}
+	for _, source := range sources {
+		for _, declaration := range source.parsed.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || function.Name.Name != name || function.Type.Params == nil {
+				continue
+			}
+			for _, field := range function.Type.Params.List {
+				carried := field.Type
+				if variadic, isVariadic := carried.(*ast.Ellipsis); isVariadic {
+					carried = variadic.Elt
+				}
+				named, isNamed := carried.(*ast.Ident)
+				if !isNamed || len(messagegroupStructFields(sources, named.Name)) == 0 {
+					continue
+				}
+				for _, parameter := range field.Names {
+					found[parameter.Name] = types.ExprString(field.Type)
+				}
+			}
+		}
+	}
+	return found
+}
+
+// messagegroupFuncParamOrder answers one named function's parameter names IN SOURCE ORDER, which
+// is what messagegroupFuncParams' map cannot carry.
+func messagegroupFuncParamOrder(sources []messagegroupSource, name string) []string {
+	order := []string{}
+	for _, source := range sources {
+		for _, declaration := range source.parsed.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || function.Name.Name != name || function.Type.Params == nil {
+				continue
+			}
+			for _, field := range function.Type.Params.List {
+				for _, parameter := range field.Names {
+					order = append(order, parameter.Name)
+				}
+			}
+		}
+	}
+	return order
+}
+
+// wrapInfoWriteOrder answers the names WrapInfo writes into MASTER section 7's info, in the order
+// it writes them, read off its body.
+//
+// It reads the ENCODER and not a list, because the encoder is the thing the known answers hold to
+// MASTER bytewise: testdata/envelope-wrap-kat.txt's H(info) is reproduced by a second
+// transcription written from MASTER's block and sharing no code with WrapInfo, so an order that
+// drifted here fails there first and in octets. A field written as envelope.TargetType is carried
+// across as targetType, which is the one difference between a struct field and the parameter that
+// states it. The raw label write has no name and is not an element.
+func wrapInfoWriteOrder(sources []messagegroupSource) []string {
+	written := []string{}
+	for _, source := range sources {
+		for _, declaration := range source.parsed.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || function.Name.Name != "WrapInfo" || function.Body == nil {
+				continue
+			}
+			for _, statement := range function.Body.List {
+				expression, isExpression := statement.(*ast.ExprStmt)
+				if !isExpression {
+					continue
+				}
+				call, isCall := expression.X.(*ast.CallExpr)
+				if !isCall || len(call.Args) != 1 {
+					continue
+				}
+				if _, isWrite := call.Fun.(*ast.SelectorExpr); !isWrite {
+					continue
+				}
+				switch argument := call.Args[0].(type) {
+				case *ast.Ident:
+					written = append(written, argument.Name)
+				case *ast.SelectorExpr:
+					written = append(written, wrapLowerFirst(argument.Sel.Name))
+				}
+			}
+		}
+	}
+	return written
+}
+
+// wrapLowerFirst and wrapUpperFirst carry a name across the one difference between an exported
+// struct field and the parameter that states it. They are a case change and nothing else: a
+// mapping table of field to parameter would pass over a parameter renamed to something that means
+// another field.
+func wrapLowerFirst(name string) string {
+	if name == "" {
+		return name
+	}
+	return strings.ToLower(name[:1]) + name[1:]
+}
+
+func wrapUpperFirst(name string) string {
+	if name == "" {
+		return name
+	}
+	return strings.ToUpper(name[:1]) + name[1:]
 }
 
 // ---------------------------------------------------------------------------
@@ -776,8 +1089,8 @@ func TestTheDeviceWrapIsTwoBodiesAndTheirPayloadTypesMustDiffer(t *testing.T) {
 		{name: "the pq_secret wrap", body: pqBody, want: pqPayload, kind: 0x01},
 		{name: "the eph_root wrap", body: ephBody, want: ephPayload, kind: 0x02},
 	} {
-		envelope, payload, err := OpenWrapBody(target.priv, wrapTestGroupId(), wrapTestTargetId(),
-			WrapExpectation{TargetType: 0x01, PayloadType: one.kind, ContentEpoch: 12}, one.body)
+		envelope, payload, err := OpenWrapBody(target.priv, wrapTestGroupId(), 12,
+			0x01, wrapTestTargetId(), one.kind, one.body)
 		if err != nil {
 			t.Fatalf("%s did not open: %v", one.name, err)
 		}
@@ -806,8 +1119,8 @@ func TestTheDeviceWrapIsTwoBodiesAndTheirPayloadTypesMustDiffer(t *testing.T) {
 		{name: "the pq_secret wrap", body: pqBody, kind: 0x02},
 		{name: "the eph_root wrap", body: ephBody, kind: 0x01},
 	} {
-		_, payload, err := OpenWrapBody(target.priv, wrapTestGroupId(), wrapTestTargetId(),
-			WrapExpectation{TargetType: 0x01, PayloadType: cross.kind, ContentEpoch: 12}, cross.body)
+		_, payload, err := OpenWrapBody(target.priv, wrapTestGroupId(), 12,
+			0x01, wrapTestTargetId(), cross.kind, cross.body)
 		if !errors.Is(err, ErrWrapEnvelopeMismatch) {
 			t.Errorf("%s opened for an opener honouring payload_type %#02x and answered %v; want ErrWrapEnvelopeMismatch",
 				cross.name, cross.kind, err)
@@ -1435,8 +1748,11 @@ func TestTheWrapDoorMatchesItsKnownAnswers(t *testing.T) {
 			t.Errorf("moving %s leaves H(info) at INFO_SHA256, so that field is in no element of wrap_key's info and belongs in section 4 as unbound", fields[0])
 		}
 		// and this package refuses such a wrap at the door, by the opener's own authority: the
-		// expectation stays where section 1 put it while the body carries the moved envelope
-		if _, disagrees := wrapTestAuthority(envelope).disagreement(other); !disagrees {
+		// three values the opener states stay where section 1 put them while the body carries
+		// the moved envelope
+		sectionOneEpoch, sectionOneTargetType, sectionOnePayloadType := wrapTestAuthority(envelope)
+		if _, disagrees := wrapEnvelopeDisagreement(other, sectionOneEpoch,
+			sectionOneTargetType, sectionOnePayloadType); !disagrees {
 			t.Errorf("an opener honouring section 1's envelope finds no disagreement with the %s row, so nothing in this door separates a genuine wrap of another %s",
 				fields[0], fields[0])
 		}

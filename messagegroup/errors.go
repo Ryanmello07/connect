@@ -586,8 +586,8 @@ var (
 	// derivation, and u8(payload_type) is the only element of wrap_key's nine that separates
 	// them, so one octet used twice is a pair of records separable by nothing any key binds --
 	// which is precisely the job MASTER section 7's own table gives that octet. What turns that
-	// separation into a refusal at the OPENER is the WrapExpectation it states: two distinct
-	// octets give two distinct keys, and an opener honouring one kind refuses the other's body
-	// before it reaches either.
+	// separation into a refusal at the OPENER is the payload_type OpenWrapBody's caller states:
+	// two distinct octets give two distinct keys, and an opener honouring one kind refuses the
+	// other's body before it reaches either.
 	ErrWrapPayloadTypeCollision = errors.New("messagegroup: the two device wraps of one target take two payload types")
 )
