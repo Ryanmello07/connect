@@ -124,7 +124,9 @@ const wrapAeadMaterialBytes = recordAeadKeyBytes + recordAeadNonceBytes
 // The version is first for the reason every offset below it is meaningful only under that
 // version. WHAT AN OPENER DOES WITH AN UNRECOGNISED ONE IS NOT RULED -- m1 open item M1-54 -- and
 // this door does not rule it either: OpenWrapBody carries the octet out to its caller and refuses
-// nothing on it. That choice is not free and it is not hidden. The version octet is the one field
+// nothing on it, and WrapExpectation gives a caller no field to ask about it with -- an opener's
+// comparison over an octet no ruling reaches would be this package ruling M1-54 quietly. That
+// choice is not free and it is not hidden. The version octet is the one field
 // of the eleven that MASTER's nine-element info does NOT bind, so until task 14 step 3's signature
 // lands there is no authority over it at all: a wrap whose version octet has been changed on the
 // wire opens to exactly the payload it carried. That is measured in wrap_test.go, pinned in
@@ -421,8 +423,79 @@ func sealWrapBodyWith(envelope WrapEnvelope, groupId []byte, targetId []byte,
 	return body, nil
 }
 
+// WrapExpectation is the OPENER'S OWN AUTHORITY over the envelope, and it is an argument of the
+// door below rather than a sentence in its documentation.
+//
+// WHY THE DOOR CANNOT DO WITHOUT IT. wrap_key is derived from the envelope the BODY carries -- m1
+// M1-55's first reading, see OpenWrapBody -- so a GENUINE wrap is always self-consistent: its
+// envelope and its key agree, whatever epoch and whatever payload kind they agree about. The AEAD
+// therefore convicts an envelope somebody EDITED after the seal and nothing else. Measured on this
+// door before this type existed, rather than argued: a genuine wrap sealed at content epoch 10 was
+// handed to an opener whose signature had no epoch in it, opened, and returned its payload byte
+// for byte; and SealDeviceWraps' two bodies for one leaf at one epoch -- which land at ONE
+// wrap_target_handle and are told apart by u8(payload_type) alone -- both opened under identical
+// arguments, with the octet carried OUT to the caller and compared against nothing. "This wrap
+// opened" and "this is the wrap I asked for" are two different sentences, and m1 task 14 property
+// 4's headline -- a wrap for epoch n+1 does not open as a wrap for epoch n -- is the second one.
+//
+// SO THE COMPARISON IS THE DOOR'S AND NOT A CALLER'S TO REMEMBER. M1-55 names this behaviour
+// itself, as the third one neither document describes -- an opener "may or may not compare the
+// carried values against its own and refuse a mismatch" -- and leaves it to the implementation;
+// what is ruled nowhere is left nowhere by taking it, because the wire does not move: the octets a
+// sealer writes and the key both ends derive are what they were. What moves is who is obliged.
+// Task 15's fan-out is the consumer that INSTALLS pq_secret[k] and eph_root[k] into a session,
+// which is MASTER section 5.3's "honour", and a residual obligation written in a comment is one
+// that consumer meets or does not. Carried as an argument, it cannot reach the payload without
+// having stated which wrap it believes it is opening.
+//
+// u8(wrap_format_version) IS DELIBERATELY NOT A FIELD. What an opener does with an unrecognised
+// version is m1 open item M1-54 and is unruled, so this type gives a caller no way to express an
+// expectation over it and this door still refuses nothing on it. The octet stays exactly as
+// unauthenticated as it was -- which is measured, printed and filed as MG-7 -- rather than being
+// hidden behind a comparison that a ruling has not authorised. wrap_test.go holds the complement
+// of the two types against that written disposition, and fails in both directions.
+//
+// WHAT IT DOES NOT ESTABLISH, because the door cannot see it: that the values came from anywhere.
+// This compares what the caller was handed against what the body carries; it cannot tell an
+// expectation read off the caller's own authority -- the epoch it is restoring, the record kind it
+// asked for -- from one copied out of the body in front of it. There is deliberately no exported
+// helper that builds a WrapExpectation from a WrapEnvelope, so that copying is something a caller
+// has to write out on purpose; nothing here stops it. Open item MG-7.
+type WrapExpectation struct {
+	TargetType   uint8
+	PayloadType  uint8
+	ContentEpoch uint64
+}
+
+// disagreement names the first envelope field that is not what the opener asked for, and answers
+// false when the carried envelope IS the wrap the opener asked for.
+//
+// IT ANSWERS A BOOL BESIDE THE STRING RATHER THAN AN EMPTY STRING, because a caller deciding on
+// the string would be comparing octets with ordinary go equality -- which mls's
+// framing_guard_test.go refuses across this tree and refused this function's first draft by name.
+// Nothing here is secret; the envelope is cleartext on the wire. The rule is mechanical for the
+// reason it exists, which is that the next comparison spelled that way is the one over a tag.
+//
+// It names one field rather than all three because the string is a diagnostic and not a verdict:
+// the verdict is ErrWrapEnvelopeMismatch, which is one sentinel however many fields disagree. The
+// three values it prints are cleartext octets of the body it was handed.
+func (self WrapExpectation) disagreement(envelope WrapEnvelope) (string, bool) {
+	switch {
+	case envelope.ContentEpoch != self.ContentEpoch:
+		return fmt.Sprintf("content epoch %d and its opener is honouring epoch %d",
+			envelope.ContentEpoch, self.ContentEpoch), true
+	case envelope.TargetType != self.TargetType:
+		return fmt.Sprintf("target_type %#02x and its opener asked for %#02x",
+			envelope.TargetType, self.TargetType), true
+	case envelope.PayloadType != self.PayloadType:
+		return fmt.Sprintf("payload_type %#02x and its opener asked for %#02x",
+			envelope.PayloadType, self.PayloadType), true
+	}
+	return "", false
+}
+
 // OpenWrapBody is the other half of the door: one wrap body, opened with the target leaf's own
-// X-Wing private half.
+// X-Wing private half, for an opener that says which wrap it is opening.
 //
 // THE DECAPSULATION'S "YES" IS NOT THE ANSWER, and this is the property the whole door turns on.
 // ML-KEM-768 uses implicit rejection: a ciphertext that was not produced for this key
@@ -436,12 +509,25 @@ func sealWrapBodyWith(envelope WrapEnvelope, groupId []byte, targetId []byte,
 //
 // THE KEY IS DERIVED FROM THE ENVELOPE'S CARRIED VALUES and not from the opener's own epoch. That
 // is unruled -- m1 open item M1-55, and ledger item 178's first residual files the sentence as
-// owed -- and MASTER section 7's own rationale is what this door follows: "a receiver that derives
-// the key from the envelope's own values and finds aead_ct does not open has detected the
-// disagreement fail-closed". What it costs is stated rather than left to be found: under this
-// reading the ten info-bound octets of the envelope are authenticated by the AEAD, the ELEVENTH --
-// the version octet -- is authenticated by nothing until task 14 step 3's signature lands, and
-// wrap_test.go measures which is which rather than asserting a table. Open item MG-7.
+// owed -- and it is M1-55's first reading, which MASTER section 7's own rationale argues for: "a
+// receiver that derives the key from the envelope's own values and finds aead_ct does not open has
+// detected the disagreement fail-closed".
+//
+// THAT SENTENCE IS ABOUT A DISAGREEMENT, AND A GENUINE WRAP OF ANOTHER EPOCH IS NOT ONE. It holds
+// where the octets on the wire and the octets the sealer used DIFFER: the opener then derives a
+// key the sealer never used and the tag fails. It says nothing about a wrap nobody edited. A wrap
+// sealed at another epoch, or carrying the other payload kind, is self-consistent -- its key
+// matches its own envelope -- and the AEAD opens it, which is measured under WrapExpectation
+// above. So the ten info-bound octets are authenticated by the AEAD against TAMPERING and against
+// nothing else, the eleventh -- the version octet -- is authenticated by nothing at all until task
+// 14 step 3's signature lands, and WHICH WRAP THIS IS is a question the AEAD was never asked. Open
+// item MG-7; wrap_test.go measures both authorities and reports what each covers rather than
+// asserting a table.
+//
+// WHICH IS WHY want IS AN ARGUMENT AND NOT A COMMENT. The opener states the wrap it is honouring,
+// and a body carrying any other envelope is refused with ErrWrapEnvelopeMismatch -- BEFORE the
+// decapsulation and before the AEAD, so the plaintext of a wrap nobody asked for is never
+// recovered in this process. What that does and does not establish is WrapExpectation's paragraph.
 //
 // target_xwing_pub comes from the opener's OWN key and is never an argument: it is one of the nine
 // inputs to wrap_key, and taking it from a caller would let a wrap be opened under a public key
@@ -450,7 +536,7 @@ func sealWrapBodyWith(envelope WrapEnvelope, groupId []byte, targetId []byte,
 // The noinline directive is this package's erase helper class, for sealWrapBodyWith's reason.
 //
 //go:noinline
-func OpenWrapBody(priv *XwingPrivateKey, groupId []byte, targetId []byte,
+func OpenWrapBody(priv *XwingPrivateKey, groupId []byte, targetId []byte, want WrapExpectation,
 	body []byte) (WrapEnvelope, []byte, error) {
 
 	if priv == nil {
@@ -463,6 +549,15 @@ func OpenWrapBody(priv *XwingPrivateKey, groupId []byte, targetId []byte,
 	envelope, err := ParseWrapEnvelope(body[:WrapEnvelopeBytes])
 	if err != nil {
 		return WrapEnvelope{}, nil, err
+	}
+	if disagreement, disagrees := want.disagreement(envelope); disagrees {
+		// AHEAD OF THE KEM AND AHEAD OF THE AEAD, so that a wrap this opener did not ask for is
+		// refused without its payload ever being recovered here -- and so that the refusal does
+		// not depend on the rest of the body parsing at all. Nothing is carried out with it:
+		// returning the envelope of a wrap that was refused is handing a caller the very value
+		// it just failed to match.
+		return WrapEnvelope{}, nil, fmt.Errorf("%w: this wrap carries %s",
+			ErrWrapEnvelopeMismatch, disagreement)
 	}
 	algId, ctXwing, aeadCt, err := parseHybridCt(body[WrapEnvelopeBytes:])
 	if err != nil {
@@ -549,6 +644,13 @@ func parseHybridCt(b []byte) (algId uint16, ctXwing []byte, aeadCt []byte, err e
 // case rather than a hypothetical, because a device leaf now receives two wrap records at one
 // epoch". A caller passing one octet twice has a fan-out whose two records are separable by
 // nothing a key binds.
+//
+// AND SEPARATING THE TWO KEYS IS NOT SEPARATING THE TWO RECORDS AT AN OPENER, which is the half
+// this function cannot hold and OpenWrapBody's WrapExpectation does. Each body's key is derived
+// from the payload_type that body CARRIES, so before that argument existed both of these opened at
+// one door under identical arguments and the octet was carried out to a caller who was under no
+// obligation to look at it. Two distinct octets are what make an opener's refusal possible; an
+// opener that states which kind it is honouring is what makes it happen.
 //
 // WHICH TWO OCTETS THEY ARE IS NOT THIS FILE'S TO SAY. u8(payload_type) has no code point in any
 // document, so the caller supplies both and this function supplies neither. See MG-7.

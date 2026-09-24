@@ -737,19 +737,29 @@ commit the version octet is authenticated by nothing at all.
 ### The reproduction
 
 `TestTheEnvelopeOctetsTheWrapKeyBindsAreRefusedAndTheSuiteReportsTheRest` in `wrap_test.go`. It
-edits each of the envelope's eleven octets on the wire and reports which are refused:
+edits each of the envelope's eleven octets on the wire and reports which are refused, **by which of
+the door's two authorities**:
 
 ```
-wrap envelope: 10 of 11 octets are refused when edited on the wire ([1 2 3 4 5 6 7 8 9 10]);
-1 are accepted ([0])
+wrap envelope, 11 octets: the AEAD refuses [1 2 3 4 5 6 7 8 9 10] and accepts [0] when the
+opener's authority moves with the edit; the opener's own comparison refuses [1 2 3 4 5 6 7 8 9 10]
+when it does not; [0] is covered by neither
 ```
 
-The accepted set is asserted against a written-down disposition of exactly `{0}` and fails in **both**
-directions — a larger set is an unauthenticated octet nobody named, and a smaller one means an
-authority arrived, which is what Task 14 step 3 landing looks like and which must delete the clause
-rather than pass quietly. `testdata/envelope-wrap-kat.txt` §4 carries the same measurement as a
-vector a second implementation can check without a KEM: one row per octet, giving `H(info)` after
-flipping it, with the verdict stated per row.
+The first column is the key: the opener's `WrapExpectation` is moved to agree with the edit, so the
+comparison passes and only the tag can refuse — which is the hardest case for the key and therefore
+the one worth measuring. The second is the opener: its authority stays where the sealer put it. Each
+set is asserted against a written-down disposition and fails in **both** directions — for the AEAD's,
+a larger accepted set is an unauthenticated octet nobody named and a smaller one means an authority
+arrived, which is what Task 14 step 3 landing looks like and which must delete the clause rather than
+pass quietly; for the comparison's, a smaller set is a `WrapExpectation` field that stopped being
+compared and a larger one is **M1-54** being ruled in this package. The union's complement — the
+octets **neither** authority covers — is asserted to be exactly `{0}`.
+`testdata/envelope-wrap-kat.txt` §4 carries the AEAD column as a vector a second implementation can
+check without a KEM: one row per octet, giving `H(info)` after flipping it, with the verdict stated
+per row. §5 carries the other direction — two **genuine** envelopes, one epoch moved and one payload
+kind moved, each with its own `H(info)`, which differs from the base: a different key and not a
+broken one, so nothing inside the seal can refuse it.
 
 For the three code points there is nothing to reproduce, which is the point: `wrap.go` takes all
 three as parameters with no default, so this package cannot be the one that chose.
@@ -762,6 +772,32 @@ edit to it changes no behaviour at all. What it costs is the future: the octet e
 second body field is a negotiation rather than a flag day (MASTER §7), and a version field an
 attacker can move is a downgrade channel the moment anything branches on it.
 
+**And that the AEAD's ten "refused" octets say anything at all about a wrap nobody edited.** They do
+not, and the measurement above is careful to say which case it is in. Under M1-55's first reading —
+this door's — `wrap_key` is derived from the envelope the body carries, so a **genuine** wrap of
+another epoch or another payload kind is self-consistent: its key matches its own envelope and the
+AEAD opens it. Measured on this door before `WrapExpectation` existed: a genuine wrap sealed at
+content epoch 10 opened at a signature with no epoch in it and returned its payload byte for byte,
+and `SealDeviceWraps`' two bodies for one leaf at one epoch — which land at **one**
+`wrap_target_handle` and differ in `u8(payload_type)` alone — both opened under identical arguments,
+with the octet carried out to a caller under no obligation to read it. So MASTER §7's *"a receiver
+that derives the key from the envelope's own values and finds `aead_ct` does not open has detected
+the disagreement fail-closed"* is a sentence about a **disagreement** and covers the tampered case
+only. Task 14 Property 4's headline — *a wrap for epoch n+1 does not open as a wrap for epoch n* — is
+about the genuine one, and in this package it is true because `OpenWrapBody` takes the opener's own
+`WrapExpectation` and refuses anything else with `ErrWrapEnvelopeMismatch`, ahead of the KEM.
+
+**What is still not established is where that expectation came from.** The door compares what it was
+handed against what the body carries; it cannot tell an expectation read off the caller's own
+authority — the epoch it is restoring, the record kind it asked for — from one copied out of the body
+in front of it. There is deliberately no exported helper that builds a `WrapExpectation` from a
+`WrapEnvelope`, so copying is something a caller writes out on purpose, and nothing here stops it.
+The consumer that will be judged on it is Task 15's fan-out, which is what **honours** `pq_secret[k]`
+and `eph_root[k]` in MASTER §5.3's sense. Taking the comparison at all is the third behaviour **M1-55**
+names and leaves to the implementation — *"may or may not compare the carried values against its own
+and refuse a mismatch"* — so it rules nothing: the wire does not move, and the ruling M1-55 owes is
+owed exactly as before.
+
 ### What a ruling has to choose
 
 1. **The three code points**, as a table: which octet a device leaf is and which a member's
@@ -770,8 +806,10 @@ attacker can move is a downgrade channel the moment anything branches on it.
    unblocks a second implementation.
 2. **`M1-54`** — what an opener does with an unrecognised `wrap_format_version`, and at what point
    relative to the AEAD open. MASTER §7's own rationale for putting the octet first points towards a
-   refusal and an early one; nothing states it. A refusal moves the measurement above from ten of
-   eleven to ten of ten and closes this item's second half without waiting for the signature.
+   refusal and an early one; nothing states it. A refusal empties the measurement's third set — the
+   octets **neither** authority covers — and closes this item's second half without waiting for the
+   signature. It is the one ruling this package could act on the same day: the field would join
+   `WrapExpectation`, which is why the complement of those two types is asserted rather than assumed.
 3. **`M1-52`** — the signature preimage's length, which is what unblocks Task 14 step 3 and is the
    only thing that puts an authenticator over the envelope as a whole.
 

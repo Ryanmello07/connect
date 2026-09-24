@@ -188,3 +188,41 @@ ENVELOPE_OCTET 7  bound   a36aa64f47f3a72b1184d97a91acbd92c33eb667fc9a1c3c9558f2
 ENVELOPE_OCTET 8  bound   a0402a747879ebeca803213417af2f21996cd8623376fa5354c7754437335701
 ENVELOPE_OCTET 9  bound   30bf13b40914bbb218801b0372846753c703b7f3ff89c75af5a9b01466fceabf
 ENVELOPE_OCTET 10 bound   77910bea4635d7c8b29f5e94f3b10c05bba72e116d366b02d0f7813b9523e831
+
+# ------------------------------------------------------------------------------------------------
+# SECTION 5 -- THE OTHER FAILING DIRECTION: A GENUINE WRAP OF ANOTHER EPOCH IS NOT A TAMPERED ONE
+# ------------------------------------------------------------------------------------------------
+#
+# SECTION 4'S TEN "bound" ROWS SAY LESS THAN THEY LOOK LIKE THEY SAY, and this section is what
+# keeps a second implementation from reading them as more. Each of those rows edits an octet AFTER
+# the seal: the sealer used one envelope, the wire carries another, the opener derives a key the
+# sealer never used, and the tag fails. That is a DISAGREEMENT, and it is the case MASTER section 7
+# means when it says "a receiver that derives the key from the envelope's own values and finds
+# aead_ct does not open has detected the disagreement fail-closed".
+#
+# A WRAP OF ANOTHER EPOCH IS NOT THAT CASE. It is a wrap nobody edited. Its envelope and its key
+# agree with each other -- differently from this file's rows, but with each other -- so it opens,
+# and it opens to the payload it carries. The two rows below are exactly that: the section 1
+# envelope with ONE field moved, and the H(info) each produces. Both differ from INFO_SHA256, which
+# is the check -- a different key, not a broken one -- and a wrap sealed under either of them is a
+# perfectly good wrap that the AEAD has no reason to refuse.
+#
+# WHAT A SECOND IMPLEMENTATION OWES, and it is not an octet: the opener must compare the carried
+# envelope against the epoch it is restoring and the payload kind it asked for, and refuse a
+# mismatch, BEFORE it honours anything. Nothing in section 3 or section 4 can check that for it,
+# because the octets are correct in both directions. The second row is the one that bites soonest:
+# MASTER section 8.2's two device wraps for one leaf at one epoch land at ONE wrap_target_handle
+# and differ in u8(payload_type) alone, so an opener that does not compare will take pq_secret[k]
+# and eph_root[k] as interchangeable -- and they are not: one is PERMANENT and one is EPH(5), which
+# is what makes section 8.1's disappearing-message promise cryptographic.
+#
+# m1 task 14 property 4's headline is this section and not section 4: "a wrap for epoch n+1 does
+# not open as a wrap for epoch n". In this package the comparison is a required argument of
+# OpenWrapBody, messagegroup.WrapExpectation, and u8(wrap_format_version) is deliberately not one
+# of its fields -- open item M1-54 leaves an unrecognised version unruled, so nothing here refuses
+# on it and section 4's row 0 still says what it says.
+#
+# FORMAT: GENUINE_OTHER <the field that moved> <the eleven envelope octets> <sha256 of info>
+
+GENUINE_OTHER content_epoch 0101010000000000000008 6b9d5b8456d9e3580036af5fb80bb9fbe1e84612f49ad2549ea1c39e9df142dd
+GENUINE_OTHER payload_type  0101020000000000000007 6a56ddd657d76a55d178c3f92bed71b48adb307e46a933794e4d95122ac0e3a5

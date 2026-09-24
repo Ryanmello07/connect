@@ -548,13 +548,32 @@ var (
 	ErrWrapAlgId = errors.New("messagegroup: this wrap body names a kem that is not x-wing")
 	// Fires when a wrap's aead_ct does not authenticate.
 	//
-	// IT IS THE ONLY VERDICT THE DOOR HAS AND THAT IS THE WHOLE SHAPE OF THE KEM. ML-KEM-768
+	// IT IS THE ONLY VERDICT OVER THE KEM AND THAT IS THE WHOLE SHAPE OF THE KEM. ML-KEM-768
 	// rejects implicitly: a ciphertext that was not produced for this key decapsulates
 	// SUCCESSFULLY to a pseudorandom secret, so every wrap addressed to another leaf reaches the
 	// AEAD with thirty two well formed octets and nothing before this point can refuse it. A
 	// caller that treated a decapsulation's nil error as "this wrap is mine" would be right about
 	// every wrap in the epoch.
+	//
+	// IT IS NOT A VERDICT ABOUT WHICH WRAP THIS IS. The key is derived from the envelope the body
+	// carries, so it convicts an envelope that was EDITED after the seal and never a genuine wrap
+	// of another epoch or another payload kind, whose envelope and whose key agree with each
+	// other. That second question is ErrWrapEnvelopeMismatch's, and it is answered first.
 	ErrWrapOpen = errors.New("messagegroup: this wrap did not open under this leaf's key")
+	// Fires when the envelope a wrap body CARRIES is not the wrap its opener asked for.
+	//
+	// IT IS A DIFFERENT VERDICT FROM ErrWrapOpen AND THE DIFFERENCE IS THE POINT. Measured, on
+	// the door as it stood before the expectation argument: a genuine wrap sealed at content
+	// epoch 10 opened at a door whose signature had no epoch in it and returned its payload byte
+	// for byte, and the two bodies SealDeviceWraps answers for one leaf at one epoch -- which
+	// land at ONE wrap_target_handle -- both opened under identical arguments. ErrWrapOpen means
+	// the octets were tampered with after the seal; this one means they were not, and the wrap is
+	// somebody else's business.
+	//
+	// The two are separable by errors.Is on purpose, and that separates nothing an attacker
+	// chose: the eleven octets of the envelope travel in the clear outside hybrid_ct, so anyone
+	// holding the record already knows which of the two a given opener will answer.
+	ErrWrapEnvelopeMismatch = errors.New("messagegroup: this wrap's envelope is not the wrap its opener asked for")
 	// Fires when a wrap is sealed to no target key, or opened with no private half.
 	ErrWrapTargetKey = errors.New("messagegroup: a wrap needs the target leaf's x-wing key and none was given")
 	// Fires when a wrap is sealed over an empty payload. A wrap with nothing inside it is a
@@ -566,6 +585,9 @@ var (
 	// Both records land at the SAME wrap_target_handle by MASTER section 8.3's unchanged
 	// derivation, and u8(payload_type) is the only element of wrap_key's nine that separates
 	// them, so one octet used twice is a pair of records separable by nothing any key binds --
-	// which is precisely the job MASTER section 7's own table gives that octet.
+	// which is precisely the job MASTER section 7's own table gives that octet. What turns that
+	// separation into a refusal at the OPENER is the WrapExpectation it states: two distinct
+	// octets give two distinct keys, and an opener honouring one kind refuses the other's body
+	// before it reaches either.
 	ErrWrapPayloadTypeCollision = errors.New("messagegroup: the two device wraps of one target take two payload types")
 )

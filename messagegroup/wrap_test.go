@@ -338,6 +338,23 @@ func newWrapTestLeaf(t *testing.T, fill byte) *wrapTestLeaf {
 func wrapTestGroupId() []byte  { return bytes.Repeat([]byte{0x21}, 32) }
 func wrapTestTargetId() []byte { return bytes.Repeat([]byte{0x71}, 16) }
 
+// wrapTestAuthority stands for an opener whose OWN authority -- the epoch it is restoring and the
+// record kind it asked for -- happens to be what some envelope says.
+//
+// IT IS A TEST HELPER AND IT IS NOT AN EXPORTED ONE, which is the whole point of OpenWrapBody's
+// expectation argument: a production caller that built its expectation out of the body in front of
+// it would have compared a value against itself, and this package gives it no door to do that
+// through. Here the cases that use it are the ones whose subject is something else -- the KEM, the
+// group binding, which octets the AEAD covers -- and every case whose subject IS the comparison
+// writes its expectation out as a literal instead.
+func wrapTestAuthority(envelope WrapEnvelope) WrapExpectation {
+	return WrapExpectation{
+		TargetType:   envelope.TargetType,
+		PayloadType:  envelope.PayloadType,
+		ContentEpoch: envelope.ContentEpoch,
+	}
+}
+
 // wrapTestPayload is a payload of the shape MASTER section 7 puts inside aead_ct --
 // secret | LP(identity_pub) | sig -- so the sizing this file asserts is the sizing MASTER
 // publishes. The signature octets are fill: task 14 step 3 is blocked by open item M1-52 and
@@ -373,7 +390,8 @@ func TestAWrapOpensForItsTargetLeafAndForNoOther(t *testing.T) {
 		t.Fatalf("SealWrapBody: %v", err)
 	}
 
-	gotEnvelope, gotPayload, err := OpenWrapBody(target.priv, wrapTestGroupId(), wrapTestTargetId(), body)
+	want := wrapTestAuthority(envelope)
+	gotEnvelope, gotPayload, err := OpenWrapBody(target.priv, wrapTestGroupId(), wrapTestTargetId(), want, body)
 	if err != nil {
 		t.Fatalf("the target leaf could not open its own wrap: %v", err)
 	}
@@ -396,27 +414,37 @@ func TestAWrapOpensForItsTargetLeafAndForNoOther(t *testing.T) {
 	if len(foreign) != XwingSharedSize {
 		t.Fatalf("a foreign decapsulation answered %d octets, want %d", len(foreign), XwingSharedSize)
 	}
-	if _, _, err := OpenWrapBody(other.priv, wrapTestGroupId(), wrapTestTargetId(), body); !errors.Is(err, ErrWrapOpen) {
+	if _, _, err := OpenWrapBody(other.priv, wrapTestGroupId(), wrapTestTargetId(), want, body); !errors.Is(err, ErrWrapOpen) {
 		t.Errorf("a second leaf's private half answered %v; want ErrWrapOpen", err)
 	}
 	// and the group and the target are bound too, which is what stops one group's wrap opening
 	// in another and one member's opening at another's handle
-	if _, _, err := OpenWrapBody(target.priv, bytes.Repeat([]byte{0x99}, 32), wrapTestTargetId(), body); !errors.Is(err, ErrWrapOpen) {
+	if _, _, err := OpenWrapBody(target.priv, bytes.Repeat([]byte{0x99}, 32), wrapTestTargetId(), want, body); !errors.Is(err, ErrWrapOpen) {
 		t.Errorf("a wrap opened under a different group_id: %v", err)
 	}
-	if _, _, err := OpenWrapBody(target.priv, wrapTestGroupId(), bytes.Repeat([]byte{0x99}, 16), body); !errors.Is(err, ErrWrapOpen) {
+	if _, _, err := OpenWrapBody(target.priv, wrapTestGroupId(), bytes.Repeat([]byte{0x99}, 16), want, body); !errors.Is(err, ErrWrapOpen) {
 		t.Errorf("a wrap opened under a different target_id: %v", err)
 	}
 }
 
-// Property: a wrap sealed at one epoch does not open as a wrap of another, in both of the two
-// places MASTER binds the epoch.
+// Property: a wrap sealed at one epoch does not open as a wrap of another, in all three of the
+// places the epoch is bound -- and the FIRST of them is the one a reader would assume and is the
+// one that needed a seam built for it.
 //
-// The FIRST is the wrap's own key: u64(content_epoch) is one of wrap_key's nine info elements, so
-// an opener handed a body whose envelope claims a different epoch derives a different key and the
-// AEAD refuses. The SECOND is the outer seal: env_key[k] is an epoch's own exporter output, so the
-// record ladder a wrap of epoch n+1 rides is not the ladder a wrap of epoch n rides, and the two
-// are separated before any wrap body is reached.
+// THE GENUINE CASE AND THE TAMPERED CASE ARE NOT THE SAME CASE, and this case used to hold only
+// the second of them. u64(content_epoch) is one of wrap_key's nine info elements, so an opener
+// handed a body whose envelope was EDITED on the wire derives a key the sealer never used and the
+// AEAD refuses -- that is the tampered half, and it is real. But the key is derived from the
+// envelope the body CARRIES, so a genuine wrap of another epoch is self-consistent: its key
+// matches its own envelope and the AEAD opens it. Measured on this door before the expectation
+// argument existed: a genuine wrap of content epoch 10 opened and returned its payload byte for
+// byte. The headline of m1 task 14 property 4 is about that wrap, not about the edited one, and it
+// is true here only because OpenWrapBody takes the epoch its opener is honouring and refuses
+// anything else -- see WrapExpectation.
+//
+// The THIRD is the outer seal: env_key[k] is an epoch's own exporter output, so the record ladder
+// a wrap of epoch n+1 rides is not the ladder a wrap of epoch n rides, and the two are separated
+// before any wrap body is reached. That half is the record layer's and not this door's.
 func TestAWrapSealedAtOneEpochDoesNotOpenAtAnother(t *testing.T) {
 	target := newWrapTestLeaf(t, 0x03)
 	payload := wrapTestPayload(0x44)
@@ -426,11 +454,37 @@ func TestAWrapSealedAtOneEpochDoesNotOpenAtAnother(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SealWrapBody: %v", err)
 	}
-	// it opens at its own epoch, which is the control that makes the refusal below mean something
-	if _, _, err := OpenWrapBody(target.priv, wrapTestGroupId(), wrapTestTargetId(), body); err != nil {
+	atNine := WrapExpectation{TargetType: 0x01, PayloadType: 0x01, ContentEpoch: 9}
+	atEight := WrapExpectation{TargetType: 0x01, PayloadType: 0x01, ContentEpoch: 8}
+	// it opens at its own epoch, which is the control that makes the refusals below mean something
+	if _, _, err := OpenWrapBody(target.priv, wrapTestGroupId(), wrapTestTargetId(), atNine, body); err != nil {
 		t.Fatalf("the wrap does not open at the epoch it was sealed at: %v", err)
 	}
-	// and does not at the epoch before it, with the envelope's own octets edited on the wire
+	// THE GENUINE HALF: the body is untouched and every octet in it is the sealer's. An opener
+	// honouring epoch 8 must not be handed epoch 9's secret, and nothing in the KEM or the AEAD
+	// can tell it so -- the refusal here is the opener's own authority and it is asserted BY NAME,
+	// because an ErrWrapOpen here would mean the key moved and the key does not move.
+	genuineEnvelope, genuinePayload, err := OpenWrapBody(target.priv, wrapTestGroupId(), wrapTestTargetId(), atEight, body)
+	if !errors.Is(err, ErrWrapEnvelopeMismatch) {
+		t.Errorf("a GENUINE wrap of epoch 9 handed to an opener honouring epoch 8 answered %v; want ErrWrapEnvelopeMismatch", err)
+	}
+	if errors.Is(err, ErrWrapOpen) {
+		t.Error("the genuine epoch 9 wrap was refused as a tag failure, so this case is measuring the AEAD and the AEAD cannot see this")
+	}
+	if genuinePayload != nil || genuineEnvelope != (WrapEnvelope{}) {
+		t.Errorf("a refused wrap carried %d octets of payload and the envelope %+v out to its caller",
+			len(genuinePayload), genuineEnvelope)
+	}
+	// and the refusal does not depend on the rest of the body: it is ahead of the KEM, so a body
+	// whose hybrid_ct is destroyed is still refused as the wrong wrap rather than as bad framing.
+	truncated := slices.Clone(body[:WrapEnvelopeBytes+4])
+	if _, _, err := OpenWrapBody(target.priv, wrapTestGroupId(), wrapTestTargetId(), atEight, truncated); !errors.Is(err, ErrWrapEnvelopeMismatch) {
+		t.Errorf("a wrap of the wrong epoch whose hybrid_ct is four octets answered %v; want ErrWrapEnvelopeMismatch, which is what puts the comparison ahead of the KEM", err)
+	}
+	// THE TAMPERED HALF: the same edit made on the wire moves wrap_key, and this is the one the
+	// AEAD convicts. The opener still honours epoch 8, so the comparison passes and the tag is
+	// what refuses -- which is how this assertion stays a measurement of the key and not of the
+	// comparison above it.
 	restated := slices.Clone(body)
 	edited, err := ParseWrapEnvelope(restated[:WrapEnvelopeBytes])
 	if err != nil {
@@ -438,7 +492,7 @@ func TestAWrapSealedAtOneEpochDoesNotOpenAtAnother(t *testing.T) {
 	}
 	edited.ContentEpoch = 8
 	copy(restated[:WrapEnvelopeBytes], edited.Encode())
-	if _, _, err := OpenWrapBody(target.priv, wrapTestGroupId(), wrapTestTargetId(), restated); !errors.Is(err, ErrWrapOpen) {
+	if _, _, err := OpenWrapBody(target.priv, wrapTestGroupId(), wrapTestTargetId(), atEight, restated); !errors.Is(err, ErrWrapOpen) {
 		t.Errorf("a wrap whose content epoch was moved from 9 to 8 answered %v; want ErrWrapOpen", err)
 	}
 
@@ -501,6 +555,14 @@ func TestAWrapSealedAtOneEpochDoesNotOpenAtAnother(t *testing.T) {
 // is task 14 step 3, blocked by M1-52. So today a wrap whose version octet was changed on the wire
 // opens to the payload it carried, with no refusal anywhere, and that is printed rather than
 // hidden behind a green round trip.
+//
+// THERE ARE TWO AUTHORITIES IN THIS DOOR AND THE CASE MEASURES THEM SEPARATELY, which is what the
+// single column it used to print could not do. The AEAD convicts an octet only when the opener's
+// own expectation MOVED WITH THE EDIT -- an opener that believes the edited value, which is the
+// hardest case for the key and therefore the one worth measuring -- and the opener's comparison
+// convicts an octet only when it did NOT. Running both columns is what separates "the key covers
+// this octet" from "somebody happened to look at it", and their union's complement is the octet
+// nothing in this door covers at all.
 func TestTheEnvelopeOctetsTheWrapKeyBindsAreRefusedAndTheSuiteReportsTheRest(t *testing.T) {
 	target := newWrapTestLeaf(t, 0x05)
 	envelope := WrapEnvelope{FormatVersion: WrapFormatVersion, TargetType: 0x02, PayloadType: 0x03, ContentEpoch: 11}
@@ -509,15 +571,24 @@ func TestTheEnvelopeOctetsTheWrapKeyBindsAreRefusedAndTheSuiteReportsTheRest(t *
 	if err != nil {
 		t.Fatalf("SealWrapBody: %v", err)
 	}
-	if _, _, err := OpenWrapBody(target.priv, wrapTestGroupId(), wrapTestTargetId(), body); err != nil {
+	sealed := wrapTestAuthority(envelope)
+	if _, _, err := OpenWrapBody(target.priv, wrapTestGroupId(), wrapTestTargetId(), sealed, body); err != nil {
 		t.Fatalf("the unedited wrap does not open, so every row below is measuring the wrong thing: %v", err)
 	}
 	refused := []int{}
 	accepted := []int{}
+	compared := []int{}
 	for octet := 0; octet < WrapEnvelopeBytes; octet += 1 {
 		edited := slices.Clone(body)
 		edited[octet] ^= 0xFF
-		_, gotPayload, err := OpenWrapBody(target.priv, wrapTestGroupId(), wrapTestTargetId(), edited)
+		moved, err := ParseWrapEnvelope(edited[:WrapEnvelopeBytes])
+		if err != nil {
+			t.Fatalf("the envelope with octet %d edited does not parse: %v", octet, err)
+		}
+		// COLUMN ONE, the key: the opener's own authority is moved to agree with the edit, so
+		// the comparison passes and the only thing left that can refuse is the tag.
+		_, gotPayload, err := OpenWrapBody(target.priv, wrapTestGroupId(), wrapTestTargetId(),
+			wrapTestAuthority(moved), edited)
 		switch {
 		case err == nil:
 			accepted = append(accepted, octet)
@@ -533,11 +604,27 @@ func TestTheEnvelopeOctetsTheWrapKeyBindsAreRefusedAndTheSuiteReportsTheRest(t *
 			t.Errorf("editing envelope octet %d answered %v, which is neither the AEAD's refusal nor an acceptance; an octet that leaves the set for a third reason is a finding",
 				octet, err)
 		}
+		// COLUMN TWO, the opener: the authority stays where the sealer put it, so an octet the
+		// expectation covers is refused by name before the KEM is reached.
+		switch _, _, err := OpenWrapBody(target.priv, wrapTestGroupId(), wrapTestTargetId(), sealed, edited); {
+		case errors.Is(err, ErrWrapEnvelopeMismatch):
+			compared = append(compared, octet)
+		case err == nil || errors.Is(err, ErrWrapOpen):
+		default:
+			t.Errorf("editing envelope octet %d answered %v against an unmoved authority, which is neither of this column's outcomes", octet, err)
+		}
 	}
-	t.Logf("wrap envelope: %d of %d octets are refused when edited on the wire (%v); %d are accepted (%v)",
-		len(refused), WrapEnvelopeBytes, refused, len(accepted), accepted)
-	// THE HALF THAT IS TRUE UNDER EVERY READING: the ten octets MASTER's info binds are refused.
-	// Octet 0 is the version and is the one the info does not reach.
+	uncovered := []int{}
+	for octet := 0; octet < WrapEnvelopeBytes; octet += 1 {
+		if !slices.Contains(refused, octet) && !slices.Contains(compared, octet) {
+			uncovered = append(uncovered, octet)
+		}
+	}
+	t.Logf("wrap envelope, %d octets: the AEAD refuses %v and accepts %v when the opener's authority moves with the edit; the opener's own comparison refuses %v when it does not; %v is covered by neither",
+		WrapEnvelopeBytes, refused, accepted, compared, uncovered)
+	// THE HALF THAT IS TRUE UNDER EVERY READING: the ten octets MASTER's info binds are refused
+	// BY THE KEY, measured against an opener that was fooled into agreeing with the edit. Octet 0
+	// is the version and is the one the info does not reach.
 	for _, octet := range []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10} {
 		if !slices.Contains(refused, octet) {
 			t.Errorf("envelope octet %d is bound into wrap_key by MASTER section 7's info and editing it was not refused; the key is not being derived from the envelope's carried values",
@@ -552,6 +639,109 @@ func TestTheEnvelopeOctetsTheWrapKeyBindsAreRefusedAndTheSuiteReportsTheRest(t *
 		t.Errorf("the accepted set is %v and the written-down disposition is exactly {0}, u8(wrap_format_version). A LARGER set is an envelope octet nothing authenticates that no document names; a SMALLER one means this door gained an authority over the version octet -- if that is task 14 step 3's signature landing, this clause and open item MG-7 come out together",
 			accepted)
 	}
+	// AND THE SECOND COLUMN, against its own written-down disposition. The opener's expectation
+	// covers exactly the ten octets the info covers -- not by coincidence: WrapExpectation is the
+	// three envelope fields MASTER's info binds and deliberately not the fourth, because ruling
+	// what an opener does with an unrecognised version is M1-54's and not this package's.
+	if !slices.Equal(compared, []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}) {
+		t.Errorf("the opener's comparison refuses %v and the written-down disposition is exactly the ten info-bound octets. A SMALLER set is a field of WrapExpectation that stopped being compared; a LARGER one means it gained the version octet, which is M1-54 being ruled here rather than in MASTER section 7",
+			compared)
+	}
+	// and the complement of the two columns together, which is the sentence MG-7 carries: one
+	// octet of the eleven is covered by NEITHER authority in this door.
+	if !slices.Equal(uncovered, []int{0}) {
+		t.Errorf("the octets no authority in this door covers are %v and the disposition is exactly {0}", uncovered)
+	}
+}
+
+// Property: the opener's expectation covers every field of the envelope except the one octet no
+// ruling reaches, and that complement is PRINTED and held against a written-down disposition.
+//
+// THE COMPLEMENT IS THE MEASUREMENT AND THE TYPES ARE WHERE IT IS DECIDABLE. The behavioural case
+// above measures which octets each authority refuses, and it can only measure the fields that
+// exist: a twelfth envelope octet added tomorrow would be carried, compared against nothing, and
+// invisible there because no row would name it. This case reads the two struct types out of the
+// source and subtracts one from the other, so a field that arrives on WrapEnvelope without
+// arriving on WrapExpectation fails here on the day it lands.
+//
+// IT FAILS IN BOTH DIRECTIONS, and the two failures mean opposite things. A complement LARGER than
+// {FormatVersion} is an envelope field an opener cannot ask about -- a value on the wire that
+// nothing in this door compares. A complement SMALLER than it means u8(wrap_format_version) became
+// expressible, which is m1 open item M1-54 -- what an opener does with an unrecognised version --
+// being decided in this package instead of in MASTER section 7, and it must arrive with the
+// ruling, with the measurement above, and with MG-7's second half coming out.
+func TestTheOpenerExpectationCoversEveryEnvelopeFieldButTheOneNoRulingReaches(t *testing.T) {
+	_, sources := messagegroupProductionSources(t)
+	envelope := messagegroupStructFields(sources, "WrapEnvelope")
+	expectation := messagegroupStructFields(sources, "WrapExpectation")
+	// THE POSITIVE CONTROL, in the same query and deliberately not a count of the expectation:
+	// the reading sees the four fields MASTER section 7 fixes and sees SOMETHING on the other
+	// side, so an empty complement below cannot be an artefact of having read nothing. How many
+	// fields the expectation has is the disposition's to state and not this control's, or a
+	// field added to it would fail here with "the reading is broken" instead of with what it is.
+	if len(envelope) != 4 || len(expectation) == 0 {
+		t.Fatalf("this reading found %d envelope fields (%v) and %d expectation fields (%v); the envelope MASTER section 7 fixes has four and this reading is not on it",
+			len(envelope), envelope, len(expectation), expectation)
+	}
+	uncovered := []string{}
+	for name, kind := range envelope {
+		wanted, isCovered := expectation[name]
+		if !isCovered {
+			uncovered = append(uncovered, name)
+			continue
+		}
+		if wanted != kind {
+			t.Errorf("WrapEnvelope.%s is %s and WrapExpectation.%s is %s; a comparison across two widths is a comparison that can be true of two different wire values",
+				name, kind, name, wanted)
+		}
+	}
+	slices.Sort(uncovered)
+	unmatched := []string{}
+	for name := range expectation {
+		if _, isCarried := envelope[name]; !isCarried {
+			unmatched = append(unmatched, name)
+		}
+	}
+	slices.Sort(unmatched)
+	t.Logf("the envelope carries %d fields and the opener's expectation covers %d; uncovered %v, and %v of the expectation match no envelope field",
+		len(envelope), len(expectation), uncovered, unmatched)
+	if !slices.Equal(uncovered, []string{"FormatVersion"}) {
+		t.Errorf("the envelope fields no opener can state an expectation over are %v and the written-down disposition is exactly {FormatVersion}. A LARGER set is a wire value this door compares against nothing; a SMALLER one is m1 open item M1-54 being ruled in this package rather than in MASTER section 7, and it comes with the ruling or not at all",
+			uncovered)
+	}
+	if len(unmatched) != 0 {
+		t.Errorf("%v are fields of WrapExpectation that no envelope field answers, so they are compared against nothing", unmatched)
+	}
+}
+
+// messagegroupStructFields answers one named struct type's exported and unexported fields, as
+// name -> type, out of this package's production source.
+func messagegroupStructFields(sources []messagegroupSource, name string) map[string]string {
+	fields := map[string]string{}
+	for _, source := range sources {
+		for _, declaration := range source.parsed.Decls {
+			general, isGeneral := declaration.(*ast.GenDecl)
+			if !isGeneral {
+				continue
+			}
+			for _, spec := range general.Specs {
+				typed, isTyped := spec.(*ast.TypeSpec)
+				if !isTyped || typed.Name.Name != name {
+					continue
+				}
+				structure, isStruct := typed.Type.(*ast.StructType)
+				if !isStruct || structure.Fields == nil {
+					continue
+				}
+				for _, field := range structure.Fields.List {
+					for _, named := range field.Names {
+						fields[named.Name] = typeExprName(field.Type)
+					}
+				}
+			}
+		}
+	}
+	return fields
 }
 
 // ---------------------------------------------------------------------------
@@ -586,7 +776,8 @@ func TestTheDeviceWrapIsTwoBodiesAndTheirPayloadTypesMustDiffer(t *testing.T) {
 		{name: "the pq_secret wrap", body: pqBody, want: pqPayload, kind: 0x01},
 		{name: "the eph_root wrap", body: ephBody, want: ephPayload, kind: 0x02},
 	} {
-		envelope, payload, err := OpenWrapBody(target.priv, wrapTestGroupId(), wrapTestTargetId(), one.body)
+		envelope, payload, err := OpenWrapBody(target.priv, wrapTestGroupId(), wrapTestTargetId(),
+			WrapExpectation{TargetType: 0x01, PayloadType: one.kind, ContentEpoch: 12}, one.body)
 		if err != nil {
 			t.Fatalf("%s did not open: %v", one.name, err)
 		}
@@ -600,6 +791,29 @@ func TestTheDeviceWrapIsTwoBodiesAndTheirPayloadTypesMustDiffer(t *testing.T) {
 		// interchanged
 		if !bytes.Equal(payload, one.want) {
 			t.Errorf("%s delivered the other record's payload", one.name)
+		}
+	}
+	// AND THE HALF A ROUND TRIP OVER EITHER BODY CANNOT SEE: the two are not interchangeable AT
+	// THE DOOR. Both bodies are genuine, both are sealed to this leaf at this epoch, and both land
+	// at ONE wrap_target_handle -- so before OpenWrapBody took an expectation, each of them opened
+	// under the other's arguments and the payload_type was carried out to a caller who was under
+	// no obligation to look at it. An opener honouring one kind must be refused the other's.
+	for _, cross := range []struct {
+		name string
+		body []byte
+		kind uint8
+	}{
+		{name: "the pq_secret wrap", body: pqBody, kind: 0x02},
+		{name: "the eph_root wrap", body: ephBody, kind: 0x01},
+	} {
+		_, payload, err := OpenWrapBody(target.priv, wrapTestGroupId(), wrapTestTargetId(),
+			WrapExpectation{TargetType: 0x01, PayloadType: cross.kind, ContentEpoch: 12}, cross.body)
+		if !errors.Is(err, ErrWrapEnvelopeMismatch) {
+			t.Errorf("%s opened for an opener honouring payload_type %#02x and answered %v; want ErrWrapEnvelopeMismatch",
+				cross.name, cross.kind, err)
+		}
+		if payload != nil {
+			t.Errorf("%s handed %d octets of payload to an opener honouring the other kind", cross.name, len(payload))
 		}
 	}
 	// and one payload_type used twice is refused by name, because it is the only element of
@@ -1175,6 +1389,62 @@ func TestTheWrapDoorMatchesItsKnownAnswers(t *testing.T) {
 	if octets != WrapEnvelopeBytes {
 		t.Fatalf("the vector carries %d ENVELOPE_OCTET rows and the envelope is %d octets", octets, WrapEnvelopeBytes)
 	}
+
+	// section 5: the OTHER failing direction, where nothing was edited at all. Each row is the
+	// section 1 envelope with one field moved, and what it fixes is that such a wrap has a
+	// perfectly good key of its own -- a different digest, not an absent one -- so no authority
+	// inside the seal can refuse it and the opener's comparison is what must.
+	genuine := 0
+	for _, row := range wrapKatRows(t, rows, "GENUINE_OTHER") {
+		fields := strings.Fields(row)
+		if len(fields) != 3 {
+			t.Fatalf("a GENUINE_OTHER row has %d fields, want 3: %q", len(fields), row)
+		}
+		encoded, err := hex.DecodeString(fields[1])
+		if err != nil {
+			t.Fatalf("a GENUINE_OTHER row's envelope: %v", err)
+		}
+		other, err := ParseWrapEnvelope(encoded)
+		if err != nil {
+			t.Fatalf("parse the %s row's envelope: %v", fields[0], err)
+		}
+		moved := []string{}
+		if other.ContentEpoch != envelope.ContentEpoch {
+			moved = append(moved, "content_epoch")
+		}
+		if other.TargetType != envelope.TargetType {
+			moved = append(moved, "target_type")
+		}
+		if other.PayloadType != envelope.PayloadType {
+			moved = append(moved, "payload_type")
+		}
+		if other.FormatVersion != envelope.FormatVersion {
+			moved = append(moved, "wrap_format_version")
+		}
+		if !slices.Equal(moved, []string{fields[0]}) {
+			t.Errorf("the %s row moves %v against section 1's envelope, and a row that moves anything else is not measuring the field it names", fields[0], moved)
+		}
+		digest := sha256.Sum256(WrapInfo(other, groupId, targetId, XwingAlgId, targetPub, ctXwing))
+		if hex.EncodeToString(digest[:]) != fields[2] {
+			t.Errorf("the %s row's H(info) is %x and the vector gives %s", fields[0], digest, fields[2])
+		}
+		// THE CHECK THE ROW EXISTS FOR: a different key, not a broken one. An implementation
+		// whose digest here equalled INFO_SHA256 would have a field that reaches no key at all,
+		// which is section 4's "unbound" verdict arriving where no octet was edited.
+		if digest == base {
+			t.Errorf("moving %s leaves H(info) at INFO_SHA256, so that field is in no element of wrap_key's info and belongs in section 4 as unbound", fields[0])
+		}
+		// and this package refuses such a wrap at the door, by the opener's own authority: the
+		// expectation stays where section 1 put it while the body carries the moved envelope
+		if _, disagrees := wrapTestAuthority(envelope).disagreement(other); !disagrees {
+			t.Errorf("an opener honouring section 1's envelope finds no disagreement with the %s row, so nothing in this door separates a genuine wrap of another %s",
+				fields[0], fields[0])
+		}
+		genuine += 1
+	}
+	if genuine != 2 {
+		t.Fatalf("the vector carries %d GENUINE_OTHER rows; the two MASTER section 8.2 puts at one wrap_target_handle are the epoch and the payload kind", genuine)
+	}
 }
 
 // wrapKatReferenceInfo is MASTER section 7's nine elements, written out here from the block and
@@ -1237,7 +1507,7 @@ func readWrapKat(t *testing.T) map[string]string {
 		}
 		rest = strings.TrimSpace(rest)
 		switch name {
-		case "LADDER", "ENVELOPE_OCTET":
+		case "LADDER", "ENVELOPE_OCTET", "GENUINE_OTHER":
 			multi[name] = append(multi[name], rest)
 		default:
 			if _, isRepeat := rows[name]; isRepeat {

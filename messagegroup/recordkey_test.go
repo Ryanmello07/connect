@@ -934,7 +934,8 @@ var recordKeyOneWayProbes = map[string]func(secret []byte) [][]byte{
 		if err != nil {
 			return nil
 		}
-		envelope, payload, err := OpenWrapBody(priv, recordKeyWrapGroupId(), secret, body)
+		envelope, payload, err := OpenWrapBody(priv, recordKeyWrapGroupId(), secret,
+			wrapTestAuthority(recordKeyWrapEnvelope()), body)
 		if err != nil {
 			return nil
 		}
