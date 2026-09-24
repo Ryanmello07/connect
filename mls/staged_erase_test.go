@@ -1242,7 +1242,18 @@ var typesTheEraseClassReachesThatOweNoErase = map[string]string{
 		"hands it out. An erase here would blank the message a caller is about to send, and the caller that " +
 		"marshalled a secret through it owns what came back",
 	"XwingPrivateKey": "an ANSWER. XwingGenerateKey and XwingKeyGenFromSeed build one per call and no " +
-		"production declaration holds one in a field; the seed inside it is the caller's to keep or to drop",
+		"production declaration holds one in a field, which messagegroup's " +
+		"TestNoDeclarationOfThisPackageHoldsAnXwingPrivateKeyInAField measures. THE SECOND CLAUSE OF " +
+		"THIS ROW USED TO READ 'the seed inside it is the caller's to keep or to drop' AND NOTHING " +
+		"MEASURED IT, because it was not true: the type declares no erase and every field of it is " +
+		"unexported, so no caller anywhere -- this package included -- has a way to drop what it " +
+		"holds. What is true is the weaker sentence: the erase this class would demand has nowhere " +
+		"to land, so the obligation is unmeetable rather than unmet, and the residual is named " +
+		"instead of argued away. A dropped one leaves its own thirty-two octet seed and the parsed " +
+		"ML-KEM and x25519 halves for the collector, on every sdk Device.DecapsulateToOwnLeaf, and " +
+		"closing that is ledger item 243's and not this gate's. The two facts the clause now rests " +
+		"on are measured by messagegroup's TestXwingPrivateKeyOffersNoWayToDropWhatItHolds, which " +
+		"goes red the day either one changes, so this sentence has to change with the code",
 	"XwingPublicKey": "the public half, whose two components are exactly what a peer is sent",
 	"cachedProposalFieldJoin": "the octets and the field names of one proposal's encoding, assembled so a " +
 		"commit's list can be compared field by field against what arrived on the wire",

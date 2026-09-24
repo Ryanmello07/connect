@@ -12,10 +12,20 @@
 # HOW THESE ANSWERS WERE OBTAINED, stated rather than claimed. They were computed by running this
 # package. That is weaker than the eph-window table next door, whose answers were derived from the
 # spec sentence first and confirmed against the code afterwards, and the difference is not papered
-# over: what makes these rows worth anything is that wrap_test.go recomputes the KDF rows a SECOND
-# WAY, from RFC 5869 written out in keyschedule_test.go over an info this file's own reader
-# assembles from MASTER section 7's field list rather than from WrapInfo. So a row is held by two
-# derivations that share no code, and only the shared INPUTS below are taken on trust.
+# over: wrap_test.go recomputes SOME of these rows a SECOND WAY, from RFC 5869 written out in
+# keyschedule_test.go over an info this file's own reader assembles from MASTER section 7's field
+# list rather than from WrapInfo.
+#
+# WHICH ROWS, exactly, because the previous version of this paragraph said "a row is held by two
+# derivations that share no code" and that was one sentence past what was done. The second
+# derivation covers INFO_SHA256 (a second encoder, assembled from MASTER's field list), WRAP_KEY
+# and WRAP_NONCE (RFC 5869 by hand over MASTER's salt), and the record_key[0] column of the LADDER
+# rows. It does NOT cover the rest: the key_body and nonce_body columns, AEAD_CT_SHA256,
+# WRAP_BODY_SHA256 and the digests in sections 4 and 5 are this package's own output, held against
+# this file and against nothing else. Those rows are a SNAPSHOT and are worth what a snapshot is
+# worth -- they pin the construction against future change and against a second implementation
+# that disagrees, and they do not independently establish that the construction is right. The
+# shared INPUTS below are taken on trust in both cases.
 #
 # FORMAT. Whitespace-separated fields, one row per line. Lines beginning with # and blank lines are
 # commentary. The first field is the row's name; what follows is named in the row's own paragraph
@@ -37,7 +47,17 @@
 # testdata/vectors/rfc/xwing-draft10.json and is not restated in this file.
 #
 # ENV_KEY, SS, GROUP_ID and TARGET_ID are ascending runs so that a transposition of any two inputs
-# is visible rather than symmetric.
+# is visible rather than symmetric, AND SO ARE THE THREE ENVELOPE OCTETS, for the same reason and
+# after the same rule was found not to have been applied to them. Every named input of this file
+# was checked pairwise against every other of its own width, since a transposition is only
+# well-formed between two values of one width: ENV_KEY, SS and GROUP_ID are the three thirty-two
+# octet inputs and no two are equal; TARGET_ID at sixteen, CT_XWING at 1120, TARGET_PUB at 1216 and
+# the payload at 132 have no same-width partner at all; the two long inputs differ in fill as well
+# as in length; and the three single octets -- wrap_format_version, target_type and payload_type --
+# were ALL 0x01 and are now 01 02 03. That last was the one collision, it made a transposition of
+# target_type and payload_type produce byte-identical answers everywhere below, and
+# TestNoTwoKnownAnswerInputsOfTheSameWidthAreEqual asserts the property rather than leaving this
+# paragraph to be re-checked by hand.
 
 INPUT_ENV_KEY          0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20
 INPUT_SS               4142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f60
@@ -52,19 +72,31 @@ INPUT_TARGET_PUB_SHA256 5c992a27b2bf010a04891bdac9c3be6944f6600d3e6e63ef56c7ef90
 
 # The envelope: u8(wrap_format_version) u8(target_type) u8(payload_type) u64(content_epoch).
 #
-# TARGET_TYPE AND PAYLOAD_TYPE ARE 0x01 HERE BECAUSE THIS FILE NEEDED AN OCTET, AND THAT IS NOT A
-# CODE POINT. MASTER section 7 names both as gaps it does not fill -- "neither has a code point
-# anywhere", and, in the clarification of 2026-09-19, "the domain is not the encoding" -- and
-# target_id is in the same list with four candidate byte strings. A second implementation that
-# reproduces the rows below has reproduced the CONSTRUCTION; it has not agreed with anybody about
-# which octet a device leaf is or which a pq_secret payload is, because no document says. Open item
-# MG-7 in messagegroup/OPENITEMS.md carries it.
+# TARGET_TYPE AND PAYLOAD_TYPE ARE 0x02 AND 0x03 HERE BECAUSE THIS FILE NEEDED TWO OCTETS THAT ARE
+# NOT EACH OTHER, AND NEITHER IS A CODE POINT. MASTER section 7 names both as gaps it does not fill
+# -- "neither has a code point anywhere", and, in the clarification of 2026-09-19, "the domain is
+# not the encoding" -- and target_id is in the same list with four candidate byte strings. A second
+# implementation that reproduces the rows below has reproduced the CONSTRUCTION; it has not agreed
+# with anybody about which octet a device leaf is or which a pq_secret payload is, because no
+# document says. Open item MG-7 in messagegroup/OPENITEMS.md carries it.
+#
+# THEY WERE BOTH 0x01 UNTIL THIS COMMIT, and what that cost was MEASURED against a transposed
+# writer rather than argued. MASTER section 7's info writes u8(target_type) at one position and
+# u8(payload_type) four elements later; an implementation that swaps the two positions was run
+# against this file's inputs both ways round. With both octets 0x01 it reproduced EVERY PRIMARY
+# ROW exactly -- INFO_SHA256, WRAP_KEY, WRAP_NONCE, AEAD_CT_SHA256 and WRAP_BODY_SHA256 -- and of
+# the thirteen rows in sections 4 and 5 it was caught by three: ENVELOPE_OCTET 1, ENVELOPE_OCTET 2
+# and the GENUINE_OTHER payload_type row, each of which perturbs one of the two octets and so
+# breaks the symmetry the inputs had. So the file was not blind, but everything it calls an ANSWER
+# was, and a second implementation checking itself against section 3 alone would have agreed with
+# a transposed writer. With the octets at 01 02 03 the same transposed writer is separated by the
+# base row and by all thirteen: 11 of 11 in section 4 and 2 of 2 in section 5.
 
 INPUT_ENVELOPE_VERSION       01
-INPUT_ENVELOPE_TARGET_TYPE   01
-INPUT_ENVELOPE_PAYLOAD_TYPE  01
+INPUT_ENVELOPE_TARGET_TYPE   02
+INPUT_ENVELOPE_PAYLOAD_TYPE  03
 INPUT_ENVELOPE_CONTENT_EPOCH 7
-INPUT_ENVELOPE_ENCODED       0101010000000000000007
+INPUT_ENVELOPE_ENCODED       0102030000000000000007
 
 # The payload, which is what MASTER section 7 puts inside aead_ct:
 #
@@ -132,16 +164,16 @@ LADDER 4294967295 b3550e0a0e9bef490a629ab5a370d17d81f86daded1085ce2e9f890d2dfa0f
 # that reproduces WRAP_BODY_LEN has agreed about every length prefix in the grammar.
 
 INFO_LEN              2429
-INFO_SHA256           133457e336c2992f0352c33f455a55d0a5d8a30756023c0f0ed874571b9e3249
+INFO_SHA256           01a58f925d3efd0082feb7f454ced7f7d197a8e3db4089a9f3759a8d257e8065
 PRK_SALT              URmessage/v1/wrap-salt
 INFO_LABEL            URmessage/v1/wrap
 ALG_ID                0014
-WRAP_KEY              284eb08cecb572f58d59858f884454f9b2247f26e61714044d7f15513ef4a1ad
-WRAP_NONCE            3a09c478382b958575d5e38d529d8a191d8b211eee6ac9c6
+WRAP_KEY              d465ae85710c39a9d9bf1ecf678cbc97c0722c0eb5d9b39b3ea71896b2f9db19
+WRAP_NONCE            d3d5eb61e74b7f36a9967f278534d5aeb7b64b4fb1ef0907
 AEAD_CT_LEN           148
-AEAD_CT_SHA256        ff006967a37bacdbf4a1742fc4a8637713aae9abc88f9e53740137827a5ffbc6
+AEAD_CT_SHA256        2c7e1ee24417336d639d691d637beaa8533cc5c221bf99018ab3aea2e0f86b87
 WRAP_BODY_LEN         1289
-WRAP_BODY_SHA256      6025a1e357fddfad1acb205418db4b09292bd0fc9e40b4974c675cef0af3386b
+WRAP_BODY_SHA256      24202f862f48a9a5624b173734e81a6b7a4197931671f2ab7d6bf21440a8e4de
 WRAP_BODY_OCCUPANCY   1293
 WRAP_BODY_RUNG        4096
 WRAP_BODY_ZERO_TAIL   2803
@@ -177,17 +209,17 @@ WRAP_BODY_ZERO_TAIL   2803
 #
 # FORMAT: ENVELOPE_OCTET <index, decimal> <bound|unbound> <sha256 of info after flipping it>
 
-ENVELOPE_OCTET 0  unbound 133457e336c2992f0352c33f455a55d0a5d8a30756023c0f0ed874571b9e3249
-ENVELOPE_OCTET 1  bound   cca9b405e24110e928be6544cefeac7352448b070d1ee5445a8882a363dfd50e
-ENVELOPE_OCTET 2  bound   bba056d90e9fbf04af6138ccd9ddb661315177a9f6b0a851175208eb095441f5
-ENVELOPE_OCTET 3  bound   0800f8d7f51b74eadee88327b2be2b3a33aad99aff8806453735e74ba08b52a8
-ENVELOPE_OCTET 4  bound   6a710a648ac18394ac45f841ed767c2a3befb7352ba77a067a9f9fb5f82e20e2
-ENVELOPE_OCTET 5  bound   8ec30553493e7a6e5320e6c13f9118714f96d178d89bda9deba0f15e8179f12c
-ENVELOPE_OCTET 6  bound   07030acaf4cbbfdfba50bdd0ba1de9e4b573196879dcfa3b4c898cbb8fbfb051
-ENVELOPE_OCTET 7  bound   a36aa64f47f3a72b1184d97a91acbd92c33eb667fc9a1c3c9558f245fbbecf39
-ENVELOPE_OCTET 8  bound   a0402a747879ebeca803213417af2f21996cd8623376fa5354c7754437335701
-ENVELOPE_OCTET 9  bound   30bf13b40914bbb218801b0372846753c703b7f3ff89c75af5a9b01466fceabf
-ENVELOPE_OCTET 10 bound   77910bea4635d7c8b29f5e94f3b10c05bba72e116d366b02d0f7813b9523e831
+ENVELOPE_OCTET 0  unbound 01a58f925d3efd0082feb7f454ced7f7d197a8e3db4089a9f3759a8d257e8065
+ENVELOPE_OCTET 1  bound   367be5c706646d831861b9109ad5e361c3d08b93bace3109b5cab72f7bb6b1d5
+ENVELOPE_OCTET 2  bound   7486900f4bc8a933513f5f680f3d70acc4be34d2ef2135eaacadc8feeb83c07d
+ENVELOPE_OCTET 3  bound   48a0b0752ad133d61a533bebc017b78cad0bd4aa2c518f7465a48aeafe7c7793
+ENVELOPE_OCTET 4  bound   55866ec107f0f625ac5e2f4e5e9e4efeaf3910c4466003910a33a6bfe0edca60
+ENVELOPE_OCTET 5  bound   12d192e7c174460ed1a4af64b8ae734364aa67d43be3891da3ff8c3783ba86c5
+ENVELOPE_OCTET 6  bound   99930ce0840a6a82a66d381e10c210245a41fac7136103e75b1e164e409bfc14
+ENVELOPE_OCTET 7  bound   ac9dce1c30b703c5eb5035442b32f13b0a01874f4afccda254f06ed760dbaa97
+ENVELOPE_OCTET 8  bound   f0f1fabaec0159178d48390aed419be4c1c732d92a8bb25303a6af67b98ae516
+ENVELOPE_OCTET 9  bound   d0996e7e09105cb822b1a36aecfdc8824268430f7ad4055eb4a5cd2bfec11f8c
+ENVELOPE_OCTET 10 bound   459b8fb2e5a3d7adcda5c7581018fcad6b9d6a61a611044ea8798db5e9c9b507
 
 # ------------------------------------------------------------------------------------------------
 # SECTION 5 -- THE OTHER FAILING DIRECTION: A GENUINE WRAP OF ANOTHER EPOCH IS NOT A TAMPERED ONE
@@ -226,5 +258,5 @@ ENVELOPE_OCTET 10 bound   77910bea4635d7c8b29f5e94f3b10c05bba72e116d366b02d0f781
 #
 # FORMAT: GENUINE_OTHER <the field that moved> <the eleven envelope octets> <sha256 of info>
 
-GENUINE_OTHER content_epoch 0101010000000000000008 6b9d5b8456d9e3580036af5fb80bb9fbe1e84612f49ad2549ea1c39e9df142dd
-GENUINE_OTHER payload_type  0101020000000000000007 6a56ddd657d76a55d178c3f92bed71b48adb307e46a933794e4d95122ac0e3a5
+GENUINE_OTHER content_epoch 0102030000000000000008 272206af37b51d0400c4176ae5ac757cd101891b656522712b36036ee820bf96
+GENUINE_OTHER payload_type  0102040000000000000007 69792187579763573428b2d5127af2be5a83d845b4afebaa58cb24271ed9fc98

@@ -19,6 +19,17 @@
 // x25519 half goes through mls's one ECDH wrapper rather than through crypto/ecdh directly,
 // which is what keeps the single reviewed call site the forbidden primitive gate asserts.
 //
+// WHAT THIS FILE ERASES AND WHAT IT CANNOT, because a producer that leaves its own copies live
+// makes every erase downstream of it worth less than it reads. Six values here are secret, live at
+// return and unreachable to the caller, and each is handed to zeroize in the body that derived it:
+// the ninety six octet seed expansion, the fresh seed XwingGenerateKey draws, and ss_M and ss_X on
+// both sides of the KEM. Three residues remain and are named rather than papered over -- the
+// ephemeral x25519 scalar inside crypto/ecdh's *PrivateKey, the SHA3-256 sponge the combiner
+// writes into, and the d | z and scalar copies inside the parsed *mlkem.DecapsulationKey768 and
+// *ecdh.PrivateKey -- because none of the three is a []byte this package holds a header over, and
+// zeroize can only reach an array it is handed. Open item M1-44's line: this removes the obvious
+// copy, not every copy.
+//
 // One deliberate divergence from the draft, stated here because it is a divergence. The draft
 // puts no check on the x25519 shared secret. crypto/ecdh refuses an all zero one, mls's wrapper
 // turns that refusal into an error, and this file surfaces it as ErrXwingInvalidPoint rather
@@ -119,6 +130,15 @@ func XwingKeyGenFromSeed(seed []byte) (*XwingPrivateKey, error) {
 		return nil, ErrXwingBadSeedSize
 	}
 	expanded := sha3.SumSHAKE256(seed, XwingExpandedSize)
+	// THE EXPANSION IS THE WHOLE PRIVATE KEY IN OCTETS -- d | z | sk_X -- and it is erased in the
+	// body that derived it, which is the discipline wrap.go keeps one file over. Nothing the caller
+	// is handed points at this array: crypto/mlkem copies d and z into the decapsulation key by
+	// value and crypto/ecdh clones the scalar, so an erase after both constructors have run blanks
+	// a copy no other header reaches. Without it every key generation leaves ninety six octets of
+	// private key in the heap for the collector to move around -- and sdk's DecapsulateToOwnLeaf
+	// re-expands this device's key on EVERY wrap it opens, which is what made this the copy that
+	// mattered.
+	defer zeroize(expanded)
 	mlkemPrivate, err := mlkem.NewDecapsulationKey768(expanded[0:XwingMlkemSeedSize])
 	if err != nil {
 		return nil, err
@@ -155,6 +175,11 @@ func XwingGenerateKey(random io.Reader) (*XwingPrivateKey, error) {
 		return nil, mls.ErrNilRandomSource
 	}
 	seed := make([]byte, XwingSeedSize)
+	// the draw is a second copy of the private key and the constructor below takes its own, so
+	// this one is erased here rather than dropped. A caller cannot reach it to erase it -- it is
+	// never returned and never stored -- which is the whole class of residue this file was
+	// leaving: a value the producer holds live past the point every consumer of it has copied.
+	defer zeroize(seed)
 	if _, err := io.ReadFull(random, seed); err != nil {
 		return nil, err
 	}
@@ -242,7 +267,17 @@ func XwingEncapsulate(random io.Reader, pub *XwingPublicKey) ([]byte, []byte, er
 	if err != nil {
 		return nil, nil, ErrXwingInvalidPoint
 	}
+	// THE TWO HALVES ARE ERASED HERE AND NOT BY THE CALLER, because the caller never sees them:
+	// what leaves this function is the combiner's output, and ss_M and ss_X stay behind. A door
+	// that erases only what it is handed erases one copy of a secret its producer already left
+	// live. The two together ARE the combiner's input once ct_X, pk_X and the label -- all three
+	// public -- are put beside them, so leaving both live hands anybody reading this heap the
+	// shared secret itself, and leaving one live collapses the hybrid onto the other half. The
+	// defers run after the return value has been computed, so the combiner has read both before
+	// either is blanked.
+	defer zeroize(x25519Shared)
 	mlkemShared, mlkemCiphertext := pub.mlkemPublic.Encapsulate()
+	defer zeroize(mlkemShared)
 	x25519Ciphertext := ephemeral.PublicKey().Bytes()
 
 	ciphertext := make([]byte, 0, XwingCiphertextSize)
@@ -274,6 +309,10 @@ func XwingDecapsulate(priv *XwingPrivateKey, ct []byte) ([]byte, error) {
 		// ml-kem that grew a second refusal must not have it turned into a shared secret here
 		return nil, err
 	}
+	// the opening side of XwingEncapsulate's erase, for the same reason and with the same
+	// ordering: the caller is handed the combiner's output and never these two, so this body is
+	// the only one that can blank them.
+	defer zeroize(mlkemShared)
 	ephemeralPublic, err := mls.X25519PublicKey(x25519Ciphertext)
 	if err != nil {
 		return nil, ErrXwingInvalidPoint
@@ -282,5 +321,6 @@ func XwingDecapsulate(priv *XwingPrivateKey, ct []byte) ([]byte, error) {
 	if err != nil {
 		return nil, ErrXwingInvalidPoint
 	}
+	defer zeroize(x25519Shared)
 	return xwingCombine(mlkemShared, x25519Shared, x25519Ciphertext, priv.x25519PublicKey), nil
 }

@@ -1263,13 +1263,74 @@ func reachedNames(reached map[string]bool) map[string]string {
 // of them -- and a gate that demanded an erase there would be demanding that a derivation blank
 // the key it just answered, which is recordAeadMaterial's shape one file over.
 //
-// The CLASS is derived from the producers and not from a list of variable names, so a fifth
-// derivation added to this file is judged without anybody extending this case.
-func TestEveryKeyTheWrapDoorDerivesIsErasedInTheBodyThatDerivedIt(t *testing.T) {
+// THE CLASS IS THE PACKAGE AND THE PRODUCERS ARE DERIVED, and both halves of that sentence are
+// repairs of a measured hole rather than decoration. The version this replaces read ONE FILE --
+// os.ReadFile("wrap.go") -- against a switch naming FIVE producers, each matched only when the
+// callee was spelled as a bare identifier. xwing.go, the file that MAKES the shared secret this
+// door erases, was therefore outside it twice over: the file was never opened, and every producer
+// in it is a selector call (sha3.SumSHAKE256, mls.X25519DH, priv.mlkemPrivate.Decapsulate). It
+// carried zero erases against six live-at-return secrets while this gate ran green, so the door
+// was erasing one copy of secrets its own producer had already left lying about. Naming xwing.go
+// beside wrap.go would have closed those six instances and left the next file in the same place,
+// which is why the subject is now every production source of this package and the producers are
+// read off what the package ITSELF erases.
+//
+// HOW A PRODUCER IS DERIVED, in two clauses and no list:
+//
+//  1. THE SEED, and it is the package's own erases read backwards. A callee is a producer at
+//     result position i when some body of this package binds a local out of position i and hands
+//     that local to zeroize. That is what tells XwingEncapsulate's SHARED SECRET at position 1
+//     from its CIPHERTEXT at position 0 without anybody writing the positions down, and it reads
+//     a selector callee by its trailing name, which is the convention zeroize_test.go's own
+//     hand-off reading already keeps;
+//  2. THE CLOSURE, because the obligation travels with the value. A declaration that binds a
+//     local out of a producer and MOVES IT OUT at its own result position j is a producer at j,
+//     to a fixed point -- which is how wrapKeyMaterial and recordAeadMaterial enter without a
+//     row, and it is the same clause the "moved out" half of the obligation rests on.
+//
+// A BUILTIN IS NOT A PRODUCER, and that narrowing is asserted below rather than assumed: read
+// without it, ratchet.go's `walking := append(...)` followed by `zeroize(walking)` makes append a
+// producer and every assembled buffer in the package -- an encoded public key, a handle key, a
+// replacement slice -- becomes an unerased derivation. The complement that narrowing removes is
+// written down in wrapBuiltinsThatAreNotProducers and checked in both directions.
+//
+// WHAT THIS GATE STILL CANNOT SEE, stated because the next reader will need it: a producer NOBODY
+// erases anywhere never enters the class, so this reading could not have caught xwing.go before
+// the erases existed. That floor is a different mechanism and is held by
+// TestEveryPrimitiveResultThisPackageBindsHasAWrittenDisposition in primitiveerase_test.go, which
+// asks the opposite question -- what did the primitives produce -- and answers it from a written
+// table rather than from the package's own habits.
+func TestEveryKeyThisPackageDerivesIsErasedInTheBodyThatDerivedIt(t *testing.T) {
+	// CONTROL ONE, over the DERIVATION: a package that seeds a producer, closes it over a
+	// move-out, and offers a builtin and a non-producer callee to be left alone.
+	derivationControl := "package control\n" +
+		"func seeds() {\n\tc, y, _ := Encapsulate(r, p)\n\tzeroize(y)\n\t_ = c\n}\n" +
+		"func closes() []byte {\n\t_, y, _ := Encapsulate(r, p)\n\treturn y\n}\n" +
+		"func appends() {\n\tbuffer := append(a, b...)\n\tzeroize(buffer)\n}\n" +
+		"func plain() {\n\tx := unrelated()\n\t_ = x\n}\n"
+	derived := wrapProducerClassIn(t, "the producer control", derivationControl)
+	wantDerived := []string{"Encapsulate@1", "closes@0"}
+	if !slices.Equal(wrapProducerNames(derived), wantDerived) {
+		t.Fatalf("the producer reading derived %v out of the control, want %v; it is not reading the seed off the package's own erase, not closing it over a move-out, or not holding the builtin narrowing",
+			wrapProducerNames(derived), wantDerived)
+	}
+	// and the narrowing's complement, ASSERTED: without the builtin clause the control's append
+	// would be a producer, and that is the whole of what the clause removes here.
+	if removed := wrapBuiltinProducersIn(t, "the producer control", derivationControl); !slices.Equal(removed, []string{"append@0"}) {
+		t.Fatalf("the builtin narrowing removed %v from the control's producer class, want [append@0]; a narrowing whose complement is empty is a clause that is not doing anything, and one whose complement is larger than this is removing coverage nobody wrote down",
+			removed)
+	}
+
+	// CONTROL TWO, over the OBLIGATION, against a fixed producer set so the two halves fail
+	// apart: erased, dropped, half erased, moved out, handed to a callee, installed in a value
+	// this body builds, and installed in storage it was handed.
+	fixed := map[wrapKeyProducer]string{
+		{callee: "XwingEncapsulate", position: 1}:  "the control's KEM",
+		{callee: "wrapKeyMaterial", position: 0}:   "the control's KDF, key half",
+		{callee: "wrapKeyMaterial", position: 1}:   "the control's KDF, nonce half",
+		{callee: "keyScheduleExpand", position: 0}: "the control's expansion",
+	}
 	const controlName = "the wrap erase control"
-	// the control first, over one function of each shape this reading must separate: erased,
-	// dropped, half erased, and moved out to the caller. A reading that cannot separate the four
-	// is a reading whose verdict on the real source means nothing.
 	control := []struct {
 		name     string
 		source   string
@@ -1285,22 +1346,121 @@ func TestEveryKeyTheWrapDoorDerivesIsErasedInTheBodyThatDerivedIt(t *testing.T) 
 		// statement has not moved it out, because the callee does not own it and the local is
 		// still there to erase when the call comes back.
 		{name: "handed to a callee", source: "func probe() ([]byte, error) {\nc, y, _ := XwingEncapsulate(r, p)\nreturn helper(c, y), nil\n}", wantHeld: []string{"y"}},
+		// THE TWO SHAPES THE WIDENING ADDED, and they arrived with it because the package outside
+		// wrap.go is full of them: NewSenderRatchet hands its walked record key to the ratchet it
+		// is building, and installEpochOnLoop reads a storage root into the session's own field.
+		// Both are the move-out clause read through a structure rather than through a return, and
+		// a gate that called either a drop would be demanding that a constructor blank the key it
+		// just installed.
+		{name: "installed in a value this body builds", source: "func probe() *R {\nk, n := wrapKeyMaterial(s, i)\nzeroize(n)\nreturn &R{key: k}\n}", wantHeld: nil},
+		{name: "installed in storage it was handed", source: "func (self *S) probe() {\nk, n := wrapKeyMaterial(s, i)\nzeroize(n)\nself.key = k\n}", wantHeld: nil},
 	}
 	for _, one := range control {
-		held := wrapUnerasedDerivations(t, controlName, "package control\n"+one.source+"\n")
+		held := wrapUnerasedDerivations(t, fixed, controlName, "package control\n"+one.source+"\n")
 		if !slices.Equal(held, one.wantHeld) {
-			t.Fatalf("the control %q reads as holding %v, want %v; the matcher is not separating an erased derivation from a dropped one, nor either from one moved out to the caller",
+			t.Fatalf("the control %q reads as holding %v, want %v; the matcher is not separating an erased derivation from a dropped one, nor either from one moved out to the caller or installed in storage that outlives the frame",
 				one.name, held, one.wantHeld)
 		}
 	}
-	raw, err := os.ReadFile("wrap.go")
-	if err != nil {
-		t.Fatalf("read wrap.go: %v", err)
+
+	// and now the real source: every production file of this package, against the class this
+	// package's own erases derive.
+	_, sources := messagegroupProductionSources(t)
+	producers := map[wrapKeyProducer]string{}
+	builtinsStruck := map[string]bool{}
+	for _, source := range sources {
+		raw, err := os.ReadFile(source.path)
+		if err != nil {
+			t.Fatalf("read %s: %v", source.path, err)
+		}
+		for key, why := range wrapProducerClassIn(t, source.path, string(raw)) {
+			if _, seen := producers[key]; !seen {
+				producers[key] = why
+			}
+		}
+		for _, struck := range wrapBuiltinProducersIn(t, source.path, string(raw)) {
+			builtinsStruck[struck[:strings.Index(struck, "@")]] = true
+		}
 	}
-	if held := wrapUnerasedDerivations(t, "wrap.go", string(raw)); len(held) != 0 {
-		t.Errorf("wrap.go derives %v out of the KEM or the wrap KDF and does not hand them to zeroize in the same body; the shared secret, the prk and the wrap key are the whole of what a wrap's confidentiality rests on",
-			held)
+	// THE NARROWING'S COMPLEMENT OVER THE REAL SOURCE, asserted in both directions against the
+	// written table. A builtin this package starts erasing and nobody excused is a producer
+	// silently struck from the class; a row that no longer strikes anything is a sentence
+	// excusing nothing and hiding that it does.
+	if struck := slices.Sorted(maps.Keys(builtinsStruck)); !slices.Equal(struck, slices.Sorted(maps2Keys(wrapBuiltinsThatAreNotProducers))) {
+		t.Errorf("the builtin narrowing strikes %v from this package's producer class and wrapBuiltinsThatAreNotProducers excuses %v; the two must agree, because a builtin struck without a row is coverage removed by nobody and a row that strikes nothing is a sentence with no measurement under it",
+			struck, slices.Sorted(maps2Keys(wrapBuiltinsThatAreNotProducers)))
 	}
+	// the positive controls on the real source, in the same query as the zero below: the class
+	// reaches BOTH doors of the KEM and the wrap KDF, and a reading that had stopped reaching
+	// them would report the same clean run a complete one reports.
+	for _, wanted := range []wrapKeyProducer{
+		{callee: "XwingEncapsulate", position: 1},
+		{callee: "XwingDecapsulate", position: 0},
+		{callee: "wrapKeyMaterial", position: 0},
+		{callee: "wrapKeyMaterial", position: 1},
+		{callee: "keyScheduleExtract", position: 0},
+		{callee: "X25519DH", position: 0},
+		{callee: "SumSHAKE256", position: 0},
+	} {
+		if _, isProducer := producers[wanted]; !isProducer {
+			t.Fatalf("this package's source does not derive %s@%d as a key material producer, so the reading below cleared every body that binds one: %v",
+				wanted.callee, wanted.position, wrapProducerNames(producers))
+		}
+	}
+	t.Logf("%d key material producer position(s) derived: %v", len(producers), wrapProducerNames(producers))
+	for _, source := range sources {
+		raw, err := os.ReadFile(source.path)
+		if err != nil {
+			t.Fatalf("read %s: %v", source.path, err)
+		}
+		if held := wrapUnerasedDerivations(t, producers, source.path, string(raw)); len(held) != 0 {
+			t.Errorf("%s derives %v out of a key material producer and neither hands them to zeroize in the same body, moves them out, nor installs them in storage that outlives the frame; a producer that leaves its own copy live makes every erase downstream of it an erase of one copy",
+				source.path, held)
+		}
+	}
+}
+
+// wrapKeyProducer is one result position of one callee that this package's own source shows
+// produces key material. The callee is its trailing name, so mls.X25519DH and a method
+// Decapsulate are each one entry -- the same widening zeroize_test.go's hand-off reading takes,
+// and for the same reason: reading a callee by its bare name can only put MORE call sites under
+// the obligation, which is the direction a gate may be wrong in.
+type wrapKeyProducer struct {
+	callee   string
+	position int
+}
+
+// The builtins a derivation may be bound from that are NOT key material producers however often
+// the result is erased afterwards.
+//
+// One row, and it is load bearing. ratchet.go walks a ladder with `walking := append(...)` and
+// erases each rung as it passes; read without this clause, append becomes a producer at position
+// zero and every assembled buffer in the package -- xwing.go's encoded public key, session.go's
+// replacement slices, engine.go's by-value proposal lists -- reads as an unerased derivation. The
+// table is checked in both directions against the builtins the seed actually offers, so a row
+// that stopped excusing anything is reported and a builtin that starts being erased needs one.
+var wrapBuiltinsThatAreNotProducers = map[string]string{
+	"append": "how this package ASSEMBLES octets rather than how it derives them. A body that " +
+		"appends key material into a buffer and then erases the buffer is erasing its own scratch, " +
+		"and the octets it appended are held to this obligation where they were derived, which is " +
+		"upstream of the append. Treating it as a producer puts every encoding in the package -- " +
+		"public keys, handle keys, wire bodies -- under an erase obligation nothing could meet",
+	"make": "an ALLOCATION and not a derivation: what decides whether the octets are key material " +
+		"is what fills the buffer afterwards, which this reading cannot see and does not claim to. " +
+		"XwingGenerateKey's `seed := make(...)` followed by io.ReadFull and an erase is the one site " +
+		"that offers it today, and the obligation there is held by a different mechanism -- " +
+		"TestEveryBufferThisPackageFillsFromEntropyIsErasedOrMovedOut, which reads the FILL rather " +
+		"than the allocation. Admitting make here would put every scratch buffer in the package " +
+		"under this gate and would still not reach a buffer somebody allocated with a literal",
+}
+
+func wrapProducerNames(producers map[wrapKeyProducer]string) []string {
+	names := []string{}
+	for key := range producers {
+		names = append(names, fmt.Sprintf("%s@%d", key.callee, key.position))
+	}
+	slices.Sort(names)
+	return names
 }
 
 // wrapMovedOutName answers the identifier a returned expression hands to the caller, or "" when
@@ -1338,13 +1498,241 @@ func mustParseMessagegroupSource(t *testing.T, name string, source string) *ast.
 	return parsed
 }
 
-// wrapUnerasedDerivations answers every identifier assigned out of a key-material producer in some
-// function body of the source, and neither handed to zeroize nor returned in that same body.
+// wrapCalleeName answers the trailing name of a callee: `zeroize`, `SumSHAKE256` for
+// sha3.SumSHAKE256, `Decapsulate` for priv.mlkemPrivate.Decapsulate.
+func wrapCalleeName(expr ast.Expr) string {
+	switch typed := expr.(type) {
+	case *ast.Ident:
+		return typed.Name
+	case *ast.SelectorExpr:
+		return typed.Sel.Name
+	case *ast.ParenExpr:
+		return wrapCalleeName(typed.X)
+	}
+	return ""
+}
+
+// wrapDerivationBinding is one local this body bound out of one result position of one call.
+type wrapDerivationBinding struct {
+	name     string
+	callee   string
+	position int
+}
+
+func wrapDerivationBindingsIn(body *ast.BlockStmt) []wrapDerivationBinding {
+	bindings := []wrapDerivationBinding{}
+	ast.Inspect(body, func(node ast.Node) bool {
+		assign, isAssign := node.(*ast.AssignStmt)
+		if !isAssign || len(assign.Rhs) != 1 {
+			return true
+		}
+		call, isCall := assign.Rhs[0].(*ast.CallExpr)
+		if !isCall {
+			return true
+		}
+		callee := wrapCalleeName(call.Fun)
+		if callee == "" {
+			return true
+		}
+		for position, left := range assign.Lhs {
+			name, isName := left.(*ast.Ident)
+			if !isName || name.Name == "_" {
+				continue
+			}
+			bindings = append(bindings, wrapDerivationBinding{name.Name, callee, position})
+		}
+		return true
+	})
+	return bindings
+}
+
+// The names this body hands to the eraser, by bare name, which is the only shape a derivation is
+// ever erased in.
+func wrapErasedNamesIn(body *ast.BlockStmt) map[string]bool {
+	erased := map[string]bool{}
+	ast.Inspect(body, func(node ast.Node) bool {
+		call, isCall := node.(*ast.CallExpr)
+		if !isCall {
+			return true
+		}
+		callee, isName := call.Fun.(*ast.Ident)
+		if !isName || callee.Name != "zeroize" || len(call.Args) != 1 {
+			return true
+		}
+		if argument, isArgument := call.Args[0].(*ast.Ident); isArgument {
+			erased[argument.Name] = true
+		}
+		return true
+	})
+	return erased
+}
+
+// Every name this body MOVES OUT to its caller, and the result positions it leaves at. A slice or
+// an index of a derivation counts as moved as well as the whole of it.
 //
-// The producers are the KEM's two doors and the wrap KDF. XwingEncapsulate's FIRST result is the
-// ciphertext and is deliberately not in the class -- it is destined for the wire -- so the reading
-// takes the shared secret's position rather than every result.
-func wrapUnerasedDerivations(t *testing.T, name string, source string) []string {
+// IT DOES NOT DESCEND INTO A CALL'S ARGUMENTS, and that clause is here because the first version
+// of this reading did. `return sealWrapBodyWith(..., shared, ...)` is not a body moving its shared
+// secret out to its caller -- it is a body HANDING it to a callee that does not own it, and the
+// local is still this body's to erase when the callee returns. Measured: with the descent in,
+// deleting SealWrapBody's `defer zeroize(shared)` left this gate and every other case in the
+// package green, which is the whole mutation this case exists to kill.
+func wrapMovedOutIn(body *ast.BlockStmt) map[string][]int {
+	moved := map[string][]int{}
+	ast.Inspect(body, func(node ast.Node) bool {
+		returned, isReturn := node.(*ast.ReturnStmt)
+		if !isReturn {
+			return true
+		}
+		for position, result := range returned.Results {
+			if named := wrapMovedOutName(result); named != "" {
+				moved[named] = append(moved[named], position)
+			}
+		}
+		return true
+	})
+	return moved
+}
+
+// Every name this body reads INTO storage that outlives the frame: a field or an index of
+// something, or an element of a value the body is BUILDING.
+//
+// It is the move-out clause read through a structure rather than through a return, and the
+// package outside wrap.go is full of both shapes -- NewSenderRatchet hands its walked record key
+// to the ratchet it constructs, installEpochOnLoop reads a storage root into the session's own
+// field. A reading that called either a drop would be demanding that a constructor blank the key
+// it just installed, which is the same demand connect/mls's drop reading refuses to make of a
+// merge.
+func wrapInstalledNamesIn(body *ast.BlockStmt) map[string]bool {
+	installed := map[string]bool{}
+	ast.Inspect(body, func(node ast.Node) bool {
+		switch typed := node.(type) {
+		case *ast.AssignStmt:
+			for position, left := range typed.Lhs {
+				switch left.(type) {
+				case *ast.SelectorExpr, *ast.IndexExpr:
+				default:
+					continue
+				}
+				if position < len(typed.Rhs) {
+					if name := wrapMovedOutName(typed.Rhs[position]); name != "" {
+						installed[name] = true
+					}
+				}
+			}
+		case *ast.CompositeLit:
+			for _, element := range typed.Elts {
+				value := element
+				if keyed, isKeyed := element.(*ast.KeyValueExpr); isKeyed {
+					value = keyed.Value
+				}
+				if name := wrapMovedOutName(value); name != "" {
+					installed[name] = true
+				}
+			}
+		}
+		return true
+	})
+	return installed
+}
+
+// The builtins the language supplies, so a derivation bound from one is told from a derivation
+// bound from a function this tree wrote.
+var wrapLanguageBuiltins = []string{
+	"append", "cap", "clear", "close", "complex", "copy", "delete", "imag", "len",
+	"make", "max", "min", "new", "panic", "print", "println", "real", "recover",
+}
+
+// wrapProducerClassIn derives, off ONE source text, every callee result position that this source
+// shows produces key material: seeded on the erases it spells and closed over the move-outs, with
+// the builtins struck.
+func wrapProducerClassIn(t *testing.T, name string, source string) map[wrapKeyProducer]string {
+	t.Helper()
+	parsed := mustParseMessagegroupSource(t, name, source)
+	producers := map[wrapKeyProducer]string{}
+	bodies := []*ast.FuncDecl{}
+	for _, declaration := range parsed.Decls {
+		function, isFunction := declaration.(*ast.FuncDecl)
+		if !isFunction || function.Body == nil {
+			continue
+		}
+		bodies = append(bodies, function)
+	}
+	admit := func(key wrapKeyProducer, why string) bool {
+		if slices.Contains(wrapLanguageBuiltins, key.callee) {
+			return false
+		}
+		if _, seen := producers[key]; seen {
+			return false
+		}
+		producers[key] = why
+		return true
+	}
+	for _, function := range bodies {
+		erased := wrapErasedNamesIn(function.Body)
+		for _, binding := range wrapDerivationBindingsIn(function.Body) {
+			if !erased[binding.name] {
+				continue
+			}
+			admit(wrapKeyProducer{binding.callee, binding.position},
+				name+": "+function.Name.Name+" erases "+binding.name)
+		}
+	}
+	for grew := true; grew; {
+		grew = false
+		for _, function := range bodies {
+			moved := wrapMovedOutIn(function.Body)
+			for _, binding := range wrapDerivationBindingsIn(function.Body) {
+				if _, isProducer := producers[wrapKeyProducer{binding.callee, binding.position}]; !isProducer {
+					continue
+				}
+				for _, at := range moved[binding.name] {
+					if admit(wrapKeyProducer{function.Name.Name, at},
+						name+": "+function.Name.Name+" moves "+binding.name+" out") {
+						grew = true
+					}
+				}
+			}
+		}
+	}
+	return producers
+}
+
+// wrapBuiltinProducersIn is the COMPLEMENT of the builtin narrowing: the producer positions the
+// seed would have admitted if a builtin were a producer, and does not.
+//
+// It exists so the narrowing can be asserted rather than trusted. An empty answer over a source
+// that erases an appended buffer is the tell that the clause has stopped doing anything.
+func wrapBuiltinProducersIn(t *testing.T, name string, source string) []string {
+	t.Helper()
+	parsed := mustParseMessagegroupSource(t, name, source)
+	removed := map[string]bool{}
+	for _, declaration := range parsed.Decls {
+		function, isFunction := declaration.(*ast.FuncDecl)
+		if !isFunction || function.Body == nil {
+			continue
+		}
+		erased := wrapErasedNamesIn(function.Body)
+		for _, binding := range wrapDerivationBindingsIn(function.Body) {
+			if !erased[binding.name] || !slices.Contains(wrapLanguageBuiltins, binding.callee) {
+				continue
+			}
+			removed[fmt.Sprintf("%s@%d", binding.callee, binding.position)] = true
+		}
+	}
+	return slices.Sorted(maps.Keys(removed))
+}
+
+// wrapUnerasedDerivations answers every identifier assigned out of a key material producer in some
+// function body of the source and neither handed to zeroize, moved out, nor installed in storage
+// that outlives the frame, in that same body.
+//
+// The producer class is derived and handed in rather than written here, which is what lets the
+// obligation and the derivation fail apart in the controls above. XwingEncapsulate's FIRST result
+// is the ciphertext and is deliberately not in the class -- it is destined for the wire -- and
+// nobody had to say so: no body of this package erases it, so the seed never admits it.
+func wrapUnerasedDerivations(t *testing.T, producers map[wrapKeyProducer]string,
+	name string, source string) []string {
+
 	t.Helper()
 	parsed := mustParseMessagegroupSource(t, name, source)
 	held := []string{}
@@ -1353,81 +1741,18 @@ func wrapUnerasedDerivations(t *testing.T, name string, source string) []string 
 		if !isFunction || function.Body == nil {
 			continue
 		}
-		erased := map[string]bool{}
-		ast.Inspect(function.Body, func(node ast.Node) bool {
-			call, isCall := node.(*ast.CallExpr)
-			if !isCall {
-				return true
+		erased := wrapErasedNamesIn(function.Body)
+		moved := wrapMovedOutIn(function.Body)
+		installed := wrapInstalledNamesIn(function.Body)
+		for _, binding := range wrapDerivationBindingsIn(function.Body) {
+			if _, isProducer := producers[wrapKeyProducer{binding.callee, binding.position}]; !isProducer {
+				continue
 			}
-			callee, isName := call.Fun.(*ast.Ident)
-			if !isName || callee.Name != "zeroize" || len(call.Args) != 1 {
-				return true
+			if erased[binding.name] || len(moved[binding.name]) != 0 || installed[binding.name] {
+				continue
 			}
-			if argument, isArgument := call.Args[0].(*ast.Ident); isArgument {
-				erased[argument.Name] = true
-			}
-			return true
-		})
-		// and every name this body MOVES OUT to its caller: a slice or an index of a derivation
-		// counts as moved as well as the whole of it.
-		//
-		// IT DOES NOT DESCEND INTO A CALL'S ARGUMENTS, and that clause is here because the first
-		// version of this reading did. `return sealWrapBodyWith(..., shared, ...)` is not a body
-		// moving its shared secret out to its caller -- it is a body HANDING it to a callee that
-		// does not own it, and the local is still this body's to erase when the callee returns.
-		// Measured: with the descent in, deleting SealWrapBody's `defer zeroize(shared)` left this
-		// gate and every other case in the package green, which is the whole mutation this case
-		// exists to kill.
-		ast.Inspect(function.Body, func(node ast.Node) bool {
-			returned, isReturn := node.(*ast.ReturnStmt)
-			if !isReturn {
-				return true
-			}
-			for _, result := range returned.Results {
-				if named := wrapMovedOutName(result); named != "" {
-					erased[named] = true
-				}
-			}
-			return true
-		})
-		ast.Inspect(function.Body, func(node ast.Node) bool {
-			assign, isAssign := node.(*ast.AssignStmt)
-			if !isAssign || len(assign.Rhs) != 1 {
-				return true
-			}
-			call, isCall := assign.Rhs[0].(*ast.CallExpr)
-			if !isCall {
-				return true
-			}
-			callee, isName := call.Fun.(*ast.Ident)
-			if !isName {
-				return true
-			}
-			secret := []int{}
-			switch callee.Name {
-			case "XwingEncapsulate":
-				secret = []int{1}
-			case "XwingDecapsulate":
-				secret = []int{0}
-			case "wrapKeyMaterial":
-				secret = []int{0, 1}
-			case "keyScheduleExtract", "keyScheduleExpand":
-				secret = []int{0}
-			default:
-				return true
-			}
-			for _, position := range secret {
-				if position >= len(assign.Lhs) {
-					continue
-				}
-				target, isName := assign.Lhs[position].(*ast.Ident)
-				if !isName || target.Name == "_" || erased[target.Name] {
-					continue
-				}
-				held = append(held, target.Name)
-			}
-			return true
-		})
+			held = append(held, binding.name)
+		}
 	}
 	slices.Sort(held)
 	return slices.Compact(held)
@@ -1436,13 +1761,18 @@ func wrapUnerasedDerivations(t *testing.T, name string, source string) []string 
 // Property: the door holds no X-Wing private key in a field, which is the written excuse
 // connect/mls's erase class carries for XwingPrivateKey.
 //
-// THE EXCUSE IS A CLAIM ABOUT THIS PACKAGE'S SOURCE AND THIS IS WHERE IT IS TRUE OR NOT.
-// mls/staged_erase_test.go excuses the type with "an ANSWER. XwingGenerateKey and
-// XwingKeyGenFromSeed build one per call and no production declaration holds one in a field; the
-// seed inside it is the caller's to keep or to drop" -- and this door is the first production
-// consumer of that type in the tree, so it is the first thing that could have made the sentence
-// false. It takes the private half as an ARGUMENT for exactly that reason, and this case is what
-// keeps it that way: a field here and the excuse has to change with the code, in the same commit.
+// THE EXCUSE IS A CLAIM ABOUT THIS PACKAGE'S SOURCE AND THIS IS WHERE ITS FIRST CLAUSE IS TRUE OR
+// NOT. mls/staged_erase_test.go excuses the type as an ANSWER that "XwingGenerateKey and
+// XwingKeyGenFromSeed build one per call and no production declaration holds one in a field", and
+// this door takes the private half as an ARGUMENT rather than holding one so that the sentence
+// stays true. A field here and the excuse has to change with the code, in the same commit.
+//
+// IT IS NOT THE FIRST PRODUCTION CONSUMER OF THE TYPE and an earlier version of this paragraph
+// said it was. sdk 48ee76e -- the S2-26 commit this file's prose already cites -- landed
+// urmessage.Device.DecapsulateToOwnLeaf, which builds an XwingPrivateKey out of the device's
+// retained seed on every wrap it opens and decapsulates with it. That consumer is one repository
+// over, it is why the type's residual is measured rather than hypothetical, and the excuse's
+// SECOND clause is held next door in TestXwingPrivateKeyOffersNoWayToDropWhatItHolds.
 func TestNoDeclarationOfThisPackageHoldsAnXwingPrivateKeyInAField(t *testing.T) {
 	_, sources := messagegroupProductionSources(t)
 	holders := []string{}
@@ -1486,6 +1816,93 @@ func TestNoDeclarationOfThisPackageHoldsAnXwingPrivateKeyInAField(t *testing.T) 
 			holders)
 	}
 	t.Logf("%d struct types read; no field of any of them holds an XwingPrivateKey", structs)
+}
+
+// Property: XwingPrivateKey offers NO WAY for anybody to drop what it holds -- it declares no
+// erase and every field of it is unexported.
+//
+// THIS IS THE EXCUSE'S SECOND CLAUSE, AND IT IS HERE BECAUSE NOTHING MEASURED IT. connect/mls's
+// erase class excused the type on two grounds; the first is held one case up, and the second read
+// "the seed inside it is the caller's to keep or to drop", which was not true and which no test
+// anywhere asked. A caller cannot drop it: there is no exported field to blank and no method to
+// call. The excuse now says the weaker thing that IS true -- the erase the class would demand has
+// nowhere to land -- and this case is what keeps the two sentences honest in both directions.
+//
+// IT GOES RED ON AN IMPROVEMENT, deliberately. The day somebody gives this type a Zeroize, or
+// exports the seed so a holder can reach it, the erase HAS somewhere to land, the excuse in
+// mls/staged_erase_test.go becomes a row about a type that declares an erase -- which that gate
+// refuses outright -- and both have to be rewritten in the commit that makes the change. That is
+// the same coupling TestNoDeclarationOfThisPackageHoldsAnXwingPrivateKeyInAField carries for the
+// first clause, and it is the whole point of writing an excuse that a measurement can reach.
+//
+// WHAT THE RESIDUAL IS, since this case is where somebody will look for it: after xwing.go's
+// erases, a dropped key leaves its own thirty-two octet seed field and the parsed
+// *mlkem.DecapsulationKey768 and *ecdh.PrivateKey, neither of which is a []byte this tree holds a
+// header over. The ninety-six octet expansion is no longer among them. sdk's own
+// wrapSeedDerivedNotAliasedSites names the site that pays for it -- Device.DecapsulateToOwnLeaf
+// re-expands on every wrap it opens -- and closing it is ledger item 243's.
+func TestXwingPrivateKeyOffersNoWayToDropWhatItHolds(t *testing.T) {
+	_, sources := messagegroupProductionSources(t)
+	fields := theXwingPrivateKeyFieldNames(sources)
+	// the positive control, in the same query as the two zeros below: the reading DOES see the
+	// type, so neither zero is a zero over nothing.
+	if !slices.Contains(fields, "seed") {
+		t.Fatalf("this reading found the fields %v of XwingPrivateKey and seed is not among them, so it is not reading the type this case is about",
+			fields)
+	}
+	exported := []string{}
+	for _, field := range fields {
+		if field != "" && strings.ToUpper(field[:1]) == field[:1] {
+			exported = append(exported, field)
+		}
+	}
+	if len(exported) != 0 {
+		t.Errorf("XwingPrivateKey exports %v, so a holder outside this package CAN reach what it holds and connect/mls's erase class excuses the type on the written ground that the erase it would demand has nowhere to land. The excuse and this case must change together, in this commit",
+			exported)
+	}
+	// and the methods it declares, read off the source rather than off a name, so a Zeroize
+	// written under any other name is found too: any method of this type that hands one of its
+	// own fields to this package's eraser.
+	erasing := []string{}
+	methods := 0
+	for _, source := range sources {
+		for _, declaration := range source.parsed.Decls {
+			function, isFunction := declaration.(*ast.FuncDecl)
+			if !isFunction || function.Recv == nil || len(function.Recv.List) != 1 {
+				continue
+			}
+			if typeExprName(function.Recv.List[0].Type) != "XwingPrivateKey" {
+				continue
+			}
+			methods += 1
+			if function.Body == nil {
+				continue
+			}
+			ast.Inspect(function.Body, func(node ast.Node) bool {
+				call, isCall := node.(*ast.CallExpr)
+				if !isCall {
+					return true
+				}
+				callee, isName := call.Fun.(*ast.Ident)
+				if !isName || callee.Name != "zeroize" {
+					return true
+				}
+				erasing = append(erasing, function.Name.Name)
+				return true
+			})
+		}
+	}
+	// the second positive control: the type declares methods, so "no method erases" is a
+	// statement about methods this reading actually found.
+	if methods == 0 {
+		t.Fatal("this reading found no method of XwingPrivateKey at all; Seed and Public are declared on it, so a zero here means the receiver matcher has stopped matching and the verdict below is empty")
+	}
+	if len(erasing) != 0 {
+		t.Errorf("%v erase storage of XwingPrivateKey, so the type DOES declare an erase; connect/mls's erase class excuses it as a type whose erase would have nowhere to land, and that gate refuses a row on a type that declares one. Both must change in this commit",
+			slices.Compact(erasing))
+	}
+	t.Logf("%d method(s) of XwingPrivateKey read, %d of them erasing; fields %v, %d of them exported",
+		methods, len(slices.Compact(erasing)), fields, len(exported))
 }
 
 func theXwingPrivateKeyFieldNames(sources []messagegroupSource) []string {
@@ -1799,6 +2216,101 @@ const wrapKatMultiSuffix = "[]"
 // The separator a repeated table's rows are joined under, which cannot occur in a row: this file
 // is ascii text and a NUL in it would already have failed the read.
 const wrapKatRowSeparator = "\x00"
+
+// Property: no two OCTET STRING inputs of the known answers that are the same width carry the
+// same octets.
+//
+// WHY THE PROPERTY AND NOT A REREADING OF THE PARAGRAPH. The file's own input paragraph says its
+// inputs are ascending runs "so that a transposition of any two inputs is visible rather than
+// symmetric", and for the three envelope octets that sentence was false for as long as it stood:
+// u8(target_type) and u8(payload_type) were both 0x01 and MASTER section 7's info writes them four
+// elements apart. Measured against a writer that swaps the two positions, the old inputs let it
+// reproduce every PRIMARY row -- INFO_SHA256, WRAP_KEY, WRAP_NONCE, AEAD_CT_SHA256 and
+// WRAP_BODY_SHA256 -- and it was caught only by the three rows of sections 4 and 5 that perturb
+// one of the two octets. With the octets at 01 02 03 it is caught by all of them. A prose sentence
+// checked by a reader is a sentence that gets re-checked by nobody, so the rule is asserted here
+// instead.
+//
+// SAME WIDTH IS THE WHOLE OF THE PAIRING, because a transposition is only well formed between two
+// values of one width -- swapping a thirty-two octet key with a sixteen octet target id does not
+// produce a file, it produces a parse error. So the reading buckets by length and compares inside
+// each bucket, and the bucket sizes are logged so a reading that had stopped finding the inputs
+// reports a suspiciously empty set rather than a clean run.
+func TestNoTwoKnownAnswerInputsOfTheSameWidthAreEqual(t *testing.T) {
+	// the negative control first, through the same matcher: two equal values of one width must be
+	// reported, and two equal values of DIFFERENT widths must not.
+	collisions := wrapKatInputCollisions(map[string][]byte{
+		"A": {0x01, 0x02}, "B": {0x01, 0x02}, "C": {0x01, 0x02, 0x03}, "D": {0x09, 0x09},
+	})
+	if want := []string{"A == B"}; !slices.Equal(collisions, want) {
+		t.Fatalf("the control reads %v, want %v; the matcher is not comparing inside a width bucket, or it is comparing across widths",
+			collisions, want)
+	}
+
+	rows := readWrapKat(t)
+	inputs := map[string][]byte{}
+	for name, value := range rows {
+		if !strings.HasPrefix(name, "INPUT_") || strings.HasSuffix(name, "_LEN") {
+			continue
+		}
+		// a DECIMAL count or epoch is not an octet string, and the two that are written in
+		// decimal are told apart by parsing: every octet string in this file is lower case hex of
+		// even length, which "7" is not.
+		if name == "INPUT_ENVELOPE_CONTENT_EPOCH" {
+			continue
+		}
+		octets, err := hex.DecodeString(value)
+		if err != nil || len(octets) == 0 {
+			continue
+		}
+		inputs[name] = octets
+	}
+	// the two long inputs are RULES rather than literals, so they are built the way the file says
+	// to build them and compared as the octets they are.
+	inputs["INPUT_CT_XWING"] = wrapKatFill(t, rows, "INPUT_CT_XWING_FILL", "INPUT_CT_XWING_LEN", "INPUT_CT_XWING_SHA256")
+	inputs["INPUT_TARGET_PUB"] = wrapKatFill(t, rows, "INPUT_TARGET_PUB_FILL", "INPUT_TARGET_PUB_LEN", "INPUT_TARGET_PUB_SHA256")
+	// the positive control, in the same query as the verdict: the three envelope octets are the
+	// pair this case was written for, and a reading that had stopped seeing them would report the
+	// same clean run a complete one reports.
+	for _, wanted := range []string{
+		"INPUT_ENVELOPE_VERSION", "INPUT_ENVELOPE_TARGET_TYPE", "INPUT_ENVELOPE_PAYLOAD_TYPE",
+		"INPUT_ENV_KEY", "INPUT_SS", "INPUT_GROUP_ID", "INPUT_TARGET_ID",
+	} {
+		if _, isRead := inputs[wanted]; !isRead {
+			t.Fatalf("this reading does not reach %s, so its verdict below is a verdict over %d input(s) that are not the ones the file is built from",
+				wanted, len(inputs))
+		}
+	}
+	widths := map[int][]string{}
+	for name, octets := range inputs {
+		widths[len(octets)] = append(widths[len(octets)], name)
+	}
+	for _, width := range slices.Sorted(maps.Keys(widths)) {
+		t.Logf("%d octet(s): %v", width, slices.Sorted(slices.Values(widths[width])))
+	}
+	if collisions := wrapKatInputCollisions(inputs); len(collisions) != 0 {
+		t.Errorf("%v are inputs of the same width carrying the same octets, so a transposition of the pair reproduces every answer below it and this file cannot see it. The inputs of this file are ascending runs precisely so that it can",
+			collisions)
+	}
+}
+
+// wrapKatInputCollisions answers every pair of inputs of one width carrying the same octets.
+func wrapKatInputCollisions(inputs map[string][]byte) []string {
+	names := slices.Sorted(maps.Keys(inputs))
+	collisions := []string{}
+	for i, one := range names {
+		for _, other := range names[i+1:] {
+			if len(inputs[one]) != len(inputs[other]) {
+				continue
+			}
+			if bytes.Equal(inputs[one], inputs[other]) {
+				collisions = append(collisions, one+" == "+other)
+			}
+		}
+	}
+	slices.Sort(collisions)
+	return collisions
+}
 
 func readWrapKat(t *testing.T) map[string]string {
 	t.Helper()
