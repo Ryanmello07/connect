@@ -885,3 +885,20 @@ const (
 	mlsSecretLabel = "URmessage/v1/storage"
 	mlsSecretBytes = 32
 )
+
+// env_key[k]'s exporter label, MASTER section 8.2, declared HERE beside mls_secret's because
+// these two are the whole of what this package exports out of the MLS key schedule.
+//
+// THE PAIR IS WHY THEY ARE TOGETHER. Two exporter labels at one epoch are two independent secrets
+// and the LABEL is all that separates them -- the context is empty and the length is the same
+// thirty two -- so a label that was a prefix or a respelling of the other would make
+// storage_root's mls_secret and the device wrap's outer root one value, and every device wrap
+// would be sealed under a key derived from the material it exists to deliver. Neither is a prefix
+// of the other and they disagree at their thirteenth octet, which is inside both.
+// m1w1repairs_test.go pins mls_secret's against MASTER's literal; wrap_test.go pins this one and
+// the relation between them.
+//
+// THE WIDTH IS NOT DECLARED HERE. env_key[k] is the head of the device wrap's record ladder, so
+// its width is a class key's, and wrap.go declares it as EnvKeyBytes beside the ladder that takes
+// it rather than as a second thirty two in this block.
+const envKeyLabel = "URmessage/v1/envelope"

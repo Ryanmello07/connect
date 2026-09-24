@@ -524,3 +524,48 @@ var (
 	// looks exactly like a rotated epoch.
 	ErrEpochKeysDestroyed = errors.New("messagegroup: this epoch keys value has been destroyed and answers nothing")
 )
+
+// ---------------------------------------------------------------------------
+// the device wrap's door, MASTER section 7 and section 8.2
+// ---------------------------------------------------------------------------
+
+var (
+	// Fires when a wrap body's eleven octet envelope is not eleven octets, or does not decode.
+	// The width is refused rather than a prefix read, because a truncated body read as an
+	// envelope answers a content epoch made of whatever followed it -- and the content epoch is
+	// one of wrap_key's nine inputs, so the wrong one is a key the sealer never derived and a tag
+	// failure that says nothing about what went wrong.
+	ErrWrapEnvelope = errors.New("messagegroup: this wrap body's envelope is not the eleven octets master section 7 fixes")
+	// Fires when the octets past the envelope are not u16(alg_id) | LP(ct_xwing) | LP(aead_ct),
+	// and when anything follows them. hybrid_ct is self-delimiting, so a trailing octet is an
+	// octet no field of the grammar names -- and a wrap body's tail sits inside a record AEAD
+	// whose key descends from env_key[k], which every member of the epoch holds.
+	ErrWrapBody = errors.New("messagegroup: this wrap body is not wrap_envelope | hybrid_ct")
+	// Fires when a wrap body names a KEM that is not X-Wing. It is refused rather than carried
+	// out to a caller because alg_id is one of wrap_key's nine inputs: a body naming another
+	// suite is a body whose key this build would derive under the wrong two octets and then
+	// blame on the tag.
+	ErrWrapAlgId = errors.New("messagegroup: this wrap body names a kem that is not x-wing")
+	// Fires when a wrap's aead_ct does not authenticate.
+	//
+	// IT IS THE ONLY VERDICT THE DOOR HAS AND THAT IS THE WHOLE SHAPE OF THE KEM. ML-KEM-768
+	// rejects implicitly: a ciphertext that was not produced for this key decapsulates
+	// SUCCESSFULLY to a pseudorandom secret, so every wrap addressed to another leaf reaches the
+	// AEAD with thirty two well formed octets and nothing before this point can refuse it. A
+	// caller that treated a decapsulation's nil error as "this wrap is mine" would be right about
+	// every wrap in the epoch.
+	ErrWrapOpen = errors.New("messagegroup: this wrap did not open under this leaf's key")
+	// Fires when a wrap is sealed to no target key, or opened with no private half.
+	ErrWrapTargetKey = errors.New("messagegroup: a wrap needs the target leaf's x-wing key and none was given")
+	// Fires when a wrap is sealed over an empty payload. A wrap with nothing inside it is a
+	// record that occupies a rung, closes a fan-out's count and delivers no secret, which is the
+	// omission m1 open item M1-22 is about arriving from the publisher's own side.
+	ErrWrapPayload = errors.New("messagegroup: a wrap carries a payload and this one is empty")
+	// Fires when the two device wraps of one target take one payload_type.
+	//
+	// Both records land at the SAME wrap_target_handle by MASTER section 8.3's unchanged
+	// derivation, and u8(payload_type) is the only element of wrap_key's nine that separates
+	// them, so one octet used twice is a pair of records separable by nothing any key binds --
+	// which is precisely the job MASTER section 7's own table gives that octet.
+	ErrWrapPayloadTypeCollision = errors.New("messagegroup: the two device wraps of one target take two payload types")
+)

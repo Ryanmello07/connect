@@ -97,3 +97,13 @@ message/testdata/fuzz/** -text
 # DISK and not only after a fold, so cmp between the two working trees is an answer rather than
 # a smudge.
 messagegroup/testdata/eph-window-kat.txt text eol=lf
+
+# messagegroup/testdata/envelope-wrap-kat.txt is the device wrap door's known answers, and it is
+# pinned for a NARROWER reason than the table above it: it has no twin in another repository, so
+# there is nothing to cmp it against. What it is instead is an INTEROP VECTOR -- a second
+# implementation of MASTER section 7's wrap KDF checks itself against these octets -- and a file
+# checked out CRLF on one machine and LF on another is a file whose own digests are read out of
+# two different byte strings. wrap_test.go folds CRLF to LF before it reads a row, for the reason
+# the paragraph above gives, so a CRLF checkout does not turn the gate red; this line is what
+# keeps the OCTETS the same everywhere, which is the only thing an interop vector has to offer.
+messagegroup/testdata/envelope-wrap-kat.txt text eol=lf

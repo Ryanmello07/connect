@@ -318,8 +318,41 @@ func TestClassKeysHoldsThreeFieldsAndNoEphKey(t *testing.T) {
 var keyScheduleExtractionSites = map[string]string{
 	"keyScheduleExtract": "spec A section 5.3 and guardrail G1's single reviewed call site: the one extraction " +
 		"of this package, delegating to mls.CryptoProvider.Extract, which takes the salt first as every " +
-		"spec text in this project writes it. Reached only from StorageRoot, which the second half of " +
-		"this gate holds",
+		"spec text in this project writes it. Its CALLERS are held by keyScheduleExtractionCallers " +
+		"below, in both directions",
+}
+
+// Every declaration of this package that CALLS the one extraction, with the derivation it is
+// making and the document that fixes it.
+//
+// THIS TABLE REPLACED A SLICE EQUALITY AND IS STRICTLY STRONGER THAN IT WAS. The second half of
+// this gate read `slices.Equal(callers, []string{"StorageRoot"})` until 2026-09-23, which is the
+// right shape while there is exactly one derivation in the corpus that extracts and the wrong one
+// the moment there are two: a builder adding the second has to edit the assertion either way, and
+// the slice form lets that edit be made by appending a NAME, with nothing written down about what
+// the new extraction is or which document fixes it. A map held in both directions cannot be
+// widened without a sentence -- the same shape keyScheduleExtractionSites above already uses, and
+// the same one mls's entropyRefusalsHeldOutsideThisPackage uses -- and it still fails BOTH ways: a
+// caller with no row fails, and a row naming a declaration that no longer calls the extraction
+// fails too, so a row cannot outlive its call site and read as coverage.
+//
+// WHAT THE OLD ASSERTION WAS DEFENDING, kept because the new one has to defend the same thing: a
+// second, unaccounted-for extraction is a second STORAGE ROOT -- thirty two octets, well formed,
+// agreed on by both ends of this implementation and by no second one. That is why the reason
+// column has to name the block it transcribes and not merely the feature it serves.
+var keyScheduleExtractionCallers = map[string]string{
+	"StorageRoot": "MASTER section 7 and spec A section 5.3: storage_root[n] = HKDF-Extract(salt = " +
+		"mls_secret[n], ikm = pq_secret[n]). The root every class key, every ladder and both record " +
+		"aeads of an epoch hang off, and the one whose transposed arguments guardrail G1 exists for",
+	"wrapKeyMaterial": "MASTER section 7's wrap KDF, adopted 2026-09-18 from red-team finding M-15: " +
+		"prk = HKDF-Extract(salt = \"URmessage/v1/wrap-salt\", ikm = ss), then " +
+		"wrap_key | wrap_nonce = HKDF-Expand(prk, info, 56). It is Extract-then-Expand in place of a " +
+		"bare Expand off a raw shared secret, under a salt no other construction here uses -- and " +
+		"MASTER states what that buys rather than claiming more: X-Wing's ss is already a uniform " +
+		"thirty two octet KDF output, so the named salt is DOMAIN SEPARATION and not entropy " +
+		"extraction. It is not a second storage root: nothing descends from this prk but one wrap's " +
+		"own key and nonce, and wrap_test.go holds that wrap.go reaches neither StorageRoot nor " +
+		"DeriveClassKeys",
 }
 
 func TestTheKeySchedulesOnlyExtractionIsStorageRoots(t *testing.T) {
@@ -352,8 +385,10 @@ func TestTheKeySchedulesOnlyExtractionIsStorageRoots(t *testing.T) {
 				name)
 		}
 	}
-	// and the other half of the word "only": the one extraction is reached from StorageRoot and
-	// from nothing else, so no second derivation can quietly acquire a root of its own.
+	// and the other half of the word "only": every caller of the one extraction carries a written
+	// row naming the block it transcribes, so no second derivation can quietly acquire a root of
+	// its own. Held in BOTH directions, which is what the slice equality this replaced could not
+	// do -- see keyScheduleExtractionCallers.
 	callers := []string{}
 	for _, source := range sources {
 		for _, declaration := range source.parsed.Decls {
@@ -367,10 +402,34 @@ func TestTheKeySchedulesOnlyExtractionIsStorageRoots(t *testing.T) {
 		}
 	}
 	slices.Sort(callers)
-	if !slices.Equal(callers, []string{"StorageRoot"}) {
-		t.Errorf("keyScheduleExtract is called from %v; spec A section 5.9 makes StorageRoot the one call site, and a second caller is a second storage root nothing in this tree accounts for",
+	if len(callers) == 0 {
+		t.Fatal("nothing in this package calls keyScheduleExtract, so the second half of this gate judged an empty class; StorageRoot is the extraction the whole key schedule hangs off and it is not optional")
+	}
+	for _, name := range callers {
+		reason, hasRow := keyScheduleExtractionCallers[name]
+		if !hasRow {
+			t.Errorf("%s calls keyScheduleExtract and keyScheduleExtractionCallers has no row for it; a second extraction is a second storage root, and one that arrives with no sentence saying which block it transcribes is one nothing in this tree accounts for",
+				name)
+			continue
+		}
+		if len(reason) == 0 {
+			t.Errorf("%s has an empty row in keyScheduleExtractionCallers, which is a name and not a reason", name)
+		}
+	}
+	for name := range keyScheduleExtractionCallers {
+		if !slices.Contains(callers, name) {
+			t.Errorf("keyScheduleExtractionCallers has a row for %s, which no longer calls the extraction; a row that outlived its call site excuses nothing and reads as coverage",
+				name)
+		}
+	}
+	// and StorageRoot is still one of them, named rather than derived, because a table held in
+	// both directions is satisfied by a package in which the key schedule's own extraction has
+	// been deleted and replaced by somebody else's.
+	if !slices.Contains(callers, "StorageRoot") {
+		t.Errorf("keyScheduleExtract is called from %v and StorageRoot is not among them; spec A section 5.3's extraction is the one this package is built on",
 			callers)
 	}
+	t.Logf("%d caller(s) of the one extraction, each with a written row: %v", len(callers), callers)
 }
 
 // Property 3's behavioural half, and the obligation the erase class in connect/mls reads off

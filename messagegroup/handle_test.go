@@ -285,6 +285,13 @@ var handleLeafIndexReadings = map[string]string{
 		"is the property, and not a binding. Two declarations carry the name, the seam's projection " +
 		"and the session's door, and the reading is the same for both",
 	"roleAtOnLoop": "neither -- RoleAt's body, and the same reading for the same reason",
+	"WrapRecordKeyZero": "LP -- MASTER section 8.2's ruling of 2026-09-13 puts env_key[k] where the " +
+		"class key stands at the head of the device wrap's ladder and changes NOTHING below the " +
+		"root: record_key[0] = HKDF-Expand(env_key[k], \"sender/v1\" | LP(leaf_index), 32) is " +
+		"RecordKeyZero's own line under a different first argument. It is in this class by reaching " +
+		"RecordKeyZero and it shares the one helper through it, which is the point -- a wrap ladder " +
+		"that spelled LP(leaf_index) for itself would be a second reading of the same octets in the " +
+		"one place where the handle a peer computes has to agree with it",
 }
 
 func TestEveryLeafIndexDerivationDeclaresItsReadingAndSharesOneHelper(t *testing.T) {

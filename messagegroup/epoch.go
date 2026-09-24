@@ -39,12 +39,18 @@
 // AND ONE VALUE IS DELIBERATELY NOT PART OF IT: env_key[k]. Spec A section 5.11 seals every device
 // wrap under env_key[k] = MLS-Exporter("URmessage/v1/envelope", "", 32) and makes caching that key
 // a normative obligation, because (*Group).Export reads the CURRENT schedule and connect has no
-// ExportAt -- measured, no ExportAt is DECLARED anywhere in connect, and the only occurrences of
-// the name are this sentence and the one epoch_test.go repeats it in -- so env_key[k] is computable
-// only while the group stands at epoch k. It is therefore not provisional
+// ExportAt -- measured, no ExportAt is DECLARED anywhere in connect, and every occurrence of the
+// name is prose arguing about it: this sentence, the one epoch_test.go repeats it in, and, since
+// item 241 and m1 task 14, pastepoch.go's and wrap.go's, which both say why there is no such
+// declaration to write -- so env_key[k] is computable off the LIVE handle only while the group
+// stands at epoch k. (*Amended here on the commit that added the fourth occurrence: this clause
+// read "the only occurrences of the name are this sentence and the one epoch_test.go repeats it
+// in", which was true when written and false from the commit that landed pastepoch.go. It is
+// corrected rather than deleted because the MEASUREMENT it carries -- no declaration -- is the
+// load-bearing half and is still exactly true.*) It is therefore not provisional
 // committer state at all: it belongs to an epoch that may already be OPEN, and destroying it
 // because some LATER commit was rejected would discard the only route into that open epoch's
-// storage_root. This type declares no field able to hold one, and epoch_test.go holds the shape as
+// storage_root that does not go back through LoadGroup. This type declares no field able to hold one, and epoch_test.go holds the shape as
 // well as the behaviour, because the shape is what stops the behaviour being re-broken by somebody
 // who finds it convenient to keep the two together.
 package messagegroup

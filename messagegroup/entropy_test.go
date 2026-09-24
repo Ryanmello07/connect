@@ -168,6 +168,35 @@ var entropyRefusalProbes = map[string]func(t *testing.T, random io.Reader) error
 		_, _, err = XwingEncapsulate(random, priv.Public())
 		return err
 	},
+	// The device wrap's two sealing doors. Neither DRAWS -- both hand the reader straight to
+	// XwingEncapsulate, which is the row above -- and both are members of this class anyway,
+	// because the class is derived from the signature and the hazard is the caller's: a door
+	// that reached crypto/rand when the reader it was handed ran dry would seal a wrap whose
+	// randomness parameter is decoration, which is the substitution xwing.go's own refusal
+	// argues at length. The rows exist so that a later body which drew its own entropy rather
+	// than delegating is judged here on the commit that writes it.
+	"SealWrapBody": func(t *testing.T, random io.Reader) error {
+		t.Helper()
+		priv, err := XwingGenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatalf("generate a key to seal to: %v", err)
+		}
+		_, err = SealWrapBody(random, priv.Public(),
+			WrapEnvelope{FormatVersion: WrapFormatVersion, TargetType: 1, PayloadType: 1, ContentEpoch: 1},
+			bytes.Repeat([]byte{0x21}, 32), bytes.Repeat([]byte{0x71}, 16), bytes.Repeat([]byte{0x11}, 32))
+		return err
+	},
+	"SealDeviceWraps": func(t *testing.T, random io.Reader) error {
+		t.Helper()
+		priv, err := XwingGenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatalf("generate a key to seal to: %v", err)
+		}
+		_, _, err = SealDeviceWraps(random, priv.Public(), 1, 1,
+			bytes.Repeat([]byte{0x21}, 32), bytes.Repeat([]byte{0x71}, 16),
+			1, bytes.Repeat([]byte{0x11}, 32), 2, bytes.Repeat([]byte{0x22}, 32))
+		return err
+	},
 }
 
 // TestEveryEntropyTakingFunctionOfThisPackageRefusesANilSource is the test mls's residual table

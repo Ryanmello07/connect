@@ -8040,6 +8040,15 @@ var entropyRefusalsHeldOutsideThisPackage = map[string]string{
 	// stop. The gate over there failed on the commit that declared it, which is how the row
 	// got written.
 	"NewEphRoot": "TestEveryEntropyTakingFunctionOfThisPackageRefusesANilSource",
+	// The device wrap's two sealing doors, landed with m1 task 14's crypto door. NEITHER
+	// DRAWS: both hand the reader they are given straight to XwingEncapsulate, the row three
+	// above. They are rows anyway because this gate reads the SIGNATURE and not the body,
+	// which is the property -- a door that reached crypto/rand the day its caller's reader ran
+	// dry would seal every wrap of every epoch under randomness its caller believed it had
+	// supplied, and nothing about the wrap would look wrong. The gate over there failed on the
+	// commit that declared these two, which is how both rows got written.
+	"SealWrapBody":    "TestEveryEntropyTakingFunctionOfThisPackageRefusesANilSource",
+	"SealDeviceWraps": "TestEveryEntropyTakingFunctionOfThisPackageRefusesANilSource",
 }
 
 func TestNoEntropyTakingFunctionLivesWhereThisGateCannotCallIt(t *testing.T) {

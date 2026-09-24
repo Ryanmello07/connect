@@ -693,3 +693,92 @@ and this item does not claim it.
 A `SPEC-LEDGER.md` number. Ledger open item 199 is the same question about the other five `AAD_head`
 fields, and this is the sixth — the one with a live consumer. `mlsframe.go`'s
 *"WHAT IT CANNOT DEFEND"* paragraph now prints six and not five.
+
+---
+
+
+## MG-7 — three of `wrap_key`'s nine inputs have no code point, and the wrap envelope's version octet is authenticated by nothing
+
+**Status: OPEN. Both halves are wire decisions and neither is this package's to take.**
+
+### The property
+
+MASTER §7's wrap KDF is normative in shape and under-determined in three of its inputs, and MASTER
+says so itself:
+
+```
+info = "URmessage/v1/wrap" ‖ LP(group_id) ‖ u64(epoch) ‖ u8(target_type) ‖ LP(target_id)
+       ‖ u8(payload_type) ‖ u16(alg_id) ‖ LP(target_xwing_pub) ‖ LP(ct_xwing)
+```
+
+- **`target_id`** is *"defined nowhere in the corpus"*. Spec A §5.11 (5) lists four candidates that
+  are four different byte strings — `recovery_handle`, the epoch-scoped `wrap_target_handle`, a leaf
+  index, a member id.
+- **`u8(target_type)` and `u8(payload_type)`** arrived with red-team **M-15** on 2026-09-18 and have
+  no code point anywhere. MASTER's clarification of 2026-09-19 is the sentence that matters: the
+  `info` table fixes the **domain** — an active device leaf and a member's `RECOVERY_PUB`, a
+  `pq_secret` payload and an `eph_root` payload — and **"the domain is not the encoding"**.
+
+MASTER's own conclusion is the property: *"the block is normative modulo those three"*, and *"a
+second implementation cannot build a wrap from it alone"*. The failure mode it names is the one that
+has no symptom: **a publisher and a restorer that choose differently produce a wrap nobody can open,
+with no error anywhere.**
+
+**The second half is a consequence of shipping the door before the signature.** The wrap envelope is
+eleven octets of cleartext outside `hybrid_ct` — `u8(wrap_format_version) ‖ u8(target_type) ‖
+u8(payload_type) ‖ u64(content_epoch)` — and the `info` above binds ten of them. It does **not**
+bind `u8(wrap_format_version)`. The only construction in the corpus that ever covers that octet is
+the body signature, whose preimage MASTER §7 extends by `LP(wrap_envelope)` for exactly this reason
+— *"without it the signature reaches the record header, the KEM transcript and the secret, and
+reaches not one octet of the envelope"* — and that signature is m1 Task 14 **step 3**, blocked by
+open item **M1-52** (the preimage is 1,320 or 1,356 octets and no document says which). So at this
+commit the version octet is authenticated by nothing at all.
+
+### The reproduction
+
+`TestTheEnvelopeOctetsTheWrapKeyBindsAreRefusedAndTheSuiteReportsTheRest` in `wrap_test.go`. It
+edits each of the envelope's eleven octets on the wire and reports which are refused:
+
+```
+wrap envelope: 10 of 11 octets are refused when edited on the wire ([1 2 3 4 5 6 7 8 9 10]);
+1 are accepted ([0])
+```
+
+The accepted set is asserted against a written-down disposition of exactly `{0}` and fails in **both**
+directions — a larger set is an unauthenticated octet nobody named, and a smaller one means an
+authority arrived, which is what Task 14 step 3 landing looks like and which must delete the clause
+rather than pass quietly. `testdata/envelope-wrap-kat.txt` §4 carries the same measurement as a
+vector a second implementation can check without a KEM: one row per octet, giving `H(info)` after
+flipping it, with the verdict stated per row.
+
+For the three code points there is nothing to reproduce, which is the point: `wrap.go` takes all
+three as parameters with no default, so this package cannot be the one that chose.
+
+### What is NOT established
+
+That the version octet being unauthenticated is **exploitable today**. Nothing in this tree consumes
+`wrap_format_version` — `OpenWrapBody` carries it out to its caller and refuses nothing on it — so an
+edit to it changes no behaviour at all. What it costs is the future: the octet exists so that a
+second body field is a negotiation rather than a flag day (MASTER §7), and a version field an
+attacker can move is a downgrade channel the moment anything branches on it.
+
+### What a ruling has to choose
+
+1. **The three code points**, as a table: which octet a device leaf is and which a member's
+   `RECOVERY_PUB` is; which a `pq_secret` payload is and which an `eph_root` payload is; and which of
+   Spec A §5.11 (5)'s four byte strings `target_id` is. It is one paragraph in MASTER §7 and it
+   unblocks a second implementation.
+2. **`M1-54`** — what an opener does with an unrecognised `wrap_format_version`, and at what point
+   relative to the AEAD open. MASTER §7's own rationale for putting the octet first points towards a
+   refusal and an early one; nothing states it. A refusal moves the measurement above from ten of
+   eleven to ten of ten and closes this item's second half without waiting for the signature.
+3. **`M1-52`** — the signature preimage's length, which is what unblocks Task 14 step 3 and is the
+   only thing that puts an authenticator over the envelope as a whole.
+
+### What is owed elsewhere
+
+A `SPEC-LEDGER.md` number. Ledger item **251** ruled the carrier for item 243 as Task 14's X-Wing
+device wrap and did not reach any of the three code points; ruling 36's own sentence — *a
+post-quantum gate cannot be discharged by a carrier whose confidentiality rests on the MLS exporter*
+— is what makes this door load-bearing rather than optional, so the encodings it needs are now on
+the critical path of the removal track rather than of a later slice.

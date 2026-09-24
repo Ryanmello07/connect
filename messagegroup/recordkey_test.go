@@ -10,6 +10,7 @@ package messagegroup
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"go/ast"
@@ -883,6 +884,72 @@ var recordKeyOneWayProbes = map[string]func(secret []byte) [][]byte{
 		}
 		return [][]byte{identityPub, []byte(role)}
 	},
+	// THE DEVICE WRAP'S FOUR DOORS. The rung arrives at each of them in the two places a wrap
+	// takes thirty two octets that must not come back out: as the TARGET DEVICE'S X-WING SEED,
+	// which is the whole of the private key its leaf's public half stands for, and as target_id,
+	// which is one of wrap_key's nine info inputs. What each answers is what it puts on the wire.
+	// A door that returned any part of either -- a body that carried the seed, an info that
+	// leaked target_id, a key material split that handed back its own input -- is a rung the
+	// ladder has already passed and fails here.
+	"WrapRecordKeyZero": func(secret []byte) [][]byte {
+		produced := [][]byte{}
+		for _, leaf := range []uint32{0, 1, 7} {
+			rung := WrapRecordKeyZero(secret, leaf)
+			key, nonce := RecordAeadBody(rung)
+			produced = append(produced, rung, key, nonce)
+		}
+		return produced
+	},
+	"SealWrapBody": func(secret []byte) [][]byte {
+		priv, err := XwingKeyGenFromSeed(secret)
+		if err != nil {
+			return nil
+		}
+		body, err := SealWrapBody(rand.Reader, priv.Public(), recordKeyWrapEnvelope(),
+			recordKeyWrapGroupId(), secret, recordKeyWrapPayload())
+		if err != nil {
+			return nil
+		}
+		return [][]byte{body, priv.Public().Bytes()}
+	},
+	"SealDeviceWraps": func(secret []byte) [][]byte {
+		priv, err := XwingKeyGenFromSeed(secret)
+		if err != nil {
+			return nil
+		}
+		pqBody, ephBody, err := SealDeviceWraps(rand.Reader, priv.Public(), 4, 1,
+			recordKeyWrapGroupId(), secret, 1, recordKeyWrapPayload(), 2, recordKeyWrapPayload())
+		if err != nil {
+			return nil
+		}
+		return [][]byte{pqBody, ephBody}
+	},
+	"OpenWrapBody": func(secret []byte) [][]byte {
+		priv, err := XwingKeyGenFromSeed(secret)
+		if err != nil {
+			return nil
+		}
+		body, err := SealWrapBody(rand.Reader, priv.Public(), recordKeyWrapEnvelope(),
+			recordKeyWrapGroupId(), secret, recordKeyWrapPayload())
+		if err != nil {
+			return nil
+		}
+		envelope, payload, err := OpenWrapBody(priv, recordKeyWrapGroupId(), secret, body)
+		if err != nil {
+			return nil
+		}
+		return [][]byte{envelope.Encode(), payload}
+	},
+}
+
+// The three fixed inputs the wrap probes above hold constant, so that the ONLY thing varying
+// across the ladder is the rung. The payload is a fill and is deliberately not a rung: a probe
+// whose payload were the secret would answer the secret, which this gate reads as a door handing
+// back its own input.
+func recordKeyWrapGroupId() []byte { return bytes.Repeat([]byte{0x21}, 32) }
+func recordKeyWrapPayload() []byte { return bytes.Repeat([]byte{0x11}, 32) }
+func recordKeyWrapEnvelope() WrapEnvelope {
+	return WrapEnvelope{FormatVersion: WrapFormatVersion, TargetType: 1, PayloadType: 1, ContentEpoch: 4}
 }
 
 func TestNothingExportedLeadsBackwardsAlongTheLadder(t *testing.T) {
