@@ -314,7 +314,16 @@ func noncerebindWhere(fileSet *token.FileSet, path string, declaration string, a
 // session's own handle for its own epoch, a prior epoch's rebuilt one otherwise -- and the write
 // key the nonce is mac'd under is on neither. So the banned subset stays empty and the complement
 // grows by one.
-const noncerebindExportedSessionMethods = 16
+//
+// Ledger item 251's ruling 40 adds the seventeenth and eighteenth, and NEITHER answers octets:
+// InstallPqSecret takes a past epoch's pq_secret and answers an error, DeclarePqSecretRotated takes
+// nothing and answers an error. Both are doors INTO the session rather than readings out of it,
+// which is exactly the shape this narrowing is about -- the hazard is a getter that hands a fixture
+// the value the subject holds, and a door answering only error can hand nothing back. So the banned
+// subset stays empty and the complement is unchanged. Worth saying out loud rather than leaving to
+// the count, because InstallPqSecret does move secret octets: they move IN, and nothing on this
+// surface answers them again.
+const noncerebindExportedSessionMethods = 18
 
 // Property 4 -- THE NARROWING, AND IT IS THE ONE PLACE IN THIS FILE WHERE AN EMPTINESS IS THE
 // PROPERTY RATHER THAN A DEFECT IN IT.

@@ -114,20 +114,29 @@ type GroupSession struct {
 	windowSize    int
 	retainedBound int
 
-	// pq_secret[n], BY EPOCH, and whether this session has ever been handed a second one.
+	// pq_secret[n], BY EPOCH, and whether this session still holds the PREMISE that there is
+	// only ever one of them.
 	//
 	// It was one scalar until ledger item 251's ruling 40, and the line that proves a scalar is
 	// wrong is pastepoch.go's: a PAST epoch's storage root was re-derived from TODAY's secret,
 	// which is right only while nothing ever rotates. pqsecret.go is the whole account of what
-	// is held, for how long, what erases it, and why the session that has never rotated behaves
+	// is held, for how long, what erases it, and why a session holding the premise behaves
 	// exactly as it did before this field existed.
+	//
+	// pqLifetime IS A PREMISE THIS SESSION HOLDS AND NOT A FACT ABOUT THE GROUP, which is the
+	// distinction its name exists to carry and the one an earlier spelling -- pqRotated -- lost.
+	// A session can OBSERVE a rotation only by living through one; a group that rotated before
+	// this process started leaves nothing for a fresh session to observe, so the premise survives
+	// a restart that has already been refuted in the world. pqsecret.go names that residual, and
+	// its two doors -- InstallPqSecret and DeclarePqSecretRotated -- are how a restorer that
+	// knows better says so.
 	//
 	// IT IS THE ONE FIELD HERE THAT SURVIVES AN EPOCH INSTALL, and deliberately: every other key
 	// in this struct is re-derived from the epoch the session moved to, and a past epoch's
 	// pq_secret is derivable from nothing at all. What bounds it instead is PastEpochWindow, and
 	// the entries the window leaves behind are erased as they go.
-	pqSecrets map[uint64][]byte
-	pqRotated bool
+	pqSecrets  map[uint64][]byte
+	pqLifetime bool
 
 	// eph_root[n], or nil.
 	//
@@ -262,6 +271,13 @@ func NewGroupSession(handle GroupHandle, pqSecret []byte, groupHandleKeyEpoch0 [
 		senders:       map[senderLadderKey]*SenderRatchet{},
 		pastEpochs:    map[uint64]*pastEpoch{},
 		pqSecrets:     map[uint64][]byte{},
+		// THE PREMISE IS TAKEN UP HERE AND IT IS THE ONLY PLACE IT IS, which is what makes it
+		// a decision rather than a default: every group alive today runs on one pq_secret for
+		// its whole life, and a session that refused their past epochs would lose the history
+		// of every one of them. What the premise is, what it is defined on, and the restart it
+		// does NOT survive are pqsecret.go's header in full. A caller that knows its group
+		// rotates says so with DeclarePqSecretRotated or by filing a past epoch's own secret.
+		pqLifetime: true,
 	}
 	self.groupId = [32]byte(groupId)
 	self.ownLeaf = handle.OwnLeafIndex()
@@ -441,8 +457,13 @@ func (self *GroupSession) EpochKeys() (*EpochKeys, error) {
 // while both production callers handed the group lifetime value in, and the session filed it over
 // the one it had. It is now recorded AT THE EPOCH THE HANDLE IS AT, so a past epoch's storage
 // root stays derivable from the secret that epoch actually ran on. pqsecret.go carries the table,
-// the window and the compatibility rule for the session that is never rotated -- which is every
-// group that exists today, and which must behave exactly as it did before this change.
+// the window and the group-lifetime premise -- which every group that exists today satisfies, and
+// which must behave exactly as it did before this change.
+//
+// THIS CALL IS ALSO THE ONE PLACE A SESSION CAN OBSERVE A ROTATION, and observing is all it does:
+// a secret differing from the one standing at this session's epoch drops the premise here and
+// nowhere else on the ordinary path. A session that was not running when the rotation happened
+// observes nothing, which pqsecret.go's header names as the residual and its two doors answer.
 //
 // GROUP_HANDLE_KEY DOES NOT MOVE. It was expanded from the epoch zero root ONCE, and what this
 // session has held since construction is that answer rather than the root -- so there is nothing

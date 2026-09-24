@@ -280,9 +280,19 @@ var (
 	ErrPqSecretLength = errors.New("messagegroup: a pq_secret is not the thirty two octets MASTER section 7 fixes")
 
 	// Fires when a derivation asks for pq_secret at an epoch this session holds no secret for
-	// AND the single-secret compatibility path cannot answer -- which means the session has been
-	// ROTATED, because while it has not, the one secret it holds answers every epoch and this
-	// sentinel is unreachable. Ledger item 251's ruling 40; pqsecret.go carries the rule.
+	// AND the single-secret compatibility path cannot answer. Ledger item 251's ruling 40;
+	// pqsecret.go carries the rule.
+	//
+	// WHAT REACHES IT, STATED AS THE THREE WAYS AND NOT AS AN IMPOSSIBILITY. A session holding
+	// the group-lifetime premise answers every epoch out of the one secret it has, so this
+	// sentinel needs the premise to be GONE, and exactly three things take it: a second,
+	// different secret arriving at an AdvanceEpoch; a past epoch's own secret arriving at
+	// InstallPqSecret and differing from today's; and DeclarePqSecretRotated, which is how a
+	// restorer states what a fresh session cannot observe. An earlier version of this comment
+	// said the sentinel was unreachable while a session had not rotated, and left out that a
+	// RESTART of a rotated group is a session that has not observed a rotation and never will --
+	// so the sentinel was not merely hard to reach there, it was the answer that shape needed
+	// and did not get. pqsecret.go's header carries that residual by name.
 	//
 	// It is its own sentinel and not ErrEpochOutOfWindow because the two are different facts
 	// with different repairs. Out of window means no device holds a schedule for that epoch and
