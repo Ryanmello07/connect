@@ -152,11 +152,17 @@ var (
 	// replaces the group's extension list WHOLESALE, so an empty list is a group with no policy
 	// and no required capabilities -- the one list no caller of this profile can have meant --
 	// and it is refused by name, before anything is staged, rather than becoming whichever
-	// refusal mls or a receiver answers.
+	// refusal mls or a receiver answers. AMENDED 2026-09-25: CommitRemoveWithExtensions carries a
+	// wholesale list too and refuses an empty one with THIS sentinel rather than a second of its
+	// own, because it is the same refusal about the same argument -- a caller matching on it is
+	// asking "did I hand a commit an empty extension list", and that question does not become a
+	// different one because the commit also carried a Remove.
 	ErrEngineCommitContextExtensionsEmpty = errors.New("messagegroup: CommitContextExtensions was handed no extensions")
 	// Fires when CommitRemove is handed no leaves, for ErrEngineCommitAddEmpty's reason at the
 	// other arm: a commit carrying no proposal and a path is a legitimate MLS commit that
-	// removes nobody, and that is never what a caller of this method meant.
+	// removes nobody, and that is never what a caller of this method meant. AMENDED 2026-09-25:
+	// CommitRemoveWithExtensions answers it too, for the sibling reason above -- a combining
+	// commit with no leaf in it is a policy commit, which CommitContextExtensions already is.
 	ErrEngineCommitRemoveEmpty = errors.New("messagegroup: CommitRemove was handed no leaves")
 	// Fires when Process has verified a commit's signature against a leaf and the pre-commit
 	// tree holds no member there. It is not a state connect/mls can produce today -- a commit

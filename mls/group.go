@@ -2819,7 +2819,7 @@ func (self *Group) MergePendingCommit() error {
 // the epoch this group's OWN staged commit would open, read before it is entered
 // ---------------------------------------------------------------------------
 
-// THE FOUR ACCESSORS BELOW ARE WHAT LETS A COMMITTER SUBMIT BEFORE IT MERGES, added 2026-09-22
+// THE FIVE ACCESSORS BELOW ARE WHAT LETS A COMMITTER SUBMIT BEFORE IT MERGES, added 2026-09-22
 // for ledger item 242's R2 (the role model's committing arm). MASTER section 9.3 gives the delivery
 // service at most one commit per (group, epoch) and has a losing submitter "re-derive against the
 // winner and retry", and CreateCommit's own header says the staged epoch is staged and not merged
@@ -2841,8 +2841,19 @@ func (self *Group) MergePendingCommit() error {
 // reason in each case -- an erased schedule exports zeros, and a shell has no schedule at all.
 //
 // NOTHING HERE IS A SETTER AND NOTHING HERE MOVES STATE. What a caller does with the answers --
-// seal an attachment, submit it, then merge or clear -- is the caller's; these four are the reads
+// seal an attachment, submit it, then merge or clear -- is the caller's; these five are the reads
 // the live group already offers, one epoch early.
+//
+// THE FIFTH IS PendingRemovedLeaves, ADDED 2026-09-25 FOR LEDGER ITEM 257's RULING 51, and it is
+// the one of the five whose answer the live group does NOT offer one epoch later either: once the
+// commit is merged the removed leaves are blank, and a blank leaf is indistinguishable from one
+// that was never filled. The fact has to be read while the staged commit still holds it, which is
+// what makes it an accessor rather than something a caller recomputes. What it is for is the epoch
+// fan-out: the wrap set is built PRE-MERGE off the LIVE tree (ruling 37), and a removed member is
+// still in that tree, so a fan-out that did not exclude it would seal the next epoch's
+// post-quantum secret to the member the commit removes -- ledger item 243 arriving inverted. Until
+// this accessor the exclusion was an argument the calling arm passed, which is a fact about
+// whether an arm remembered rather than about what the commit does.
 
 // PendingEpoch is the epoch this group's staged commit opens.
 func (self *Group) PendingEpoch() (uint64, error) {
@@ -2864,6 +2875,37 @@ func (self *Group) PendingMemberCount() (int, error) {
 		return 0, ErrNoPendingCommit
 	}
 	return len(self.pending.OccupiedLeavesAfter()), nil
+}
+
+// PendingRemovedLeaves is the leaves this group's staged commit takes OUT of the group, in the
+// order the commit's proposals resolved -- (*StagedCommit).RemovedLeaves, which is where the
+// commit's Remove proposals were APPLIED against this client's own tree rather than where a
+// header said they would be.
+//
+// IT IS READ OFF THE STAGED COMMIT AND NOT OFF A DIFF OF THE TWO TREES, and that is the decision
+// worth stating, because the diff is what a reader reaches for. A commit may remove a leaf and
+// ADD a member that lands on the very leaf the removal blanked: RFC 9420 section 12.3 applies
+// Removes before Adds and an Add fills the leftmost blank, so the occupied-leaf sets of the live
+// and the staged tree can agree exactly while a member was removed. A derivation off that diff
+// answers the empty set for such a commit, and the fan-out then seals the next epoch to the
+// removed member's own X-Wing key, which is the whole defect the exclusion exists to prevent.
+// The staged commit carries the answer directly and no tree comparison can reproduce it. That is
+// MEASURED and not reasoned from the RFC: messagegroup's
+// TestARemovalWhoseLeafIsRefilledInTheSameCommitIsStillNamedByTheStagedCommit builds that commit,
+// asserts the two occupied-leaf sets and the two member counts EQUAL, and holds this accessor to
+// naming the removal anyway. The order is the proposals' and not an ascending one, which
+// TestTheStagedCommitNamesTheLeavesInTheOrderTheProposalsDid drives with two leaves named high
+// to low.
+//
+// The slice is storage the caller owns: RemovedLeaves copies, so nothing here aliases the staged
+// value the merge is about to install.
+func (self *Group) PendingRemovedLeaves() ([]LeafIndex, error) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.pending == nil {
+		return nil, ErrNoPendingCommit
+	}
+	return self.pending.RemovedLeaves(), nil
 }
 
 // PendingGroupContext is the serialized GroupContext of the epoch the staged commit opens, which

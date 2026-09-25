@@ -1592,9 +1592,9 @@ func groupAnswerPairwiseLeaf(t *testing.T, group *Group) LeafIndex {
 }
 
 // groupAnswerStagedCommit stages a commit on the group this gate follows when none is staged, so
-// that the four Pending rows have a staged epoch to read.
+// that the five Pending rows have a staged epoch to read.
 //
-// IT IS IDEMPOTENT, for groupAnswerPairwiseLeaf's reason: the four rows carry no projection, so
+// IT IS IDEMPOTENT, for groupAnswerPairwiseLeaf's reason: the five rows carry no projection, so
 // TestAGroupGoesOnPublishingWhatItWasFoundedOn asks each of them TWICE over one group and requires
 // the two answers to be equal, and a helper that staged a fresh commit per call would put a
 // second epoch -- fresh path secrets, a fresh tree hash, a fresh exporter -- in front of the
@@ -1770,13 +1770,16 @@ func groupAnswerRows(t *testing.T) []groupAnswerRow {
 			group.ClearPendingCommit()
 			return []any{&commitErr}
 		}},
-		// THE FOUR READS OFF A STAGED COMMIT, ledger item 242's R2 (2026-09-22): what a committer
-		// announces before the delivery service has answered. Each is driven PAST a staged commit
-		// rather than into ErrNoPendingCommit, for the lifecycle rows' reason, and through the
-		// idempotent stager so that the publishing gate's two calls read one staged epoch. The
-		// two that answer octets -- the marshalled staged context and the staged exporter -- are
-		// the two a caller could write through, and both are fresh: Marshal copies, and an
-		// exporter is a derivation.
+		// THE FIVE READS OFF A STAGED COMMIT, ledger item 242's R2 (2026-09-22) and item 257's
+		// ruling 51 (2026-09-25): what a committer announces before the delivery service has
+		// answered. Each is driven PAST a staged commit rather than into ErrNoPendingCommit, for
+		// the lifecycle rows' reason, and through the idempotent stager so that the publishing
+		// gate's two calls read one staged epoch. The two that answer octets -- the marshalled
+		// staged context and the staged exporter -- are the two a caller could write through, and
+		// both are fresh: Marshal copies, and an exporter is a derivation. PendingRemovedLeaves
+		// answers a slice of a scalar type and no byte storage at all, and it is swept for the
+		// same property the other four are: RemovedLeaves copies, so the vector it hands out is
+		// not the staged commit's own.
 		{name: "PendingEpoch", call: func(group *Group) []any {
 			groupAnswerStagedCommit(t, group)
 			answer, err := group.PendingEpoch()
@@ -1785,6 +1788,11 @@ func groupAnswerRows(t *testing.T) []groupAnswerRow {
 		{name: "PendingMemberCount", call: func(group *Group) []any {
 			groupAnswerStagedCommit(t, group)
 			answer, err := group.PendingMemberCount()
+			return []any{&answer, &err}
+		}},
+		{name: "PendingRemovedLeaves", call: func(group *Group) []any {
+			groupAnswerStagedCommit(t, group)
+			answer, err := group.PendingRemovedLeaves()
 			return []any{&answer, &err}
 		}},
 		{name: "PendingGroupContext", call: func(group *Group) []any {

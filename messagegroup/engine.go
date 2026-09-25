@@ -237,6 +237,37 @@ type GroupHandle interface {
 	CommitPolicy(policy []byte) (commit []byte, welcome []byte, ratchetTree []byte, err error)
 	CommitRemove(leaves []uint32) (commit []byte, welcome []byte, ratchetTree []byte, err error)
 
+	// CommitRemoveWithExtensions IS THE ARM A REMOVAL ACTUALLY SHIPS ON, added 2026-09-25 for
+	// ledger item 257's ruling 51, and it is here because CommitRemove above cannot carry one.
+	//
+	// A bare Remove of the LAST leaf of an identity the policy NAMES is an R0c phantom at every
+	// honest receiver: MASTER section 6's urmessage_group_policy is keyed by credential identity,
+	// the entry survives a commit that carries no GroupContextExtensions proposal, and the group
+	// the commit opens then names an identity with no leaf. Any SetRole names an identity
+	// permanently -- nothing calls RemoveRole -- so the OWNER cannot remove an ADMIN and a new
+	// owner cannot remove the ex-owner's leaf through CommitRemove at all. What closes it is one
+	// commit carrying the Remove AND the policy that drops the entry, and until this arm the only
+	// door onto a multi-proposal commit was Commit(nil), the fold of cached proposals item 242's
+	// ruling 13 forbids in production.
+	//
+	// TWO PARAMETERS AND NOT A PROPOSAL LIST. A general CommitProposals taking []mls.Proposal is
+	// the obvious generalisation and it is refused by the same rule every other method here obeys:
+	// TestNoMethodOfEitherEngineInterfaceNamesAConnectMlsType errors on any qualified type in
+	// either interface's signature, so the arm is spelled in the two go types the seam already
+	// carries -- a leaf is the uint32 CommitRemove takes, and a list is the []ExtensionBytes
+	// CommitContextExtensions takes.
+	//
+	// AND THERE IS NO ...WithPolicy CONVENIENCE BESIDE IT. CommitPolicy exists because a role
+	// change replaces one entry of a list the seam can read for itself; a removal's list is
+	// assembled by the sdk, which holds the identity being removed and the role model that
+	// decides what the post-commit list is. A second arm here would be this package deciding it.
+	//
+	// THE PROPOSAL ORDER IS FIXED INSIDE, Remove first and the GroupContextExtensions last, and
+	// the adapter says why at the site. It is not a preference: the commit's own proposal vector
+	// carries the caller's order into the confirmed transcript hash, so an order chosen per call
+	// site is two signed commits for one removal.
+	CommitRemoveWithExtensions(leaves []uint32, extensions []ExtensionBytes) (commit []byte, welcome []byte, ratchetTree []byte, err error)
+
 	// PendingEpoch and PendingExport are the two reads that let a committer SUBMIT BEFORE IT
 	// MERGES, added 2026-09-22 for ledger item 242's R2. Commit's own contract says the staged
 	// epoch is staged and not merged because the delivery service accepts at most one commit per
@@ -248,14 +279,19 @@ type GroupHandle interface {
 	// admin's role change was left at a private epoch nobody else entered, unable to open the
 	// winner's commit or to seal a record the server would take, until the app restarted.
 	//
-	// PendingEpoch answers the three facts that are not key material in one value, read off the
+	// PendingEpoch answers the facts that are not key material in one value, read off the
 	// staged tree and the staged context -- the epoch the staged commit opens, the members it
-	// leaves in the group, and the serialized post-commit GroupContext -- and PendingExport is
-	// Export through the staged epoch's schedule, a fresh derivation the caller owns and erases
-	// exactly as Export's answer is. Both answer an error when nothing is staged, so an
-	// announcement can never be built out of the epoch the group is already in. They are two
-	// methods and not four for the reason EngineProcessed is a value: the facts arrive together
-	// and are read together, and the one that is a secret stays behind a call.
+	// leaves in the group, the leaves it takes OUT of it, and the serialized post-commit
+	// GroupContext -- and PendingExport is Export through the staged epoch's schedule, a fresh
+	// derivation the caller owns and erases exactly as Export's answer is. Both answer an error
+	// when nothing is staged, so an announcement can never be built out of the epoch the group is
+	// already in. They are two methods and not five for the reason EngineProcessed is a value: the
+	// facts arrive together and are read together, and the one that is a secret stays behind a
+	// call. AMENDED 2026-09-25 for ledger item 257's ruling 51, which is what put the removed
+	// leaves on the value: they were a parameter an arm passed to the fan-out, and a parameter is
+	// a fact about whether an arm remembered. Nothing on this interface changed to carry them --
+	// the field went on a struct the method already answers, which is the whole shape the ruling
+	// chose.
 	//
 	// The values are the ones the live handle answers once MergePendingCommit has run --
 	// engine_test.go holds each of them to its live sibling across a merge -- so a caller that
@@ -364,17 +400,35 @@ type ExtensionBytes struct {
 
 // PendingEpoch is the epoch a handle's OWN staged commit would open, as the committer is allowed
 // to see it before the delivery service has accepted the commit: the epoch number, the number of
-// members the staged tree holds, and the serialized post-commit GroupContext. It is what
-// GroupHandle.PendingEpoch answers and it carries no key material; the staged epoch's exporter
-// is GroupHandle.PendingExport, a call rather than a field, so the one secret an announcement
-// needs is derived on demand and erased by the caller rather than parked in a struct.
+// members the staged tree holds, the leaves the commit takes out of the group, and the serialized
+// post-commit GroupContext. It is what GroupHandle.PendingEpoch answers and it carries no key
+// material; the staged epoch's exporter is GroupHandle.PendingExport, a call rather than a field,
+// so the one secret an announcement needs is derived on demand and erased by the caller rather
+// than parked in a struct.
 //
-// Every field is a value or a copy. GroupContext is a fresh marshal of the staged context, so a
-// caller that keeps this value keeps nothing that aliases the epoch a merge is about to install.
+// REMOVEDLEAVES IS A FIELD HERE AND NOT AN ARGUMENT SOMEWHERE ELSE, added 2026-09-25 for ledger
+// item 257's ruling 51, and the reason is what the field replaced. The epoch fan-out that seals
+// the next epoch's post-quantum secret to each member is built PRE-MERGE off the LIVE tree, where
+// a removed member is still standing -- so the fan-out has to EXCLUDE the leaves this commit
+// removes, or the one member the commit exists to shut out is handed the secret of the epoch it
+// opens. That exclusion was a vector a caller passed down beside the commit, on the reasoning
+// that there was nothing to read it off; the staged commit had it all along, this handle already
+// answers a value read off that staged commit, and the field costs no method on the seam. An arm
+// can no longer forget an argument it does not pass.
+//
+// IT IS THE LEAVES AND NOT THE MEMBER COUNT'S COMPLEMENT. len(RemovedLeaves) has no arithmetic
+// relationship to MemberCount that holds across proposal types: an Add leaves this empty while
+// MemberCount rises, because an added leaf is not in the live tree and gets no wrap at all, so
+// any equality between a wrap set's size and MemberCount is false on every Add.
+//
+// Every field is a value or a copy. GroupContext is a fresh marshal of the staged context and
+// RemovedLeaves is a fresh vector, so a caller that keeps this value keeps nothing that aliases
+// the epoch a merge is about to install.
 type PendingEpoch struct {
-	Epoch        uint64
-	MemberCount  int
-	GroupContext []byte
+	Epoch         uint64
+	MemberCount   int
+	RemovedLeaves []uint32
+	GroupContext  []byte
 }
 
 // EngineProcessed is one ingested MLS message as the storage layer is allowed to see it.
@@ -1203,6 +1257,18 @@ func (self *connectMlsHandle) CommitRemove(leaves []uint32) ([]byte, []byte, []b
 	if len(leaves) == 0 {
 		return nil, nil, nil, fmt.Errorf("%w: no leaves", ErrEngineCommitRemoveEmpty)
 	}
+	result, err := self.group.CreateCommit([][]byte{}, removeProposals(leaves), nil)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return result.Commit, result.Welcome, result.RatchetTree, nil
+}
+
+// removeProposals is one by-value Remove per leaf, in the caller's order. It is a declaration of
+// its own because two arms build it -- CommitRemove and CommitRemoveWithExtensions -- and a
+// second transcription of the conversion would be a second place the seam's uint32 becomes an
+// mls.LeafIndex, which this file's header rule allows in exactly one.
+func removeProposals(leaves []uint32) []mls.Proposal {
 	byValue := make([]mls.Proposal, 0, len(leaves))
 	for _, leaf := range leaves {
 		byValue = append(byValue, mls.Proposal{
@@ -1210,11 +1276,76 @@ func (self *connectMlsHandle) CommitRemove(leaves []uint32) ([]byte, []byte, []b
 			Remove:       &mls.Remove{Removed: mls.LeafIndex(leaf)},
 		})
 	}
-	result, err := self.group.CreateCommit([][]byte{}, byValue, nil)
+	return byValue
+}
+
+// CommitRemoveWithExtensions builds ONE commit carrying every Remove and then the wholesale
+// GroupContextExtensions, which is the shape a removal ships on. See the interface for why a bare
+// CommitRemove cannot carry a named identity's last leaf and why this is two parameters rather
+// than a proposal list.
+//
+// THE ORDER IS REMOVE FIRST AND THE EXTENSIONS LAST, AND IT IS FIXED HERE RATHER THAN LEFT TO THE
+// CALLER. Both orders build, both are followed by an honest receiver, and the state they leave is
+// the same one: RFC 9420 section 12.3 applies proposals by TYPE -- Update, then Remove, then Add,
+// then GroupContextExtensions -- so the vector's order reaches neither the tree nor the extension
+// list, and measured through this seam both orders answer the same RemovedLeaves, the same
+// MembersAfter and a byte-identical post-commit extension list at every receiver.
+//
+// WHAT THE ORDER DOES REACH IS THE CONFIRMED TRANSCRIPT HASH. The commit's own proposal vector is
+// inside the FramedContent that RFC 9420 section 8.2's ConfirmedTranscriptHashInput is taken
+// over, so two clients building "the same" removal in two orders sign two different commits and
+// the epoch has two names. Measured rather than reasoned, because a removal's own commit cannot
+// show it: section 12.4 forces an update path on any commit carrying a Remove, and the path draws
+// fresh secrets every time, so the SAME removal built twice from one state already answers two
+// confirmed transcript hashes. The shape that isolates the order is the one commit section 12.4
+// leaves pathless -- Adds only -- where the same vector built twice answers one hash and the
+// swapped vector answers another;
+// TestTheProposalOrderOfACommitIsWhatTheConfirmedTranscriptHashIsTakenOver drives both halves,
+// and the equal pair is the control that says the difference is the order and not the draw.
+//
+// SO A KAT OVER THIS ARM IS A KAT OVER THE VECTOR, not over the octets: what is pinned is that
+// the removal and the policy leave in one commit in one order, and the arm is the one place that
+// order is decided.
+//
+// BOTH EMPTIES ARE REFUSED BY NAME, each with the sentinel of the arm that owns the refusal, and
+// nothing is staged on either: an empty leaf vector is CommitRemove's refusal (a commit with a
+// path and no proposal removes nobody) and an empty list is CommitContextExtensions' (RFC 9420
+// section 12.1.6 replaces the list wholesale, so an empty one is a group with no policy). THE
+// BY-REFERENCE VECTOR IS EMPTY AND NOT NIL, for CommitAdd's reason.
+func (self *connectMlsHandle) CommitRemoveWithExtensions(leaves []uint32,
+	extensions []ExtensionBytes) ([]byte, []byte, []byte, error) {
+
+	if len(leaves) == 0 {
+		return nil, nil, nil, fmt.Errorf("%w: and the combining arm refuses it for that reason too",
+			ErrEngineCommitRemoveEmpty)
+	}
+	if len(extensions) == 0 {
+		return nil, nil, nil, fmt.Errorf("%w: and the combining arm refuses it for that reason too",
+			ErrEngineCommitContextExtensionsEmpty)
+	}
+	result, err := self.group.CreateCommit([][]byte{},
+		removeWithExtensionsProposals(leaves, extensions), nil)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 	return result.Commit, result.Welcome, result.RatchetTree, nil
+}
+
+// removeWithExtensionsProposals is the combining arm's by-value vector: every Remove, then the
+// one GroupContextExtensions.
+//
+// IT IS A DECLARATION OF ITS OWN SO THAT THE ORDER IS A VALUE SOMETHING CAN READ. The order is a
+// property of the commit this seam signs -- see the arm's header -- and an order built inline at
+// the CreateCommit call would be a property only a reader could check.
+// TestTheCombiningArmBuildsTheRemovesFirstAndTheExtensionsLast asks this function for its answer
+// and reads the types off it, so a flip goes red on the vector rather than on a hash nobody can
+// hold two builds of.
+func removeWithExtensionsProposals(leaves []uint32, extensions []ExtensionBytes) []mls.Proposal {
+	byValue := removeProposals(leaves)
+	return append(byValue, mls.Proposal{
+		ProposalType:           mls.ProposalTypeGroupContextExtensions,
+		GroupContextExtensions: &mls.GroupContextExtensions{Extensions: mlsExtensionsOf(extensions)},
+	})
 }
 
 // currentExtensions is this handle's group-context extension list at the current epoch, decoded
@@ -1288,6 +1419,14 @@ func mlsExtensionsOf(extensions []ExtensionBytes) []mls.Extension {
 // the new epoch under the old context's hash and the old membership's count. mls's own accessors
 // answer ErrNoPendingCommit when nothing is staged and this adapter passes that through, as it
 // passes MergePendingCommit's through.
+//
+// REMOVEDLEAVES IS THE SHARPEST CASE OF THAT SAME RULE, and it is the field ledger item 257's
+// ruling 51 added: the LIVE tree of a staged removal still holds the member being removed, so a
+// reading off the live handle answers the empty set for every removal there is -- and the caller
+// that reads this is the fan-out deciding which leaves NOT to seal the next epoch to. The live
+// reading is not a stale answer there; it is the removed member handed the secret. mls's
+// PendingRemovedLeaves reads the staged commit's own resolved vector, and the conversion back to
+// this seam's uint32 happens here, which is this file's header rule.
 func (self *connectMlsHandle) PendingEpoch() (*PendingEpoch, error) {
 	epoch, err := self.group.PendingEpoch()
 	if err != nil {
@@ -1297,11 +1436,24 @@ func (self *connectMlsHandle) PendingEpoch() (*PendingEpoch, error) {
 	if err != nil {
 		return nil, err
 	}
+	removed, err := self.group.PendingRemovedLeaves()
+	if err != nil {
+		return nil, err
+	}
 	contextBytes, err := self.group.PendingGroupContext()
 	if err != nil {
 		return nil, err
 	}
-	return &PendingEpoch{Epoch: epoch, MemberCount: memberCount, GroupContext: contextBytes}, nil
+	removedLeaves := make([]uint32, 0, len(removed))
+	for _, leaf := range removed {
+		removedLeaves = append(removedLeaves, uint32(leaf))
+	}
+	return &PendingEpoch{
+		Epoch:         epoch,
+		MemberCount:   memberCount,
+		RemovedLeaves: removedLeaves,
+		GroupContext:  contextBytes,
+	}, nil
 }
 
 // PendingExport is Export through the staged epoch's schedule: the same three go types in and

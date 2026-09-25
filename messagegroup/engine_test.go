@@ -88,6 +88,15 @@ var sectionSixGroupHandle = map[string]string{
 	"CommitContextExtensions": "func(extensions []ExtensionBytes) (commit []byte, welcome []byte, ratchetTree []byte, err error)",
 	"CommitPolicy":            "func(policy []byte) (commit []byte, welcome []byte, ratchetTree []byte, err error)",
 	"CommitRemove":            "func(leaves []uint32) (commit []byte, welcome []byte, ratchetTree []byte, err error)",
+	// AMENDED 2026-09-25 for ledger item 257's ruling 51, the removal track's seam arm: the one
+	// commit that carries a Remove AND the policy that stops it naming an identity with no leaf.
+	// CommitRemove above cannot ship a removal on its own -- a bare Remove of a NAMED identity's
+	// last leaf is an R0c phantom at every honest receiver -- and Commit(nil), the only other door
+	// onto a multi-proposal commit, is the by-reference fold item 242's ruling 13 forbids in
+	// production. It is two go-typed parameters and not a proposal list because
+	// TestNoMethodOfEitherEngineInterfaceNamesAConnectMlsType errors on any qualified type in
+	// either interface's signature, which is what refuses a general CommitProposals outright.
+	"CommitRemoveWithExtensions": "func(leaves []uint32, extensions []ExtensionBytes) (commit []byte, welcome []byte, ratchetTree []byte, err error)",
 	// AMENDED 2026-09-22 for ledger item 242's R2, the role model's committing arm: the two
 	// reads that let a committer submit before it merges. The record that announces an epoch
 	// carries that epoch's facts -- write and read keys through its exporter, a hash of its
@@ -267,8 +276,20 @@ func TestTheEngineInterfacesAreExactlySectionSixsBlock(t *testing.T) {
 	// rather than in the sdk because the answer has to be read off the handle of the record's OWN
 	// epoch -- item 242's ruling 17 -- and the only door onto a prior epoch's handle is the
 	// session, behind this interface.
-	if len(sectionSixGroupEngine) != 5 || len(sectionSixGroupHandle) != 34 {
-		t.Errorf("section 6's block is transcribed as %d and %d methods; it was measured at 5 and 34, and a change to either is a change to the seam",
+	// AND IT IS 5 AND 35 FROM 2026-09-25's X4 STEP 1, ledger item 257's ruling 51: the HANDLE half
+	// gains CommitRemoveWithExtensions, ONE method, and it is the whole of what the removal track
+	// needs from this seam. A removal of a NAMED identity's last leaf cannot ship as a bare
+	// CommitRemove -- the policy would go on naming an identity with no leaf, which every honest
+	// receiver refuses as an R0c phantom -- so the Remove and the GroupContextExtensions that
+	// drops the entry have to leave in ONE commit, and the only other door onto a multi-proposal
+	// commit is the by-reference fold item 242's ruling 13 forbids in production. One method and
+	// not two: the ruling refuses a ...WithPolicy convenience beside it, because the sdk builds
+	// the full extension list itself and a second arm here would be this package deciding what a
+	// removal's post-commit policy is. And ZERO methods for the removed-leaf set the same ruling
+	// derives, which is the other half of it: that read went on the PendingEpoch value this
+	// interface already answers, so the seam grew a field rather than a thirty-sixth method.
+	if len(sectionSixGroupEngine) != 5 || len(sectionSixGroupHandle) != 35 {
+		t.Errorf("section 6's block is transcribed as %d and %d methods; it was measured at 5 and 35, and a change to either is a change to the seam",
 			len(sectionSixGroupEngine), len(sectionSixGroupHandle))
 	}
 }
@@ -286,8 +307,10 @@ func TestTheEngineInterfacesAreExactlySectionSixsBlock(t *testing.T) {
 // a type change rather than a factory change.
 //
 // The scope question (R3a) is answered separately from the class question: the CLASS is the
-// method set of both interfaces read off the syntax tree, which is 34 members at this commit and
-// is never a list; the SCOPE is engine.go, because that is the file section 2.2's tree puts the
+// method set of both interfaces read off the syntax tree, which is 40 members at this commit --
+// 5 and 35, and the figure written here was the HANDLE half alone until 2026-09-25, which is a
+// count its own sentence does not describe -- and is never a list; the SCOPE is engine.go,
+// because that is the file section 2.2's tree puts the
 // interface in and an interface declared anywhere else would fail
 // TestThisPackageIsBuiltFromExactlyTheseImports before it reached here.
 func TestNoMethodOfEitherEngineInterfaceNamesAConnectMlsType(t *testing.T) {
