@@ -1,0 +1,519 @@
+# Fork-only CI for connect.
+#
+# GitHub Actions is disabled for the urnetwork organization, and urnetwork/connect carries no
+# workflow files since e8611390, so this file lives only on this fork's default branch. Nothing
+# starts it by itself: someone with write access to the fork dispatches it, naming the repository
+# and the ref to test. It checks that ref out, puts the sibling repositories beside it the way its
+# go.mod and its test.sh ask, and runs its tests. The ref under test needs no workflow file.
+#
+# Two uses:
+#   - a branch of this fork: repository Ryanmello07/connect, ref the branch or a commit;
+#   - the control: repository urnetwork/connect, ref main or a commit of it. A failure that also
+#     happens on the control is upstream's own.
+#
+# Job "test" runs the steps urnetwork/connect's own workflow ran until e8611390 removed it
+# (.github/workflows/test.yml): build, the platform variants, js/wasm, go test with a 60 minute
+# timeout on a runner given an IPv6 address, then the send-buffer and extender tests, which do not
+# gate. It differs from that file in these ways:
+#   - the repository and ref are inputs;
+#   - go vet also runs over every package, and gates;
+#   - a failed step does not stop the later ones, so one run reports every step. The job still
+#     fails if any gating step fails;
+#   - go test writes -json to a file, so every test's outcome is listed and two runs can be
+#     compared test by test. The step prints a summary, and the files are uploaded;
+#   - setup-go's cache is off, so no run starts from another run's build or module cache.
+#
+# Job "test-sh" runs the ref's own test.sh, the script the maintainers run on their own hardware:
+# zsh, -race, no timeout. It may fail without failing the run: -race on a shared runner is slow
+# and timing-sensitive, and test.sh stops at the first package that fails. The notes on its steps
+# name the two things a runner has to stand in for.
+name: fork-ci
+
+run-name: fork-ci ${{ inputs.repository }} @ ${{ inputs.ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: The connect repository to test, as owner/name
+        required: true
+        default: Ryanmello07/connect
+        type: string
+      ref:
+        description: The branch, tag or full commit SHA to test in that repository
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: build, vet, go test
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - name: Check out the ref under test
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      # go.mod resolves this with `replace github.com/urnetwork/glog => ../glog`,
+      # so it has to sit beside the checkout
+      - name: Check out glog dependency
+        run: git clone --depth 1 https://github.com/urnetwork/glog.git ../glog
+
+      # go.mod also has `replace gvisor.dev/gvisor => ../gvisor`: urnetwork's fork
+      # of gvisor, on its `go` branch.
+      - name: Check out gvisor dependency
+        run: git clone --depth 1 --branch go https://github.com/urnetwork/gvisor.git ../gvisor
+
+      # go.mod's toolchain line names the Go this module is built and tested with.
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      # test.sh is a zsh script, and the TestTestScriptPackageDiscovery* tests
+      # run it. The runner image does not ship zsh.
+      - name: Install zsh
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq zsh
+
+      # The family tests ask probeFamilySupport whether this host has IPv6. It
+      # counts only a global address on a non-loopback interface, and a runner
+      # has none. This gives the runner a ULA address on a dummy interface. It
+      # adds no route beyond its own /64.
+      - name: Give the runner an IPv6 address for the family probe
+        run: |
+          sudo ip link add ci-v6 type dummy
+          sudo ip link set ci-v6 up
+          sudo ip -6 addr add fd00:ca::1/64 dev ci-v6 nodad
+
+      - name: Record what is under test
+        env:
+          INPUT_REPOSITORY: ${{ inputs.repository }}
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/results"
+          {
+            echo "repository: $INPUT_REPOSITORY"
+            echo "ref: $INPUT_REF"
+            echo "head: $(git rev-parse HEAD)"
+            echo "tracked files: $(git ls-files | wc -l)"
+            echo "go: $(go version)"
+            echo "go.mod: $(grep -E '^(go|toolchain) ' go.mod | tr '\n' ' ')"
+            echo "glog: $(git -C ../glog rev-parse HEAD)"
+            echo "gvisor: $(git -C ../gvisor rev-parse HEAD)"
+            echo "runner: $(uname -srm), $(nproc) cpus"
+          } | tee "$RUNNER_TEMP/results/under-test.txt"
+          {
+            echo '### Under test'
+            echo '```'
+            cat "$RUNNER_TEMP/results/under-test.txt"
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      # Reads one go test -json stream. Prints each package's result, every failed test with the
+      # end of its output, and every test a failed package started and never finished: a timeout
+      # or a crash ends the binary before those report. Writes the same facts as files.
+      - name: Write the result summarizer
+        id: ready
+        run: |
+          cat >"$RUNNER_TEMP/summarize.py" <<'PY'
+          import json
+          import os
+          import sys
+
+          label, path, out = sys.argv[1:4]
+          final, started, packages, output, build_output, stream = {}, set(), {}, {}, [], []
+          unparsed = 0
+          if os.path.exists(path):
+              for line in open(path, encoding="utf-8", errors="replace"):
+                  try:
+                      event = json.loads(line)
+                  except ValueError:
+                      unparsed += 1
+                      continue
+                  action = event.get("Action")
+                  package = event.get("Package") or ""
+                  test = event.get("Test")
+                  if action == "build-output":
+                      build_output.append(event.get("Output", ""))
+                  elif action == "run" and test:
+                      started.add((package, test))
+                  elif action == "output":
+                      output.setdefault((package, test), []).append(event.get("Output", ""))
+                      stream.append((package, event.get("Output", "")))
+                  elif action in ("pass", "fail", "skip"):
+                      if test:
+                          final[(package, test)] = action
+                      else:
+                          packages[package] = action
+          else:
+              print("no test output at %s: the step did not get as far as go test" % path)
+
+          failed = sorted(k for k, v in final.items() if v == "fail")
+          unfinished = sorted(k for k in started if k not in final)
+          failed_packages = sorted(p for p, v in packages.items() if v == "fail")
+
+
+          def count(want, top_level):
+              return sum(1 for (_, test), v in final.items() if v == want and not (top_level and "/" in test))
+
+
+          def tail(key, limit):
+              lines = "".join(output.get(key, [])).splitlines()
+              for text in lines[-limit:]:
+                  print("      | " + text[:400])
+
+
+          print("== %s: package results" % label)
+          for package in sorted(packages):
+              print("  %-5s %s" % (packages[package], package))
+          if build_output:
+              print("== %s: build output" % label)
+              for text in "".join(build_output).splitlines()[:200]:
+                  print("      | " + text[:400])
+          print("== %s: failed tests (%d)" % (label, len(failed)))
+          for package, test in failed:
+              print("  FAIL %s %s" % (package, test))
+              tail((package, test), 60)
+          print("== %s: tests a failed package started and never finished (%d)" % (label, len(unfinished)))
+          for package, test in unfinished:
+              print("  UNFINISHED %s %s" % (package, test))
+          timeouts = [i for i, (_, text) in enumerate(stream) if text.startswith("panic: test timed out")]
+          for i in timeouts:
+              print("== %s: %s timed out" % (label, stream[i][0]))
+              for _, text in stream[i:i + 16]:
+                  print("      | " + text.rstrip("\n")[:400])
+          for package in failed_packages:
+              if any(p == package for p, _ in failed):
+                  continue
+              print("== %s: %s failed with no failed test; the end of its own output" % (label, package))
+              tail((package, None), 60)
+          totals = "%d passed, %d skipped, %d failed, counting every test and subtest; %d passed, %d skipped, %d failed at the top level; %d packages ok, %d failed; %d binaries timed out; %d lines were not json" % (
+              count("pass", False), count("skip", False), count("fail", False),
+              count("pass", True), count("skip", True), count("fail", True),
+              sum(1 for v in packages.values() if v == "pass"), len(failed_packages), len(timeouts), unparsed)
+          print("== %s: %s" % (label, totals))
+
+          os.makedirs(out, exist_ok=True)
+          with open(os.path.join(out, label + ".failed.txt"), "w", encoding="utf-8") as f:
+              for package, test in failed:
+                  f.write("%s %s\n" % (package, test))
+          with open(os.path.join(out, label + ".unfinished.txt"), "w", encoding="utf-8") as f:
+              for package, test in unfinished:
+                  f.write("%s %s\n" % (package, test))
+          with open(os.path.join(out, label + ".outcomes.txt"), "w", encoding="utf-8") as f:
+              for (package, test), v in sorted(final.items()):
+                  f.write("%s %s %s\n" % (v, package, test))
+          with open(os.path.join(out, label + ".packages.txt"), "w", encoding="utf-8") as f:
+              for package in sorted(packages):
+                  f.write("%s %s\n" % (packages[package], package))
+          with open(os.path.join(out, label + ".totals.txt"), "w", encoding="utf-8") as f:
+              f.write(totals + "\n")
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              with open(summary, "a", encoding="utf-8") as f:
+                  f.write("### %s\n\n%s\n\n" % (label, totals))
+                  for package in failed_packages:
+                      f.write("- package failed: `%s`\n" % package)
+                  for package, test in failed[:100]:
+                      if "/" not in test:
+                          f.write("- failed: `%s` `%s`\n" % (package, test))
+                  for package, test in unfinished[:100]:
+                      f.write("- never finished: `%s` `%s`\n" % (package, test))
+                  f.write("\n")
+          PY
+          python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$RUNNER_TEMP/summarize.py"
+
+      - name: Build
+        id: build
+        run: go build ./...
+
+      - name: Vet
+        id: vet
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
+        run: go vet ./...
+
+      # The release SDK imports the root package for js/wasm. Exercise each
+      # socket-buffer descriptor implementation: native Linux selects unix,
+      # Windows selects its Handle implementation, and browser WASM selects
+      # the deliberate no-socket fallback. protocol and emoji are the other
+      # connect packages sdk/js imports. vet compiles the js test package too.
+      - name: Build root package platform variants
+        id: variants
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
+        run: |
+          GOOS=darwin GOARCH=arm64 go build . ./protocol ./emoji
+          GOOS=windows GOARCH=amd64 go build . ./protocol ./emoji
+          GOOS=js GOARCH=wasm GOEXPERIMENT=greenteagc go build . ./protocol ./emoji
+          GOOS=js GOARCH=wasm GOEXPERIMENT=greenteagc go vet .
+
+      # The js-only tests (*_js_test.go) run under node. The exec wrapper keeps
+      # net/http on fetch so the browser http tests drive a fake fetch.
+      - name: Test js/wasm
+        id: js
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
+        run: |
+          status=0
+          GOOS=js GOARCH=wasm GOEXPERIMENT=greenteagc \
+            go test -json -count=1 -exec "$PWD/tools/go_js_wasm_exec_fetch.sh" -run '^(TestWebRtcJs|TestHttpPlatformJs)' . \
+            >"$RUNNER_TEMP/results/js.json" 2>"$RUNNER_TEMP/results/js.stderr" || status=$?
+          cat "$RUNNER_TEMP/results/js.stderr"
+          python3 "$RUNNER_TEMP/summarize.py" js "$RUNNER_TEMP/results/js.json" "$RUNNER_TEMP/results"
+          echo "go test exit status: $status"
+          exit $status
+
+      # -count=1 defeats the test result cache so a green run always means the
+      # tests actually ran. The root package takes 30 to 35 minutes on a runner.
+      # Two things are left to the two steps after this one, and printed here:
+      # the extender package, and the send-buffer test.
+      - name: Test
+        id: test
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
+        run: |
+          go list ./... >"$RUNNER_TEMP/results/packages.txt"
+          grep -v '/extender$' "$RUNNER_TEMP/results/packages.txt" >"$RUNNER_TEMP/results/test.packages-run.txt"
+          echo "packages in the module: $(wc -l <"$RUNNER_TEMP/results/packages.txt")"
+          echo "packages this step tests: $(wc -l <"$RUNNER_TEMP/results/test.packages-run.txt"): $(tr '\n' ' ' <"$RUNNER_TEMP/results/test.packages-run.txt")"
+          echo "packages left to the extender step: $(grep '/extender$' "$RUNNER_TEMP/results/packages.txt" | tr '\n' ' ')"
+          echo "tests left to the send-buffer step: TestUpstreamTcpSendBufferGrowsUnderLoad"
+          status=0
+          go test -json -count=1 -timeout 60m -skip '^TestUpstreamTcpSendBufferGrowsUnderLoad$' \
+            $(cat "$RUNNER_TEMP/results/test.packages-run.txt") \
+            >"$RUNNER_TEMP/results/test.json" 2>"$RUNNER_TEMP/results/test.stderr" || status=$?
+          cat "$RUNNER_TEMP/results/test.stderr"
+          python3 "$RUNNER_TEMP/summarize.py" test "$RUNNER_TEMP/results/test.json" "$RUNNER_TEMP/results"
+          echo "go test exit status: $status"
+          exit $status
+
+      # TestUpstreamTcpSendBufferGrowsUnderLoad waits for the kernel to grow a
+      # loopback socket's send buffer to tcp_wmem's maximum, which a runner does
+      # in one run and not in the next. It is reported and does not gate.
+      - name: Test send-buffer autotuning (host-dependent, non-blocking)
+        id: sendbuf
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          status=0
+          go test -json -count=1 -timeout 5m -run '^TestUpstreamTcpSendBufferGrowsUnderLoad$' . \
+            >"$RUNNER_TEMP/results/send-buffer.json" 2>"$RUNNER_TEMP/results/send-buffer.stderr" || status=$?
+          cat "$RUNNER_TEMP/results/send-buffer.stderr"
+          python3 "$RUNNER_TEMP/summarize.py" send-buffer "$RUNNER_TEMP/results/send-buffer.json" "$RUNNER_TEMP/results"
+          echo "go test exit status: $status"
+          exit $status
+
+      # extender's TestExtender sleeps a fixed 1s for its listeners to come up
+      # and then fails with EOF on a loaded runner. It is reported and does not
+      # gate.
+      - name: Test extender (known flaky, non-blocking)
+        id: extender
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          status=0
+          go test -json -count=1 -timeout 5m ./extender/... \
+            >"$RUNNER_TEMP/results/extender.json" 2>"$RUNNER_TEMP/results/extender.stderr" || status=$?
+          cat "$RUNNER_TEMP/results/extender.stderr"
+          python3 "$RUNNER_TEMP/summarize.py" extender "$RUNNER_TEMP/results/extender.json" "$RUNNER_TEMP/results"
+          echo "go test exit status: $status"
+          exit $status
+
+      - name: Step outcomes
+        if: ${{ always() }}
+        env:
+          BUILD: ${{ steps.build.outcome }}
+          VET: ${{ steps.vet.outcome }}
+          VARIANTS: ${{ steps.variants.outcome }}
+          JS: ${{ steps.js.outcome }}
+          TEST: ${{ steps.test.outcome }}
+          SENDBUF: ${{ steps.sendbuf.outcome }}
+          EXTENDER: ${{ steps.extender.outcome }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/results"
+          {
+            echo "build: $BUILD"
+            echo "vet: $VET"
+            echo "platform variants: $VARIANTS"
+            echo "js/wasm tests: $JS"
+            echo "go test: $TEST"
+            echo "send-buffer test (does not gate): $SENDBUF"
+            echo "extender tests (do not gate): $EXTENDER"
+          } | tee "$RUNNER_TEMP/results/steps.txt"
+          {
+            echo '### Step outcomes'
+            echo '```'
+            cat "$RUNNER_TEMP/results/steps.txt"
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: fork-ci-test
+          path: ${{ runner.temp }}/results
+          if-no-files-found: warn
+
+  test-sh:
+    name: test.sh under zsh, with -race (may fail without failing the run)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 355
+    steps:
+      - name: Check out the ref under test
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Check out glog dependency
+        run: git clone --depth 1 https://github.com/urnetwork/glog.git ../glog
+
+      - name: Check out gvisor dependency
+        run: git clone --depth 1 --branch go https://github.com/urnetwork/gvisor.git ../gvisor
+
+      # test.sh builds the NGINX that warp/lb pins (make -C ../warp/lb nginx_local)
+      # and points the tests at it.
+      - name: Check out warp, for the NGINX test.sh builds
+        run: git clone --depth 1 https://github.com/urnetwork/warp.git ../warp
+
+      # Stand-in 1 of 2. test.sh takes ../tests/network-intensive-suite-lock.sh
+      # so two network-heavy suites never share one host. That script is in
+      # urnetwork/tests, a private repository this runner cannot clone. This is
+      # the stand-in connect's own TestTestScriptPackageDiscovery* tests write
+      # beside test.sh (test_script_discovery_test.go). It takes no lock, which
+      # a runner that runs nothing else does not need.
+      - name: Stand in for the suite lock
+        run: |
+          mkdir -p ../tests
+          cat >../tests/network-intensive-suite-lock.sh <<'GATE'
+          #!/bin/sh
+          if [ "$1" = --verify-held ]; then
+            [ "$2" = run-all ] && [ "$URNETWORK_NETWORK_TEST_LOCK_HELD" = 1 ]
+            exit $?
+          fi
+          [ "$1" = run-all ] && [ "$2" = run-all-connect ] && [ "$3" = -- ] || exit 70
+          shift 3
+          exec env URNETWORK_NETWORK_TEST_LOCK_HELD=1 "$@"
+          GATE
+          chmod 700 ../tests/network-intensive-suite-lock.sh
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Install zsh
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq zsh
+
+      - name: Give the runner an IPv6 address for the family probe
+        run: |
+          sudo ip link add ci-v6 type dummy
+          sudo ip link set ci-v6 up
+          sudo ip -6 addr add fd00:ca::1/64 dev ci-v6 nodad
+
+      - name: Record what is under test
+        env:
+          INPUT_REPOSITORY: ${{ inputs.repository }}
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/results"
+          {
+            echo "repository: $INPUT_REPOSITORY"
+            echo "ref: $INPUT_REF"
+            echo "head: $(git rev-parse HEAD)"
+            echo "tracked files: $(git ls-files | wc -l)"
+            echo "go: $(go version)"
+            echo "go.mod: $(grep -E '^(go|toolchain) ' go.mod | tr '\n' ' ')"
+            echo "glog: $(git -C ../glog rev-parse HEAD)"
+            echo "gvisor: $(git -C ../gvisor rev-parse HEAD)"
+            echo "warp: $(git -C ../warp rev-parse HEAD)"
+            echo "zsh: $(zsh --version)"
+            echo "runner: $(uname -srm), $(nproc) cpus"
+          } | tee "$RUNNER_TEMP/results/under-test.txt"
+          {
+            echo '### Under test (test.sh)'
+            echo '```'
+            cat "$RUNNER_TEMP/results/under-test.txt"
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      # Stand-in 2 of 2. test.sh writes each package's profiles and race reports
+      # into a profile/ directory in that package. .gitignore names it
+      # (**/profile), so a fresh checkout has none, and go test exits 2 when it
+      # cannot write the memory profile. The directories made here are the ones
+      # test.sh's own package discovery lists.
+      - name: Make the profile directories test.sh writes into
+        run: |
+          go list -race -f '{{if or .TestGoFiles .XTestGoFiles}}{{.Dir}}{{end}}' ./... >"$RUNNER_TEMP/test-directories.txt"
+          while IFS= read -r d; do
+            [ -n "$d" ] || continue
+            mkdir -p "$d/profile"
+            echo "$d/profile"
+          done <"$RUNNER_TEMP/test-directories.txt"
+
+      # The ref's own test.sh, unchanged: -race, -timeout 0, the timing-sensitive
+      # groups first in their own processes, then every package. The only limit
+      # added is the host's: a job may run six hours, so the script is stopped
+      # after 330 minutes and what it printed until then is kept.
+      - name: test.sh
+        id: testsh
+        run: |
+          set +e
+          timeout --signal=TERM --kill-after=120 330m zsh ./test.sh 2>&1 | tee "$RUNNER_TEMP/results/test-sh.log"
+          status=${PIPESTATUS[0]}
+          set -e
+          echo "$status" >"$RUNNER_TEMP/results/test-sh.status"
+          echo "test.sh exit status: $status"
+          exit "$status"
+
+      - name: Summarize test.sh
+        if: ${{ always() }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/results/race"
+          log="$RUNNER_TEMP/results/test-sh.log"
+          clean="$RUNNER_TEMP/results/test-sh.clean.log"
+          touch "$log"
+          sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' "$log" >"$clean"
+          find . -path '*/profile/race.out*' -type f | sort >"$RUNNER_TEMP/results/race-reports.txt"
+          while IFS= read -r report; do
+            cp "$report" "$RUNNER_TEMP/results/race/$(echo "$report" | sed 's#^\./##; s#/#_#g')"
+          done <"$RUNNER_TEMP/results/race-reports.txt"
+          grep -E '^--- FAIL: ' "$clean" | sed -E 's/^--- FAIL: ([^ ]+).*/\1/' | sort -u >"$RUNNER_TEMP/results/test-sh.failed.txt" || true
+          {
+            echo "test.sh exit status: $(cat "$RUNNER_TEMP/results/test-sh.status" 2>/dev/null || echo 'not recorded: the step did not finish') (124 means it was stopped at 330 minutes; 66 is the race detector's)"
+            echo "top-level tests: $(grep -c -E '^--- PASS: ' "$clean") passed, $(grep -c -E '^--- FAIL: ' "$clean") failed, $(grep -c -E '^--- SKIP: ' "$clean") skipped"
+            echo "test binaries that finished, with their result lines:"
+            grep -E '^(ok|FAIL)[[:space:]]+[^[:space:]]' "$clean" | sed 's/^/  /' || true
+            echo "failed top-level tests:"
+            sed 's/^/  /' "$RUNNER_TEMP/results/test-sh.failed.txt"
+            echo "the last test started: $(grep -E '^=== RUN ' "$clean" | tail -n 1 | sed -E 's/^=== RUN +//')"
+            echo "race reports: $(wc -l <"$RUNNER_TEMP/results/race-reports.txt")"
+            while IFS= read -r report; do
+              echo "  $report"
+              head -n 60 "$report" | sed 's/^/      | /'
+            done <"$RUNNER_TEMP/results/race-reports.txt"
+            echo "the last lines test.sh printed:"
+            tail -n 25 "$clean" | cut -c1-300 | sed 's/^/      | /'
+          } | tee "$RUNNER_TEMP/results/test-sh.summary.txt"
+          {
+            echo '### test.sh'
+            echo '```'
+            cat "$RUNNER_TEMP/results/test-sh.summary.txt"
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: fork-ci-test-sh
+          path: ${{ runner.temp }}/results
+          if-no-files-found: warn
