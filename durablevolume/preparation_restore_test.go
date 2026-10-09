@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 // Restored targets use the same real write-ahead publisher as fresh targets;
 // source authority, original bytes and new physical coordinates stay separate.
@@ -14,6 +14,8 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 // Only this fixture's fixed synthetic grammar may produce its new checkpoint.
@@ -45,13 +47,22 @@ func preparationRestoreTestAdapter() PreparationAdapter {
 // different. The target fence explicitly denies prior target state only.
 func newPreparationRestoreFixture(t *testing.T) *preparationFixture {
 	t.Helper()
+	return newPreparationRestoreModeFixture(t, 0600)
+}
+
+// Exact original modes are exported from real files, never patched in a report.
+func newPreparationRestoreModeFixture(t *testing.T, mode os.FileMode) *preparationFixture {
+	t.Helper()
 	f := newPreparationFixture(t)
 	raw := []byte("exact reviewed public bytes\n")
 	if err := os.WriteFile(filepath.Join(f.volume.root, "record.bin"), raw, 0600); err != nil {
 		t.Fatal(err)
 	}
-	var stat syscall.Stat_t
-	if err := syscall.Stat(f.volume.root, &stat); err != nil {
+	if err := os.Chmod(filepath.Join(f.volume.root, "record.bin"), mode); err != nil {
+		t.Fatal(err)
+	}
+	var stat unix.Stat_t
+	if err := unix.Stat(f.volume.root, &stat); err != nil {
 		t.Fatal(err)
 	}
 	anchor, err := json.Marshal(struct {
@@ -62,7 +73,7 @@ func newPreparationRestoreFixture(t *testing.T) *preparationFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := syscall.Setxattr(f.volume.root, "user.urnetwork.attempt-ledger-custody", anchor, 1); err != nil {
+	if err := unix.Setxattr(f.volume.root, "user.urnetwork.attempt-ledger-custody", anchor, unix.XATTR_CREATE); err != nil {
 		t.Fatal(err)
 	}
 	fence := f.volume.fence(t)
@@ -86,8 +97,11 @@ func newPreparationRestoreFixture(t *testing.T) *preparationFixture {
 	if err := os.WriteFile(filepath.Join(archive, "record.bin"), raw, 0600); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Chmod(filepath.Join(archive, "record.bin"), mode); err != nil {
+		t.Fatal(err)
+	}
 	for _, attribute := range report.Entries[0].OwnerAttributes {
-		if err := syscall.Setxattr(archive, attribute.Name, attribute.Value, 1); err != nil {
+		if err := unix.Setxattr(archive, attribute.Name, attribute.Value, unix.XATTR_CREATE); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -99,13 +113,13 @@ func newPreparationRestoreFixture(t *testing.T) *preparationFixture {
 	if err := errors.Join(readErr, generation.Close()); err != nil {
 		t.Fatal(err)
 	}
-	if err := syscall.Setxattr(archive, RootGenerationAttribute, nonce, 1); err != nil {
+	if err := unix.Setxattr(archive, RootGenerationAttribute, nonce, unix.XATTR_CREATE); err != nil {
 		t.Fatal(err)
 	}
 	f.request.Purpose = "restore"
 	f.request.Owners[0].Purpose = "restore"
 	f.request.RestoreSource = &PreparationRestoreSource{Directory: archive, Inventory: Reference{Path: reportPath, Sha256: testDigest(reportRaw)}, FormerWriterFence: fence}
-	if err := syscall.Stat(f.request.RootPath, &stat); err != nil {
+	if err := unix.Stat(f.request.RootPath, &stat); err != nil {
 		t.Fatal(err)
 	}
 	targetFence, err := json.Marshal(PreparationFence{Schema: PreparationFenceSchema, RootPath: f.request.RootPath, RootInode: stat.Ino, Purpose: "restore", FormerWritersStopped: true, NoPreviousTargetState: true, Evidence: "synthetic target has no earlier state; original source is explicitly retained"})
@@ -247,7 +261,7 @@ func TestPreparationRestoreRefusesAlteredSourceAndTargetAuthority(t *testing.T) 
 				}
 				want = "differs from original exported bytes"
 			case "attribute":
-				if err := syscall.Removexattr(f.request.RestoreSource.Directory, "user.urnetwork.attempt-ledger-custody"); err != nil {
+				if err := unix.Removexattr(f.request.RestoreSource.Directory, "user.urnetwork.attempt-ledger-custody"); err != nil {
 					t.Fatal(err)
 				}
 				want = "missing original owner authority"

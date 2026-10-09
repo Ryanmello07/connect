@@ -313,6 +313,14 @@ message Auth {
     // platform counts as v4. The platform ignores the intent unless the
     // family it observed the connection arrive on agrees.
     int32 ip_family = 6;
+
+    // the client intends to provide publicly on this connection. The platform
+    // then judges the client as a provider instead of counting it toward the
+    // network's concurrent client limit. This is the frame form of the H1
+    // `X-UR-Provide-Intent: 1` header, for transports that authenticate with
+    // this frame (H3, DNS-carried H3 and the legacy H1 first frame). An old
+    // server ignores the unknown field, which counts as no intent.
+    bool provide_intent = 7;
 }
 
 
@@ -418,6 +426,14 @@ message ExchangeSignals {
     // initial WaitingForSdpOffer from a newly restarted passive association.
     // Older peers omit/ignore it and retain the legacy compatibility path.
     bytes sender_generation_id = 4;
+    // True for the signaling of the peer-to-peer webrtc extender carrier
+    // (EXTENDER.md S): a dialer's SDP offer to an extender and the extender's
+    // SDP answer, keyed by stream_id like a p2p negotiation but never bound
+    // to a transport peer connection. A receiver that predates the field
+    // sees an offer for a stream it has no peer connection for and drops it,
+    // which is the compatibility path: an old extender simply does not
+    // answer.
+    bool extender_carrier = 5;
 }
 
 // signals are sent in real time to the destination of the peer pair
@@ -569,6 +585,11 @@ message StoredContract {
     // `provide_mode` is `Network`; empty for all other provide modes.
     string principal = 11;
 
+    // Absolute admission deadline, sealed into the platform-signed bytes.
+    // Missing preserves legacy contracts without a time limit. At or after
+    // this Unix millisecond timestamp no new transfer bytes may be debited.
+    optional int64 expiration_time_unix_milli = 12;
+
     // FIXME companion contract id
 }
 
@@ -584,6 +605,15 @@ message CloseContract {
     // this ID with the exact party, amount and checkpoint flag before emission
     // is enabled on hosted clients; older backends ignore the field.
     bytes report_id = 5;
+    // Optional canonical original-close-report envelope signed by the client key.
+    // The versioned envelope binds its policy domain and this exact report tuple.
+    // Empty preserves legacy bytes; evidence-aware backends retain the original
+    // before counting it as authenticated work. A signature alone does not prove
+    // a complete contract, earning window, reliability or provider eligibility.
+    bytes original_report = 6;
+    // Optional signed report-chain companion. Older routes may omit it; missing
+    // inventory remains unknown without changing the original close obligation.
+    bytes original_inventory = 7;
 }
 
 
@@ -698,6 +728,10 @@ message EncryptedKey {
 message ClientKey {
     // 32-byte Ed25519 public key.
     bytes public_key = 1;
+    // Optional exact client-key history namespace; absent keeps the legacy
+    // operator-selected domain. A configured provider sends the same digest
+    // used by its original signed close reports on every key rotation.
+    bytes history_domain_hash = 2;
 }
 
 

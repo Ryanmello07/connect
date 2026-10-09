@@ -6,10 +6,13 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net"
+	"net/http"
 	"net/netip"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"golang.org/x/net/dns/dnsmessage"
 
 	"github.com/urnetwork/connect/protocol"
 )
@@ -153,8 +156,6 @@ func TestExtenderNetworkClientBootstrapsAndAppliesHelloRootKeys(t *testing.T) {
 		t.Fatal("the bootstrap never resolved")
 	}
 
-	// the change monitor is the barrier; the pass applies the hello keys before
-	// it adds the bootstrap addresses, so these landing proves the keys did
 	waitForDirectoryAddresses(t, directory, map[string]string{
 		"192.0.2.200":   ExtenderSourceDns,
 		"2001:db8::200": ExtenderSourceDns,
@@ -166,6 +167,19 @@ func TestExtenderNetworkClientBootstrapsAndAppliesHelloRootKeys(t *testing.T) {
 	if entry.State != ExtenderStateUnverified && entry.State != ExtenderStateHold && entry.State != ExtenderStateWarning {
 		t.Fatalf("state = %s, expected an unverified bootstrap address", entry.State)
 	}
+
+	// the same answer carries the operator's gossip identity, which the member
+	// role's node dials (C6, D3). Hello runs beside the pass, and the status
+	// names the identity once the keys that came with it are in force, so it
+	// is the barrier for them too.
+	waitForExtenderNetworkStatus(
+		t,
+		networkClient,
+		"the operator gossip peer id",
+		func(status ExtenderNetworkClientStatus) bool {
+			return status.GossipPeerId == testExtenderGossipPeerId
+		},
+	)
 
 	// the hello keys are the anchor now, so a record signed by them applies
 	record := signTestRecord(
@@ -179,17 +193,6 @@ func TestExtenderNetworkClientBootstrapsAndAppliesHelloRootKeys(t *testing.T) {
 	if _, err := directory.ApplyRecord(record, ExtenderSourceFeed); err != nil {
 		t.Fatalf("the hello root keys were never applied: %v", err)
 	}
-
-	// the same answer carries the operator's gossip identity, which the member
-	// role's node dials (C6, D3)
-	waitForExtenderNetworkStatus(
-		t,
-		networkClient,
-		"the operator gossip peer id",
-		func(status ExtenderNetworkClientStatus) bool {
-			return status.GossipPeerId == testExtenderGossipPeerId
-		},
-	)
 }
 
 // The first attempt is marked complete even when nothing answers, so the
@@ -785,6 +788,103 @@ func TestExtenderNetworkClientBootstrapAppliesSignedTxtRecords(t *testing.T) {
 		if len(candidates) != 1 || len(candidates[0].PublicKey) == 0 {
 			t.Fatalf("v%d candidates = %v, expected the one verified address", ipVersion, candidates)
 		}
+	}
+}
+
+// The TXT bootstrap queries the DoH settings the strategy has in force
+// (P216). The defaults are black-holed, and a user's bootstrap DoH server is
+// set on the running strategy: that server is the one the bootstrap asks, and
+// the signed record it serves lands verified. Nothing falls through to a
+// system resolver here, which this test has none of.
+func TestExtenderNetworkClientTxtBootstrapUsesTheStrategyDohSettings(t *testing.T) {
+	clock := newTestClock()
+	directory, rootPrivateKey := newTestExtenderDirectory(t, clock, func(settings *ExtenderDirectorySettings) {
+		// the loop dials the candidate and fails here; with no hold it stays
+		settings.HoldTimeout = 0
+		settings.MaxHoldTimeout = 0
+	})
+	signedTxt := testExtenderDnsRecordTxt(t, rootPrivateKey, clock, "192.0.2.241")
+	// a character string is at most 255 bytes, so the record is published
+	// split, as the operator publishes it
+	signedTxtStrings := []string{}
+	for remaining := signedTxt; remaining != ""; {
+		n := min(255, len(remaining))
+		signedTxtStrings = append(signedTxtStrings, remaining[:n])
+		remaining = remaining[n:]
+	}
+
+	txtNames := make(chan string, 16)
+	dohUrl, tlsConfig, address := newControlDohTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := base64.RawURLEncoding.DecodeString(r.URL.Query().Get("dns"))
+		if err == nil {
+			var p dnsmessage.Parser
+			if _, err := p.Start(raw); err == nil {
+				if q, err := p.Question(); err == nil && q.Type == dnsmessage.TypeTXT {
+					select {
+					case txtNames <- q.Name.String():
+					default:
+					}
+				}
+			}
+		}
+		writeDohTxtWire(w, r, [][]string{signedTxtStrings}, 60)
+	}))
+	dialer := &controlDohTestDialer{allowedAddresses: []string{address}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	strategySettings := DefaultClientStrategySettings()
+	strategySettings.DohSettings = controlDohTestDefaultSettings(dialer)
+	strategySettings.ConnectSettings.Resolver = &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network string, address string) (net.Conn, error) {
+			return nil, fmt.Errorf("no system resolver in this test")
+		},
+	}
+	strategySettings.ConnectSettings.DialContextSettings = &DialContextSettings{
+		DialContext: func(ctx context.Context, network string, addr string) (net.Conn, error) {
+			return nil, fmt.Errorf("no route in this test")
+		},
+		PacketConnFactory: func(ctx context.Context) (net.PacketConn, error) {
+			return nil, fmt.Errorf("no packet endpoint in this test")
+		},
+	}
+	clientStrategy := NewClientStrategy(ctx, strategySettings)
+	t.Cleanup(clientStrategy.Close)
+	clientStrategy.SetInternalDohSettings(controlDohTestSettings(dohUrl, tlsConfig, dialer))
+
+	settings := DefaultExtenderNetworkClientSettings()
+	settings.Now = clock.Now
+	settings.ExtenderDnsName = "extender.space.example"
+	settings.MinBackoff = time.Millisecond
+	settings.MaxBackoff = 10 * time.Millisecond
+	settings.DialTimeout = 2 * time.Second
+	settings.HelloTimeout = 2 * time.Second
+	settings.IpVersionSupported = func(ipVersion int) bool { return true }
+	settings.ProbeWindowCount = 0
+	settings.Hello = func(ctx context.Context) (*ExtenderHelloResult, error) {
+		return nil, nil
+	}
+	settings.ResolveDns = func(ctx context.Context, name string) ([]netip.Addr, error) {
+		return nil, nil
+	}
+	// ResolveDnsTxt is left nil: the default resolution is what is tested
+	networkClient := NewExtenderNetworkClient(ctx, clientStrategy, directory, settings)
+	t.Cleanup(networkClient.Close)
+
+	select {
+	case name := <-txtNames:
+		if name != "extender.space.example." {
+			t.Fatalf("the named server was asked for the txt of %q", name)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the bootstrap never asked the named DoH server")
+	}
+	waitForDirectoryAddresses(t, directory, map[string]string{
+		"192.0.2.241": ExtenderSourceDns,
+	})
+	if entry := testDirectoryEntry(t, directory, netip.MustParseAddr("192.0.2.241")); len(entry.PublicKey) == 0 {
+		t.Fatal("the record's address carries no key, expected the txt record to verify it")
 	}
 }
 

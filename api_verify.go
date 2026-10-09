@@ -68,14 +68,26 @@ type SnSetWalletCallback ApiCallback[*SnSetWalletResult]
 type SnSetWalletArgs struct {
 	ColdkeySs58 string `json:"coldkey_ss58"`
 	ClientId    *Id    `json:"client_id,omitempty"`
+	Message     string `json:"message,omitempty"`
+	Signature   string `json:"signature,omitempty"`
 }
 
+// A refused set's stable code, when it has one ("" otherwise).
+// The signature is well formed but does not verify for the coldkey over the
+// challenge (in practice: signed with another account than the address).
+const SnSetWalletErrorCodeSignatureMismatch = "signature_mismatch"
+
 type SnSetWalletError struct {
+	// one of the `SnSetWalletErrorCode*` values; absent from older servers
+	// and for other refusals
+	Code    string `json:"code,omitempty"`
 	Message string `json:"message"`
 }
 
 type SnSetWalletResult struct {
-	Error *SnSetWalletError `json:"error,omitempty"`
+	Error             *SnSetWalletError `json:"error,omitempty"`
+	MappingHash       string            `json:"mapping_hash,omitempty"`
+	MappingGeneration uint64            `json:"mapping_generation,omitempty"`
 }
 
 // SnSetWallet sets the subnet wallet via the authenticated

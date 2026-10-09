@@ -5,6 +5,7 @@ import (
 	"errors"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	// "errors"
@@ -351,6 +352,14 @@ func DefaultContractManagerSettingsNoNetworkEvents() *ContractManagerSettings {
 type ContractManagerSettings struct {
 	SequenceBufferSize int
 
+	// Optional exact client-key-history policy domain digest. Zero leaves reports
+	// unsigned. The manager copies it once; retries never adopt another domain.
+	CloseReportDomainHash [32]byte
+	// Optional independently configured request/cut transport and durable outbox.
+	OriginalWorkCapture *OriginalWorkCaptureSettings
+	// Optional individual pre-send request and returned reservation custody.
+	OriginalContractCapture *OriginalContractCaptureSettings
+
 	// this should be enough to do a single ping
 	InitialContractTransferByteCount ByteCount
 	// InitialNetworkPeerContractTransferByteCount covers a bounded interactive
@@ -389,7 +398,8 @@ type ContractManagerSettings struct {
 	// its queue, for a destination that is never used again), and prevents
 	// handing out a stale contract the platform may have already force-closed
 	// server-side — keep this below the platform's unused-contract force-close
-	// window (5 minutes). <= 0 disables expiry.
+	// window (5 minutes). <= 0 disables enqueue-age expiry; signed absolute
+	// deadlines always apply.
 	ContractQueueExpireTimeout time.Duration
 
 	// the epoch for emitting open contract usage events to
@@ -413,7 +423,12 @@ type ContractManager struct {
 	cancel context.CancelFunc
 	client *Client
 
-	settings *ContractManagerSettings
+	settings              *ContractManagerSettings
+	closeReportDomainHash [32]byte
+	closeInventory        originalCloseInventoryOwner
+	wholeWorkInventory    originalWorkInventoryOwner
+	originalWorkCapture   *OriginalWorkCaptureSettings
+	contractCreation      originalContractCreationOwner
 
 	mutex             sync.Mutex
 	closed            bool
@@ -430,6 +445,9 @@ type ContractManager struct {
 	provideMonitor *Monitor
 
 	destinationContracts map[ContractKey]*contractQueue
+	// Protected by mutex. Contract-free clients need no expiry worker; once
+	// a contract is queued, the worker remains owned through its final flush.
+	contractExpiryStarted bool
 
 	receiveNoContractClientIds map[Id]bool
 	sendNoContractClientIds    map[Id]bool
@@ -467,6 +485,11 @@ type ContractManager struct {
 	// Nil test barriers expose callback admission and manager join entry.
 	beforeCallbackAdmissionLockForTest func()
 	beforeCloseWaitForTest             func()
+	// Nil in production; exposes completed original creation before route selection.
+	beforeOriginalCloseFrameForTest func(*protocol.CloseContract)
+	// Nil test barriers expose shutdown before retry admission and first send.
+	beforeCloseControlAdmissionForTest func(*protocol.Frame)
+	beforeCloseControlSendForTest      func(*protocol.Frame)
 }
 
 func NewContractManagerWithDefaults(ctx context.Context, client *Client) *ContractManager {
@@ -497,6 +520,8 @@ func NewContractManager(
 		cancel:                          cancel,
 		client:                          client,
 		settings:                        settings,
+		closeReportDomainHash:           settings.CloseReportDomainHash,
+		wholeWorkInventory:              originalWorkInventoryOwner{generation: NewId()},
 		provideSecretKeys:               map[protocol.ProvideMode][]byte{},
 		provideModes:                    map[protocol.ProvideMode]bool{},
 		providePaused:                   false,
@@ -520,7 +545,19 @@ func NewContractManager(
 		contractManager.startWorker("provide ping", contractManager.providePing)
 	}
 
-	contractManager.startWorker("contract expiry", contractManager.expireQueuedContracts)
+	if directory, err := originalContractCreationDirectory(settings); err != nil {
+		client.log.Errorf("[contract]original request custody configuration unavailable: %v", err)
+	} else {
+		contractManager.contractCreation.directory = directory
+		if settings.OriginalContractCapture != nil {
+			contractManager.contractCreation.scope = OriginalContractStoreScope{DomainHash: contractManager.closeReportDomainHash, ClientId: [16]byte(client.ClientId()), PublicKey: settings.OriginalContractCapture.PublicKey, SourceGeneration: settings.OriginalContractCapture.SourceGeneration}
+		}
+	}
+	if settings.OriginalWorkCapture != nil {
+		capture := *settings.OriginalWorkCapture
+		contractManager.originalWorkCapture = &capture
+		contractManager.startWorker("original work capture", contractManager.runOriginalWorkCapture)
+	}
 
 	return contractManager
 }
@@ -620,6 +657,12 @@ func (self *ContractManager) closeAndWait(ctx context.Context) error {
 // otherwise be retained forever.
 func (self *ContractManager) expireQueuedContracts() {
 	timeout := self.settings.ContractQueueExpireTimeout
+	// Absolute deadlines still retire idle reservations when enqueue-age
+	// expiry is disabled. Poll independently enforces the exact deadline.
+	interval := time.Minute
+	if 0 < timeout {
+		interval = max(time.Nanosecond, min(interval, timeout/2))
+	}
 
 	// the contract manager is closing: close all still-queued (pending)
 	// contracts so their escrow is released promptly. `closeContracts`
@@ -648,13 +691,6 @@ func (self *ContractManager) expireQueuedContracts() {
 	}
 
 	for {
-		// when expiry is disabled the nil tick channel blocks forever and the
-		// loop only waits for shutdown
-		var tick <-chan time.Time
-		if 0 < timeout {
-			tick = time.After(timeout / 2)
-		}
-
 		select {
 		case <-self.ctx.Done():
 			finalFlush()
@@ -664,10 +700,13 @@ func (self *ContractManager) expireQueuedContracts() {
 			// is the shutdown signal
 			finalFlush()
 			return
-		case <-tick:
+		case <-time.After(interval):
 		}
 
-		minEnqueueTime := time.Now().Add(-timeout)
+		var minEnqueueTime time.Time
+		if 0 < timeout {
+			minEnqueueTime = time.Now().Add(-timeout)
+		}
 		expired := self.expireQueuedContractsBefore(minEnqueueTime)
 		if 0 < len(expired) {
 			if self.client.log.V(1).Enabled() {
@@ -699,7 +738,7 @@ func (self *ContractManager) expireQueuedContractsBefore(
 			self.hasOpenContractForKeyWithLock(contractKey) {
 			// Keep the newest successor even when it outlives the orphan
 			// timeout, but do not retain every delayed/retried create result.
-			// One stale successor is sufficient to make rollover immediate;
+			// One unexpired stale successor makes rollover immediate;
 			// retaining all of them would make a slow live sequence an
 			// unbounded memory/escrow sink.
 			expired = append(
@@ -1298,7 +1337,11 @@ func (self *ContractManager) Verify(storedContractHmac []byte, storedContractByt
 		return false
 	}
 
-	return VerifyStoredContract(self.settings, provideSecretKey, storedContractBytes, storedContractHmac)
+	verified := VerifyStoredContract(self.settings, provideSecretKey, storedContractBytes, storedContractHmac)
+	if verified {
+		self.admitOriginalWork(storedContractBytes)
+	}
+	return verified
 }
 
 func (self *ContractManager) GetProvideSecretKey(provideMode protocol.ProvideMode) ([]byte, bool) {
@@ -1483,6 +1526,7 @@ func (self *ContractManager) addContractToQueue(
 	if sourceId != self.client.ClientId() {
 		return fmt.Errorf("Contract source must be this client: %s<>%s", sourceId, self.client.ClientId())
 	}
+	self.admitOriginalWork(contract.StoredContractBytes)
 
 	if self.client.log.V(1).Enabled() {
 		self.client.log.Infof("[contract]add %s %s\n", self.client.ClientId(), contractKey.Destination)
@@ -1493,10 +1537,18 @@ func (self *ContractManager) addContractToQueue(
 	// path, never repopulate a queue that no worker will consume or flush again.
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
-	if self.closed {
+	if self.closed || self.ctx.Err() != nil || self.client.IsDone() {
 		return errContractQueueDrained
 	}
-	return contractQueue.Add(contract, storedContract)
+	if err := contractQueue.Add(contract, storedContract); err != nil {
+		return err
+	}
+	if !self.contractExpiryStarted {
+		// This admission shares Close's lock, so a successfully queued result
+		// always has a joined final-flush owner, even when expiry is disabled.
+		self.contractExpiryStarted = self.startWorker("contract expiry", self.expireQueuedContracts)
+	}
+	return nil
 }
 
 // Coalesces an identical pending request within its exact queue generation.
@@ -1560,10 +1612,14 @@ func (self *ContractManager) CreateContract(contractKey ContractKey, contractSeq
 		self.client.log.Infof("[contract]create %s %s\n", self.client.ClientId(), contractKey.Destination)
 	}
 
+	self.beginOriginalWorkCreate()
+	originalRequest := self.captureOriginalContractRequest(frame)
 	self.client.ClientOob().SendControl(
 		[]*protocol.Frame{frame},
 		func(resultFrames []*protocol.Frame, err error) {
 			defer finish()
+			defer self.finishOriginalWorkCreate(resultFrames, err)
+			self.captureOriginalContractAdmission(originalRequest, resultFrames, err)
 			if err == nil {
 				// the OOB round-trip completed: the backend is reachable
 				noteBackendSuccess()
@@ -1707,27 +1763,38 @@ func (self *ContractManager) CloseContractWithCheckpoint(
 	// retransfers and the closed-client OOB path keep the serialized frame;
 	// another equal-byte checkpoint is a different operation with a new ID.
 	// Deploy only after every backend route supports close-report identities.
-	frame, err := ToFrame(&protocol.CloseContract{
+	report := &protocol.CloseContract{
 		ContractId:       contractId.Bytes(),
 		AckedByteCount:   uint64(ackedByteCount),
 		UnackedByteCount: uint64(unackedByteCount),
 		Checkpoint:       checkpoint,
 		ReportId:         NewId().Bytes(),
-	}, self.settings.ProtocolVersion)
+	}
+	if self.closeReportDomainHash != ([32]byte{}) {
+		original, inventory, signErr := self.signOriginalCloseInventory(report)
+		if signErr != nil {
+			self.retainOriginalWorkClose(report)
+			// Optional evidence failure cannot erase the original close obligation.
+			// The empty envelope remains visibly unauthenticated to its consumer.
+			self.client.log.Errorf("[contract]original close evidence unavailable: %v", signErr)
+		} else {
+			report.OriginalReport = original
+			report.OriginalInventory = inventory
+		}
+	}
+	if self.beforeOriginalCloseFrameForTest != nil {
+		self.beforeOriginalCloseFrameForTest(report)
+	}
+	frame, err := ToFrame(report, self.settings.ProtocolVersion)
 	if err != nil {
 		self.client.log.Infof("[contract]could not create close contract frame = %s\n", err)
 		return
 	}
 
-	if self.ctx.Err() != nil || self.client.IsDone() {
-		// the client context is closed (the contract manager is closing).
-		// note the manager ctx is the client's parent ctx, so check both.
-		// `ControlSync` rides the in-band client transport, which is gone —
-		// it would drop the close without a single attempt. Send a one-shot
-		// cleanup over the out-of-band api on a Background context instead,
-		// since the lifecycle context is closed. One shot, never retried, so
-		// cleanup cannot run away; the server's expired-contract force-close
-		// remains the backstop if the single attempt fails.
+	// Takes the retained frame for one cleanup attempt after native delivery
+	// loses its lifecycle. The external OOB owner takes custody on return;
+	// server expiry remains the backstop if that attempt fails.
+	sendCleanup := func(cleanupFrame *protocol.Frame) {
 		sendCallback := func(resultFrames []*protocol.Frame, sendErr error) {
 			if sendErr == nil {
 				if self.client.log.V(1).Enabled() {
@@ -1737,39 +1804,64 @@ func (self *ContractManager) CloseContractWithCheckpoint(
 				self.client.log.Infof("[contract]could not close %s after client close = %s\n", contractId, sendErr)
 			}
 		}
-		frames := []*protocol.Frame{frame}
+		frames := []*protocol.Frame{cleanupFrame}
 		if clientOob, ok := self.client.ClientOob().(OutOfBandControlWithCtx); ok {
 			clientOob.SendControlWithCtx(context.Background(), frames, sendCallback)
 		} else {
 			self.client.ClientOob().SendControl(frames, sendCallback)
 		}
+	}
+	if self.ctx.Err() != nil || self.client.IsDone() {
+		sendCleanup(frame)
 		return
 	}
 
 	closeControlSync := NewControlSync(self.ctx, self.client, fmt.Sprintf("close-contract-%s", contractId))
+	if self.beforeCloseControlAdmissionForTest != nil {
+		self.beforeCloseControlAdmissionForTest(frame)
+	}
 	self.mutex.Lock()
 	if self.closed {
 		self.mutex.Unlock()
 		closeControlSync.Close()
-		MessagePoolReturn(frame.MessageBytes)
+		sendCleanup(frame)
 		return
 	}
+	// Keep exact bytes until native acknowledgment or a single joined cleanup
+	// handoff. Close may cancel the sync before Send admits its first worker.
+	cleanupFrame := &protocol.Frame{
+		MessageType:  frame.MessageType,
+		MessageBytes: MessagePoolShareReadOnly(frame.MessageBytes),
+	}
+	var closeAcknowledged atomic.Bool
 	self.closeControlSyncs[closeControlSync] = true
 	if !self.startWorker("contract close sync", func() {
 		<-closeControlSync.workers.Done()
 		self.mutex.Lock()
 		delete(self.closeControlSyncs, closeControlSync)
 		self.mutex.Unlock()
+		if closeAcknowledged.Load() {
+			MessagePoolReturn(cleanupFrame.MessageBytes)
+		} else {
+			sendCleanup(cleanupFrame)
+		}
 	}) {
 		delete(self.closeControlSyncs, closeControlSync)
 		self.mutex.Unlock()
 		closeControlSync.Close()
-		MessagePoolReturn(frame.MessageBytes)
+		MessagePoolReturn(cleanupFrame.MessageBytes)
+		sendCleanup(frame)
 		return
 	}
 	self.mutex.Unlock()
+	if self.beforeCloseControlSendForTest != nil {
+		self.beforeCloseControlSendForTest(frame)
+	}
 	closeControlSync.Send(frame, nil, func(sendErr error) {
 		defer closeControlSync.Close()
+		if sendErr == nil {
+			closeAcknowledged.Store(true)
+		}
 		if sendErr == nil && opened {
 			contractQueue := self.openContractQueue(contractKey)
 			contractQueue.RemoveUsedContract(contractId)
@@ -1951,8 +2043,9 @@ func (self *ContractManager) closeContractQueueWithForceRemove(
 // a contract waiting in the queue, stamped so unconsumed contracts can be
 // expired (see `ContractQueueExpireTimeout`)
 type queuedContract struct {
-	contract    *protocol.Contract
-	enqueueTime time.Time
+	contract                *protocol.Contract
+	enqueueTime             time.Time
+	expirationTimeUnixMilli *int64
 }
 
 // The original key also fences legacy queues that intentionally collapse
@@ -2037,7 +2130,7 @@ func (self *contractQueue) Close() {
 // `minEnqueueTime` — stale entries are removed and returned as `expired` for
 // the caller to close (the platform force-closes unused contracts, so a stale
 // queued contract may already be settled server-side). A zero `minEnqueueTime`
-// expires nothing.
+// disables enqueue-age expiry; signed absolute deadlines always apply.
 func (self *contractQueue) Poll(minEnqueueTime time.Time) (*protocol.Contract, []*protocol.Contract) {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
@@ -2052,7 +2145,7 @@ func (self *contractQueue) Poll(minEnqueueTime time.Time) (*protocol.Contract, [
 	return nil, expired
 }
 
-// Expire removes and returns all contracts enqueued before `minEnqueueTime`.
+// Removes contracts past their signed deadline or enqueue-age cutoff.
 func (self *contractQueue) Expire(minEnqueueTime time.Time) []*protocol.Contract {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
@@ -2061,27 +2154,34 @@ func (self *contractQueue) Expire(minEnqueueTime time.Time) []*protocol.Contract
 }
 
 // ExpireBeforeKeepingNewest expires stale entries while retaining at most one
-// stale successor. If a non-stale successor exists, every stale entry can be
-// removed; otherwise the newest stale entry is the bounded rollover reserve.
+// stale successor whose signed deadline is still valid. If a non-stale
+// successor exists, every stale entry can be removed; otherwise the newest
+// unexpired stale entry is the bounded rollover reserve.
 func (self *contractQueue) ExpireBeforeKeepingNewest(
 	minEnqueueTime time.Time,
 ) []*protocol.Contract {
 	self.mutex.Lock()
 	defer self.mutex.Unlock()
 
-	if minEnqueueTime.IsZero() || len(self.contracts) == 0 {
+	if len(self.contracts) == 0 {
 		return nil
 	}
+	currentTimeUnixMilli := time.Now().UnixMilli()
+	expired := []*protocol.Contract{}
 	var newestId Id
 	var newestTime time.Time
 	for contractId, queued := range self.contracts {
+		if queued.expirationTimeUnixMilli != nil && *queued.expirationTimeUnixMilli <= currentTimeUnixMilli {
+			expired = append(expired, queued.contract)
+			delete(self.contracts, contractId)
+			continue
+		}
 		if newestTime.IsZero() || newestTime.Before(queued.enqueueTime) {
 			newestId = contractId
 			newestTime = queued.enqueueTime
 		}
 	}
 
-	expired := []*protocol.Contract{}
 	for contractId, queued := range self.contracts {
 		if queued.enqueueTime.Before(minEnqueueTime) &&
 			(contractId != newestId || !newestTime.Before(minEnqueueTime)) {
@@ -2094,8 +2194,10 @@ func (self *contractQueue) ExpireBeforeKeepingNewest(
 
 func (self *contractQueue) expireWithLock(minEnqueueTime time.Time) []*protocol.Contract {
 	var expired []*protocol.Contract
+	currentTimeUnixMilli := time.Now().UnixMilli()
 	for contractId, queuedContract := range self.contracts {
-		if queuedContract.enqueueTime.Before(minEnqueueTime) {
+		if queuedContract.enqueueTime.Before(minEnqueueTime) ||
+			(queuedContract.expirationTimeUnixMilli != nil && *queuedContract.expirationTimeUnixMilli <= currentTimeUnixMilli) {
 			expired = append(expired, queuedContract.contract)
 			delete(self.contracts, contractId)
 		}
@@ -2121,8 +2223,9 @@ func (self *contractQueue) Add(contract *protocol.Contract, storedContract *prot
 			self.log.Infof("[contract]add update existing %s\n", contractId)
 		}
 		self.contracts[contractId] = &queuedContract{
-			contract:    contract,
-			enqueueTime: time.Now(),
+			contract:                contract,
+			enqueueTime:             time.Now(),
+			expirationTimeUnixMilli: storedContract.ExpirationTimeUnixMilli,
 		}
 		self.updateMonitor.NotifyAll()
 	} else if !self.trackUsedContracts || !self.usedContractIds[contractId] {
@@ -2133,8 +2236,9 @@ func (self *contractQueue) Add(contract *protocol.Contract, storedContract *prot
 			self.usedContractIds[contractId] = true
 		}
 		self.contracts[contractId] = &queuedContract{
-			contract:    contract,
-			enqueueTime: time.Now(),
+			contract:                contract,
+			enqueueTime:             time.Now(),
+			expirationTimeUnixMilli: storedContract.ExpirationTimeUnixMilli,
 		}
 		self.updateMonitor.NotifyAll()
 	} else {
