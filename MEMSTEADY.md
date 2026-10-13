@@ -4037,3 +4037,150 @@ blocks. Every retained runtime sample, including prequiet and teardown peaks,
 must satisfy its selected 32/64 MiB absolute gate. Fresh physical qualification
 is still pending. Android iOS-profile results cannot establish the signed iOS
 extension's total `phys_footprint` below 50 MiB.
+
+### 2026-10-10: loaded H1 repeat census and reference-calibration correctness
+
+Ten fresh, uninstrumented host processes compared private D and E on the same
+original Run1 H1 workload, in order D,E | E,D | D,E | E,D | D,E. Both include
+the same 13-file production composition; E changes only pacing sample selection
+to preserve independently covered service evidence ahead of an offer-only
+lower bound. This was not a LIVE-versus-candidate or physical-device comparison.
+
+All ten bodies were correct. Nine tests passed; process 05/D failed the
+unchanged direct-underlay headroom gate and makes pair 3 performance-ineligible.
+No attempt was retried or removed. All ten rows, probe denominators, latency
+percentiles and retained evidence fingerprints are in
+[the measurement ledger](../tests/PERFVAR-MEASUREMENTS.md#2026-10-10--h1-de-run1-20261010--complete-loaded-diagnostic-census).
+
+The observations are mixed, with **no qualified performance win**. Across all
+five scheduled attempts per side, including invalid 05, E's median reported
+duration was 10.360 s versus D's 11.038 s, but its mean was 12.218 s versus
+11.408 s. These are descriptive totals, not a qualified aggregate. E was faster
+in both E-first pairs; E-second pairs had mixed signs. Probe offers continue
+until the complete download helper returns, including the reverse completion
+byte, so longer duration changes the cohort. More completed probes does not
+establish lower latency; successful-probe p50/p95 and failures must stay visible.
+No cause or repair of the historical 0/64 observation is established.
+
+Separately, eleven deterministic reference-calibration processes completed:
+two expected RED arms each had two semantic failures; nine GREEN arms totaled
+42 passing tests, with no skips. Three fresh default and three fresh tagged
+confirmations passed. The constant-flight reference uses the existing 256-KiB
+floor; delivery-arm settings, production budgets, timers, workload and the 90%
+capacity/fairness/queue gates are unchanged. This corrects reference-fixture
+validity, not the loaded H1 result, and does not qualify a product speedup.
+The default guards still require integrated, default-source parent validation;
+tagged diagnostics cannot stand in for that coverage.
+
+Fresh composed canonical correctness and full physical qualification remain
+pending independently. The iOS profile must satisfy its 32-MiB observed-runtime
+gate in every retained phase, and normal Android its separate 64-MiB gate,
+including prequiet and teardown peaks. Host samples and regression proofs
+qualify neither profile nor a signed iOS extension's below-50-MiB total
+`phys_footprint`. No baseline is promoted.
+
+### 2026-10-10: bounded H1 phase attribution
+
+Four fresh instrumented Run1 processes completed in D/E then E/D order.
+Seven recorder controls passed in each of four separate normal/race D/E
+processes. All traffic traces were complete and non-overflowed; source,
+native, resource and six-receipt paired runtime checks held. The original
+workload, 6.416-second probe deadline and calibration gates were unchanged.
+
+| Arm | Body phase (s) | Completion return (s) | Bulk duration (s) | Loaded successes/offers | Qualification |
+| --- | ---: | ---: | ---: | ---: | --- |
+| 09 D | 8.665750 | 4.416964 | 13.082919 | 30/77 | Test passed; diagnostic only |
+| 10 E | 8.425805 | 1.605492 | 10.031358 | 41/59 | Test passed; diagnostic only |
+| 11 E | 3.938436 | 0.935818 | 4.874323 | 29/29 | Headroom gate failed |
+| 12 D | 11.020256 | 14.378473 | 25.399066 | 43/149 | Test passed; diagnostic only |
+
+Body phase is loaded-start to verified body, not exact network-byte service
+time. Completion return is successful local one-byte write to origin read,
+not a Transfer ACK. The separate probe-settlement tails were 3.516163,
+2.050852, 1.346478 and 4.563837 seconds; they are outside bulk duration.
+Recorder overhead is unknown: do not subtract it or pool these observations
+with the ten earlier uninstrumented runs. Arm 11 remains invalid performance
+evidence despite its correct body and successful probes.
+
+All 314 loaded offers reconcile to 143 successes, 170 expirations and one
+late response. Every offer eventually returned. Maximum reader-to-owner
+handoff was 0.221 ms, so it does not explain the multi-second misses. Arm 10
+had return-side delays; arm 12 also had outbound delays (failed-probe
+offer-to-echo median 9.398 s). Aggregate drop/recovery counters cannot identify
+the delayed packet or its active flow.
+
+Source audit found a production-reachable candidate: native packet readers
+wait for synchronous batch sends, whose flow groups are admitted serially.
+An earlier TCP group waiting for reliable retention can delay later UDP
+groups. Production's default send timeout is five seconds, unlike this
+fixture's indefinite wait. Grouped NoAck traffic also excludes the scalar
+direct-write bypass. A forced exact-peer-ACK barrier test is the next step;
+these traces do not prove that admission was their stalled boundary.
+
+Any isolation or grouped fast-path candidate must retain bounded message/byte
+ownership, per-flow order, whole-group/partial-success accounting and reliable
+TCP delivery. Enlarging queues or changing timeouts is not a demonstrated fix.
+The reviewed correctness composition is now integrated, but default-source
+parents and fresh physical iOS32/Android64 qualification remain pending.
+
+### 2026-10-13 UTC: first-cell collector publication failure; qualification pending
+
+The fresh canonical physical lane reached its first iOS32/control Wi-Fi cell
+but readiness exited 2 with `collector-session-owner-required` before workload
+collection. Its retained launcher published the required owner receipt
+429.134 ms after the failed check, then later joined with exit 0. The reader
+had no publication handshake across the launcher's asynchronous role/identity
+checks. This is a harness startup-ordering failure, not a demonstrated memory
+budget failure.
+
+The retained partial summary peaked at 18,792,464 B (17.92 MiB), with zero
+sampled 32-MiB breaches, but it is **INELIGIBLE**:
+`eligible=false` / `INCOMPLETE_TEARDOWN`. Its 29 retained runtime reads are
+not independent workload observations or a completed steady/teardown proof.
+Physical, LOWBAR and MEMSTEADY checks failed; owned cleanup passed. Cleanup
+success must not be used to waive missing live-gate/prefix/teardown evidence.
+
+The private repair keeps the actual retained launcher identity while awaiting
+publication, including the adjacent instrumentation-owner ordering, within the
+original collector 15-second and instrumentation remaining 180-second budgets.
+Observed owner/terminal/identity and invalid completed-prefix failures still
+refuse; no memory or teardown gate changes. Repair/fresh-parent qualification
+and integration remain provisional here, not a physical acceptance claim.
+
+This attempt contributes **zero qualified cells out of 168 and zero required
+observations out of 560**. Fresh full qualification still requires seven blocks,
+280 observations independently for iOS32 and normal Android64, both arms and
+phones, Wi-Fi/cellular/P2P roles, workload/quiet/lifecycle/teardown coverage,
+and every retained runtime peak at or below its matching 32/64-MiB limit.
+The DeviceLocal target and Go soft limit remain 32/32 MiB and 64/64 MiB;
+there is no budget tuning or measured Android64 performance gain in this record.
+Android surrogate measurements cannot prove a signed iOS extension's total
+`phys_footprint` below 50 MiB. No baseline is promoted.
+
+Source epoch, exact chronology and retained incident fingerprints are recorded
+in [the measurement ledger](../tests/PERFVAR-MEASUREMENTS.md#2026-10-13-utc--pcp-7kv2yp-01--collector-publication-failure).
+
+### 2026-10-13 UTC: collector repair private QA accepted; device replay pending
+
+Root and the sole executor accepted all 27 private repair-qualification arms
+with natural joins and intact source/native/resource/cleanup custody.
+The three original causal controls retained exactly 2/2/3 expected semantic
+failures. Candidate Node focused 18, whole-file 59 and complete 26-file
+preflight parent 536 each passed initially and in three fresh confirmations.
+Candidate Go focused 4 passed initial normal/race and three fresh normal/race
+pairs. Unfiltered backend normal/race each passed 328 top-level plus 601 nested
+tests; the six-file outer runner normal/race each passed 95 top-level plus
+180 nested tests. Candidate runs had no test failures, skips or race reports;
+earlier failed attempts are preserved, not relabeled.
+
+These receipts qualify the exact private XrQpLJ/MbXTNN source combination,
+not a new default-source/full-runner or real-device run. Fresh default-source
+validation and full iOS32/Android64 physical qualification remain pending.
+The earlier attempt remains INELIGIBLE at 0/168 cells and 0/560 required
+observations; its 17.92-MiB partial peak is not a memory PASS.
+The seven-block dual-profile census and every 32/64-MiB all-phase gate are
+unchanged. There is no Android64 performance/utilization result, baseline
+promotion or signed-iOS total-footprint claim.
+
+See [the accepted private-QA ledger addendum](../tests/PERFVAR-MEASUREMENTS.md#collector-publication-repair--accepted-private-qa-not-device-qualification)
+for exact scopes and retained source/evidence references.
