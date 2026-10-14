@@ -34,9 +34,10 @@ import (
 //
 // A socket whose dial fails after it exists is closed by Go inside the dial,
 // on the flow goroutine, outside the limiter. Such a flow is counted while it
-// dials, so those closes are bounded by the cap and the backlog limit. Icmp
-// flows hold IcmpCreateFile handles on Windows, not sockets, and have small
-// caps; they are not covered.
+// dials, so those closes are bounded by the cap and the backlog limit, and a
+// dial the egress pin would refuse is refused before any socket exists
+// (egressDialRefusal). Icmp flows hold IcmpCreateFile handles on Windows, not
+// sockets, and have small caps; they are not covered.
 //
 // Both are owned by one buffer and safe for concurrent use. A nil limiter or
 // occupancy (a buffer or sequence built directly, in tests) is inert.

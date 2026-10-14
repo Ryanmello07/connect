@@ -5,6 +5,7 @@ package connect
 
 import (
 	"net"
+	"net/netip"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -21,10 +22,10 @@ func TestApplyEgressInterfaceDarwin(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer unix.Close(fd)
-	if err := applyEgressInterface(uintptr(fd), uint32(loopback.Index), uint32(loopback.Index)); err != nil {
+	if err := applyEgressInterface(uintptr(fd), 4, netip.Addr{}, uint32(loopback.Index), uint32(loopback.Index)); err != nil {
 		t.Fatalf("pin valid IPv4 socket: %v", err)
 	}
-	if err := applyEgressInterface(^uintptr(0), uint32(loopback.Index), uint32(loopback.Index)); err == nil {
+	if err := applyEgressInterface(^uintptr(0), 0, netip.Addr{}, uint32(loopback.Index), uint32(loopback.Index)); err == nil {
 		t.Fatal("invalid socket was accepted without an egress binding")
 	}
 }

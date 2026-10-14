@@ -273,16 +273,24 @@ func (self *ConnectSettings) DialContext(ctx context.Context, network string, ad
 // straight to the dialer: the former has no family choice left, the latter
 // cannot be raced meaningfully.
 func (self *ConnectSettings) raceDialContext(netDialer *net.Dialer) DialContextFunction {
+	// a peer the egress pin would refuse is refused before a socket exists
+	// (egressDialRefusal)
+	dialContext := func(ctx context.Context, network string, addr string) (net.Conn, error) {
+		if err := egressDialRefusal(addr); err != nil {
+			return nil, err
+		}
+		return netDialer.DialContext(ctx, network, addr)
+	}
 	return func(ctx context.Context, network string, addr string) (net.Conn, error) {
 		host, port, err := net.SplitHostPort(addr)
 		if err != nil || !isRaceableDialNetwork(network) || isIPLiteralDialAddr(host) || isZonedIPLiteralDialHost(host) {
-			return netDialer.DialContext(ctx, network, addr)
+			return dialContext(ctx, network, addr)
 		}
 		addrs, err := resolveDialAddrs(ctx, dialResolver(self.Resolver), network, host)
 		if err != nil {
 			return nil, err
 		}
-		return dialHostPortRace(ctx, network, port, addrs, DefaultDialFallbackDelay, netDialer.DialContext)
+		return dialHostPortRace(ctx, network, port, addrs, DefaultDialFallbackDelay, dialContext)
 	}
 }
 

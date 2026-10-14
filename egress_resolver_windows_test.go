@@ -103,8 +103,9 @@ func loopbackInterfaceIndex(t *testing.T) uint32 {
 }
 
 // The forced egress bind and the substituted server follow the family: the
-// v4 case forces the loopback index for v4 and substitutes the v4 loopback,
-// the v6 case does the same through the v6 index and IPV6_UNICAST_IF.
+// v4 case forces the loopback index for v4 and substitutes the v4 loopback;
+// the v6 case substitutes the v6 loopback, which the pin leaves unpinned
+// because loopback never routes into the tunnel (applyEgressPin).
 func TestEgressResolverDialSubstitutesAndBinds(t *testing.T) {
 	forEachIpVersion(t, func(t *testing.T, ipVersion int) {
 		answer := testLoopbackAddr(ipVersion).Next()
