@@ -2188,8 +2188,15 @@ type UdpBufferSettings struct {
 	// buffer), an aggregate flow state and fd ceiling for hosts with a hard
 	// process memory budget. uses the same lru cleanup as `UserLimit`.
 	// 0 (the default) is no limit.
-	GlobalLimit   int
-	MaxWindowSize uint32
+	GlobalLimit int
+	// How many of this buffer's flows may be inside an upstream socket close
+	// at once (flow_socket_close.go). 0 selects the platform default.
+	SocketCloseConcurrency int
+	// How many evicted or retired flows may still be closing their sockets
+	// before admission refuses new flows. 0 derives it from `GlobalLimit`
+	// (none when there is no cap); negative disables it.
+	SocketCloseBacklogLimit int
+	MaxWindowSize           uint32
 	// Tests inspect the configured socket before the first datagram is written.
 	// Runs on the flow's opener; nil is a production no-op.
 	afterSocketOpenForTest func(*UdpSequence, net.Conn)
@@ -2897,6 +2904,8 @@ type UdpBuffer[BufferId comparable] struct {
 	// for its socket close; nil leaves the drops uncounted
 	kernelReceiveDropCount *atomic.Uint64
 	egressRealism          *egressRealismCounters
+	socketCloseLimiter     *flowSocketCloseLimiter
+	socketOccupancy        *flowSocketOccupancy
 
 	mutex sync.Mutex
 
@@ -2910,13 +2919,16 @@ func newUdpBuffer[BufferId comparable](
 	receiveCallback receiveTransferPacketFunction,
 	udpBufferSettings *UdpBufferSettings,
 ) *UdpBuffer[BufferId] {
+	log := loggerOrDefault(udpBufferSettings.Log)
 	return &UdpBuffer[BufferId]{
 		ctx:                 ctx,
-		log:                 loggerOrDefault(udpBufferSettings.Log),
+		log:                 log,
 		receiveCallback:     receiveCallback,
 		udpBufferSettings:   udpBufferSettings,
 		receiveDispatcher:   newUdpReceiveDispatcher(ctx, udpBufferSettings),
 		sharedLifecycleWake: make(chan struct{}, 1),
+		socketCloseLimiter:  newFlowSocketCloseLimiter(udpBufferSettings.SocketCloseConcurrency, log, "udp"),
+		socketOccupancy:     newFlowSocketOccupancy(log, "udp"),
 		sequences:           map[BufferId]*UdpSequence{},
 		sourceSequences:     map[TransferPath]map[BufferId]*UdpSequence{},
 		retiredSourceIds:    map[Id]bool{},
@@ -2961,6 +2973,17 @@ func (self *UdpBuffer[BufferId]) udpSend(
 			} else {
 				self.removeSequenceWithLock(bufferId, sequence)
 			}
+		}
+
+		// Evicted and retired flows leave the index before their socket has
+		// closed. While too many are still closing, refuse new flows, so
+		// eviction cannot keep opening sockets faster than they close
+		// (flow_socket_close.go).
+		if !self.socketOccupancy.admit(
+			len(self.sequences),
+			flowSocketCloseBacklogLimit(self.udpBufferSettings.SocketCloseBacklogLimit, self.udpBufferSettings.GlobalLimit),
+		) {
+			return nil
 		}
 
 		if 0 < self.udpBufferSettings.UserLimit {
@@ -3023,6 +3046,8 @@ func (self *UdpBuffer[BufferId]) udpSend(
 		if sequence == nil {
 			return nil
 		}
+		sequence.socketCloseLimiter = self.socketCloseLimiter
+		sequence.releaseSocketOccupancy = self.socketOccupancy.occupy()
 		// Shared lifecycle opens the socket here, before any send item exists.
 		sequence.egressTarget = newProviderEgressTarget(
 			self.udpBufferSettings.EgressTtlMode, udp.ttl, ipProtocolNumberUdp, self.egressRealism,
@@ -3087,6 +3112,8 @@ func (self *UdpBuffer[BufferId]) udpSend(
 						}
 					}
 					sequence.detachMemoryIndex()
+					// Run has returned, so its socket close has too
+					sequence.releaseOccupancy()
 				}()
 				sequence.Run()
 			})
@@ -3296,6 +3323,11 @@ type UdpSequence struct {
 	retirementOperations           *lifecycleAdmission
 	retirementDone                 chan struct{}
 	kernelReceiveDropCount         *atomic.Uint64
+	// nil outside a buffer: the socket then closes inline
+	socketCloseLimiter *flowSocketCloseLimiter
+	// gives back the flow's place in its buffer's socket occupancy once its
+	// socket has closed; nil outside a buffer
+	releaseSocketOccupancy func()
 
 	sendMutex sync.Mutex
 	sendItems chan *UdpSendItem
@@ -3611,16 +3643,26 @@ func (self *UdpSequence) openSocket() (net.Conn, error) {
 	return socket, nil
 }
 
-// Closes the flow's upstream socket, first adding the datagrams the kernel
-// dropped at it to the NAT's counter. The read is one getsockopt per flow
-// close, so it costs nothing on the packet path.
+// Closes the flow's upstream socket through the buffer's close limiter, first
+// adding the datagrams the kernel dropped at it to the NAT's counter. The read
+// is one getsockopt per flow close, so it costs nothing on the packet path.
 func (self *UdpSequence) closeSocket(socket net.Conn) {
+	self.countKernelReceiveDrops(socket)
+	_ = self.socketCloseLimiter.close(socket)
+}
+
+func (self *UdpSequence) countKernelReceiveDrops(socket net.Conn) {
 	if self.kernelReceiveDropCount != nil {
 		if dropCount := udpSocketReceiveDropCount(socket); 0 < dropCount {
 			self.kernelReceiveDropCount.Add(dropCount)
 		}
 	}
-	_ = socket.Close()
+}
+
+func (self *UdpSequence) releaseOccupancy() {
+	if self.releaseSocketOccupancy != nil {
+		self.releaseSocketOccupancy()
+	}
 }
 
 func (self *UdpSequence) startSharedSocket() bool {
@@ -3677,7 +3719,13 @@ func (self *UdpSequence) Run() {
 	if err != nil {
 		return
 	}
-	defer self.closeSocket(socket)
+	// Cancel before the close can wait for a slot, so a flow that ended on its
+	// own (idle, a failed write) stops taking packets and is replaced instead
+	// of holding its tuple while it waits.
+	defer func() {
+		self.cancel()
+		self.closeSocket(socket)
+	}()
 	// f, _ := udpConn.File()
 	// fd := SocketHandle(f.Fd())
 	// syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_MTU, self.udpBufferSettings.Mtu)
@@ -3873,8 +3921,13 @@ func (self *UdpSequence) Close() {
 				self.socketReadPoller.unregister(self)
 			}
 			if self.sharedSocket != nil {
-				self.closeSocket(self.sharedSocket)
+				// Usually under the buffer mutex, so it never waits for a close
+				// slot. The shared lifecycle needs the readiness poller, which
+				// Windows does not have, and close(2) does not block here.
+				self.countKernelReceiveDrops(self.sharedSocket)
+				_ = self.sharedSocket.Close()
 			}
+			self.releaseOccupancy()
 			select {
 			case self.sharedLifecycleWake <- struct{}{}:
 			default:
@@ -4193,6 +4246,13 @@ type TcpBufferSettings struct {
 	// process memory budget. uses the same lru cleanup as `UserLimit`.
 	// 0 (the default) is no limit.
 	GlobalLimit int
+	// How many of this buffer's flows may be inside an upstream socket close
+	// at once (flow_socket_close.go). 0 selects the platform default.
+	SocketCloseConcurrency int
+	// How many evicted or retired flows may still be closing their sockets
+	// before admission refuses new flows. 0 derives it from `GlobalLimit`
+	// (none when there is no cap); negative disables it.
+	SocketCloseBacklogLimit int
 	// EnableOrphanRst replies with a RST to a non-SYN packet that matches no
 	// sequence (PROXYDRAIN1.md §3.5). Without it a source whose flow state
 	// was lost here (e.g. the source client restarted with a fresh identity,
@@ -4417,6 +4477,8 @@ type TcpBuffer[BufferId comparable] struct {
 	egressRealism                  *egressRealismCounters
 	flowCloseCallback              tcpFlowCloseFunction
 	admissionCapacity              *receiveCapacitySignal
+	socketCloseLimiter             *flowSocketCloseLimiter
+	socketOccupancy                *flowSocketOccupancy
 
 	mutex sync.Mutex
 	// The local NAT closes send admission before waiting, so no Add can race
@@ -4437,14 +4499,17 @@ func newTcpBuffer[BufferId comparable](
 	receiveCallback receiveTransferPacketFunction,
 	tcpBufferSettings *TcpBufferSettings,
 ) *TcpBuffer[BufferId] {
+	log := loggerOrDefault(tcpBufferSettings.Log)
 	return &TcpBuffer[BufferId]{
-		log:               loggerOrDefault(tcpBufferSettings.Log),
-		ctx:               ctx,
-		receiveCallback:   receiveCallback,
-		tcpBufferSettings: tcpBufferSettings,
-		sequences:         map[BufferId]*TcpSequence{},
-		sourceSequences:   map[TransferPath]map[BufferId]*TcpSequence{},
-		retiredSourceIds:  map[Id]bool{},
+		log:                log,
+		ctx:                ctx,
+		receiveCallback:    receiveCallback,
+		tcpBufferSettings:  tcpBufferSettings,
+		socketCloseLimiter: newFlowSocketCloseLimiter(tcpBufferSettings.SocketCloseConcurrency, log, "tcp"),
+		socketOccupancy:    newFlowSocketOccupancy(log, "tcp"),
+		sequences:          map[BufferId]*TcpSequence{},
+		sourceSequences:    map[TransferPath]map[BufferId]*TcpSequence{},
+		retiredSourceIds:   map[Id]bool{},
 	}
 }
 
@@ -4612,6 +4677,17 @@ func (self *TcpBuffer[BufferId]) tcpSendWithOwner(
 		// 		delete(self.sourceSequences, sequence.source)
 		// 	}
 		// }
+		// Evicted and retired flows leave the index before their socket has
+		// closed. While too many are still closing, refuse new flows, so
+		// eviction cannot keep opening sockets faster than they close
+		// (flow_socket_close.go).
+		if !self.socketOccupancy.admit(
+			len(self.sequences),
+			flowSocketCloseBacklogLimit(self.tcpBufferSettings.SocketCloseBacklogLimit, self.tcpBufferSettings.GlobalLimit),
+		) {
+			return nil
+		}
+
 		if 0 < self.tcpBufferSettings.UserLimit {
 			// limit the total connections per source to avoid blowing up the ulimit
 			if sourceSequences := self.sourceSequences[source]; self.tcpBufferSettings.UserLimit <= len(sourceSequences) {
@@ -4677,6 +4753,8 @@ func (self *TcpBuffer[BufferId]) tcpSendWithOwner(
 		sequence.admissionCapacity = self.admissionCapacity
 		sequence.egressRealism = self.egressRealism
 		sequence.flowCloseCallback = self.flowCloseCallback
+		sequence.socketCloseLimiter = self.socketCloseLimiter
+		releaseSocketOccupancy := self.socketOccupancy.occupy()
 		flowMemory := sequence.memory
 		sequence.memory = natMemoryReservation{}
 		self.sequences[bufferId] = sequence
@@ -4704,6 +4782,8 @@ func (self *TcpBuffer[BufferId]) tcpSendWithOwner(
 						delete(self.sourceSequences, sequence.source)
 					}
 				}
+				// Run has returned, so its socket close has too
+				releaseSocketOccupancy()
 			}()
 			if self.tcpBufferSettings.beforeSequenceRunWithStateForTest != nil {
 				self.tcpBufferSettings.beforeSequenceRunWithStateForTest(sequence)
@@ -5000,6 +5080,8 @@ type TcpSequence struct {
 	tcpBufferSettings *TcpBufferSettings
 	egressRealism     *egressRealismCounters
 	egressTarget      providerEgressTarget
+	// nil outside a buffer: the socket then closes inline
+	socketCloseLimiter *flowSocketCloseLimiter
 
 	// Guarded by the connection mutex. Chunk copies survive Transfer delivery
 	// until the source's inner cumulative TCP acknowledgement releases them.
@@ -5561,7 +5643,9 @@ func (self *TcpSequence) Run() {
 	self.UpdateLastActivityTime()
 	self.log.V(2).Infof("[init]connect success\n")
 
-	defer socket.Close()
+	// No cancel first, as udp needs: once Run returns, closing
+	// `writePayloads` ends the writer child, which cancels the flow.
+	defer self.socketCloseLimiter.close(socket)
 	egressDial.afterConnect(socket)
 	if tcpConn, ok := socket.(*net.TCPConn); ok {
 		// the default dialer ran the buffer control hook before connecting;
