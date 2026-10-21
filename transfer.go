@@ -6848,7 +6848,10 @@ type SendSequence struct {
 	// its own leaf-lock timestamp barrier instead of waiting on this lock.
 	windowQualityLock             sync.RWMutex
 	windowQualityLastNotification time.Time
-	beforeWindowRetentionForTest  func()
+	// the newest network path generation this sequence accepted (see
+	// networkQualityChangedOnPath); guarded by windowQualityLock
+	windowQualityPathGeneration  uint64
+	beforeWindowRetentionForTest func()
 	// Protected by deliveredBytesMutex with the generation's checkpoints.
 	windowQualityAfterNanos int64
 	// the receiver's latest advertised hold (THROUGHPUTFIX §37.3)
@@ -10136,7 +10139,8 @@ func (self *SendSequence) updateContractWithAckPromotion(
 			// succeed. The loop still waits out the retry interval, so the
 			// sequence resumes promptly once a successful auth or OOB
 			// round-trip clears the degraded state.
-			if !isBackendDegraded() {
+			degraded := isBackendDegraded()
+			if !degraded {
 				self.client.ContractManager().CreateContract(
 					metadata.key,
 					self.contractSeqIndex,
@@ -10144,7 +10148,16 @@ func (self *SendSequence) updateContractWithAckPromotion(
 				)
 			}
 
-			if traceNextContract(min(timeout, retryInterval)) {
+			wait := min(timeout, retryInterval)
+			if baseRetryInterval := self.sendBufferSettings.CreateContractRetryInterval; degraded && 0 < baseRetryInterval {
+				// nothing was requested, so this wait only has to notice the
+				// gate clearing: a sequence that began waiting in a short
+				// degraded spell (a network switch) then requests within the
+				// base interval of recovery, not after the backed-off one.
+				// Later requests keep the backed-off spacing.
+				wait = min(wait, baseRetryInterval)
+			}
+			if traceNextContract(wait) {
 				return true
 			}
 			retryInterval = nextCreateContractRetryInterval(retryInterval, maxRetryInterval)
@@ -10838,15 +10851,15 @@ func (self *SendSequence) sendWithSetContractDisposition(
 		self.sendBufferSettings.beforeGroupRetainForTest()
 	}
 	admissionErr := item.acks.commitPreparedHandoffs(func() error {
+		if err := self.ctx.Err(); err != nil {
+			return err
+		}
 		if !ack || !self.resendQueue.lifetimeBudget {
 			return nil
 		}
 		frameByteCount := self.retainedSendFrameByteCount(MessageByteCount(sendFrames), len(sendFrames))
 		if aheadContract != nil {
 			frameByteCount = addReceiveQueueByteCount(frameByteCount, ByteCount(proto.Size(aheadContract.contract)))
-		}
-		if err := self.ctx.Err(); err != nil {
-			return err
 		}
 		if !item.reservePreparedMemory(self.resendQueue.budget,
 			addReceiveQueueByteCount(groupMemoryBytes,

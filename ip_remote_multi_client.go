@@ -291,6 +291,10 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// API must never wedge the enumerate/expand machinery
 		WindowGeneratorTimeout:      20 * time.Second,
 		IpFamilyStarvedRetryTimeout: defaultIpFamilyStarvedRetryTimeout,
+		// long enough to cover an outage of a few minutes, counted from the
+		// loss, and short enough that a provider the window has not seen for
+		// longer is found again through discovery like any other
+		RecentExitMemoryTimeout: 5 * time.Minute,
 		// WindowMaxScale:              4.0,
 		// WindowExpandMaxOvershotScale: 2.0,
 		// WindowRevisitTimeout:      2 * time.Minute,
@@ -863,6 +867,13 @@ type MultiClientSettings struct {
 	// the platform for a family again after a family-filtered discovery
 	// returned nothing (IPV6.md B2). 0 uses the default of one minute.
 	IpFamilyStarvedRetryTimeout time.Duration
+	// RecentExitMemoryTimeout is how long, from the loss, a window remembers an
+	// exit it lost to an outage of ours, so the rounds that re-form the window
+	// ask the platform for that provider by client id ahead of discovery
+	// (ip_remote_multi_client_recent_exits.go). An older entry is never used.
+	// Non-positive disables the memory: lost exits are replaced by discovery
+	// alone. The user's Fixed IP keeps its own re-dial and does not read this.
+	RecentExitMemoryTimeout time.Duration
 	// WindowMaxScale              float64
 	// WindowExpandMaxOvershotScale float64
 	// WindowRevisitTimeout      time.Duration
@@ -990,13 +1001,11 @@ type MultiClientSettings struct {
 	// our sendStalled bar and the verdict stays convictSendStalls, the probe
 	// only decides whether that verdict is deserved.
 	//
-	// What it buys: a stalled exit and a merely CONGESTED exit are the same
-	// observation -- bytes committed, no acks -- and today both are convicted
-	// at the 3s bar. An exit whose upstream is saturated (or whose send window
-	// is full of the very data the stall is about) answers a control ping in a
-	// couple of rtts, because the ping rides the transport rather than the
-	// blocked flow. Asking is cheap and the answer is decisive, so the fast
-	// 3-4s rescue is kept without paying for it in false removals.
+	// A positive control-ping ACK proves reachability when flow ACKs are stale.
+	// The ping can share local admission and serialization with stalled data;
+	// local refusal is not remote evidence. Successful admission alone also
+	// does not establish first-route-write; the existing admitted timeout
+	// policy remains separate from that positive proof.
 	//
 	// The interposition is confined to the send-stall path. The no-send-ack
 	// verdict, the transport-down hold, and the cping loop keep their exact
@@ -2678,6 +2687,7 @@ func NewRemoteUserNatMultiClient(
 		settings,
 		multiClient.reliabilitySettings,
 		multiClient.uplinkGate,
+		multiClient.uplinkLastIngress,
 		multiClient.reliabilityMetricsRef,
 		multiClient.clientFlowCount,
 		multiClient.providerQualified,
@@ -2702,6 +2712,7 @@ func NewRemoteUserNatMultiClient(
 			settings,
 			multiClient.reliabilitySettings,
 			multiClient.uplinkGate,
+			multiClient.uplinkLastIngress,
 			multiClient.reliabilityMetricsRef,
 			multiClient.clientFlowCount,
 			multiClient.providerQualified,
@@ -7698,7 +7709,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 			// Re-arm only the windows selected by this flow on each read.
 			qualityOfferChanged, speedOfferChanged = nil, nil
 			if self.groupRaceCandidatesForTest != nil {
-				return update.filterAffinityRenewalSources(self.groupRaceCandidatesForTest(sendPacketGroup))
+				return self.groupRaceCandidatesForTest(sendPacketGroup)
 			}
 			for _, windowType := range self.selectWindowTypes(firstPacket, sendPacketGroup.pin.appId) {
 				if window, ok := self.windows[windowType]; ok {
@@ -7748,9 +7759,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 					// current build's default), orderedClients is exactly what
 					// raceCandidates returned, untouched.
 					if 0 < len(orderedClients) {
-						if allowed := update.filterAffinityRenewalSources(orderedClients); len(allowed) != 0 {
-							return allowed
-						}
+						return orderedClients
 					}
 				}
 			}
@@ -7779,12 +7788,6 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 
 			orderedClients := coalesceOrderedClients()
 			if len(orderedClients) == 0 {
-				if update.affinitySources.renewal {
-					// No unused authenticated source fits this window. Preserve
-					// the incumbent and the caller's retry owner; do not steal an
-					// established sibling or exceed the hard client capacity.
-					return
-				}
 				// IPV6.md B6: once the windows hold exits and none can carry
 				// v6, a v6 flow is answered with no-route and dropped, so the
 				// application fails fast (and falls back to v4) instead of
@@ -7881,6 +7884,18 @@ func (self *RemoteUserNatMultiClient) stampUplinkIngress() {
 		return
 	}
 	self.uplinkLastIngressNanos.Store(nowNanos)
+}
+
+// uplinkLastIngress reads the ingress stamp: when a provider-originated packet
+// last arrived anywhere in the tunnel, at most uplinkStampCoarseness older than
+// the truth. Zero when nothing has arrived yet. A lock-free read, safe from any
+// goroutine; the windows read it through uplinkLastIngressFunc.
+func (self *RemoteUserNatMultiClient) uplinkLastIngress() time.Time {
+	lastNanos := self.uplinkLastIngressNanos.Load()
+	if lastNanos == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, lastNanos)
 }
 
 // sendingChannelCount reports how many channels across all windows currently
@@ -8194,6 +8209,13 @@ func (self *RemoteUserNatMultiClient) NotifyNetworkChanged() {
 	// exactly how a capture tells them apart
 	loggerOrDefault(self.log).Infof("%s\n", relEvent("network_change", "rebased", true, "kick", true))
 	NetworkChanged()
+	// a window short of exits -- some lost in the outage, or a tunnel that
+	// started with no network -- re-evaluates on the new path now instead of
+	// at its next WindowResizeTimeout pass, and asks the platform again now
+	// instead of at the end of a backoff grown on the old path
+	for _, window := range self.windows {
+		window.notifyNetworkChanged()
+	}
 }
 
 // reliabilityMetricsRef hands the shared counters to the window channels via
@@ -8540,7 +8562,9 @@ func (self *RemoteUserNatMultiClient) clientReceivePackets(
 			if !admitted {
 				continue
 			}
-			batchLeases = append(batchLeases, lease)
+			if lease.parent != nil {
+				batchLeases = append(batchLeases, lease)
+			}
 			// Established flows batch application delivery, but every ack-bearing
 			// packet records recovery authority under the flow lock first. The
 			// first-answer resolve path below commits provider ownership under
@@ -8673,7 +8697,7 @@ func (self *RemoteUserNatMultiClient) clientReceivePacketResolve(
 	success := self.receiveClientPath(ipPath, func(update *multiClientChannelUpdate) {
 		defer update.releaseCollapseClaims()
 		resolvedUpdate = update
-		if !update.allowsAffinitySource(sourceClient) || !update.acceptsAffinityIngress(sourceClient, tcpControl) {
+		if !update.acceptsAffinityIngress(sourceClient, tcpControl) {
 			return
 		}
 		// Established-flow lookup avoids the parent stateLock; ack-bearing
@@ -11012,6 +11036,12 @@ type multiClientWindow struct {
 	// callback convention as reliabilitySettingsFunc; nil (bare fixtures)
 	// reads as gate off.
 	uplinkGateFunc func(now time.Time) (stale bool, freshSince time.Time)
+	// uplinkLastIngressFunc reads when the tunnel last received a packet from
+	// any provider (zero when never); see RemoteUserNatMultiClient.uplinkLastIngress.
+	// The recent-exit memory reads it with the gate to tell a verdict collected
+	// in the dark from one against the provider (classifyRecentExit). nil
+	// (bare fixtures) remembers no verdict.
+	uplinkLastIngressFunc func() time.Time
 	// reliabilityMetricsFunc hands the parent's shared counters to the
 	// channels. nil (bare fixtures) loses the counts, never the traffic --
 	// every counter method tolerates a nil receiver.
@@ -11095,6 +11125,10 @@ type multiClientWindow struct {
 
 	generatorMonitor *Monitor
 	resizeMonitor    *Monitor
+	// networkChangeMonitor ends a platform-error retry wait when the host's
+	// network path changes (see notifyNetworkChanged). nil (bare fixtures)
+	// never wakes a wait.
+	networkChangeMonitor *Monitor
 
 	// --- window honesty (see ip_remote_multi_client_outcome.go) ---
 
@@ -11156,6 +11190,12 @@ type multiClientWindow struct {
 	// The exit a sticky window lost to transport loss, for the next discovery
 	// round to ask for first. Its own lock inside.
 	stickyRedial stickyRedial
+
+	// --- recent exits (see ip_remote_multi_client_recent_exits.go) ---
+
+	// The exits any other window lost to an outage of ours, for the rounds
+	// that re-form it to ask for first. Its own lock inside.
+	recentExits recentExitMemory
 }
 
 func newMultiClientWindow(
@@ -11173,6 +11213,7 @@ func newMultiClientWindow(
 	settings *MultiClientSettings,
 	reliabilitySettingsFunc func() *ReliabilitySettings,
 	uplinkGateFunc func(now time.Time) (stale bool, freshSince time.Time),
+	uplinkLastIngressFunc func() time.Time,
 	reliabilityMetricsFunc func() *reliabilityMetrics,
 	flowCountFunc func(*multiClientChannel) int,
 	providerQualifiedFunc func(MultiHopId) bool,
@@ -11197,6 +11238,7 @@ func newMultiClientWindow(
 		settings:                     settings,
 		reliabilitySettingsFunc:      reliabilitySettingsFunc,
 		uplinkGateFunc:               uplinkGateFunc,
+		uplinkLastIngressFunc:        uplinkLastIngressFunc,
 		reliabilityMetricsFunc:       reliabilityMetricsFunc,
 		flowCountFunc:                flowCountFunc,
 		providerQualifiedFunc:        providerQualifiedFunc,
@@ -11211,6 +11253,7 @@ func newMultiClientWindow(
 		clients:                      map[Id]*multiClientChannel{},
 		generatorMonitor:             NewMonitor(),
 		resizeMonitor:                NewMonitor(),
+		networkChangeMonitor:         NewMonitor(),
 		failures:                     &windowFailureRecorder{},
 		createFailThrottle:           newLogThrottle(evaluationFailureLogInterval),
 		pingFailThrottle:             newLogThrottle(evaluationFailureLogInterval),
@@ -11406,6 +11449,24 @@ func (self *multiClientWindow) convictSendStalls(stallTimeout time.Duration) boo
 	for i, client := range stalled {
 		verdict := verdicts[i]
 		if !verdict.convict {
+			if client.ctx != nil && client.ctx.Err() != nil {
+				// Closing a channel is not a successful peer-health observation.
+				continue
+			}
+			if verdict.localUnwritten {
+				// Local refusal or expiry carries no peer-health evidence. Report it once
+				// in this stale episode without refreshing its pending clock.
+				if client.markStallHoldOnce() {
+					loggerOrDefault(self.log).Infof("%s\n", relEvent(
+						"busy_probe",
+						"exit", client.ClientId(),
+						"outcome", "held",
+						"detail", verdict.detail,
+						"bar", stallTimeout,
+					))
+				}
+				continue
+			}
 			// acquitted by the probe, or deferred to the next pass (a single
 			// unsendable probe). Nothing is written here: the acquittal already
 			// refreshed the stall bar through addBusyProbeAck, and there is no
@@ -11643,18 +11704,24 @@ func (self *multiClientWindow) peerIdentityChanged() {
 
 // the performance profile will take effect at the next `resize` iteration
 func (self *multiClientWindow) SetPerformanceProfile(performanceProfile *PerformanceProfile) {
-	self.stateLock.Lock()
-	defer self.stateLock.Unlock()
+	forgottenCount := func() int {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
 
-	if performanceProfilesEqual(self.performanceProfile, performanceProfile) {
-		return
-	}
-	self.performanceProfile = performanceProfile
-	// a lost exit is only wanted back under the profile it was lost in
-	self.stickyRedial.Forget()
-	if self.resizeMonitor != nil {
-		self.resizeMonitor.NotifyAll()
-	}
+		if performanceProfilesEqual(self.performanceProfile, performanceProfile) {
+			return 0
+		}
+		self.performanceProfile = performanceProfile
+		// a lost exit is only wanted back under the profile it was lost in
+		self.stickyRedial.Forget()
+		forgottenCount := self.recentExits.Forget()
+		if self.resizeMonitor != nil {
+			self.resizeMonitor.NotifyAll()
+		}
+		return forgottenCount
+	}()
+	// logged with no lock held
+	self.logRecentExitsForgotten(forgottenCount, "profile_change")
 }
 
 // generatorCallResult carries one generator call's result across the deadline
@@ -11770,6 +11837,8 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 
 	for {
 		generatorNotify := self.generatorMonitor.NotifyChannel()
+		// before the platform call, so a change during it ends the retry wait
+		networkChanged := self.networkChangeNotify()
 
 		// exclude healthy destinations that are already in the window
 		windowDestinations := func() map[MultiHopId]bool {
@@ -11806,10 +11875,8 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 			// a hung/erroring platform api is the platform-unreachable class
 			// unless the message names auth or rate limiting
 			class := self.recordEvaluationFailure(windowFailurePlatform, err)
-			select {
-			case <-self.ctx.Done():
+			if !self.waitWindowRetry(self.ctx, class, networkChanged) {
 				return
-			case <-time.After(self.windowRetryDelay(class)):
 			}
 			continue
 		}
@@ -11876,6 +11943,7 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 					if timeout <= 0 {
 						return
 					}
+					networkChanged := self.networkChangeNotify()
 
 					// a destination-aware generator can reuse a persisted
 					// identity for this destination (PROXYDRAIN1.md §3.5).
@@ -11913,10 +11981,8 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 						// round trip, so its timeout is platform-unreachable
 						// (auth/rate refine via the message)
 						class := self.recordEvaluationFailure(windowFailurePlatform, err)
-						select {
-						case <-self.ctx.Done():
+						if !self.waitWindowRetry(self.ctx, class, networkChanged) {
 							return
-						case <-time.After(self.windowRetryDelay(class)):
 						}
 						continue
 					}
@@ -11929,6 +11995,7 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 						MultiClientGeneratorClientArgs: *clientArgs,
 						FixedDestination:               fixedDestination,
 						stickyRedial:                   enumerated.stickyRedial,
+						recentExit:                     enumerated.recentExit,
 					}
 					select {
 					case <-self.ctx.Done():
@@ -12072,7 +12139,16 @@ func (self *multiClientWindow) resize() {
 				// a verdict against the provider: ask for the same provider
 				// first (see stickyRedial)
 				self.rememberStickyRedial(client, err, stickyExit)
+				// every other window remembers an exit lost to an outage of
+				// ours for the rounds that re-form it (see recentExitMemory).
+				// Classified before the removal, while the uplink gate still
+				// counts this exit's outstanding sends; held after it, so a
+				// round in flight never finds the exit still in the window.
+				lostExit, lostExitMaxCount, rememberLostExit := self.classifyRecentExit(client, err, stats, windowSize, stickyExit)
 				removeClient(client)
+				if rememberLostExit {
+					self.rememberRecentExit(client, lostExit, lostExitMaxCount)
+				}
 			}
 		}
 
@@ -12887,6 +12963,7 @@ func (self *multiClientWindow) expand(
 				// what the re-emitted event must carry
 				self.clientExtenderIps(existingClient),
 			)
+			self.noteRecentExitDropped(args, "declined")
 			return false
 		}
 		if !self.strictWindowAdmissionAllowed(clientId, windowSize) {
@@ -12901,6 +12978,7 @@ func (self *multiClientWindow) expand(
 			// its generator args at this point; do not return them separately.
 			client.Cancel()
 			self.monitor.AddProviderEvent(args.ClientId, ProviderStateNotAdded, args.Destination.Tail(), args.Location, args.IpFamily)
+			self.noteRecentExitDropped(args, "declined")
 			return false
 		}
 
@@ -12942,6 +13020,7 @@ func (self *multiClientWindow) expand(
 		// the outcome watchdog stands down: this window has proven it can
 		// install a provider (and a latched failed state is cleared)
 		self.noteClientAdded(client)
+		self.noteRecentExitAdmitted(args)
 		if _, attempted := fixedAttempts[args.Destination]; attempted {
 			fixedAttempts[args.Destination] = true
 			self.noteFixedDestinationAdmitted(args.Destination)
@@ -12978,6 +13057,7 @@ func (self *multiClientWindow) expand(
 		// the Client/OOB join; do not also revoke them directly here.
 		candidate.client.Cancel()
 		self.monitor.AddProviderEvent(candidate.args.ClientId, ProviderStateNotAdded, candidate.args.Destination.Tail(), candidate.args.Location, candidate.args.IpFamily)
+		self.noteRecentExitDropped(candidate.args, "not_admitted")
 	}
 
 	// admitPending admits from the evaluated pool while budget remains. Every
@@ -13249,6 +13329,7 @@ requestCandidates:
 				} else if setupFailed && evaluationCtx.Err() == nil {
 					self.monitor.AddProviderEvent(args.ClientId, ProviderStateNotAdded, args.Destination.Tail(), args.Location, args.IpFamily)
 				}
+				self.noteRecentExitDropped(args, recentExitEvaluationReason(providerFailure))
 			} else if client.dataOnlyProviderProbe {
 				// Registered construction is sufficient to select this explicit
 				// provider. The application's DNS/URL exchange owns qualification;
@@ -13318,6 +13399,7 @@ requestCandidates:
 					if providerFailure && 0 < ipv6Shortfall && args.IpFamily.SupportsIpv6() {
 						self.noteIpv6CandidateFailed()
 					}
+					self.noteRecentExitDropped(args, recentExitEvaluationReason(providerFailure))
 					return true
 				}
 				pendingPingFailures = append(pendingPingFailures, pendingPingFailure{
@@ -13904,6 +13986,7 @@ func (self *multiClientWindow) verdictRemovalAllowed(now time.Time) bool {
 func (self *multiClientWindow) shuffle() {
 	// a shuffle asks for new exits, so a lost exit is not dialed again
 	self.stickyRedial.Forget()
+	self.logRecentExitsForgotten(self.recentExits.Forget(), "shuffle")
 	for _, client := range self.unorderedClients() {
 		client.Cancel()
 	}
@@ -13914,6 +13997,15 @@ func (self *multiClientWindow) shuffle() {
 // tail) client id. Cancellation wakes the resize loop, which reaps the client
 // (emitting ProviderStateRemoved) and refills the window.
 func (self *multiClientWindow) removeProvider(egressClientId Id) bool {
+	// the user removed this provider, so a loss of it is not asked for again
+	if self.recentExits.ForgetProvider(egressClientId) {
+		loggerOrDefault(self.log).Infof("%s\n", relEvent(
+			"recent_exit",
+			"provider", egressClientId,
+			"action", "drop",
+			"reason", "removed",
+		))
+	}
 	removed := false
 	for _, client := range self.unorderedClients() {
 		if client.Destination().Tail() == egressClientId {
@@ -14235,6 +14327,8 @@ func (self *multiClientWindow) Close() {
 	for _, client := range removedClients {
 		client.Close()
 	}
+	// a closed window re-forms nothing; a new destination builds new windows
+	self.logRecentExitsForgotten(self.recentExits.Forget(), "close")
 	// DELIBERATELY NOT self.removeClients(removedClients) -- but the reason is
 	// worth stating, because the bare commented-out call above invited exactly
 	// the wrong fix.
@@ -14298,6 +14392,11 @@ type multiClientChannelArgs struct {
 	// candidate cannot take the slot and change the egress ip the re-dial
 	// exists to keep.
 	stickyRedial bool
+
+	// Marks an exit the window lost to an outage of ours, asked for again by
+	// name (enumerateRecentExits). It is evaluated and admitted like any other
+	// candidate; the mark only names its outcome in the log.
+	recentExit bool
 
 	// contractStatus preserves the identity of the channel whose contract
 	// manager emitted a result. The public constructor callback does not carry
@@ -15704,12 +15803,10 @@ func (self *multiClientChannel) markDrainMigrateOnce() bool {
 	return true
 }
 
-// busyProbeUnsendableConvictions is how many consecutive probes must fail to
-// even reach the wire, inside one stale episode, before the stall verdict
-// stands on that evidence alone. One is not enough: the send path being wedged
-// full of the same unacked data the probe is investigating is what a congested
-// exit looks like too, and a live one drains enough between polls for the next
-// probe to queue.
+// Preserve the compatibility threshold for nonnil send errors inside one stale
+// episode. Exact false/nil local refusals do not contribute: repeated occupied
+// local capacity is not evidence of remote failure. Nonnil errors are not
+// automatically wire evidence either; their existing policy stays separate.
 const busyProbeUnsendableConvictions = 2
 
 // errBusyProbeUnavailable marks a channel with no probe plumbing under it (a
@@ -15746,6 +15843,9 @@ func busyProbeWriteTimeout(budget time.Duration, cpingWriteTimeout time.Duration
 type busyProbeVerdict struct {
 	// convict: the send-stall verdict stands this pass.
 	convict bool
+	// localUnwritten distinguishes local refusal or queue expiry from a peer
+	// answer and bounds its diagnostic with the existing stale-episode latch.
+	localUnwritten bool
 	// detail extends the conviction reason so a field capture can tell WHICH
 	// probe outcome convicted. "" convicts with today's exact reason string,
 	// which is what a channel with no probe plumbing gets.
@@ -15869,8 +15969,8 @@ func (self *multiClientChannel) hasRecentBusyProbeAck(window time.Duration) bool
 	return !self.busyProbeAckTime.IsZero() && time.Since(self.busyProbeAckTime) < window
 }
 
-// addBusyProbeSendFailure counts one probe that could not be queued and reports
-// whether the run inside this stale episode is now long enough to convict on.
+// Count a nonnil send error under the existing compatibility policy. Exact
+// local false/nil refusal and cancellation never contribute to this run.
 func (self *multiClientChannel) addBusyProbeSendFailure() int {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -15878,10 +15978,9 @@ func (self *multiClientChannel) addBusyProbeSendFailure() int {
 	return self.busyProbeSendFailures
 }
 
-// sendBusyProbe puts the probe's control ping on the wire through the same
-// plumbing the idle cping loop uses. The seam (busyProbeSendFunc) exists only
-// so the probe's decisions can be driven from a test; production is always the
-// SendDetailedMessage path below.
+// Offer the control ping through the idle cping plumbing. Success reports
+// admission, not first-route-write; the callback separately reports completion.
+// The test seam drives decisions; production uses SendDetailedMessage below.
 func (self *multiClientChannel) sendBusyProbe(timeout time.Duration, ackCallback func(error)) (bool, error) {
 	if self.busyProbeSendFunc != nil {
 		return self.busyProbeSendFunc(timeout, ackCallback)
@@ -15902,9 +16001,8 @@ func (self *multiClientChannel) sendBusyProbe(timeout time.Duration, ackCallback
 // borrowed. What it buys: "bytes committed, nothing acknowledged" is the same
 // observation for an exit that died and for an exit whose upstream is saturated
 // or whose send window is full of the very data the stall is about. The control
-// ping rides the transport rather than the blocked flow, so a live exit answers
-// it in a couple of rtts. Asking costs one packet; the answer separates the two
-// cases the passive signal cannot.
+// ping can share local admission and serialization with the stalled flow. A
+// positive answer is useful evidence; a locally refused question is not.
 //
 // WHERE THIS MAY INTERPOSE, and nowhere else:
 //   - the sendStalled path only. The no-send-ack blackhole verdict has its own
@@ -15924,14 +16022,19 @@ func (self *multiClientChannel) sendBusyProbe(timeout time.Duration, ackCallback
 //   - ack inside the budget: the exit is alive despite the stalled flow acks.
 //     Record the liveness (addBusyProbeAck, which refreshes the stall bar
 //     without forging a send ack) and do not convict.
-//   - budget expires: convict, with the reason naming the probe. One fresh
+//   - budget expires: retain the existing admitted-probe timeout policy, with
+//     the reason naming the probe. This timer starts at admission, not a first
+//     route-write receipt; it is not proof of on-wire silence. One fresh
 //     budget is granted first if the wait itself was suspended (see
 //     schedulerPauseDetected) -- a probe armed before a doze must not convict on
 //     wake, when neither the exit's answer nor this waiter had a cpu. A host
 //     sleep counts too (schedulerPauseElapsed).
-//   - the probe cannot be queued twice in one stale episode: convict. Once is
-//     not evidence (a congested exit drains between polls); twice, while the
-//     same data sits unacked, is.
+//   - exact false/nil admission refusal or unwritten queue expiry: hold without
+//     refreshing the stall clock or inventing a peer answer. Repetition does not
+//     turn local admission pressure into remote evidence.
+//   - nonnil send errors: retain the existing two-error compatibility policy.
+//     These errors are not all remote evidence; this narrow refusal correction
+//     does not broaden their classification.
 //   - no probe plumbing at all: convict exactly as before the probe existed.
 //
 // Locking: takes only this channel's stateLock, in short sections, never across
@@ -15955,11 +16058,22 @@ func (self *multiClientChannel) busyLivenessProbe(budget time.Duration) busyProb
 		default:
 		}
 	})
+	if self.ctx != nil && self.ctx.Err() != nil {
+		return busyProbeVerdict{detail: "liveness probe abandoned: channel closing"}
+	}
 	if errors.Is(err, errBusyProbeUnavailable) {
 		return busyProbeVerdict{convict: true}
 	}
+	if !success && err == nil {
+		// The caller's bounded local admission refused this ping before taking
+		// ownership. No question reached the peer, regardless of prior refusals.
+		return busyProbeVerdict{
+			localUnwritten: true,
+			detail:         "liveness probe locally refused before admission",
+		}
+	}
 	if err != nil || !success {
-		// could not even be queued. see busyProbeUnsendableConvictions
+		// Preserve the separate nonnil-error compatibility policy.
 		if failures := self.addBusyProbeSendFailure(); busyProbeUnsendableConvictions <= failures {
 			return busyProbeVerdict{
 				convict: true,
@@ -16006,6 +16120,18 @@ func (self *multiClientChannel) busyLivenessProbe(budget time.Duration) busyProb
 			return busyProbeVerdict{detail: "liveness probe abandoned: channel closing"}
 		case err := <-probeDone:
 			if err != nil {
+				if self.ctx != nil && self.ctx.Err() != nil {
+					return busyProbeVerdict{detail: "liveness probe abandoned: channel closing"}
+				}
+				if packetTransferExpiredUnwritten(err) {
+					// This ping never reached serialization. Local queue pressure
+					// is not a failed remote answer and cannot retire other flows.
+					// Keep their pending clock and accounting: no ACK was observed.
+					return busyProbeVerdict{
+						localUnwritten: true,
+						detail:         "liveness probe locally expired before write",
+					}
+				}
 				// the send sequence gave up on the ping itself. that is a
 				// failed question, not an answer, so it convicts -- but it is
 				// named distinctly from a plain timeout so a capture can tell

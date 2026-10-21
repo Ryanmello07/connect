@@ -1,5 +1,52 @@
 # Memory-budget performance research
 
+## 2026-10-20 checkpoint: hosted variability remains unqualified
+
+Fresh common-source Pixel hosted-US H1+ diagnostics produced one completed
+**57 Mbps** result (53.470 s), between two 90-second nonterminal timeouts
+(raw displays 1.3 and 31 Mbps; neither is a valid throughput measurement).
+The private SDK receive-budget redistribution was **not included**. A later
+owned iOS-profile workload retained two more timeouts and one completed
+**11 Mbps** result; there is no valid three-attempt median.
+
+Provider pairing or current MAIN variability remains plausible, not proven.
+The fresh default logs contain no busy-probe convictions in these intervals;
+cold companion contract failures also occur during the successful run.
+Do not attribute the remaining stalls to the corrected local-expiry verdict
+or promote a performance baseline. At the user's direction, further hosted
+comparisons are deferred and passing focused synthetic changes are checkpointed.
+
+The owned 32-MiB replay was interrupted during quiet because observed host
+disk growth exceeded its temporary resource allowance, **not** an app-memory
+breach. Its retained Go-runtime peak was 31,199,264 bytes (29.75 MiB), but
+quiet/teardown did not complete: this is **not memory qualification**.
+The 32-MiB iOS-profile and 64-MiB Android-profile qualifications remain open;
+Android cannot prove an iOS extension's total physical footprint. Approved
+receipt-bound Pixel recovery completed with verified APK hashes and absent
+staged credentials; the interrupted session's evidence was preserved.
+
+The checkpoint includes the local unwritten-probe correction, confirmed by
+44 deterministic roots in three fresh normal and three race processes.
+Separate private local-admission, replay-namespace, CDP-observer, and budget
+candidates remain unintegrated and lack device-performance qualification.
+Source-only successor test recipes must not be counted as executed coverage.
+Raw receipts and corrected default-log analysis are retained under
+`/Volumes/data/urnetwork-h1-chronology.Y0OYTR/full-campaign-current.Fxlt45/`.
+
+### Local correctness follow-up: probe admission refusal
+
+The real Transfer regression also reproduced two synchronous local admission
+refusals retiring a channel with written data pending. The correction now holds
+an exact `false, nil` refusal without adding an error strike, inventing an ACK,
+or refreshing the pending clock; owner cancellation does not judge peer health.
+Unknown nonnil-error and admitted-probe timeout policies remain separate.
+The same 48 roots passed normal3/race3 privately and again directly against the
+integrated files, with zero failures/skips/race reports. This does not explain
+the fresh Fast stalls (no such convictions were observed), qualify performance,
+or complete the outstanding 32/64-MiB memory checks. Receipts are retained in
+`local-admission48-postcheckpoint.20261020` and
+`local-admission48-shared-confirm.20261020` under the artifact root above.
+
 This is the working research document for converting bounded mobile memory
 headroom into lower page TTFB and higher transfer speed while keeping the current
 iOS v2 profile's Go runtime at or below a hard 32 MiB cap in every phase. Its subject is the allocation
@@ -4824,3 +4871,103 @@ A separate short-EOF zero-progress issue in the copy helper has an untested
 private candidate, excluded from this repair. Current transport callers
 request no more than their payloader's declared remaining length; no ordinary
 production trigger or connection to this heap incident is established.
+
+### 2026-10-20: installed-build hosted H1 Fast.com diagnostic
+
+Local-probe remediation: deterministic pre-fix unit and real Transfer tests
+reproduced false retirement from exact pre-wire queue expiry; the real test
+canceled the client with a written data Pack still pending. The candidate
+passed all 44 new/adjacent roots in three fresh normal and three fresh race
+processes, zero skips/race reports. Tests pin same-sequence data/ACK recovery,
+unchanged pending/ACK clocks, bounded held logging, cancellation, mixed error
+classification, and genuine written-probe timeout. An initial synthetic
+nil-context fixture panic is preserved separately; successor fixtures only
+give the test siblings explicit contexts. Production and both corrected tests
+are now integrated byte-for-byte with the qualified private afterimages.
+No rebuilt APK or post-fix Fast.com improvement is qualified yet.
+Focused closure: `pixel-busy-probe-local-expiry.LQJEjM/FINAL.OUTCOME.json`,
+SHA-256 `02e07eedc8143597bda52b8096a4f9c14d30bd1723fd1c1b250e4c12c7521010`.
+
+Post-refresh default-log review found a local false-health-verdict event
+inside the measured interval. At 21:13:31.927865 UTC, a busy liveness probe
+convicted its exit after `queued Pack expired before serialization: send Pack
+was not admitted`. This is a local pre-wire failure, not proof that the peer
+failed to answer a transmitted probe. Two sequence cancellations followed;
+one recorded 38 pending items. A deterministic root test and narrow fix are
+being prepared; no fix or causal resolution of the entire Fast timeout is
+qualified yet. The second redacted bundle is retained at
+`fast-simple-pixel-diagnostics/urnetwork-diagnostics-20261020-211705-redacted.zip`
+under the artifact directory below, SHA-256
+`d96de812cea02b924c0e8e89acef0dab00343681b6415f17222130188891f9c7`.
+
+US reconnect follow-up: a fresh session showed H1+ 100% before traffic;
+Fast.com displayed **50 Mbps** but remained nonterminal at the unchanged
+90-second deadline. Invalid/incomplete, not a completed speed measurement.
+Run start was 21:13:18 UTC; receipt `FAST-SIMPLE-PIXEL-H1-REFRESH-01.json`
+is retained alongside the receipts below. Provider identity changes were
+not verified, so this neither confirms nor rules out a bad-provider cause.
+Owners joined, test targets checked absent and owned forward removed.
+
+Pixel `3B161FDJG001KT`, installed app `2026.10.19` / code `1076002883`,
+ordinary signed-in UI, United States, showed H1+ 100% immediately before
+VPN traffic. No experimental SDK budget treatment was installed.
+
+- Direct, VPN disconnected: **330 Mbps**, completed in 10.252 seconds;
+  spinner stopped, valid result, cleanup complete.
+- Clean US H1 repeat, one active Fast.com test: **800 Kbps displayed** at
+  the 90-second deadline, indicator nonterminal, document complete.
+  Invalid/incomplete result, not a completed throughput measurement.
+  Page-target counters: 26,315,570 bytes, 32 cancellations, all other fixed
+  failure categories zero. Worker traffic may be omitted; these are not
+  authoritative speed totals or proof of the stall's cause.
+- Earlier VPN run: 8.4 Mbps displayed but timed out with a competing manual
+  Fast.com tab; exclude from comparisons. Two setup retries failed during
+  navigation without an attributed DNS/TLS/reset category.
+
+This reproduces a substantial hosted-H1 symptom, not attribution to a local
+change or remote provider. No fresh Go-runtime memory samples were available;
+neither the 32 MiB iOS nor 64 MiB Android profile is qualified by this run.
+All owners joined; diagnostic tabs were checked absent, the owned ADB forward
+removed, and Pixel left connected to US H1. This is diagnostic evidence only,
+not full PERF or baseline promotion.
+
+Raw receipts: `FAST-SIMPLE-PIXEL-{DIRECT-01,H1-CLEAN-01}.json` under
+`/Volumes/data/urnetwork-h1-chronology.Y0OYTR/full-campaign-current.Fxlt45`.
+Installed base APK SHA-256:
+`e1844698948e1eec2544bcfbea84ef4feb5f46feb648d66a978cdf4f7b0a743c`.
+
+### 2026-10-20: receiver-head continuity metadata and bounded host replay
+
+The exact two-file upstream H1 correction
+`e65dc397816ffd0cdefc3eef0f94f4d0159b6f57`, authored by Bitprecipice, was
+tested as an overlay on Connect `1311aa6b`, not as the complete merged
+`58786550` tree or the larger private paid-response composition. It keeps
+the full receiver-head denominator while tracking actual gaps between heads.
+The deterministic OLD continuous-train root failed; the genuine-hole control
+passed. The seven-root candidate set passed three fresh normal and three
+fresh race processes.
+
+`TestWindowServiceRecoverySuffixMemoryBound` measured coverage 168 B,
+sample 360 B and service 25,688 B in all six processes, below the unchanged
+192/512/32,768-B caps. The new scalar adds 8 B per supply and 16 B per sample;
+the 67 embedded samples account for 1,072 B of fixed service growth.
+The existing owner census charges the service through `unsafe.Sizeof`.
+The scalar-only metadata and zero-allocation suffix-merge checks passed;
+they do not measure transport-path allocations, retained heap, runtime
+peaks or native footprint.
+
+The unchanged eight-offset parent passed three fresh normal processes.
+Across 72 one-second bins, the minimum was 95.76448 Mbps and all measurement
+relay drops were zero. Nonmeasurement relay drops reached 373 and end capacity
+debt reached 14,481,920 B; all debt records completed and settlement error
+fields were empty. The fixture's 48-MiB budget/debt cap remained unchanged.
+It is not a waiver of the 32-MiB iOS-surrogate / 64-MiB Android memory gates.
+
+Exact source scope, raw receipt hashes, nonmeasurement loss/debt rows and
+limitations are in the 2026-10-20 continuous-receiver-head entry in
+`PACKETFLOW-REGRESSION.md`. This finite host result does not qualify parent
+race, full PERF/MAIN/ALL, physical Fast, either complete device-memory profile
+or native iOS lifetime `phys_footprint <50 MiB`. It does not causally resolve
+the separate historical loaded-probe 0/64 result. Private grace/full-turn
+research is deferred with its evidence retained, not incorporated or
+qualified by this result.
