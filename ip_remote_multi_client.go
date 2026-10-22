@@ -7387,6 +7387,9 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 			// round.
 			if self.clientDialFailure(currentClient, ipPath, false) {
 				currentClient = nil
+				// Guarded inference withdrew the incumbent. Replacement admission
+				// is an ordinary race, not a reuse of that former selection.
+				sendPacketGroup.affinitySynReuse = false
 			}
 		}
 		if !self.canSendPacketGroup(sendPacketGroup, update, currentClient) {
@@ -12014,12 +12017,13 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 			}
 			continue
 		}
-		// The platform answered. Any success clears the backoff so the window
-		// returns to its normal cadence once the platform recovers. A fixed
+		// The platform answered, which clears the error backoff so the window
+		// returns to its normal cadence once the platform recovers. A refused
+		// mint keeps its rate-limit backoff until a mint succeeds. A fixed
 		// destination set is listed locally without asking the platform, so
-		// it proves nothing about the mint that is backing off.
+		// it proves nothing about the platform either.
 		if _, fixed := self.generator.FixedDestinationSize(); !fixed {
-			self.windowRetryReset()
+			self.windowListingRetryReset()
 		}
 
 		// unconditional (V0): the platform answered with ZERO candidates. Only
