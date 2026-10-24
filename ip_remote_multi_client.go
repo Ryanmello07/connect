@@ -295,8 +295,10 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// a discovery window whose expansion admits nothing expands again
 		// after 5-10s, then half as often per such pass down to once per 1-2
 		// minutes
-		DiscoveryExpandRetryMin: 10 * time.Second,
-		DiscoveryExpandRetryMax: 2 * time.Minute,
+		DiscoveryExpandRetryMin:        10 * time.Second,
+		DiscoveryExpandRetryMax:        2 * time.Minute,
+		DiscoveryDemandListingsPerPass: 3,
+		DiscoveryDemandListingInterval: time.Second,
 		// long enough for a slow-but-alive platform API round trip; a hung
 		// API must never wedge the enumerate/expand machinery
 		WindowGeneratorTimeout: 20 * time.Second,
@@ -876,6 +878,15 @@ type MultiClientSettings struct {
 	// pacing.
 	DiscoveryExpandRetryMin time.Duration
 	DiscoveryExpandRetryMax time.Duration
+	// DiscoveryDemandListingsPerPass bounds additional discovery calls in one
+	// existing acquisition. The default is 3; positive values are capped at 3
+	// to bound platform work, and non-positive values disable extra reads.
+	// A nonempty demand result may mint once, using an existing request slot.
+	DiscoveryDemandListingsPerPass int
+	// DiscoveryDemandListingInterval is the minimum time between additional
+	// discovery calls. The default and enforced floor are one second, including
+	// for zero or negative values. It never shortens a platform retry or rest.
+	DiscoveryDemandListingInterval time.Duration
 	// WindowGeneratorTimeout bounds each generator call the window's
 	// enumerate/expand machinery makes (NextDestinations, NewClientArgs,
 	// NewClientArgsForDestination). The generator wraps a platform API that
@@ -4294,6 +4305,9 @@ func (self *RemoteUserNatMultiClient) inheritAffinityClient4WithLock(update *mul
 		if c == nil || c.IsDone() || !c.supportsIpVersion(4) || (!sticky && self.clientAtFlowCapWithLock(c)) {
 			continue
 		}
+		if self.affinityDonorServiceFailedWithLock(update, c, now) {
+			continue
+		}
 		// off: the legacy short-circuit, preserved exactly -- a donor no more
 		// recent than the current best is never even asked for its verdict.
 		// On, every candidate must be evaluated to be ranked, which is the one
@@ -4381,6 +4395,9 @@ func (self *RemoteUserNatMultiClient) inheritAffinityClient6WithLock(update *mul
 		}
 		// see the v4 twin: a downgraded donor takes no new v6 flows
 		if c == nil || c.IsDone() || !c.supportsIpVersion(6) || (!sticky && self.clientAtFlowCapWithLock(c)) {
+			continue
+		}
+		if self.affinityDonorServiceFailedWithLock(update, c, now) {
 			continue
 		}
 		if !scored && !createTime.After(mostRecentCreateTime) {
@@ -5397,6 +5414,7 @@ func (self *RemoteUserNatMultiClient) removeClient(client *multiClientChannel) {
 		teardownUpdates = append(teardownUpdates, unplaced...)
 
 		for _, update := range teardownUpdates {
+			update.discoveryAttemptStamp.Add(1)
 			update.sourceReset.Store(true)
 			update.client.Store(nil)
 
@@ -5678,6 +5696,7 @@ func (self *RemoteUserNatMultiClient) migrateClientFlows(client *multiClientChan
 				}
 				delete(self.flowUpdates, update)
 				delete(updates, update)
+				update.discoveryAttemptStamp.Add(1)
 				update.sourceReset.Store(true)
 				update.client.Store(nil)
 				if update.cancel != nil {
@@ -7364,6 +7383,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 		for packetIndex := range sendPacketGroup.packets {
 			update.noteConnectAttempt(sendPacketGroup.packets[packetIndex].ipPath)
 		}
+		self.requestDiscoveryForSourceSyn(update, ipPath)
 
 		// Client-side dial-failure inference. A connection attempt
 		// retransmitting on an exit that has answered nothing is the silent
@@ -7472,6 +7492,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 					if selection == nil || selection.client != client || !update.client.clearSelection(selection) {
 						return false
 					}
+					update.discoveryAttemptStamp.Add(1)
 					update.sourceReset.Store(true)
 					return true
 				}()
@@ -7833,6 +7854,11 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 			if self.groupRaceCandidatesForTest != nil {
 				return self.groupRaceCandidatesForTest(sendPacketGroup)
 			}
+			// Data, UDP, pinned and already-established traffic retain their
+			// original field without another health walk.
+			preferHealthyWindows := ipPath.Protocol == IpProtocolTcp && ipPath.Syn && !ipPath.Ack &&
+				!sendPacketGroup.pin.pinned() && !update.receivedInbound.Load()
+			var failedFallback, benchedFallback []*multiClientChannel
 			for _, windowType := range self.selectWindowTypes(firstPacket, sendPacketGroup.pin.appId) {
 				if window, ok := self.windows[windowType]; ok {
 					var offerChanged *<-chan struct{}
@@ -7852,6 +7878,16 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 							orderedClients = crossed
 						} else if fallback := window.lastResortClientsForIpVersion(ipPath.Version); 0 < len(fallback) {
 							orderedClients = fallback
+						}
+					}
+					benchedField := false
+					if preferHealthyWindows {
+						if healthy := healthyCrossWindowCandidates(orderedClients); 0 < len(healthy) {
+							orderedClients = healthy
+						} else {
+							// The compaction writes nothing when no healthy client
+							// exists, preserving this field's ordinary fallback order.
+							benchedField = true
 						}
 					}
 					orderedClients = self.filterDestinationServiceFailures(orderedClients, ipPath)
@@ -7877,15 +7913,32 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 						// narrows it. See scoredPlacementReorder.
 						orderedClients = self.scoredPlacementReorder(orderedClients, ipPath, sendPacketGroup.pin.appId)
 					}
-					// legacy selection unchanged: with the gate off (every
-					// current build's default), orderedClients is exactly what
-					// raceCandidates returned, untouched.
 					if 0 < len(orderedClients) {
-						return orderedClients
+						// Prefer ordinary healthy offers across permitted windows.
+						// Retain healthy service-failed and benched fields only
+						// when no unfailed healthy offer exists.
+						if !preferHealthyWindows || sendPacketGroup.pin.pinned() || update.receivedInbound.Load() {
+							return orderedClients
+						}
+						if benchedField {
+							if benchedFallback == nil {
+								benchedFallback = orderedClients
+							}
+							continue
+						}
+						if !self.destinationServiceFailuresExhausted(orderedClients, ipPath) {
+							return orderedClients
+						}
+						if failedFallback == nil {
+							failedFallback = orderedClients
+						}
 					}
 				}
 			}
-			return []*multiClientChannel{}
+			if failedFallback != nil {
+				return failedFallback
+			}
+			return benchedFallback
 		}
 
 		raceClients(coalesceOrderedClients(), 0)
@@ -9246,6 +9299,9 @@ func (self *RemoteUserNatMultiClient) clientDialFailure(sourceClient *multiClien
 			self.noteIpFamilyDowngrade(sourceClient)
 		}
 	}
+	if rerace && firstFromExit {
+		self.requestDiscoveryForFailedAttempt(signaledUpdate, sourceClient, egressIpPath)
+	}
 
 	if standing == dialFailureWithdrawn {
 		// the race goes on without the exit, or, left empty, ends so the
@@ -9916,6 +9972,9 @@ type multiClientChannelUpdate struct {
 	dialFailedSyn     uint32
 	dialFailedSynEnd  uint32
 	dialFailedSynSeen bool
+	// Source-observed attempt time/version, independent of collapse replay.
+	discoveryAttemptStarted time.Time
+	discoveryAttemptStamp   atomic.Uint64
 	// Those of dialFailedClients whose failure arrived as the provider's own
 	// signal rather than the silence inference. An exit that said it cannot
 	// reach the destination is never adopted on a later answer; the app's
@@ -10651,6 +10710,8 @@ func (self *multiClientChannelUpdate) noteConnectAttempt(ipPath *IpPath) {
 		}
 		return
 	}
+	self.discoveryAttemptStarted = time.Now()
+	self.discoveryAttemptStamp.Add(1)
 	self.dialFailedSynSeen, self.dialFailedSyn, self.dialFailedSynEnd = true, ipPath.SequenceNumber, end
 	self.dialFailedClients = nil
 	self.dialFailureSignaledClients = nil
@@ -10661,6 +10722,9 @@ func (self *multiClientChannelUpdate) noteConnectAttempt(ipPath *IpPath) {
 func (self *multiClientChannelUpdate) forgetDialFailedClient(client *multiClientChannel) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	if slices.Contains(self.dialFailedClients, client) {
+		self.discoveryAttemptStamp.Add(1)
+	}
 	self.dialFailedClients = slices.DeleteFunc(self.dialFailedClients, func(failed *multiClientChannel) bool {
 		return failed == client
 	})
@@ -11247,7 +11311,9 @@ type multiClientWindow struct {
 	// Expansion pacing of a discovery window after passes that admitted
 	// nothing. Guarded by stateLock. See
 	// ip_remote_multi_client_discovery_retry.go.
-	discoveryRetry discoveryExpandRetry
+	discoveryRetry         discoveryExpandRetry
+	discoveryDemand        discoveryAcquisitionDemand
+	discoveryDemandChanged *Monitor
 
 	generatorMonitor *Monitor
 	resizeMonitor    *Monitor
@@ -11974,8 +12040,15 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 		}()
 	}()
 
+	var demandRead *discoveryDemandRead
 	for {
 		generatorNotify := self.generatorMonitor.NotifyChannel()
+		if demandRead != nil && !self.discoveryDemandReadLive(demandRead) {
+			notify := demandRead.generatorNotify
+			demandRead = nil
+			demandRead = self.waitDiscoveryDemand(notify, true)
+			continue
+		}
 		// before the platform call, so a change during it ends the retry wait
 		networkChanged := self.networkChangeNotify()
 
@@ -12007,12 +12080,30 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 		// family-aware discovery order: v6-capable first while a shortfall
 		// is open, then the main fill -- or, for a resize-pass probe, the
 		// v6-capable request alone; see enumerateDestinations
-		probeOnly := self.takeIpv6ProbeRequest()
-		destinations, err := self.enumerateDestinations(
-			slices.Collect(maps.Keys(windowDestinations())),
-			probeOnly,
-		)
+		probeOnly := false
+		var destinations []enumeratedDestination
+		var err error
+		if demandRead == nil {
+			probeOnly = self.takeIpv6ProbeRequest()
+			destinations, err = self.enumerateDestinations(slices.Collect(maps.Keys(windowDestinations())), probeOnly)
+		} else {
+			destinations, err = self.listDiscoveryDemand(demandRead, slices.Collect(maps.Keys(windowDestinations())))
+			if !self.discoveryDemandReadLive(demandRead) {
+				notify := demandRead.generatorNotify
+				demandRead = nil
+				demandRead = self.waitDiscoveryDemand(notify, true)
+				continue
+			}
+		}
 		if err != nil {
+			if demandRead != nil {
+				// The demand call retains backend refusal authority even if
+				// its current slot ends while that response arrives.
+				notify := demandRead.generatorNotify
+				demandRead = nil
+				demandRead = self.waitDiscoveryDemand(notify, true)
+				continue
+			}
 			select {
 			case <-self.ctx.Done():
 				return
@@ -12086,6 +12177,9 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 					continue
 				}
 
+				if demandRead != nil && !self.claimDiscoveryDemandMint(demandRead) {
+					return
+				}
 				for {
 					timeout := expirationTime.Sub(time.Now())
 					if timeout <= 0 {
@@ -12101,7 +12195,9 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 					// removeLateClientArgs rather than discarded.
 					var clientArgs *MultiClientGeneratorClientArgs
 					var err error
-					if destinationGenerator, ok := self.generator.(MultiClientGeneratorWithDestination); ok {
+					if demandRead != nil {
+						clientArgs, err = self.mintDiscoveryDemand(demandRead, destination)
+					} else if destinationGenerator, ok := self.generator.(MultiClientGeneratorWithDestination); ok {
 						clientArgs, err = windowGeneratorCall(
 							self.ctx,
 							self.settings.WindowGeneratorTimeout,
@@ -12118,7 +12214,19 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 							self.removeLateClientArgs,
 						)
 					}
+					if demandRead != nil && !self.discoveryDemandReadLive(demandRead) {
+						if clientArgs != nil {
+							self.generator.RemoveClientArgs(clientArgs)
+						}
+						return
+					}
 					if err != nil {
+						if demandRead != nil {
+							if clientArgs != nil {
+								self.generator.RemoveClientArgs(clientArgs)
+							}
+							return
+						}
 						select {
 						case <-self.ctx.Done():
 							return
@@ -12145,7 +12253,13 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 						stickyRedial:                   enumerated.stickyRedial,
 						recentExit:                     enumerated.recentExit,
 					}
-					if !self.offerClientArgs(args, time.Now().Add(timeout)) {
+					offered := false
+					if demandRead == nil {
+						offered = self.offerClientArgs(args, time.Now().Add(timeout))
+					} else {
+						offered = self.offerDiscoveryDemandArgs(demandRead, args)
+					}
+					if !offered {
 						select {
 						case <-self.ctx.Done():
 						default:
@@ -12163,16 +12277,23 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 			self.setIpv6CandidateReady(false)
 		}
 
-		select {
-		case <-self.ctx.Done():
+		demandRead = nil
+		demandRead = self.waitDiscoveryDemand(generatorNotify, len(destinations) == 0)
+		if self.ctx.Err() != nil {
 			return
-		case <-generatorNotify:
 		}
 	}
 }
 
 func (self *multiClientWindow) resize() {
 	for {
+		// Cancellation can race a ready resize edge after an expansion ends.
+		// Leave owned channels to Close instead of starting a teardown pass.
+		select {
+		case <-self.ctx.Done():
+			return
+		default:
+		}
 		update := self.resizeMonitor.NotifyChannel()
 
 		var windowSize WindowSizeSettings
@@ -13353,6 +13474,10 @@ func (self *multiClientWindow) expand(
 		self.settings.PingTimeout,
 	)
 	evaluationOwner.deadline = passEndTime
+	if !fixedDestination && currentWindowSize < targetWindowSize && 0 < requestCount {
+		self.beginDiscoveryAcquisition(evaluationOwner, self.evalEpochContext(), requestEndTime, targetWindowSize, windowSize.WindowSizeHardMax)
+		defer self.endDiscoveryAcquisition(evaluationOwner)
+	}
 
 requestCandidates:
 	for i := 0; i < requestCount; i += 1 {
@@ -13362,7 +13487,10 @@ requestCandidates:
 			break
 		}
 
+		self.beginDiscoveryDemandSlot(evaluationOwner)
 		self.generatorMonitor.NotifyAll()
+		requestExpired := time.After(timeout)
+	awaitCandidate:
 		select {
 		case <-self.ctx.Done():
 			return
@@ -13376,6 +13504,10 @@ requestCandidates:
 		case args, ok := <-self.clientChannelArgs:
 			if !ok {
 				return
+			}
+			if !self.acceptDiscoveryDemandArgs(evaluationOwner, args) {
+				self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
+				goto awaitCandidate
 			}
 			// A ready args channel and the acquisition timer can race in select.
 			// Recheck the wall clock after receipt so a candidate observed after
@@ -13785,11 +13917,13 @@ requestCandidates:
 				// as usual (the enumerator took the re-dial).
 				break requestCandidates
 			}
-		case <-time.After(timeout):
+		case <-requestExpired:
 			self.log.V(2).Infof("[multi]expand window timeout waiting for args\n")
 			break requestCandidates
 		}
 	}
+
+	self.endDiscoveryAcquisition(evaluationOwner)
 
 	// Candidate acquisition is over. Retain pass ownership until every ping
 	// resolves, capped at acquisition + setup + one full initial-ping budget.
@@ -14531,6 +14665,9 @@ func (self *multiClientWindow) removeClients(removedClients ...*multiClientChann
 type multiClientChannelArgs struct {
 	MultiClientGeneratorClientArgs
 	ackRouteWriteFailureOwner *ackRouteWriteFailureOwner
+	// Only demand-minted args carry an exact ordinary request-slot receipt.
+	discoveryDemandOwner *multiClientEvaluationOwner
+	discoveryDemandSlot  uint64
 	// A fixed destination offer owns no identity until expand accepts it.
 	// Only the receiving expansion mutates this after the unbuffered handoff.
 	deferredClientArgs bool
