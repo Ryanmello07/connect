@@ -1,5 +1,77 @@
 # Memory-budget performance research
 
+## 2026-10-24 UTC: revised 100-page overlap qualification
+
+The `next-navigation-image-v2` fixture now proves an actual unfinished original
+image body at every next-HTML handoff, rather than relying on historical prefix
+tokens. Only its final 1 KiB waits; other bytes and assets stream. The native
+pressure and shared SDK paths retain the original page sizes, four-page bound,
+network shape, CSS custody, cancellation and timing contracts.
+
+Qualification passed 15 normal and 15 race roots, with two intended behavioral
+failures when restoring the old writer. One uninstrumented SDK run then passed
+100 HTML / 400 assets / 99 overlaps: median TTFB 1.101654 s, p95 2.239751 s,
+maximum 4.233728 s and no samples at least five seconds. All 99 handoffs had
+more than 1 KiB of unfinished body, median 124,672 B; this does not identify
+native queue occupancy. The checked SDK post-join usage and pending counters
+returned to zero, while global unpublished-offer quiescence remains unknown.
+
+This is one changed-workload run, not a statistical improvement or an observed
+32 MiB process-memory pass. Six providers share the host process. Real-device
+MEMSTEADY/PERFVAR must still qualify the 32 MiB iOS surrogate and 64 MiB Android
+profiles. Production budgets, routing and the five-second engineering target
+are unchanged. Measurements, preserved failure and cleanup-control details are
+in [the PERFVAR measurement record](../tests/PERFVAR-MEASUREMENTS.md).
+
+## 2026-10-24 UTC: retired-channel cache ownership and C10 follow-up
+
+Service-failure cache keys retained retired channel pointers after flowless
+removal, same-identity replacement and window shutdown. Its 4,096-entry bound
+was not a bound on reference lifetime: ten-minute expiry was only visited-key
+policy, with no guaranteed visit after retirement. The cleanup now prunes the
+exact channel generation at those lifecycle edges and rejects late writes from
+a canceled owner under the existing parent lock. Live replacements, provider
+events and established-flow policy are preserved. No retired-owner map, worker,
+timer, payload copy or ordinary per-packet map sweep was added.
+
+The private current-source proof passed two compile checks, five isolated causal
+controls and 600 positive executions (300 normal, 300 race; 273 distinct roots),
+with no skips or race reports. This proves release of the service-cache root;
+it does not measure retained bytes, establish whole-object collection, or
+attribute the browsing delay to this defect. Full-suite and physical 32 MiB
+iOS-surrogate / 64 MiB Android qualification remain pending.
+
+The first fresh uninstrumented C10 confirmation completed 100 HTML and 400
+assets but failed its selected five-second performance budget: page 1 first
+byte was 5.597088041 s, inclusive tap duration 5.885931375 s, TCP acquisition
+5.278528875 s. Every other page stayed below five seconds; SDK post-join
+ownership drained to zero. The separate overlap count was 98 rather than 99;
+existing rows locate the missing premise at page 28. Prefix tokens had proved
+earlier streaming progress, not a body still unfinished at the next tap.
+The original failure remains retained; confirmations 2 and 3 were not run.
+
+One later instrumented observation completed 100/400/99 with page 1 at
+2.720150125 s inclusive. Its complete first-phase SDK ledger covered 13 calls,
+nine unmatched data/ACK calls, with a maximum 130,334 ns and no pre-tap call in
+flight. Actual guard reads rejected the failed donor for the second source
+connection; it reached the owned speed exit. No multi-second producer or
+control-publication delay was observed in this run. This does not explain the
+earlier uninstrumented interval, and the observation is neither a matched
+performance comparison nor a product qualification. Unsupported global
+generation joins remain unknown. Five seconds is an engineering target, not a
+protocol correctness guarantee or a timer that caused the request to stop.
+
+Evidence: `c10-retention-proof.PREP.n2vxvw2m`, proof-summary SHA-256
+`aff24a0cb474c45a78b0d2ebe3bdad70f7041cefb882126a6bc0c402faa11002`,
+all-joined receipt `9201a2f0d1becaeb986ddccf3541a612585272b671ec3432d3c21f1fa431bed6`.
+C10 confirmation raw SHA-256
+`ca6d26b45ffebafe66cf56fc9b7e8fcb9914104d427be5fe084fe16037a4ffac`;
+observation raw SHA-256
+`c5172146afcb5c3c323558376f5da7590a678a9e35c9a535540d94ee59916e22`.
+All use checkpoint Connect `e90d59eb`, Server `f101b3190`, Tests `0efc83c`
+(with the explicitly recorded private cleanup or observation overlay).
+No performance baseline was promoted.
+
 ## 2026-10-24 UTC: full-window service refusal and recovery
 
 A matched, sequential host replay used the public SDK with a 32 MiB admission
