@@ -2,6 +2,7 @@ package connect
 
 import (
 	"context"
+	mathrand "math/rand/v2"
 	"sync"
 	"time"
 
@@ -20,9 +21,11 @@ type ControlSyncOob struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	client       *Client
-	scopeTag     string
-	retryTimeout time.Duration
+	client   *Client
+	scopeTag string
+	// retries back off from retryTimeout, doubling to maxRetryTimeout
+	retryTimeout    time.Duration
+	maxRetryTimeout time.Duration
 
 	sendLock  sync.Mutex
 	closed    bool
@@ -42,12 +45,13 @@ func NewControlSyncOob(ctx context.Context, client *Client, scopeTag string) *Co
 	cancelCtx, cancel := context.WithCancel(ctx)
 
 	return &ControlSyncOob{
-		ctx:          cancelCtx,
-		cancel:       cancel,
-		client:       client,
-		scopeTag:     scopeTag,
-		retryTimeout: 1 * time.Second,
-		workers:      newLifecycleAdmission(),
+		ctx:             cancelCtx,
+		cancel:          cancel,
+		client:          client,
+		scopeTag:        scopeTag,
+		retryTimeout:    1 * time.Second,
+		maxRetryTimeout: 60 * time.Second,
+		workers:         newLifecycleAdmission(),
 	}
 }
 
@@ -126,6 +130,11 @@ func (self *ControlSyncOob) Send(frame *protocol.Frame, ackCallback AckFunction)
 		return true
 	}
 
+	// A provider with many proxy identities runs these per identity. A fixed
+	// 1s retry against a failing API made every identity retry every second
+	// (connect#227); back off instead, jittered so identities spread out.
+	// Attempts of one Send run one after another, so the delay needs no lock.
+	retryDelay := self.retryTimeout
 	var send func()
 	send = func() {
 		// stop if a newer Send for this scope superseded this one, or done
@@ -170,7 +179,8 @@ func (self *ControlSyncOob) Send(frame *protocol.Frame, ackCallback AckFunction)
 			select {
 			case <-handleCtx.Done():
 			case <-self.client.Done():
-			case <-time.After(self.retryTimeout):
+			case <-time.After(oobRetryJitter(retryDelay)):
+				retryDelay = min(2*retryDelay, max(self.maxRetryTimeout, self.retryTimeout))
 				if !self.startWorker(send) {
 					handleCancel()
 				}
@@ -214,4 +224,13 @@ func (self *ControlSyncOob) closeAndWait(ctx context.Context) error {
 		self.beforeCloseWaitForTest()
 	}
 	return waitForLifecycleDone(ctx, self.workers.Done(), "out-of-band control sync workers")
+}
+
+// oobRetryJitter spreads a retry delay uniformly over [delay/2, delay).
+func oobRetryJitter(delay time.Duration) time.Duration {
+	if delay < 2 {
+		return delay
+	}
+	half := delay / 2
+	return half + time.Duration(mathrand.Int64N(int64(half)))
 }
