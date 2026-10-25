@@ -5877,3 +5877,139 @@ above; confirmation on the final integrated source remains required. The
 mandatory functional100 receipt guard separately passed 24 patched normal/race
 executions against four causal OLD failures. Explicit provider4 research remains
 manual, separate from mandatory functional recovery.
+
+## 2026-10-24: fresh canonical SDK 100-page functional replay
+
+The C13b canonical run of
+`TestFullTunH1Sdk32ServiceRefusalRecovery100Pages` passed once with
+100 HTML requests, 400 asset attempts and 99 next-navigation overlaps.
+It used `next-navigation-image-v2`, the public SDK/native TUN/H1/provider
+path, CPU8, the unchanged 300-second workload budget and five-second
+navigation target. There was no instrumentation overlay or workload retry.
+
+| All-page first-byte measurement | Result |
+| --- | ---: |
+| Median | 0.858013459 s |
+| p95, nearest rank | 2.065520583 s |
+| Maximum | 3.780069917 s |
+| Pages at or above five seconds | 0 / 100 |
+
+The original 12,288-byte CSS stream retained its TCP tuple and public owner
+through the next HTML handoff. All checked native packet entries and
+origin connection owners completed; the late constructor joined. The
+checked SDK post-join memory ownership fields were zero. Unpublished
+offers/global publication quiescence remain unknown. Packet-entry counters
+are not API-call counts and do not prove individual SYN acceptance.
+
+The v2 fixture verifies that an original image is unfinished at each
+next-navigation handoff, then releases its final 1 KiB before fetching
+the next HTML. This guarantees overlap, not native-queue backlog. Historical
+v1 runs retain their original weaker overlap meaning. This single pass is
+a functional recovery result, not a statistically qualified improvement,
+a Fast.com measurement, or proof of the cause of the reported device pauses.
+
+The fixture cohosts SDK, providers and origins. Its aggregate Go memory
+cannot qualify isolated 32 MiB iOS-profile or 64 MiB Android-profile usage.
+Those physical-device startup/active/quiet/teardown checks remain pending;
+actual iOS extension total physical footprint is also unqualified.
+
+Source: Connect `15bdd250f22976923e4b7f6bd7366eab859fe584`,
+SDK `3bd24c6865ff92dc61bf764465cf60775134a304`,
+Server `936c63f651444797775a7b44a76a6088b375c546`,
+Tests `4ba46b48426831831173103811152a67dae80504`; whole-source fingerprint
+`6d1a60145c675d44176cdf5969f2d1a3714025517ba7d6860fcb470f74b7f464`.
+Actual root RUN 17:03:53.881705 UTC; PASS 17:07:19.598488 UTC.
+One root RUN/PASS, zero FAIL/SKIP; root elapsed 205.72 s.
+
+Evidence owner: `h1-disjoint-controls.PREP.7tk80_6o/c13b-sdk100-once.PREP._rdr6c11`
+under the retained current112 evidence root.
+`C13B-SDK100-MEASUREMENTS.json` SHA-256:
+`aac7ff9e7342289adf2ab741253920287d5e057af543332e7cf48abdef1a9622`.
+Raw Go JSON SHA-256:
+`fa9d7608905f6e5419386db698a83fa4dc32b822b88857d70b073d8454ca7124`.
+Final all-joined custody receipt SHA-256:
+`b2e5e5c1a4864f242f439e6458913421e403a277c5a704c224548e2235da8644`.
+Full correctness and complete simulator/benchmark/device qualification
+remain open; no performance baseline is promoted.
+
+## 2026-10-24: hosted H1 device measurements and accepted-SYN custody
+
+The frozen C14 physical campaign reached its first cell: Pixel
+`3B161FDJG001KT`, Wi-Fi, iOS-profile surrogate, H1, provider disabled,
+API-alt disabled, CPU4. The app used 32 MiB for its DeviceLocal target,
+Go soft limit and observed-runtime gate. This is Android evidence; it
+does not measure an iOS extension's total physical footprint.
+
+| First-cell measurement | Result |
+| --- | ---: |
+| Observed Go runtime peak, including teardown | 29.301 MiB |
+| Quiet observed Go runtime peak | 24.262 MiB |
+| Teardown observed Go runtime peak | 23.363 MiB |
+| Retained runtime events after joins | 207 |
+| Observed 32 MiB breaches | 0 |
+| Wikipedia median TTFB / load, five navigations | 206.2 / 545.7 ms |
+| First Wikipedia TTFB / load | 32,713.5 / 33,043.9 ms |
+| First Wikipedia reported DNS | 18,102.6 ms |
+| Fast.com valid attempts | 32 and 9.9 Mbps |
+| Fast.com invalid attempt | display-poll deadline at approximately 90 s |
+
+Wikipedia TTFBs were 32,713.5, 255.2, 206.2, 189.9 and 189.4 ms.
+The median hides the real cold-page pause. CDP independently reports
+18,102.5 ms DNS, but its connection timing differs from NavigationTiming;
+the remaining wait cannot safely be assigned to one TCP handshake.
+During the failed Fast attempt, Wi-Fi/VPN remained connected and aggregate
+TUN traffic continued, with bursty receive intervals including a 15.327 s
+low-traffic stretch. Aggregate counters do not identify the affected
+provider or browser worker. The nonterminal 1.3 Mbps display is not a result.
+
+The cell passed its startup/workload/quiet/teardown memory checks but failed
+workload eligibility solely on Fast attempt 2. The full campaign preserved
+that failure and stopped with the other 111 cells not run. Neither the
+complete iOS32 profile nor Android64 profile is qualified by this cell,
+and no speed improvement or baseline promotion is claimed.
+
+A subsequent deterministic public-native regression found an independent
+local bug: SYN offers refused before queue admission initialized the
+provider-silence clock. Offers at virtual 0, 1 and just beyond 3 seconds
+produced zero admissions and zero writes, yet recorded one destination
+failure, one provider dial strike and one rerace, losing the binding.
+The unchanged-code test failed once with
+`OLD_NATIVE_SYN_REFUSAL_PROVIDER_ATTRIBUTION`; it was not rerolled.
+
+The tested candidate starts the clock only after actual accepted custody,
+keys it to the exact selection receipt and SYN generation, and rejects
+stale delayed callbacks. Refused offers preserve earlier accepted clocks.
+The inference remains before duplicate collapse so an accepted silent SYN
+can still recover. No queue, worker, timer policy or memory limit was added.
+Six public-native causal/boundary tests plus direct clock, descriptor-reuse,
+UDP, readiness, promotion and stalled-send controls passed: 29 normal and
+29 race roots, zero failures or skips. This proves the local attribution
+fix, not that it caused the physical DNS/Fast pauses. Cold DoH/provider-ready
+SYN retry timing and a composed 100-page fixture remain research targets.
+
+Evidence is retained under the current112 root:
+`physical-c14-full112-clean.PREP.520ii7cc/FINAL-PHYSICAL-CUSTODY.json`
+SHA-256 `19348baf0182a22096654f04d0eb180a9efa6897319d2dbe5ace4f14cca38983`;
+first-cell record SHA-256
+`e3fc54d29767389141975c8b5498bd2ca244b940493eb073685d7a968bbf38db`.
+The private fix packet is
+`/private/tmp/urnetwork-native-syn-clock-fix.PREP.wiyivsno/PACKET.json`,
+SHA-256 `583977c197d48a214370194b67f80f7e4f405d77e1ce743142e67b42cf8b2716`.
+Normal raw Go JSON SHA-256
+`fe3ede1851e511f5adcc9d251bec80694f84ed8817cc8afb2c41e231ba19189f`;
+race raw Go JSON SHA-256
+`016201fd34f68d98b97fe32ee5c57c906e3346c6fd0ffe91c010390b187593d5`.
+
+C14 Connect and SDK full correctness scripts passed, including 514 SDK JS
+tests. The later Windows command was canceled by the artifact observer's
+shared-lock starvation, rather than a test assertion; Proxy/Server/SN did
+not run. The full correctness campaign therefore remains incomplete.
+Until lock fairness is separately tested, campaigns use one global
+accounting owner through final joins. Required test scopes and capacity
+limits remain unchanged. Full simulator48/benchmark60 and device112
+qualification still require execution; historical results keep their
+original source identities.
+
+Focused candidate qualification completed with all processes joined and cache
+released; final custody SHA-256
+`56a1ba54ba918fceefc732a63031db8d2236f1bb86a7d7a56efcdf3585ccacaf`.
