@@ -273,6 +273,7 @@ func newClientTlsHandshaker(fingerprint string, config *tls.Config) *clientTlsHa
 // configuration, its server name set. On error the tls connection is closed,
 // and with it conn.
 func (self *clientTlsHandshaker) handshake(ctx context.Context, conn net.Conn, config *tls.Config) (net.Conn, error) {
+	config = withCachedChainVerification(config, tlsVerifiedChainCacheRoots())
 	if !self.chrome {
 		tlsConn := tls.Client(conn, config)
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
