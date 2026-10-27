@@ -120,7 +120,7 @@ func TestUdpReceiveDispatcherAggregateQueueIsFlowIndependent(t *testing.T) {
 
 	totalCapacity := 0
 	for i := range dispatcher.shards {
-		totalCapacity += cap(dispatcher.shards[i].items)
+		totalCapacity += dispatcher.shards[i].itemCount
 	}
 	if totalCapacity != settings.ReceiveShardCount*settings.SequenceBufferSize {
 		t.Fatalf("aggregate queue capacity=%d, want %d", totalCapacity, settings.ReceiveShardCount*settings.SequenceBufferSize)
@@ -136,11 +136,46 @@ func TestUdpReceiveDispatcherAggregateQueueIsFlowIndependent(t *testing.T) {
 	}
 	afterCapacity := 0
 	for i := range dispatcher.shards {
-		afterCapacity += cap(dispatcher.shards[i].items)
+		afterCapacity += dispatcher.shards[i].itemCount
 	}
 	if afterCapacity != totalCapacity {
 		t.Fatalf("queue capacity grew with flow count: %d -> %d", totalCapacity, afterCapacity)
 	}
+}
+
+// A dispatcher holds no queue until a shard starts, and a started shard holds
+// exactly its share. A provider process runs one nat per provider, and most
+// of them never receive udp.
+func TestUdpReceiveDispatcherAllocatesQueuesOnFirstUse(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	settings := DefaultUdpBufferSettingsWithBufferSize(7)
+	settings.ReceiveShardCount = 3
+	dispatcher := newUdpReceiveDispatcher(ctx, settings)
+	for i := range dispatcher.shards {
+		if dispatcher.shards[i].items != nil {
+			t.Fatalf("shard %d holds a queue before any flow used it", i)
+		}
+	}
+
+	dispatcher.startShard(&dispatcher.shards[1])
+	for i := range dispatcher.shards {
+		started := dispatcher.shards[i].items != nil
+		if started != (i == 1) {
+			t.Fatalf("shard %d started = %t", i, started)
+		}
+	}
+	if capacity := cap(dispatcher.shards[1].items); capacity != settings.SequenceBufferSize {
+		t.Fatalf("started shard capacity = %d, want %d", capacity, settings.SequenceBufferSize)
+	}
+	// a second start keeps the same queue
+	items := dispatcher.shards[1].items
+	dispatcher.startShard(&dispatcher.shards[1])
+	if dispatcher.shards[1].items != items {
+		t.Fatal("a second start replaced the queue")
+	}
+
+	cancel()
+	dispatcher.waitForLifecycle()
 }
 
 func BenchmarkUdpReceiveDispatcher(b *testing.B) {

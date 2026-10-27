@@ -40,7 +40,7 @@ func TestProviderDatagramPublicDispatchFullQueueAndTerminalGate(t *testing.T) {
 		sequence.receiveDispatcher, sequence.receiveShard = dispatcher, 0
 		shard := &dispatcher.shards[0]
 		// Pin the exact full-queue boundary without a consumer racing it.
-		shard.startOnce.Do(func() {})
+		shard.startOnce.Do(shard.makeItems)
 		released := 0
 		newPublic := func() *providerDatagramPublicDispatch {
 			fanout := &providerDatagramFanout{sequence: sequence, released: func() { released++ }}

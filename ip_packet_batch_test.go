@@ -269,6 +269,7 @@ func TestUdpReceiveDispatcherTerminalWaitDrainsLateAdmittedPacket(t *testing.T) 
 	settings := DefaultUdpBufferSettingsWithBufferSize(1)
 	dispatcher := newUdpReceiveDispatcher(ctx, settings)
 	shard := &dispatcher.shards[0]
+	shard.makeItems()
 	workerDone := make(chan struct{})
 	dispatcher.waitGroup.Add(1)
 	go func() {

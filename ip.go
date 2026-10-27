@@ -2535,7 +2535,11 @@ type udpReceiveDispatchItem struct {
 type udpReceiveDispatchShard struct {
 	ctx       context.Context
 	startOnce sync.Once
+	// made by the first start, so a nat that never receives udp (most of a
+	// many-provider process) holds no queue. Read only after startShard, or
+	// after the dispatcher's wait group, which orders it after the make.
 	items     chan udpReceiveDispatchItem
+	itemCount int
 	batchSize int
 	// Prepared actors are asynchronous producers. Closing this small gate
 	// before the final drain prevents a late publication after worker exit.
@@ -2562,7 +2566,7 @@ func newUdpReceiveDispatcher(ctx context.Context, settings *UdpBufferSettings) *
 	for i := range dispatcher.shards {
 		dispatcher.shards[i] = udpReceiveDispatchShard{
 			ctx:       ctx,
-			items:     make(chan udpReceiveDispatchItem, max(0, settings.SequenceBufferSize)),
+			itemCount: max(0, settings.SequenceBufferSize),
 			batchSize: max(1, settings.WriteBatchSize),
 		}
 	}
@@ -2606,12 +2610,17 @@ func (dispatcher *udpReceiveDispatcher) enqueue(sequence *UdpSequence, packet []
 
 func (dispatcher *udpReceiveDispatcher) startShard(shard *udpReceiveDispatchShard) {
 	shard.startOnce.Do(func() {
+		shard.makeItems()
 		dispatcher.waitGroup.Add(1)
 		go HandleError(func() {
 			defer dispatcher.waitGroup.Done()
 			shard.run()
 		})
 	})
+}
+
+func (shard *udpReceiveDispatchShard) makeItems() {
+	shard.items = make(chan udpReceiveDispatchItem, shard.itemCount)
 }
 
 func (shard *udpReceiveDispatchShard) closePreparedAdmission() {
