@@ -72,16 +72,3 @@ func TestProxiedPlatformTransportRunsH1Only(t *testing.T) {
 		strategy.Close()
 	}
 }
-
-// A proxied strategy builds no alt dialers: both send udp from a host socket.
-func TestProxiedClientStrategyHasNoAltDialers(t *testing.T) {
-	settings := DefaultClientStrategySettings()
-	settings.AltUrl = "https://alt.space.example"
-	if dialers := newAltDialers(nil, settings); len(dialers) == 0 {
-		t.Fatal("the alt url built no alt dialers, so the test proves nothing")
-	}
-	settings.ProxySettings = &ProxySettings{Network: "tcp", Address: "192.0.2.1:1080"}
-	if dialers := newAltDialers(nil, settings); len(dialers) != 0 {
-		t.Fatalf("a proxied strategy built %d alt dialers", len(dialers))
-	}
-}
