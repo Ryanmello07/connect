@@ -1660,6 +1660,15 @@ func NewPlatformTransport(
 	)
 }
 
+// Whether an h3 dial of a transport on clientStrategy would bypass the
+// strategy's proxy: a proxy is set, and no packet conn factory supplies the h3
+// endpoints in place of a host udp socket.
+func h3BypassesProxy(clientStrategy *ClientStrategy, settings *PlatformTransportSettings) bool {
+	return clientStrategy != nil &&
+		clientStrategy.ConnectSettings().ProxySettings != nil &&
+		settings.H3PacketConnFactory == nil
+}
+
 func NewPlatformTransportWithTargetMode(
 	ctx context.Context,
 	clientStrategy *ClientStrategy,
@@ -1766,6 +1775,22 @@ func NewPlatformTransportWithTargetMode(
 		if targetMode == TransportModeH3DnsPump {
 			log.Infof("[t]h3dnspump is not available over ipv6; using h3dns\n")
 			targetMode = TransportModeH3Dns
+			transport.targetMode = targetMode
+		}
+	}
+	if h3BypassesProxy(clientStrategy, settings) {
+		// every h3 mode sends udp from a host socket (openH3PacketConn), which
+		// a proxy cannot carry: it would leave from this host's own address
+		// instead of the proxy's, so a proxied transport runs h1 alone
+		for _, mode := range []TransportMode{TransportModeH3, TransportModeH3Dns, TransportModeH3DnsPump} {
+			delete(transport.modePreferences, mode)
+		}
+		if len(transport.modePreferences) == 0 {
+			transport.modePreferences[TransportModeH1] = 1
+		}
+		if isH3TransportMode(targetMode) {
+			log.Infof("[t]%s cannot dial through the proxy; using h1\n", targetMode)
+			targetMode = TransportModeH1
 			transport.targetMode = targetMode
 		}
 	}

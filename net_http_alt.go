@@ -55,6 +55,12 @@ func newAltDialers(clientStrategy *ClientStrategy, settings *ClientStrategySetti
 	if altHost == "" {
 		return nil
 	}
+	// both alt carriers send udp from a host socket, which a proxy cannot
+	// carry: a proxied strategy would reach the api from this host's own
+	// address instead of the proxy's
+	if settings.ProxySettings != nil {
+		return nil
+	}
 	dialers := []*clientDialer{}
 	for _, altDialer := range []struct {
 		description string
