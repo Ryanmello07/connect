@@ -1669,9 +1669,10 @@ type ClientSettings struct {
 	beforeClientKeyPublishForTest func()
 
 	// TransportDelay, when set, offers the per-message delay header on this
-	// client's P2P streams as the active side (DELAY.md §6.1). A passive
-	// side accepts an offer regardless, stamping and echoing only. Nil
-	// offers nothing; only non-provider window clients set it (D3).
+	// client's P2P streams as the active side, while the client's edges
+	// accept it on its platform connections (DELAY.md §6.1). A passive side
+	// accepts an offer regardless, stamping and echoing only. Nil offers
+	// nothing; only non-provider window clients set it (D3).
 	TransportDelay *TransportDelaySettings
 }
 
@@ -6875,7 +6876,8 @@ type SendSequence struct {
 	// A producer waiting outside Pack admission is still a real retention
 	// owner. Its arrival or departure wakes the loop to join or leave the
 	// shared budget's line without giving idle sequences a speculative turn.
-	retainedAdmissionWake chan struct{}
+	retainedAdmissionWake               chan struct{}
+	afterRetainedAdmissionDemandForTest func()
 	// Prepared provider returns have already paid memory admission. They must
 	// still wait for the same protocol window / reliable-flight capacity.
 	preparedFlightUnavailable resendCapacityGate
@@ -7324,14 +7326,27 @@ func (self *SendSequence) awaitResendCapacity(
 	if self.preparedPackFits(sendPack) {
 		gate = &self.preparedFlightUnavailable
 	}
+	if gate.closed.Load() {
+		return false, errors.New("send capacity source closed"), timeout
+	}
 	if gate.open(timeout != 0) {
 		return true, nil, timeout
 	}
 	if timeout == 0 {
+		if group, ok := sendPack.ackTarget.(*parsedPacketGroup); ok && group.isSynRetry() {
+			group.noteSynRetryCapacityRefusal(self, gate)
+		}
 		return false, nil, timeout
 	}
 	startTime := time.Now()
-	if waiter := gate.queue(); waiter != nil {
+	waiter := gate.queue()
+	if gate.closed.Load() {
+		if waiter != nil {
+			gate.abandon(waiter)
+		}
+		return false, errors.New("send capacity source closed"), timeout
+	}
+	if waiter != nil {
 		if gate == &self.resendCapacityUnavailable {
 			self.notifyRetainedAdmissionDemand()
 			defer self.notifyRetainedAdmissionDemand()
@@ -7343,6 +7358,10 @@ func (self *SendSequence) awaitResendCapacity(
 			timeoutChannel = timer.C
 		}
 		for passed := false; !passed; {
+			if gate.closed.Load() {
+				gate.abandon(waiter)
+				return false, errors.New("send capacity source closed"), timeout
+			}
 			select {
 			case <-sendPack.Ctx.Done():
 				gate.abandon(waiter)
@@ -7368,6 +7387,9 @@ func (self *SendSequence) notifyRetainedAdmissionDemand() {
 	select {
 	case self.retainedAdmissionWake <- struct{}{}:
 	default:
+	}
+	if hook := self.afterRetainedAdmissionDemandForTest; hook != nil {
+		hook()
 	}
 }
 
@@ -7688,6 +7710,9 @@ func (self *SendSequence) Pack(sendPack *SendPack, timeout time.Duration) (bool,
 		}
 	}
 	if sendPack.Ack {
+		if group, ok := sendPack.ackTarget.(*parsedPacketGroup); ok && group.isSynRetry() {
+			group.prepareSynRetryReadinessCapacity(self)
+		}
 		admitted, err, capacityTimeout := self.awaitResendCapacity(sendPack, timeout)
 		if err != nil || !admitted {
 			if err == nil {
@@ -9030,6 +9055,8 @@ func (self *SendSequence) Run() {
 	}()
 	defer func() {
 		self.cancel()
+		self.resendCapacityUnavailable.close()
+		self.preparedFlightUnavailable.close()
 		if ackWorkerStarted {
 			<-ackWorkerDone
 		}
@@ -13669,6 +13696,8 @@ func (self *SendSequence) closeContractMultiRouteWriter() {
 
 func (self *SendSequence) Close() {
 	self.cancel()
+	self.resendCapacityUnavailable.close()
+	self.preparedFlightUnavailable.close()
 	if self.packAdmission != nil {
 		self.packAdmission.close()
 	}
@@ -13706,6 +13735,8 @@ func (self *SendSequence) Close() {
 
 func (self *SendSequence) Cancel() {
 	self.cancel()
+	self.resendCapacityUnavailable.close()
+	self.preparedFlightUnavailable.close()
 }
 
 // Classifies a receiver-evidenced resend so it does not advance timeout backoff

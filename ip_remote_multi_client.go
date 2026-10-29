@@ -1419,6 +1419,8 @@ type MultiClientSettings struct {
 	ProviderPolicyPreferenceTtl time.Duration
 	// nil disables activity association (`IpAssoc`)
 	IpAssocSettings *IpAssocSettings
+	// Nil in production; installed before the owned association worker starts.
+	afterIpAssocShedForTest func(closed bool)
 
 	RemoteUserNatMultiClientMonitorSettings
 }
@@ -1662,6 +1664,13 @@ type RemoteUserNatMultiClient struct {
 	synRetryHead                  *tcpSynRetry
 	synRetryTail                  *tcpSynRetry
 	beforeSynRetryDispatchForTest func(*multiClientChannelUpdate)
+	// Credited capacity subscriptions share the existing reaper and parent lock.
+	synRetryReadyHead                 *tcpSynRetryReadiness
+	synRetryReadyTail                 *tcpSynRetryReadiness
+	synRetryReadyCount                int
+	synRetryReadinessRefusals         atomic.Uint64
+	beforeSynRetryReadinessForTest    func(*multiClientChannelUpdate)
+	beforeSynRetryReadinessArmForTest func(*multiClientChannelUpdate)
 
 	settings *MultiClientSettings
 	log      Logger
@@ -2708,7 +2717,15 @@ func NewRemoteUserNatMultiClient(
 		flowReaperDone:               make(chan struct{}),
 	}
 	if settings.IpAssocSettings != nil {
-		multiClient.ipAssoc = NewIpAssoc(cancelCtx, settings.IpAssocSettings)
+		cache := multiClient.blockActionCache
+		afterShed := cache.clear
+		if hook := settings.afterIpAssocShedForTest; hook != nil {
+			afterShed = func() {
+				cache.clear()
+				hook(cancelCtx.Err() != nil)
+			}
+		}
+		multiClient.ipAssoc = newIpAssoc(cancelCtx, settings.IpAssocSettings, afterShed)
 	}
 	multiClient.providerPolicyPreference = newProviderPolicyPreference(
 		SecurityPolicyGeneration(multiClient.securityPolicy),
@@ -3180,7 +3197,8 @@ func (self *RemoteUserNatMultiClient) invalidateServerNames(addrs []netip.Addr) 
 		self.blockActionCache.delete(key)
 		self.blockActionIgnoreCache.delete(key)
 		if self.ipAssoc != nil {
-			for _, member := range self.ipAssoc.GetClusterAddrs(key) {
+			_, members := self.ipAssoc.clusterMembers(key)
+			for _, member := range members {
 				memberKey := member.Unmap()
 				if memberKey != key {
 					self.blockActionCache.delete(memberKey)
@@ -3621,9 +3639,9 @@ func (self *RemoteUserNatMultiClient) destinationAffinityIpPathWithLock(ipPath *
 	// back to plain per-ip affinity rather than panicking
 	if self.reliabilitySettings().ClusterAffinityFallback && self.ipAssoc != nil {
 		if addr, ok := ipAssocAddr(ipPath.DestinationIp); ok {
-			// GetClusterAddrs is a lock-free atomic load, safe to call with the
-			// parent stateLock held
-			if rep, ok := clusterAffinityRepresentative(self.ipAssoc.GetClusterAddrs(addr)); ok {
+			// Immutable members use one lock-free atomic publication load.
+			_, members := self.ipAssoc.clusterMembers(addr)
+			if rep, ok := clusterAffinityRepresentative(members); ok {
 				destinationIp = rep.AsSlice()
 			}
 		}
@@ -4944,6 +4962,7 @@ func stopFlowReaperTimer(timer *time.Timer) {
 
 func (self *RemoteUserNatMultiClient) runFlowReaper() {
 	defer func() {
+		self.discardSynRetryReadiness()
 		self.discardSynRetries()
 		if self.flowReaperDone != nil {
 			close(self.flowReaperDone)
@@ -4954,6 +4973,7 @@ func (self *RemoteUserNatMultiClient) runFlowReaper() {
 	defer timer.Stop()
 
 	for {
+		self.drainSynRetryReadiness()
 		self.drainSynRetries()
 		if self.ctx.Err() != nil {
 			return
@@ -6290,7 +6310,7 @@ func (self *RemoteUserNatMultiClient) smtpBlockActionParts(
 	config := self.config.Load()
 	blockerActive := config.blocker != nil && config.blocker.Enabled()
 	if !ignored && (blockActionState.matcher != nil || self.blockActionCollector.hasCallbacks() || blockerActive) {
-		decision = self.blockActionDecision(blockActionState, config.blocker, blockerActive, ipPath)
+		decision = self.blockActionDecision(blockActionState, config.blocker, blockerActive, ipPath, config)
 	}
 	if decision != nil {
 		match = decision.match
@@ -6538,7 +6558,7 @@ func (self *RemoteUserNatMultiClient) sendPacketWithPolicy(
 	blockerActive := config.blocker != nil && config.blocker.Enabled()
 	var decision *blockActionDecision
 	if !ignored && (blockActionState.matcher != nil || self.blockActionCollector.hasCallbacks() || blockerActive) {
-		decision = self.blockActionDecision(blockActionState, config.blocker, blockerActive, ipPath)
+		decision = self.blockActionDecision(blockActionState, config.blocker, blockerActive, ipPath, config)
 	}
 	var match *blockActionMatch
 	blockerBlock := false
@@ -6662,7 +6682,7 @@ func (self *RemoteUserNatMultiClient) sendReassembledUdpFragmentsWithPolicy(
 	blockerActive := config.blocker != nil && config.blocker.Enabled()
 	var decision *blockActionDecision
 	if !ignored && (blockActionState.matcher != nil || self.blockActionCollector.hasCallbacks() || blockerActive) {
-		decision = self.blockActionDecision(blockActionState, config.blocker, blockerActive, ipPath)
+		decision = self.blockActionDecision(blockActionState, config.blocker, blockerActive, ipPath, config)
 	}
 	var match *blockActionMatch
 	blockerBlock := false
@@ -6979,7 +6999,7 @@ func (self *RemoteUserNatMultiClient) sendPacketGroup(
 	blockerActive := config.blocker != nil && config.blocker.Enabled()
 	var decision *blockActionDecision
 	if !ignored && (blockActionState.matcher != nil || self.blockActionCollector.hasCallbacks() || blockerActive) {
-		decision = self.blockActionDecision(blockActionState, config.blocker, blockerActive, ipPath)
+		decision = self.blockActionDecision(blockActionState, config.blocker, blockerActive, ipPath, config)
 	}
 	var match *blockActionMatch
 	blockerBlock := false
@@ -7112,39 +7132,41 @@ func (self *RemoteUserNatMultiClient) sendPreparedPacketGroup(
 // the cached override match, blocker match, and server names for a
 // destination. the external lookups (server names, cluster) run outside the
 // cache lock
-func (self *RemoteUserNatMultiClient) blockActionDecision(state *blockActionState, blocker Blocker, blockerActive bool, ipPath *IpPath) *blockActionDecision {
+func (self *RemoteUserNatMultiClient) blockActionDecision(state *blockActionState, blocker Blocker, blockerActive bool, ipPath *IpPath, configs ...*multiClientConfig) *blockActionDecision {
 	addr, ok := ipAssocAddr(ipPath.DestinationIp)
 	if !ok {
 		return nil
 	}
 
+	// Capture invalidation before source ownership so a pre-shed snapshot
+	// cannot obtain a post-shed cache token.
+	cacheEpoch := self.blockActionCache.epoch.Load()
 	var clusterVersion uint64
+	var members []netip.Addr
 	if self.ipAssoc != nil {
-		clusterVersion = self.ipAssoc.ClusterVersion()
+		clusterVersion, members = self.ipAssoc.clusterMembers(addr)
 	}
 	now := time.Now()
 
-	if decision := self.blockActionCache.get(addr, state.version, clusterVersion, blockerActive, now); decision != nil {
-		return decision
-	}
-
-	// decisions are made on the cluster level.
-	// a destination with no cluster is a cluster of itself
-	clusterIps := []netip.Addr{addr}
-	if self.ipAssoc != nil {
-		if members := self.ipAssoc.GetClusterAddrs(addr); 0 < len(members) {
-			// The published snapshot is immutable. Only this cache miss owns
-			// a mutable copy to order for the decision.
-			clusterIps = slices.Clone(members)
+	// Packet callers bind the immutable config they sampled before entering
+	// this method. An old caller cannot acquire a post-replacement cache epoch.
+	if len(configs) == 0 || self.config.Load() == configs[0] {
+		if decision := self.blockActionCache.get(addr, state.version, clusterVersion, blockerActive, now); decision != nil {
+			return decision
 		}
 	}
-	slices.SortFunc(clusterIps, func(a netip.Addr, b netip.Addr) int {
-		return a.Compare(b)
-	})
+
+	// A published cluster is already ordered and immutable; singleton state
+	// belongs to this decision. No per-destination cluster backing is copied.
+	clusterIps := members
+	if len(clusterIps) == 0 {
+		clusterIps = []netip.Addr{addr}
+	}
 
 	decision := &blockActionDecision{
 		overridesVersion: state.version,
 		clusterVersion:   clusterVersion,
+		cacheEpoch:       cacheEpoch,
 		blockerEnabled:   blockerActive,
 		expireTime:       now.Add(self.blockActionCache.ttl),
 		clusterKey:       clusterIps[0],
@@ -7182,7 +7204,14 @@ func (self *RemoteUserNatMultiClient) blockActionDecision(state *blockActionStat
 	if match != nil && match.any() {
 		decision.match = match
 	}
-	self.blockActionCache.put(addr, decision)
+	// Retired overrides or a changed blocker may finish for this caller but
+	// cannot establish reusable cache ownership.
+	current := self.blockActionState.Load()
+	if (len(configs) == 0 || self.config.Load() == configs[0]) &&
+		(current == nil || current.version == state.version) &&
+		(blocker == nil && !blockerActive || blocker != nil && blocker.Enabled() == blockerActive) {
+		self.blockActionCache.putForSource(addr, decision, self.ipAssoc)
+	}
 	return decision
 }
 
@@ -7814,6 +7843,9 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 					return
 				}
 
+				if sendPacketGroup.isSynRetry() {
+					sendPacketGroup.noteSynRetryReadinessWidth(1)
+				}
 				sendPacketGroup.prepareAdmissionObservations(client)
 				sendPacketGroup.completionSelection = nil
 				// A one-candidate formation still has an initial race/probe
@@ -7974,6 +8006,9 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 					return
 				}
 
+				if sendPacketGroup.isSynRetry() {
+					sendPacketGroup.noteSynRetryReadinessWidth(len(raceOrderedClients))
+				}
 				var scheduleOnce sync.Once
 				scheduleRace := func() {
 					if initRace != nil {
@@ -10063,6 +10098,7 @@ func (self *RemoteUserNatMultiClient) RemoveProvider(egressClientId Id) bool {
 }
 
 func (self *RemoteUserNatMultiClient) Close() {
+	self.blockActionCache.close()
 	self.cancel()
 	self.egressIpv4Fragments.close()
 
