@@ -330,6 +330,13 @@ func (self *ConnectSettings) NetDialer() *net.Dialer {
 	}))
 }
 
+// dialsThroughProxy reports that the tcp dials of these settings go through
+// ProxySettings. A DialContextSettings dial context takes priority over the
+// proxy (DialContext), so those settings do not.
+func (self *ConnectSettings) dialsThroughProxy() bool {
+	return self.ProxySettings != nil && self.DialContextSettings == nil
+}
+
 type ProxySettings struct {
 	Network string
 	Address string
@@ -355,7 +362,7 @@ func (self *ProxySettings) NewDialContext(ctx context.Context, forward proxy.Dia
 			conn, err = proxyDialer.Dial(network, addr)
 		}
 		if err != nil {
-			return nil, err
+			return nil, proxyDialError(err)
 		}
 		return conn, nil
 	}

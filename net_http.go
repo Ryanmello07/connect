@@ -471,7 +471,11 @@ func NewClientStrategy(ctx context.Context, settings *ClientStrategySettings) *C
 			dialers[dialer] = true
 		}
 	}
-	if settings.EnableResilient {
+	// Through a socks proxy the resilient variants only add parallel
+	// connections: the proxy carries the same TLS bytes for each of them, and
+	// a shared proxy gateway refuses the burst. A proxied strategy keeps the
+	// one normal dialer.
+	if settings.EnableResilient && !settings.ConnectSettings.dialsThroughProxy() {
 		// TODO ECH support
 		if settings.ExposeServerHostNames && settings.ExposeServerIps {
 			// fragment+reorder

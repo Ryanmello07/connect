@@ -55,6 +55,12 @@ func newAltDialers(clientStrategy *ClientStrategy, settings *ClientStrategySetti
 	if altHost == "" {
 		return nil
 	}
+	// alt dials quic from a host udp socket, which a socks proxy cannot
+	// carry. On a proxied strategy it would send the api traffic from the
+	// host's own address instead of the proxy's.
+	if settings.ConnectSettings.dialsThroughProxy() {
+		return nil
+	}
 	dialers := []*clientDialer{}
 	for _, altDialer := range []struct {
 		description string
