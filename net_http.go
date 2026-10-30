@@ -2458,7 +2458,10 @@ func (self *ClientStrategy) expandExtenderDialers() (expandedDialers []*clientDi
 				extenderConfigsForCandidate(customExtenderCandidate(ip), extenderIpSecrets[ip], spoofDomains)...,
 			)
 		}
-	} else if directory := self.settings.ExtenderDirectory; directory != nil {
+	} else if directory := self.settings.ExtenderDirectory; directory != nil && !self.settings.ConnectSettings.dialsThroughProxy() {
+		// a proxied strategy draws no discovered extenders: each would be one
+		// more parallel connection through the proxy, which a shared proxy
+		// gateway refuses in a burst. Custom extenders above still apply.
 		familyCandidates := [][]*ExtenderCandidate{}
 		candidates := directory.Candidates
 		if self.settings.DisableManualExtenders {

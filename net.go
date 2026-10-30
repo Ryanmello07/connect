@@ -345,6 +345,12 @@ type ProxySettings struct {
 
 func (self *ProxySettings) NewDialContext(ctx context.Context, forward proxy.Dialer) DialContextFunction {
 	return func(ctx context.Context, network string, addr string) (net.Conn, error) {
+		release, err := acquireProxyHostDial(ctx, self.Address)
+		if err != nil {
+			return nil, err
+		}
+		defer release()
+
 		proxyDialer, err := proxy.SOCKS5(
 			self.Network,
 			self.Address,

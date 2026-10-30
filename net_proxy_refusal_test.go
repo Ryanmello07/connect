@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/netip"
+	"sync"
 	"testing"
 	"time"
 )
@@ -122,5 +124,112 @@ func TestProxiedClientStrategyKeepsOneProxiedDialer(t *testing.T) {
 	injected.DialContextSettings = &DialContextSettings{DialContext: (&net.Dialer{}).DialContext}
 	if got := descriptions(injected); !got["fragment"] || !got["alt h3"] {
 		t.Fatalf("an injected dial context lost its dialers: %v", got)
+	}
+}
+
+// Socks dials to one proxy host wait for one of ProxyHostDialConcurrency
+// slots, across ports; a waiting dial gives up with its context.
+func TestProxyHostDialsAreBounded(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	var stateLock sync.Mutex
+	inFlight, maxInFlight := 0, 0
+	hold := make(chan struct{})
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				stateLock.Lock()
+				inFlight++
+				maxInFlight = max(maxInFlight, inFlight)
+				stateLock.Unlock()
+				<-hold
+				stateLock.Lock()
+				inFlight--
+				stateLock.Unlock()
+			}()
+		}
+	}()
+
+	// one gateway host, two port spellings: the host is the key
+	_, port, _ := net.SplitHostPort(listener.Addr().String())
+	addresses := []string{"127.0.0.1:" + port, "127.0.0.1:" + port}
+
+	n := ProxyHostDialConcurrency + 8
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	for i := range n {
+		settings := DefaultConnectSettings()
+		settings.ProxySettings = &ProxySettings{Network: "tcp", Address: addresses[i%2]}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := settings.DialContext(ctx, "tcp", "api.example:443")
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(hold)
+	close(errs)
+
+	stateLock.Lock()
+	defer stateLock.Unlock()
+	if maxInFlight != ProxyHostDialConcurrency {
+		t.Fatalf("%d socks dials reached the proxy host at once, want %d", maxInFlight, ProxyHostDialConcurrency)
+	}
+	waited := 0
+	for err := range errs {
+		if errors.Is(err, context.DeadlineExceeded) {
+			waited++
+		}
+	}
+	if waited < n-ProxyHostDialConcurrency {
+		t.Fatalf("%d dials ended with their context, want at least %d", waited, n-ProxyHostDialConcurrency)
+	}
+}
+
+// A proxied strategy draws no extenders from its directory; the same
+// directory gives a direct strategy its extender dialers.
+func TestProxiedClientStrategyExpandsNoDirectoryExtenders(t *testing.T) {
+	clock := newTestClock()
+	directory, rootPrivateKey := newTestExtenderDirectory(t, clock, nil)
+	t.Cleanup(setSpoofDomainsForTest([]string{"spoof.example"}))
+	t.Cleanup(swapControlFamilyProbe(func(family int) bool { return true }))
+	ip := netip.MustParseAddr("192.0.2.111")
+	record := signTestRecord(
+		t,
+		rootPrivateKey,
+		newTestExtenderKey(t),
+		clock.Now(),
+		clock.Now().Add(14*24*time.Hour),
+		testExtenderAddress(ip.String(), ExtenderCarrierTcp),
+	)
+	if _, err := directory.ApplyRecord(record, ExtenderSourceFeed); err != nil {
+		t.Fatal(err)
+	}
+	expand := func(proxied bool) int {
+		settings := DefaultClientStrategySettings()
+		settings.ExtenderDirectory = directory
+		if proxied {
+			settings.ProxySettings = &ProxySettings{Network: "tcp", Address: "192.0.2.1:1080"}
+		}
+		strategy := NewClientStrategy(context.Background(), settings)
+		defer strategy.Close()
+		return len(strategy.expandExtenderDialers())
+	}
+	if expand(false) == 0 {
+		t.Fatal("a direct strategy expanded no extenders, so the test proves nothing")
+	}
+	if n := expand(true); n != 0 {
+		t.Fatalf("a proxied strategy expanded %d extender dialers", n)
 	}
 }
