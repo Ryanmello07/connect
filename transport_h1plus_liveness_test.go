@@ -33,79 +33,12 @@ type h1LivenessConn struct {
 	writeTimedOut        atomic.Bool
 	closeOnce            sync.Once
 	closed               chan struct{}
-	// deadlineStatsLock guards deadlineStats: the deadline installations that
-	// reached this socket and the time its write deadline left as writes began
-	deadlineStatsLock sync.Mutex
-	deadlineStats     h1LivenessDeadlineStats
-}
-
-// The socket deadline activity since the last reset.
-type h1LivenessDeadlineStats struct {
-	readDeadlineCount  int
-	writeDeadlineCount int
-	// the write deadline the socket holds, zero for none
-	writeDeadline time.Time
-	// writes begun, and the least and most time their write deadline left
-	writeCount               int
-	leastWriteDeadlineLeft   time.Duration
-	mostWriteDeadlineLeft    time.Duration
-	writesWithoutAnyDeadline int
-}
-
-// Forgets the counts so far, such as the upgrade's, but not the deadline the
-// socket holds.
-func (self *h1LivenessConn) resetDeadlineStats() {
-	self.deadlineStatsLock.Lock()
-	defer self.deadlineStatsLock.Unlock()
-	self.deadlineStats = h1LivenessDeadlineStats{writeDeadline: self.deadlineStats.writeDeadline}
-}
-
-// The counts since the last reset.
-func (self *h1LivenessConn) deadlineStatsSnapshot() h1LivenessDeadlineStats {
-	self.deadlineStatsLock.Lock()
-	defer self.deadlineStatsLock.Unlock()
-	return self.deadlineStats
-}
-
-// Records the write deadline in force as a write begins.
-func (self *h1LivenessConn) noteWriteBegin() {
-	self.deadlineStatsLock.Lock()
-	defer self.deadlineStatsLock.Unlock()
-	stats := &self.deadlineStats
-	stats.writeCount += 1
-	if stats.writeDeadline.IsZero() {
-		stats.writesWithoutAnyDeadline += 1
-		return
-	}
-	left := time.Until(stats.writeDeadline)
-	if stats.writeCount-stats.writesWithoutAnyDeadline == 1 {
-		// the first write with a deadline
-		stats.leastWriteDeadlineLeft = left
-		stats.mostWriteDeadlineLeft = left
-	} else {
-		stats.leastWriteDeadlineLeft = min(stats.leastWriteDeadlineLeft, left)
-		stats.mostWriteDeadlineLeft = max(stats.mostWriteDeadlineLeft, left)
-	}
-}
-
-// The upgrade installs both deadlines together; count only what it leaves.
-func (self *h1LivenessConn) SetDeadline(deadline time.Time) error {
-	if err := self.Conn.SetDeadline(deadline); err != nil {
-		return err
-	}
-	self.deadlineStatsLock.Lock()
-	defer self.deadlineStatsLock.Unlock()
-	self.deadlineStats.writeDeadline = deadline
-	return nil
+	// Tests pause only after the delegated socket operation succeeded.
+	afterIoForTest atomic.Pointer[func(write bool, n int)]
 }
 
 // Successful deadline installation delegates to the same bounded pipe.
 func (self *h1LivenessConn) SetReadDeadline(deadline time.Time) error {
-	func() {
-		self.deadlineStatsLock.Lock()
-		defer self.deadlineStatsLock.Unlock()
-		self.deadlineStats.readDeadlineCount += 1
-	}()
 	if self.failReadDeadline.Load() {
 		self.readRejected.Store(true)
 		return errors.New("synthetic read deadline rejected")
@@ -115,22 +48,11 @@ func (self *h1LivenessConn) SetReadDeadline(deadline time.Time) error {
 
 // A rejected writer deadline must not permit the heartbeat write to proceed.
 func (self *h1LivenessConn) SetWriteDeadline(deadline time.Time) error {
-	func() {
-		self.deadlineStatsLock.Lock()
-		defer self.deadlineStatsLock.Unlock()
-		self.deadlineStats.writeDeadlineCount += 1
-	}()
 	if self.failWriteDeadline.Load() {
 		self.writeRejected.Store(true)
 		return errors.New("synthetic write deadline rejected")
 	}
-	if err := self.Conn.SetWriteDeadline(deadline); err != nil {
-		return err
-	}
-	self.deadlineStatsLock.Lock()
-	defer self.deadlineStatsLock.Unlock()
-	self.deadlineStats.writeDeadline = deadline
-	return nil
+	return self.Conn.SetWriteDeadline(deadline)
 }
 
 // Counts only a new read begun after a deadline error, not an in-flight read.
@@ -138,7 +60,13 @@ func (self *h1LivenessConn) Read(message []byte) (int, error) {
 	if self.readRejected.Load() {
 		self.readsAfterRejection.Add(1)
 	}
-	return self.Conn.Read(message)
+	n, err := self.Conn.Read(message)
+	if err == nil {
+		if hook := self.afterIoForTest.Load(); hook != nil {
+			(*hook)(false, n)
+		}
+	}
+	return n, err
 }
 
 // The ordinary failure case tests the real writer's existing terminal path.
@@ -149,10 +77,14 @@ func (self *h1LivenessConn) Write(message []byte) (int, error) {
 	if self.failWrite.Load() {
 		return 0, errors.New("synthetic socket write failed")
 	}
-	self.noteWriteBegin()
 	self.writesInProgress.Add(1)
 	defer self.writesInProgress.Add(-1)
 	n, err := self.Conn.Write(message)
+	if err == nil {
+		if hook := self.afterIoForTest.Load(); hook != nil {
+			(*hook)(true, n)
+		}
+	}
 	var timeout net.Error
 	if errors.As(err, &timeout) && timeout.Timeout() {
 		self.writeTimedOut.Store(true)
@@ -375,11 +307,6 @@ func newH1LivenessFixtureWithRoutes(t *testing.T, pausePeer bool, writeTimeout t
 		settings.WriteTimeout = writeTimeout
 	}
 	settings.ReconnectTimeout = time.Hour
-	// Exact deadlines, re-armed before every operation, so that a boundary
-	// test here reads the timeout itself. The lazy re-arm's tests restore the
-	// production slack (withLazyH1Deadlines).
-	settings.ReadDeadlineSlackFraction = 0
-	settings.WriteDeadlineSlackFraction = 0
 	settings.TransportBufferSize = 1
 	settings.H1PlusStats = fixture.stats
 	settings.H1ConnectionStats = fixture.connectionStats

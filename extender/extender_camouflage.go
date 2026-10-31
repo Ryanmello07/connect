@@ -464,15 +464,12 @@ func (self *extenderCamouflage) spliceDohCache() *connect.DohCache {
 // timeout. Owns and joins cancellation from before the first write, including
 // failed and partial hello writes. None of it touches the O1 relay counters (P10).
 //
-// The idle deadlines are re-armed lazily, as in the relay (relayDeadline): a
-// read or write still fails no earlier than the idle timeout after it starts.
-// Each connection's write deadline is owned by the one goroutine that writes
-// it: the site's by this one for the hello and then by its copy worker.
+// Native deadlines bound each socket read or write, including the hello,
+// without canceling an operation that already completed while its caller was
+// descheduled. A non-positive idle timeout leaves both directions unbounded.
 func (self *extenderCamouflage) relaySplice(ctx context.Context, clientConn net.Conn, siteConn net.Conn, initialBytes []byte) {
 	idle := self.settings.ProxyIdleTimeout
 	maxByteCount := self.settings.ProxyMaxResponseByteCount
-	clientWriteDeadline := newRelayDeadline(idle, self.settings.RelayDeadlineSlackFraction)
-	siteWriteDeadline := newRelayDeadline(idle, self.settings.RelayDeadlineSlackFraction)
 
 	relayCtx, relayCancel := context.WithCancel(ctx)
 	var relayWorkers sync.WaitGroup
@@ -487,17 +484,22 @@ func (self *extenderCamouflage) relaySplice(ctx context.Context, clientConn net.
 		<-connectionsClosed
 		relayWorkers.Wait()
 	}()
-	// The peek's header budget ends at this handoff. Relay I/O installs its
-	// own idle deadlines, including leaving them unset when idle is disabled.
-	clientConn.SetDeadline(time.Time{})
-	writeAll := func(dst net.Conn, dstWriteDeadline *relayDeadline, writeBytes []byte) bool {
+	// The peek's header budget ends at this handoff, including when the
+	// splice's own idle budget is disabled.
+	if err := clientConn.SetDeadline(time.Time{}); err != nil {
+		return
+	}
+	if err := siteConn.SetDeadline(time.Time{}); err != nil {
+		return
+	}
+	writeAll := func(dst net.Conn, writeBytes []byte) bool {
 		for 0 < len(writeBytes) {
 			if relayCtx.Err() != nil {
 				return false
 			}
 			if 0 < idle {
-				if deadline, changed := dstWriteDeadline.next(time.Now()); changed {
-					dst.SetWriteDeadline(deadline)
+				if err := dst.SetWriteDeadline(time.Now().Add(idle)); err != nil {
+					return false
 				}
 			}
 			n, err := dst.Write(writeBytes)
@@ -508,16 +510,15 @@ func (self *extenderCamouflage) relaySplice(ctx context.Context, clientConn net.
 		}
 		return true
 	}
-	if !writeAll(siteConn, &siteWriteDeadline, initialBytes) {
+	if !writeAll(siteConn, initialBytes) {
 		return
 	}
 
 	var relayedByteCount atomicInt64
-	copyDirection := func(dst net.Conn, dstWriteDeadline *relayDeadline, src net.Conn) {
+	copyDirection := func(dst net.Conn, src net.Conn) {
 		defer relayWorkers.Done()
 		defer relayCancel()
 		buffer := make([]byte, extenderCamouflageSpliceBufferByteCount)
-		srcReadDeadline := newRelayDeadline(idle, self.settings.RelayDeadlineSlackFraction)
 		for {
 			select {
 			case <-relayCtx.Done():
@@ -525,8 +526,8 @@ func (self *extenderCamouflage) relaySplice(ctx context.Context, clientConn net.
 			default:
 			}
 			if 0 < idle {
-				if deadline, changed := srcReadDeadline.next(time.Now()); changed {
-					src.SetReadDeadline(deadline)
+				if err := src.SetReadDeadline(time.Now().Add(idle)); err != nil {
+					return
 				}
 			}
 			n, err := src.Read(buffer)
@@ -536,7 +537,7 @@ func (self *extenderCamouflage) relaySplice(ctx context.Context, clientConn net.
 					// splice, never counting the byte as O1 relay traffic
 					return
 				}
-				if !writeAll(dst, dstWriteDeadline, buffer[:n]) {
+				if !writeAll(dst, buffer[:n]) {
 					return
 				}
 			}
@@ -546,8 +547,8 @@ func (self *extenderCamouflage) relaySplice(ctx context.Context, clientConn net.
 		}
 	}
 	relayWorkers.Add(2)
-	go connect.HandleError(func() { copyDirection(siteConn, &siteWriteDeadline, clientConn) }, relayCancel)
-	go connect.HandleError(func() { copyDirection(clientConn, &clientWriteDeadline, siteConn) }, relayCancel)
+	go connect.HandleError(func() { copyDirection(siteConn, clientConn) }, relayCancel)
+	go connect.HandleError(func() { copyDirection(clientConn, siteConn) }, relayCancel)
 	<-relayCtx.Done()
 }
 
