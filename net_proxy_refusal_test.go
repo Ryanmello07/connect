@@ -158,7 +158,7 @@ func TestProxyHostDialsAreBounded(t *testing.T) {
 		}
 	}()
 
-	// one gateway host, two port spellings: the host is the key
+	// one gateway host for every dial: the host, not the port, is the key
 	_, port, _ := net.SplitHostPort(listener.Addr().String())
 	addresses := []string{"127.0.0.1:" + port, "127.0.0.1:" + port}
 
@@ -194,6 +194,55 @@ func TestProxyHostDialsAreBounded(t *testing.T) {
 	}
 	if waited < n-ProxyHostDialConcurrency {
 		t.Fatalf("%d dials ended with their context, want at least %d", waited, n-ProxyHostDialConcurrency)
+	}
+	// every slot is free again after the dials ended with an error
+	freeCtx, freeCancel := context.WithTimeout(context.Background(), time.Second)
+	defer freeCancel()
+	for range ProxyHostDialConcurrency {
+		release, err := acquireProxyHostDial(freeCtx, addresses[0])
+		if err != nil {
+			t.Fatalf("a slot stayed held after its dial ended: %v", err)
+		}
+		defer release()
+	}
+}
+
+// A gateway that accepts the connection and never answers the handshake
+// holds a slot only until the dial's own timeout, even when the caller's
+// context has no deadline.
+func TestProxyHostDialStallEndsAtItsTimeout(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				<-done
+			}()
+		}
+	}()
+	previous := proxyHostDialTimeout
+	proxyHostDialTimeout = 200 * time.Millisecond
+	defer func() { proxyHostDialTimeout = previous }()
+
+	settings := DefaultConnectSettings()
+	settings.ProxySettings = &ProxySettings{Network: "tcp", Address: listener.Addr().String()}
+	start := time.Now()
+	_, err = settings.DialContext(context.Background(), "tcp", "api.example:443")
+	if err == nil {
+		t.Fatal("a stalled handshake dialed")
+	}
+	if elapsed := time.Since(start); 5*time.Second < elapsed {
+		t.Fatalf("a stalled handshake held its slot for %s", elapsed)
 	}
 }
 

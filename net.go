@@ -350,6 +350,11 @@ func (self *ProxySettings) NewDialContext(ctx context.Context, forward proxy.Dia
 			return nil, err
 		}
 		defer release()
+		// a slot is shared by every proxy on the host, so a gateway that
+		// accepts the connection and never answers the handshake cannot hold
+		// it longer than this, even for a caller with no deadline
+		ctx, cancel := context.WithTimeout(ctx, proxyHostDialTimeout)
+		defer cancel()
 
 		proxyDialer, err := proxy.SOCKS5(
 			self.Network,

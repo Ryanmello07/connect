@@ -5,6 +5,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"time"
 )
 
 // ProxyUnavailableError is a socks refusal that a busy or briefly failing
@@ -61,6 +62,10 @@ func proxyDialError(err error) error {
 // Established connections do not count; only the setup does. A dial waits for
 // a slot within its own context.
 const ProxyHostDialConcurrency = 32
+
+// proxyHostDialTimeout bounds one socks dial, connect and handshake, while it
+// holds a slot. The connect alone has the dialer's own timeout.
+var proxyHostDialTimeout = 30 * time.Second
 
 var proxyHostDials = struct {
 	mutex sync.Mutex

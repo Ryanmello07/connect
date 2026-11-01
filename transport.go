@@ -1661,11 +1661,12 @@ func NewPlatformTransport(
 }
 
 // Whether an h3 dial of a transport on clientStrategy would bypass the
-// strategy's proxy: a proxy is set, and no packet conn factory supplies the h3
+// strategy's proxy: its tcp dials go through the proxy (an injected dial
+// context takes priority over one), and no packet conn factory supplies the h3
 // endpoints in place of a host udp socket.
 func h3BypassesProxy(clientStrategy *ClientStrategy, settings *PlatformTransportSettings) bool {
 	return clientStrategy != nil &&
-		clientStrategy.ConnectSettings().ProxySettings != nil &&
+		clientStrategy.ConnectSettings().dialsThroughProxy() &&
 		settings.H3PacketConnFactory == nil
 }
 
