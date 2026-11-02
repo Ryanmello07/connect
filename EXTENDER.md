@@ -216,7 +216,16 @@ A7. Family match. The forward dial and the reverse proxy transport use
 `tcp4` or `tcp6` by the family of the client's outer socket, so name
 resolution yields only that family. The udp carriers use the family of the
 datagram source. A destination with no address of that family fails the
-request; the client moves to another extender.
+request; the client moves to another extender. The forward dial, stream or
+datagram, is bounded by `ForwardDialTimeout`, 5 s (connect#230). The
+extender has already answered the request when it dials, so a dial that
+never connected used to hold the client's stream open, silently, for as
+long as the embedder's dialer did, which had no timeout. 5 s allows two lost
+SYNs or a slow resolver, and it is half of the operator's 10 s activation
+probe budget (C2): a forward dial that fails closes the stream while the
+probe still has budget left to see it close. The failure reaches
+`ErrorHandler` as `ExtenderErrorStageForwardDial` or
+`ExtenderErrorStageDatagramForwardDial`.
 
 A8. Reserved services. `Service` 1 (gossip) hands the taken-over stream to
 the in-process gossip listener (D2). `Service` 2 (feed) hands it to the
@@ -233,7 +242,7 @@ callback until its consumer releases the connection.
 
 A9. Limits. Relay read and write timeouts 30 s as today. Header read
 deadline 10 s, which also bounds the outer handshake and, as the HTTP
-server's read timeout, the request body. Per-source concurrent connections 64, total 4096, both
+server's read timeout, the request body. Forward dial 5 s (A7). Per-source concurrent connections 64, total 4096, both
 settings. Idle QUIC connections close after 30 s.
 
 A10. Spoof list and dial. `SpoofDomains()` in connect root returns the
@@ -589,13 +598,15 @@ limit 6 per hour per client and 60 per hour per account, each per address
 family, so one family's failures never spend the other's (2026-10-28). An
 activation posted to `api-v4` or `api-v6` that arrives on the other family
 is refused before it is probed. The handler probes the caller ip synchronously
-within 10 s: for each requested carrier, `connect.ProbeExtenderCarrier`
-dials that carrier with a random spoof name, sends a header with a
-challenge and verifies the response signature against `public_key_hex`;
-then `connect.ProbeExtenderForward` performs a verified `GET /hello`
-through the tcp carrier to the api url. Result `{activated, ip,
-ip_version, carriers, refused_carriers, error, expire_time, allowed_hosts,
-record, bootstrap}`: `record` is the extender's own freshly signed record,
+within one 10 s probe budget, in this order: the required test (C2a) --
+`connect.ProbeExtenderCarrier` dials the tcp carrier with a random spoof
+name, sends a header with a challenge and verifies the response signature
+against `public_key_hex`, then `connect.ProbeExtenderForward` performs a
+verified `GET /hello` through the tcp carrier to the api url -- and only
+then each offered optional carrier: each dns port under its own 3 s (L2),
+then quic with what is left. Result `{activated, ip, ip_version,
+carriers, refused_carriers, probe_steps, error, expire_time,
+allowed_hosts, record, bootstrap}`: `record` is the extender's own freshly signed record,
 `bootstrap` up to 8 signed records of other active extenders, chosen at
 random, `allowed_hosts` the operator patterns of A5. On success the row
 and the family's address row are upserted active, `record_issue_time` is
@@ -603,7 +614,7 @@ set, and a record publish row is inserted. The country comes from the ip
 geolocation of the caller. A failed required test (C2a) returns `activated: false`
 with the failing test in `error` and stores nothing. An optional carrier
 that fails its probe is left out of the stored `carriers` and listed in
-`refused_carriers` (carrier, port, error); it does not fail the activation. Acceptance requires
+`refused_carriers` (carrier, port, error, elapsed_ms, budget_left_ms); it does not fail the activation. Acceptance requires
 public tcp (the offered `tcp_port`, 443 by default) or peer-to-peer webrtc, each of which proves the forward
 (C2a). Zero ports and an empty tld
 take the C1 defaults. The budgets are spent at the probe: every check that
@@ -652,6 +663,33 @@ it passes at least one required test. Every other carrier is optional.
   failing an activation that passed a required test; the uptime task probes
   a webrtc-accepted address over webrtc and does not deactivate it for a
   missing tcp port.
+
+C2b. Probe timing (connect#230, 2026-11-01). Every probe step is timed,
+because the steps share one budget and an answer that came too late, one
+starved by the steps before it, and no answer at all were the same
+`context deadline exceeded`. `probe_steps` lists every step run, in order,
+refusals included: `name` (`tcp`, `forward`, `dns`, `quic`), `ip_version`,
+`port` (the forward names the tcp port it runs over), `elapsed_ms`,
+`budget_left_ms` (what was left of the 10 s budget when the step started)
+and `outcome` (`ok`; `error`, it failed on its own; `timeout`, its budget
+ran out before it answered). A refusal's last step is the one that refused
+it; a request refused before the probe has no list. Each
+`refused_carriers` entry carries the same two times. A refusal says how
+long its step ran: "the forward failed after 0.1 s: ..." makes no claim
+about the budget, while a step whose budget ran out says how much it had,
+"the forward did not answer within the 0.5 s left of the 10 s probe
+budget: context deadline exceeded" or "the tcp carrier did not answer
+within the 10 s probe budget: ...". A left out carrier that timed out reads
+"no answer within 3 s: ..." for a dns port and "no answer within the 6.5 s
+left of the 10 s probe budget: ..." for quic; one that failed on its own
+keeps its probe's error. Old providers decode the answer into
+`connect.ExtenderActivateResult`, which skips the new fields. The api
+counts every activation in `urnetwork_extender_activations_total{stage,
+outcome, family}` -- stage `request`, `config`, `budget`, `tcp`, `forward`
+or `store`; outcome `refused`, `error`, `timeout`, `other_family` or
+`activated`; family `ipv4`, `ipv6` or `unknown` -- and times every step in
+`urnetwork_extender_activation_step_seconds{step, outcome}`, a histogram
+whose buckets end at 10 s. The extenders dashboard shows both.
 
 C3. Uptime probes. Taskworker task every 5 minutes over every active
 address, batched, concurrency 16, a challenge probe over the required path
@@ -1084,7 +1122,10 @@ tcp 443 first, the one port an extender requires, and only then start
 device opts in (`DeviceLocalSettings.ProvideExtenderDnsPrivilegedPort`,
 L2), each udp carrier bound independently and a failed udp bind disabling
 that carrier alone; the forward dialer is
-the device's egress-aware connect dial narrowed by family; the whitelist is
+the device's egress-aware connect dial narrowed by family, and its failures
+(A7) are logged, the first of each kind at once and then at most one line a
+minute carrying the count since, so an extender whose egress cannot reach
+the operator says so (connect#230); the whitelist is
 A5 from the space hosts plus the spoof list; the space's node is rebuilt
 with the extender role, the in-process listener, the feed server and the
 listen addresses of the activated families, so it becomes a listening
@@ -1109,21 +1150,71 @@ advertised. When the user has chosen the feed-only gossip mode, the role
 runs the server and the feed service without a node and refuses the gossip
 service.
 
-G3. Activation loop. At start, every 24 hours, and on triggers: own key
-revoked as observed in the directory, the observed public address from
-hello changing (checked hourly), and network change. Per family with a
-global address (`FamilySupported`), `POST` activate to the family api
-url with the client jwt through a direct-only client strategy, since an
-activation that crossed an extender would publish the extender's address,
-apply the bootstrap records to the directory, and record the status.
-Backoff on failure 10 minutes doubling to 6 hours; a refusal of any
-attempted family holds the whole pass and the retry reissues both, and a
-pass that attempted nothing retries on the backoff rather than the daily
-tick. A family without an address is skipped. The hourly address check is
-one hello for both families and compares the address, not the port. The
-24 hour tick, the hourly check and the backoff count the time the host
-slept: a minute after waking from a sleep of 15 minutes or more, what came
-due during the sleep is due.
+G3. Activation loop. Each family keeps its own schedule. A family is posted
+at start, on its own 24 hour tick, and when a trigger makes it due: the own
+key observed revoked in the directory and a network change make every family
+due, and the hourly caller address check makes due the family whose address
+moved. A pass posts the families that are due, in ip version order, each to
+its family api url with the client jwt through a direct-only client
+strategy, since an activation that crossed an extender would publish the
+extender's address; it applies the bootstrap records to the directory and
+records the status. A success moves the family to its tick. A failure holds
+that family alone, 10 minutes doubling to 6 hours, and a success resets its
+hold, so a family the operator keeps refusing never re-posts one that works.
+A family without a global address on the host (`FamilySupported`) is not
+posted and is looked at again every 10 minutes, without doubling, since the
+look is local; one that gains an address is posted within 10 minutes however
+long it went without one, and its first failure after that holds 10
+minutes. A family whose global addresses on the host are all private (RFC
+1918, RFC 4193, carrier-grade NAT, the 464XLAT range; `FamilyPublic`) can
+be dialed back only through something that forwards to it: it is posted at
+start, on its tick and on every trigger as any family is, and a refusal of
+it while it has not activated holds it until its next tick instead of the
+backoff, since a NAT that never forwards refuses every retry alike. It has
+activated once it has since start, or once the directory holds this
+extender's own current record naming an address of the family, which is the
+operator's word that it published the family after its probes passed and
+which carries a restart. Only the newest record of the key counts
+(`CurrentRecordNamesFamily`): a revoked or expired one does not, nor does an
+address an older record named that the newest no longer does, though the
+directory keeps that address, nor one another key has claimed since. The
+schedules move once every post of the pass is answered, so the record
+another family's answer brings counts too. Once it has activated, something
+forwards to it, so its refusals -- the operator's budgets, a probe that
+failed, the re-post of a revocation -- are held on the backoff as any
+family's are. An interface table that cannot be read counts as public here,
+so it never lengthens a hold. The
+measurement request rides the first post of a pass that can carry it
+(lag.dev/PLAN.md C4); when a pass activated a family and no post carried a
+request that is wanted, the families it activated are posted once more at
+once, and that post is followed by no other. The address check is one
+hello, to the plain api url, compared within the family it arrived on and
+by the address, not the port: an address the operator published for any
+family is unchanged, and so is the one the last check saw on that family
+while the family's published address is still the one that check was read
+against (an activation that moves the published address forgets it), so a
+dual-stack host whose hello arrives on either family, or a host whose hello
+leaves from another of its addresses than its activation, posts nothing,
+and a host that returns to an address it left is posted at the next check;
+a family that is not activated is left to its schedule. An
+operator with no family api hosts is posted once a cycle to its plain api
+url on one schedule. The ticks, the hourly check and the holds count the
+time the host slept: a minute after waking from a sleep of 15 minutes or
+more, what came due during the sleep is due. Per-family schedules decided
+2026-11-01 from the lag.dev health check: one schedule for both families
+made a v4 behind a NAT, refused at every post, re-post the working v6 on
+every step of the shared backoff (every 6 hours at the cap, 4 to 7 times a
+day where 1 was due), and one hello compared with the last read every
+dual-stack host's switch of family as a moved address and re-posted both.
+Revised the same day on review: the day's hold of a private family's
+refusal was any refusal's, so a revocation's re-post refused once left an
+activated family unposted for a day; the address a check saw outlived an
+activation that moved the family; and the look for a family without an
+address doubled to 6 hours. A second review carried "activated" across a
+restart, through the directory's own record, so a forwarded family whose
+first post of a run is refused by the operator is not held for the day; a
+third read that record's newest body alone rather than every address the
+directory keeps for the key.
 
 G4. connectctl gains `extender`, a standalone extender for operators and
 tests: `--jwt`, `--api_url`, `--extender_key_file`, listen port flags,
@@ -3870,6 +3961,10 @@ with the database.
 | `connect.ExtenderConfig` | the camouflaged tcp dial folds in as a camo-first-then-legacy staggered race on the existing tcp carrier, driven by `RealityPublicKey`; kill switch is the sibling branch's `ConnectSettings.TlsClientHelloFingerprint="go"` (P8) |
 | `sdk.DeviceLocalSettings` | `DefaultCamouflage` added, default following `DefaultProvideExtender` (P7) |
 | extender udp 4053 and udp 53 (dns carrier) | a request is one TXT question with no aa bit and an EDNS0 opt record (udp payload 1232); a response repeats the opt record only for a request that carried one (Q2); old peers unchanged in both directions (Q3) |
+| `POST /network/extender-activate` answer | `probe_steps` added; `refused_carriers` entries gain `elapsed_ms` and `budget_left_ms`; a probe refusal's `error` says how long its step ran, or how much budget it had; old providers skip the fields (C2b) |
+| api metrics | `urnetwork_extender_activations_total{stage, outcome, family}`, `urnetwork_extender_activation_step_seconds{step, outcome}` (C2b) |
+| `extender.ExtenderSettings` | `ForwardDialTimeout` (5 s) added; `ExtenderErrorStageForwardDial`, `ExtenderErrorStageDatagramForwardDial` exported (A7) |
+| sdk native extender role | logs forward dial failures at most once a minute per kind, `ForwardDialErrorLogInterval` on its settings (G2) |
 
 Old clients keep working: the header's new fields are optional, the hello
 field is additive, the tables are new, and a v1 extender client still
@@ -4492,3 +4587,58 @@ The permanent lifecycle, strategy-identity, DNS-state, and signed-record tests
 cover these root causes with synthetic fixtures and explicit ordering. This
 review preserves the phased server/SDK and empty borrowed-resource limitations
 listed above; it does not change their deployment status.
+
+## Design note: authenticated seed bundle (EXTENDER-UPDATE2 §2, 2026-11-02)
+
+The cold-start bootstrap of EXTENDER-UPDATE2 §2 is built in connect as a
+separate signed format beside the unsigned K7 share, which is unchanged.
+
+- Format (`protocol/extender.proto`, new messages only): `ExtenderSeedBody`
+  (format version 1, network host, sequence, issue and expiry times, serialized
+  open-tier records, serialized root-signed revocations) inside
+  `ExtenderSeedEnvelope` (body bytes, signature, key id). The envelope is
+  ed25519 over `ur-extender-seed-v1` || body; the key id is a lookup hint only.
+  The text form is `ur-seed:1:` and base64url without padding
+  (`net_extender_seed.go`).
+- Trust: an envelope verifies only under the root keys the directory already
+  holds (network-space configuration or hello), and every record inside is
+  verified again under its own root signature, network host, tier
+  (`ExtenderRecordOpen`, so no gated or canary record) and expiry. A bundle has
+  no field for keys, hosts, gossip urls or resolver settings, and a body or
+  envelope with a field a v1 reader does not know is refused rather than
+  partly read. Records must list public addresses only, outlive the bundle, and
+  be issued before it.
+- Limits: 64 KiB per envelope (checked before decoding), 8 records, 32
+  addresses, 32 revocations, 8 KiB per record, 1 KiB per revocation, a 30-day
+  maximum validity, and a 5-minute clock allowance either way (the directory's
+  `RecordExpireSkew`). A clock outside the allowance gets an explicit
+  `expired` or `not_yet_valid` refusal.
+- State (`net_extender_seed_store.go`): per normalized network host, the
+  greatest accepted sequence, its body digest and the bundle, all hosts in one
+  document saved through a byte backend (`ExtenderSeedStore`, the shape of
+  `ExtenderDirectoryStore`; `ExtenderSeedFileStore` writes temp, sync, rename).
+  Lower sequences are rollbacks, a different body at the floor a conflict, the
+  same bundle idempotent; nothing is written on a refusal; a backend that cannot
+  load fails closed; an undecodable document is no history. A floor binds only
+  while its envelope verifies under the keys in force, so a floor set by a key
+  a root update removed, or by a root a K7 settings import installed, is void
+  and dropped; a rotation the client followed keeps its floor, and an empty key
+  set judges nothing.
+- Directory: records enter only through `ApplyRecord` and revocations through
+  `ApplyRevocationSource`, both with `ExtenderSourceSeed`, revocations first. No
+  address is ever added, so the dialability rule is unchanged: a seed address
+  without a verified key is not dialable. A record applied from a seed carries
+  a per-key `seed` marker (stored as `record_source`); a lapsed seed record is
+  never one of the retained expired identities, so the expiry recovery never
+  offers a stale seed to a new cold start. A newer record from another source
+  clears the marker.
+- Bootstrap pass (`net_extender_seed_bootstrap.go`): https mirrors, each with
+  an optional dns-independent address (tls still verifies the url's host);
+  redirects only to configured hosts over https within a bound; every mirror
+  runs its own attempts with backoff under one attempt, dial and byte budget and
+  one deadline, so a stalled mirror holds up only itself; the first acceptable
+  bundle wins and the rest are canceled. Per-mirror outcomes are fixed codes
+  with no addresses. After a usable apply the owner calls
+  `ExtenderNetworkClient.Wake`, which reads a failed hello and hint again at
+  once and runs a pass, so control reach and the gated release follow on the
+  seed's verified records.
