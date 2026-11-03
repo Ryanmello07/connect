@@ -19791,6 +19791,15 @@ components:
             The extender's identity public key, hex. Every probe requires a
             signature over a fresh challenge under this key.
           type: string
+        reality_public_key_hex:
+          description: |
+            An optional X25519 public key the extender publishes, as hex. A
+            passing activation stores it, and the extender's records carry it
+            while the network that posted it holds the identity key. Omitted,
+            a passing activation clears a stored key. A value that is not a
+            usable 32-byte X25519 key is refused before anything is probed.
+            The activation does not prove the extender holds the private half.
+          type: string
         tcp_port:
           description: The tcp carrier port. 0 takes the default, 443.
           type: integer
