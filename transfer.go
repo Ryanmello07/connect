@@ -6966,6 +6966,9 @@ type SendSequence struct {
 	serviceAckHeadSet    bool
 	// lastHeadAckTime is when the cumulative (head) ACK last advanced.
 	lastHeadAckTime time.Time
+	// The head sequence number at lastHeadAckTime. A snapshot also counts
+	// duplicate and late ACKs at or below the head, which are not progress.
+	lastHeadAckSequenceNumber uint64
 	// The first successful acknowledged-lane write since the destination last
 	// acknowledged an outstanding item, zero while nothing written is
 	// unanswered. Owned by the send worker; RetainedAckTimeout runs from here.
@@ -9489,7 +9492,7 @@ sendSequenceLoop:
 		ackSnapshot := ackWindow.Snapshot(true)
 		ackUpdated := 0 < ackSnapshot.ackUpdateCount || 0 < len(ackSnapshot.selectiveAcks)
 		if 0 < ackSnapshot.ackUpdateCount {
-			self.lastHeadAckTime = time.Now()
+			self.noteHeadAck(ackSnapshot.headAck.sequenceNumber, time.Now())
 			self.receiveAckFeedbackAt(
 				ackSnapshot.headAck.messageId,
 				false,

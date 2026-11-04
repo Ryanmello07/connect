@@ -149,6 +149,18 @@ func (self *SendSequence) ackProgressDeadline(item *sendItem) time.Time {
 	return self.lastHeadAckTime.Add(item.ackTimeout)
 }
 
+// Only a head that moves forward renews lifetimes. An ACK snapshot also counts
+// a repeated or late ACK at or below the head, which a stuck head keeps
+// receiving (a duplicate soliciting the cumulative ACK, a spurious resend of
+// a delivered item). Counting those would renew a stalled sequence forever.
+func (self *SendSequence) noteHeadAck(sequenceNumber uint64, now time.Time) {
+	if !self.lastHeadAckTime.IsZero() && sequenceNumber <= self.lastHeadAckSequenceNumber {
+		return
+	}
+	self.lastHeadAckSequenceNumber = sequenceNumber
+	self.lastHeadAckTime = now
+}
+
 // The time this item's lifetime ends, counting head progress. A resend capped
 // at the send-time deadline alone would always be due once the item outlives it.
 func (self *SendSequence) ackLifetimeDeadline(item *sendItem) time.Time {
