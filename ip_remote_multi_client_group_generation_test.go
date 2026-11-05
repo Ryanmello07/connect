@@ -3,12 +3,16 @@
 package connect
 
 import (
+	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
 	"unsafe"
+
+	"github.com/urnetwork/connect/protocol"
 )
 
 // A SYN already in the channel can precede its producer's admission observer.
@@ -176,7 +180,7 @@ func testTcpGroupRecoveryResetSynCancellation(t *testing.T, producerPaused bool)
 		first, releaseFirst := make(chan struct{}), make(chan struct{})
 		producerEntered, releaseProducer := make(chan struct{}), make(chan struct{})
 		terminal := make(chan struct{}, 1)
-		var firstOnce, producerOnce sync.Once
+		var firstOnce, producerOnce, firstWriteOnce sync.Once
 		unparkFirst := func() { firstOnce.Do(func() { close(releaseFirst) }) }
 		unparkProducer := func() { producerOnce.Do(func() { close(releaseProducer) }) }
 		var offers, receives, appliedAcks atomic.Int64
@@ -198,10 +202,14 @@ func testTcpGroupRecoveryResetSynCancellation(t *testing.T, producerPaused bool)
 					<-releaseProducer
 				}
 			}
+			// Client-wide: another sequence's first item, such as the key
+			// publication released at teardown, must not close it again.
 			settings.SendBufferSettings.afterInitialWriteQueuedForTest = func(_ sendSequenceId, sequence uint64) {
 				if sequence == 0 {
-					close(first)
-					<-releaseFirst
+					firstWriteOnce.Do(func() {
+						close(first)
+						<-releaseFirst
+					})
 				}
 			}
 			settings.SendBufferSettings.afterAckSendItemForTest = func(_ sendSequenceId, sequence uint64) {
@@ -349,13 +357,16 @@ func TestTcpGroupRecoveryCanceledOlderObserverKeepsFollowingAck(t *testing.T) {
 
 // Established drain policies receive both groups before disposing either.
 // A cold flow-isolating destination first receives ordinarily, opens its writer,
-// and disposes that canceled group before its next iteration drains the second.
+// and refuses materialization after cancellation; Close disposes its queued tail.
 func testTcpGroupRecoveryCanceledDrain(t *testing.T, flowIsolation, coldStart bool) {
 	t.Helper()
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
-		var receives atomic.Int64
-		var first *parsedPacketGroup
+		var receives, retains atomic.Int64
+		var observeColdBoundary atomic.Bool
+		var terminalErrs []error
+		var first, second *parsedPacketGroup
+		var source *SendSequence
 		budget := NewTransferMemoryBudget(kib(64))
 		f := newGroupDispositionQueueFixture(t, budget, func(settings *ClientSettings) {
 			settings.SendBufferSettings.beforeGroupDequeueForTest = func(source *SendSequence) {
@@ -368,20 +379,42 @@ func testTcpGroupRecoveryCanceledDrain(t *testing.T, flowIsolation, coldStart bo
 					// typed target can replay any source-generation controls.
 					source.Cancel()
 				case 2:
+					if coldStart {
+						t.Error("cold canceled source received its queued tail instead of returning before materialization")
+					}
 					flags := first.completionFlags.Load()
 					if source.ctx.Err() == nil || source.flowIsolation.Load() != flowIsolation ||
 						flags&groupCompletionReceived == 0 || flags&(groupCompletionDequeued|groupCompletionSourceControls) != 0 {
 						t.Error("second receive lost cancellation or replayed earlier source controls")
 					}
-					if coldStart {
-						if flags&groupCompletionDisposed == 0 || flags&groupCompletionLinked != 0 || first.collapseSource != nil {
-							t.Error("cold writer startup did not dispose the first ordinary receive before the later drain")
-						}
-					} else if flags&groupCompletionDisposed != 0 || flags&groupCompletionLinked == 0 {
+					if flags&groupCompletionDisposed != 0 || flags&groupCompletionLinked == 0 {
 						t.Error("drain did not retain the earlier cleanup-received group without control replay")
 					}
 				default:
 					t.Error("unexpected extra source receive")
+				}
+			}
+			if coldStart {
+				observeColdBoundary.Store(true)
+				observer := settings.SendBufferSettings.SendPackLifecycleObserver
+				settings.SendBufferSettings.SendPackLifecycleObserver = func(event SendPackLifecycleObservation) {
+					observer(event)
+					if observeColdBoundary.Load() && event.Phase == SendPackLifecyclePhaseTerminal {
+						terminalErrs = append(terminalErrs, event.Err)
+					}
+				}
+				settings.SendBufferSettings.beforeGroupRetainForTest = func() {
+					if !observeColdBoundary.Load() {
+						return
+					}
+					retains.Add(1)
+					if receives.Load() != 1 || source.ctx.Err() != context.Canceled || !source.flowIsolation.Load() ||
+						source.contractMultiRouteWriter == nil || source.currentPreparedHandoff != nil ||
+						first.completionFlags.Load()&groupCompletionReceived == 0 ||
+						first.completionFlags.Load()&(groupCompletionDisposed|groupCompletionDequeued|groupCompletionSourceControls) != 0 ||
+						second.completionFlags.Load()&groupCompletionReceived != 0 {
+						t.Error("cold cancellation did not reach materialization with exactly one cleanup receive and an untouched queued tail")
+					}
 				}
 			}
 		})
@@ -391,7 +424,7 @@ func testTcpGroupRecoveryCanceledDrain(t *testing.T, flowIsolation, coldStart bo
 			})
 		}
 		first = groupRecoveryCallerGroup(t, f, groupDispositionControlPacket(100, 700, 64, tcpFlagRst|tcpFlagAck))
-		second := groupRecoveryCallerGroup(t, f, groupDispositionControlPacket(100, 800, 64, tcpFlagAck))
+		second = groupRecoveryCallerGroup(t, f, groupDispositionControlPacket(100, 800, 64, tcpFlagAck))
 		for _, group := range []*parsedPacketGroup{first, second} {
 			if !f.selected.SendGroupWithAck(group, 0, true) {
 				MessagePoolReturn(group.packets[0].packet)
@@ -399,7 +432,7 @@ func testTcpGroupRecoveryCanceledDrain(t *testing.T, flowIsolation, coldStart bo
 			}
 		}
 		f.requireParked()
-		source := first.collapseSource
+		source = first.collapseSource
 		if source == nil || source != second.collapseSource || f.update.sourceRstSequence() != 800 {
 			t.Fatal("source and latest accepted ACK setup failed")
 		}
@@ -418,26 +451,56 @@ func testTcpGroupRecoveryCanceledDrain(t *testing.T, flowIsolation, coldStart bo
 		}
 		f.unpark()
 		synctest.Wait()
-		if receives.Load() != 2 || source.flowIsolation.Load() != flowIsolation {
-			t.Fatal("actual carrier branch did not drain both cleanup receives")
-		}
-		if f.update.sourceRstSequence() != 800 || f.update.IsDone() || f.update.sequenceControlOrder != 0 ||
-			f.update.sequenceClaims != nil || f.terminal.Load() != 2 || budget.UsedByteCount() != 0 || len(f.route) != 0 {
-			t.Fatal("cleanup-received predecessor overwrote the later ACK or replayed canceled controls")
-		}
-		for _, group := range []*parsedPacketGroup{first, second} {
-			if flags := group.completionFlags.Load(); flags&groupCompletionReceived == 0 ||
-				flags&(groupCompletionDequeued|groupCompletionSourceControls) != 0 || group.collapseSource != nil {
-				t.Fatal("cleanup receive acquired a live control ordinal or retained its source worker")
-			}
-		}
 		select {
 		case <-source.done:
 		default:
 			t.Fatal("canceled source worker did not join")
 		}
+		wantReceives := int64(2)
+		if coldStart {
+			wantReceives = 1
+			if retains.Load() != 1 {
+				t.Fatalf("cold cancellation reached materialization %d times, want 1", retains.Load())
+			}
+			if len(terminalErrs) != 2 || !errors.Is(terminalErrs[0], context.Canceled) || terminalErrs[1] == nil {
+				t.Fatalf("cold materialization and queued-tail disposal did not report exactly two failures: %v", terminalErrs)
+			}
+			if stats := budget.Stats(); stats.UsedByteCount != 0 || stats.ReservedByteCount != stats.ReleasedByteCount {
+				t.Fatalf("cold canceled source did not reconcile its exact memory budget: %+v", stats)
+			}
+		}
+		if receives.Load() != wantReceives || source.flowIsolation.Load() != flowIsolation {
+			t.Fatalf("actual carrier branch received %d groups with isolation=%v, want %d with isolation=%v",
+				receives.Load(), source.flowIsolation.Load(), wantReceives, flowIsolation)
+		}
+		if f.update.sourceRstSequence() != 800 || f.update.IsDone() || f.update.sequenceControlOrder != 0 ||
+			f.update.sequenceClaims != nil || f.terminal.Load() != 2 || budget.UsedByteCount() != 0 || len(f.route) != 0 {
+			t.Fatal("cleanup-received predecessor overwrote the later ACK or replayed canceled controls")
+		}
+		for index, group := range []*parsedPacketGroup{first, second} {
+			flags := group.completionFlags.Load()
+			wantReceived := !coldStart || index == 0
+			if (flags&groupCompletionReceived != 0) != wantReceived ||
+				flags&(groupCompletionDequeued|groupCompletionSourceControls) != 0 || group.collapseSource != nil {
+				t.Fatalf("canceled group %d lost exact cleanup custody or acquired source controls: flags=%x", index, flags)
+			}
+			if coldStart && (flags&groupCompletionDisposed == 0 || flags&groupCompletionTerminal == 0 ||
+				flags&groupCompletionLinked != 0 || group.affinitySourceState&affinitySourceMaterialized != 0 ||
+				group.affinitySourceState&affinitySourceFailed == 0) {
+				t.Fatalf("cold canceled group %d lost raw disposal or acquired materialization: flags=%x", index, flags)
+			}
+		}
 		if source.contractMultiRouteWriter != nil {
 			t.Fatal("canceled source retained its destination selector")
+		}
+		if coldStart {
+			if f.client.initialSendWriteCount.Load() != 0 {
+				t.Fatal("canceled cleanup constructed a physical write")
+			}
+			// The materialization observation belongs only to the joined source.
+			// Its healthy sibling uses the normal production retention path.
+			observeColdBoundary.Store(false)
+			affinitySourceCancellationHealthySibling(t, f)
 		}
 	})
 }
@@ -452,10 +515,102 @@ func TestTcpGroupRecoveryCanceledFlowIsolatingDrainKeepsLatestAck(t *testing.T) 
 	testTcpGroupRecoveryCanceledDrain(t, true, false)
 }
 
-// A cold selector starts with ordinary ingress, then drains after opening.
-// Reentrant cancellation must preserve the latest accepted ACK across both.
+// A cold selector receives one group, then cancellation refuses materialization.
+// Closing its queued tail must preserve the latest accepted ACK and live siblings.
 func TestTcpGroupRecoveryCanceledColdFlowIsolatingStartupKeepsLatestAck(t *testing.T) {
 	testTcpGroupRecoveryCanceledDrain(t, true, true)
+}
+
+// A single packet is an ordinary reliable Pack on the same source as the
+// groups. Its prepared reservation refused by cancellation disposes only that
+// Pack: the worker finishes its iteration as after a canceled group, and the
+// next flow-isolating drain cleanup-receives the group queued behind it.
+func TestTcpGroupRecoveryCanceledReliablePackStillDrainsQueuedGroup(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		var prepares, receives atomic.Int64
+		prepared, queued := make(chan struct{}), make(chan struct{})
+		budget := NewTransferMemoryBudget(kib(64))
+		f := newGroupDispositionQueueFixture(t, budget, func(settings *ClientSettings) {
+			settings.SendBufferSettings.beforeGroupRetainForTest = func() {
+				if prepares.Add(1) == 1 {
+					close(prepared)
+					<-queued
+				}
+			}
+			settings.SendBufferSettings.beforeGroupDequeueForTest = func(source *SendSequence) {
+				if receives.Add(1) != 1 || source.ctx.Err() == nil {
+					t.Error("the queued group was not received once, after the cancellation")
+				}
+			}
+		})
+		f.client.RouteManager().UpdateTransportWithProperties(f.transport, []Route{f.route}, TransferCarrierProperties{
+			Unreliable: true, UnreliableFlowIsolation: true,
+		})
+		frame, err := ToFrame(&protocol.SimpleMessage{Content: "reliable"}, DefaultProtocolVersion)
+		if err != nil {
+			t.Fatal(err)
+		}
+		packResults := make(chan error, 1)
+		if !f.client.SendWithTimeout(frame, f.peer, func(err error) { packResults <- err }, 0) {
+			MessagePoolReturn(frame.MessageBytes)
+			t.Fatal("the reliable Pack did not reach the source queue")
+		}
+		f.requireParked()
+		var source *SendSequence
+		func() {
+			f.client.sendBuffer.mutex.Lock()
+			defer f.client.sendBuffer.mutex.Unlock()
+			for id, sequence := range f.client.sendBuffer.sendSequences {
+				if id.Destination == f.peer {
+					source = sequence
+				}
+			}
+		}()
+		// Run is parked: its writer state has one fixture owner until unpark.
+		// Normal Run cleanup closes it.
+		if source == nil || source.openContractMultiRouteWriter() == nil || !source.transferFlightPolicy().flowIsolation {
+			t.Fatal("the source has no flow-isolating destination selector")
+		}
+		f.unpark()
+		synctest.Wait()
+		select {
+		case <-prepared:
+		default:
+			t.Fatal("the reliable Pack never reached its prepared reservation")
+		}
+		group := groupRecoveryCallerGroup(t, f, groupDispositionControlPacket(100, 800, 64, tcpFlagAck))
+		if !f.selected.SendGroupWithAck(group, 0, true) {
+			MessagePoolReturn(group.packets[0].packet)
+			t.Fatal("the group did not reach the source queue behind the Pack")
+		}
+		source.Cancel()
+		close(queued)
+		synctest.Wait()
+		select {
+		case err := <-packResults:
+			if err == nil {
+				t.Fatal("the canceled reliable Pack reported success")
+			}
+		default:
+			t.Fatal("the canceled reliable Pack has no result")
+		}
+		if receives.Load() != 1 {
+			t.Fatal("the canceled worker returned before its next drain received the queued group")
+		}
+		if flags := group.completionFlags.Load(); flags&groupCompletionReceived == 0 ||
+			flags&(groupCompletionDequeued|groupCompletionSourceControls) != 0 || group.collapseSource != nil {
+			t.Fatal("cleanup receive acquired a live control ordinal or retained its source worker")
+		}
+		select {
+		case <-source.done:
+		default:
+			t.Fatal("canceled source worker did not join")
+		}
+		if source.contractMultiRouteWriter != nil || budget.UsedByteCount() != 0 || len(f.route) != 0 {
+			t.Fatal("canceled source retained its selector, a reservation or a physical Pack")
+		}
+	})
 }
 
 // Two real race candidates may replay the same source cohorts at different
@@ -464,7 +619,9 @@ func testTcpGroupRecoverySeparateRaceReset(t *testing.T, sameSyn, refuseOtherSyn
 	t.Helper()
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
-		firstBudget, secondBudget := NewTransferMemoryBudget(kib(64)), NewTransferMemoryBudget(kib(64))
+		// A data/SYN burst is two public source groups. Fund all four
+		// candidate receipts; local retention refusal has its own 64-KiB root.
+		firstBudget, secondBudget := NewTransferMemoryBudget(kib(128)), NewTransferMemoryBudget(kib(128))
 		f := newGroupDispositionQueueFixture(t, firstBudget, nil)
 		other := newGroupDispositionQueueFixture(t, secondBudget, func(settings *ClientSettings) {
 			if refuseOtherSyn {
@@ -622,9 +779,9 @@ func TestTcpGroupRecoveryUnwrittenNewSynPromotionKeepsSemanticTail(t *testing.T)
 	})
 }
 
-// Equal group ordinals do not order members. A wholly unwritten group still
-// keeps its final semantic action on the existing race owner until promotion.
-func testTcpGroupRecoveryUnwrittenMixedControls(t *testing.T, resetLast bool) {
+// Unwritten controls keep their exact source/member order until promotion.
+// A client SYN starts a separate public group; SYN/ACK stays in its raw group.
+func testTcpGroupRecoveryUnwrittenMixedControls(t *testing.T, resetLast bool, synFlags byte) {
 	t.Helper()
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
@@ -637,7 +794,7 @@ func testTcpGroupRecoveryUnwrittenMixedControls(t *testing.T, resetLast bool) {
 		f.parent.groupRaceCandidatesForTest = func(*parsedPacketGroup) []*multiClientChannel {
 			return []*multiClientChannel{f.selected, other.selected}
 		}
-		syn := groupDispositionControlPacket(900, 800, 96, tcpFlagSyn)
+		syn := groupDispositionControlPacket(900, 800, 96, synFlags)
 		rst := groupDispositionControlPacket(901, 900, 128, tcpFlagRst|tcpFlagAck)
 		packets := [][]byte{rst, syn}
 		wantAck, wantWindow := uint32(800), uint16(96)
@@ -645,20 +802,26 @@ func testTcpGroupRecoveryUnwrittenMixedControls(t *testing.T, resetLast bool) {
 			packets = [][]byte{syn, rst}
 			wantAck, wantWindow = 900, 128
 		}
-		if f.offer(packets...) != 2 {
+		if count, accepted := f.offerWithResults(packets...); count != 2 || !accepted[0] || !accepted[1] {
 			t.Fatal("mixed control group did not reach public admission")
 		}
 		f.requireParked()
 		other.requireParked()
 		f.unpark()
 		synctest.Wait()
-		if len(f.route) != 0 || f.terminal.Load() != 1 || budget.UsedByteCount() != 0 || f.update.race == nil {
+		groups := int64(1)
+		if !resetLast && synFlags&tcpFlagAck == 0 {
+			groups = 2
+		}
+		if len(f.route) != 0 || f.started.Load() != groups || f.terminal.Load() != groups ||
+			budget.UsedByteCount() != 0 || f.update.race == nil {
 			t.Fatal("unfunded mixed group retained physical ownership or lost its race")
 		}
 		state := f.update.race.clientStates[f.selected]
-		if state.collapseControl.synOrder != state.collapseControl.rstOrder ||
+		if (state.collapseControl.synOrder == state.collapseControl.rstOrder) != (groups == 1) ||
+			groups == 2 && state.collapseControl.synOrder <= state.collapseControl.rstOrder ||
 			state.collapseControl.closed != resetLast {
-			t.Fatal("equal-ordinal semantic state discarded member order")
+			t.Fatal("unwritten semantic state discarded exact source/member order")
 		}
 		f.update.stateLock.Lock()
 		f.update.commitRaceClientWithLock(f.selected)
@@ -675,12 +838,17 @@ func testTcpGroupRecoveryUnwrittenMixedControls(t *testing.T, resetLast bool) {
 
 // A final reset remains terminal even after a new SYN in the same raw group.
 func TestTcpGroupRecoveryUnwrittenSynThenResetPromotesClosed(t *testing.T) {
-	testTcpGroupRecoveryUnwrittenMixedControls(t, true)
+	testTcpGroupRecoveryUnwrittenMixedControls(t, true, tcpFlagSyn)
 }
 
-// A final genuine new SYN supersedes the earlier reset in that raw group.
+// A final genuine new SYN supersedes the earlier reset in source order.
 func TestTcpGroupRecoveryUnwrittenResetThenSynPromotesOpen(t *testing.T) {
-	testTcpGroupRecoveryUnwrittenMixedControls(t, false)
+	testTcpGroupRecoveryUnwrittenMixedControls(t, false, tcpFlagSyn)
+}
+
+// Equal group ordinals still preserve a final SYN/ACK's member-order reopen.
+func TestTcpGroupRecoveryUnwrittenResetThenSynAckPromotesOpen(t *testing.T) {
+	testTcpGroupRecoveryUnwrittenMixedControls(t, false, tcpFlagSyn|tcpFlagAck)
 }
 
 // A candidate which refused the RST can win while its later same-SYN group
@@ -692,14 +860,22 @@ func TestTcpGroupRecoverySameCohortResetSurvivesWinnerPromotion(t *testing.T) {
 		var receives atomic.Int64
 		var releaseOnce sync.Once
 		unpark := func() { releaseOnce.Do(func() { close(release) }) }
-		firstBudget, secondBudget := NewTransferMemoryBudget(kib(64)), NewTransferMemoryBudget(kib(64))
+		firstBudget, secondBudget := NewTransferMemoryBudget(kib(128)), NewTransferMemoryBudget(kib(128))
 		f := newGroupDispositionQueueFixture(t, firstBudget, nil)
 		other := newGroupDispositionQueueFixture(t, secondBudget, func(settings *ClientSettings) {
 			settings.SendBufferSettings.SequenceBufferSize = 1
 			settings.SendBufferSettings.beforeGroupDequeueForTest = func(*SendSequence) {
-				if receives.Add(1) == 2 {
+				if receives.Add(1) == 3 {
 					close(entered)
 					<-release
+				}
+			}
+			settings.SendBufferSettings.afterGroupAdmissionForTest = func(target sendGroupAdmissionTarget) {
+				group := target.(*parsedPacketGroup)
+				if len(group.packets) == 1 && len(group.packets[0].payload) == 1 {
+					// Admission counts unwritten work, including dequeued data.
+					// Quiesce its actual write/release before offering split SYN.
+					synctest.Wait()
 				}
 			}
 		})
@@ -713,6 +889,9 @@ func TestTcpGroupRecoverySameCohortResetSurvivesWinnerPromotion(t *testing.T) {
 		syn := groupDispositionControlPacket(900, 500, 64, tcpFlagSyn)
 		rst := groupDispositionControlPacket(901, 700, 64, tcpFlagRst|tcpFlagAck)
 		data := groupRecoveryPacket(901, 800, 64, tcpFlagAck, []byte{1})
+		// The later same-ISN SYN carries one byte beyond the preceding data.
+		// Its real progress requires admission without reopening the reset cohort.
+		progressingSyn := groupRecoveryPacket(900, 500, 64, tcpFlagSyn, []byte{1, 2})
 		if f.offer(syn) != 1 || f.offer(rst) != 1 {
 			t.Fatal("initial race admission setup refused")
 		}
@@ -723,7 +902,7 @@ func TestTcpGroupRecoverySameCohortResetSurvivesWinnerPromotion(t *testing.T) {
 		}
 		other.unpark()
 		other.acknowledgeAll(syn)
-		if f.offer(data, syn) != 2 {
+		if count, accepted := f.offerWithResults(data, progressingSyn); count != 2 || !accepted[0] || !accepted[1] {
 			t.Fatal("progressing same-SYN group did not reach both candidates")
 		}
 		synctest.Wait()
@@ -732,8 +911,27 @@ func TestTcpGroupRecoverySameCohortResetSurvivesWinnerPromotion(t *testing.T) {
 		default:
 			t.Fatal("winner's same-SYN group did not pause at its real receive boundary")
 		}
+		pendingSyn := false
+		for group := f.update.sequenceClaims; group != nil; group = group.collapseNext {
+			flags := group.completionFlags.Load()
+			if group.completionClient == other.selected && group.ipPath.Syn &&
+				group.collapseOrder() == 0 && group.collapseSource != nil &&
+				flags&(groupCompletionAdmitted|groupCompletionLinked) == groupCompletionAdmitted|groupCompletionLinked &&
+				flags&(groupCompletionReceived|groupCompletionDequeued|groupCompletionDone|
+					groupCompletionTerminal|groupCompletionAbandoned) == 0 {
+				if len(group.packets) != 1 || group.packets[0].ipPath.SequenceNumber != 900 ||
+					group.packets[0].ipPath.TcpPayloadByteCount != 2 || len(group.packets[0].payload) != 2 ||
+					group.packets[0].payload[0] != 1 || group.packets[0].payload[1] != 2 {
+					t.Fatal("winner's raw same-ISN SYN lost its exact uncovered payload suffix")
+				}
+				pendingSyn = true
+			}
+		}
+		if !pendingSyn || other.started.Load() != 4 || other.terminal.Load() != 2 {
+			t.Fatal("winner's split SYN lacked exact admitted raw custody after data write")
+		}
 		f.unpark()
-		f.acknowledgeAll(syn, rst, data, syn)
+		f.acknowledgeAll(syn, rst, data, progressingSyn)
 		if f.update.IsDone() || !f.update.sequenceCloseReady.Load() {
 			t.Fatal("same-cohort reset did not wait for the winner's pending raw control")
 		}
@@ -745,7 +943,7 @@ func TestTcpGroupRecoverySameCohortResetSurvivesWinnerPromotion(t *testing.T) {
 			t.Fatal("winner's earlier open SYN erased the later matching-cohort reset")
 		}
 		unpark()
-		other.acknowledgeAll(data, syn)
+		other.acknowledgeAll(data, progressingSyn)
 		if !f.update.IsDone() || f.update.race != nil || f.update.synGenerationNumber != 900 ||
 			f.update.sequenceClaims != nil || f.update.sequenceSynOffers != 0 ||
 			firstBudget.UsedByteCount() != 0 || secondBudget.UsedByteCount() != 0 {
@@ -754,8 +952,74 @@ func TestTcpGroupRecoverySameCohortResetSurvivesWinnerPromotion(t *testing.T) {
 	})
 }
 
+// A raw candidate's different SYN makes a return to the committed ISN a new
+// cohort. Nil selection must not hide that pending source-owned transition.
+func TestTcpGroupRecoveryPendingRaceSynAbaIsNotSameSyn(t *testing.T) {
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		entered, release := make(chan struct{}), make(chan struct{})
+		var receives atomic.Int64
+		var releaseOnce sync.Once
+		unpark := func() { releaseOnce.Do(func() { close(release) }) }
+		firstBudget, secondBudget := NewTransferMemoryBudget(kib(128)), NewTransferMemoryBudget(kib(128))
+		f := newGroupDispositionQueueFixture(t, firstBudget, func(settings *ClientSettings) {
+			settings.SendBufferSettings.beforeGroupDequeueForTest = func(*SendSequence) {
+				if receives.Add(1) == 2 {
+					close(entered)
+					<-release
+				}
+			}
+		})
+		other := newGroupDispositionQueueFixture(t, secondBudget, nil)
+		t.Cleanup(unpark)
+		syn := groupDispositionControlPacket(100, 500, 64, tcpFlagSyn)
+		middle := groupDispositionControlPacket(900, 700, 64, tcpFlagSyn)
+		if count, accepted := f.offerWithResults(syn); count != 1 || !accepted[0] {
+			t.Fatal("initial SYN did not reach public admission")
+		}
+		f.requireParked()
+		f.unpark()
+		f.acknowledgeAll(syn)
+		if count, accepted := f.offerWithResults(syn); count != 0 || accepted[0] {
+			t.Fatal("same-cohort SYN retransmission bypassed retained suppression")
+		}
+		f.update.client.Store(nil)
+		f.parent.settings.MultiRaceSetOnResponseTimeout = time.Hour
+		f.parent.groupRaceCandidatesForTest = func(*parsedPacketGroup) []*multiClientChannel {
+			return []*multiClientChannel{f.selected, other.selected}
+		}
+		if count, accepted := f.offerWithResults(middle); count != 1 || !accepted[0] {
+			t.Fatal("intervening candidate SYN did not reach public admission")
+		}
+		synctest.Wait()
+		select {
+		case <-entered:
+		default:
+			t.Fatal("intervening SYN did not reach its real pre-dequeue barrier")
+		}
+		if count, accepted := f.offerWithResults(syn); count != 1 || !accepted[0] {
+			t.Fatal("pending different-SYN cohort was hidden by nil selection")
+		}
+		unpark()
+		f.acknowledgeAll(middle, syn)
+		other.requireParked()
+		other.unpark()
+		other.acknowledgeAll(middle, syn)
+		f.update.stateLock.Lock()
+		f.update.commitRaceClientWithLock(f.selected)
+		f.update.stateLock.Unlock()
+		f.update.releaseCollapseClaims()
+		if f.update.IsDone() || f.update.synGenerationNumber != 100 || f.offer(syn) != 0 ||
+			f.update.sequenceClaims != nil || f.update.sequenceSynOffers != 0 ||
+			firstBudget.UsedByteCount() != 0 || secondBudget.UsedByteCount() != 0 ||
+			f.started.Load() != f.terminal.Load() || other.started.Load() != other.terminal.Load() {
+			t.Fatal("actual ABA winner lost its final gate or retained source ownership")
+		}
+	})
+}
+
 // A retained return to the old ISN is a real new cohort when an intervening
-// admitted SYN was wholly unwritten. Its exact member index cuts off old proof.
+// admitted SYN was wholly unwritten. The split source boundary cuts old proof.
 func TestTcpGroupRecoveryRetainedSynAfterUnwrittenAbaResetsCohort(t *testing.T) {
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
@@ -763,10 +1027,19 @@ func TestTcpGroupRecoveryRetainedSynAfterUnwrittenAbaResetsCohort(t *testing.T) 
 		var releaseOnce sync.Once
 		unpark := func() { releaseOnce.Do(func() { close(release) }) }
 		var reservations atomic.Int64
+		var recording atomic.Bool
+		sourceEntered, sourceRelease := make(chan struct{}), make(chan struct{})
+		var sourceOnce, sourceReleaseOnce sync.Once
+		unparkSource := func() { sourceReleaseOnce.Do(func() { close(sourceRelease) }) }
 		budget := NewTransferMemoryBudget(kib(64))
 		f := newGroupDispositionQueueFixture(t, budget, func(settings *ClientSettings) {
+			settings.SendBufferSettings.beforeGroupDequeueForTest = func(*SendSequence) {
+				if recording.Load() {
+					sourceOnce.Do(func() { close(sourceEntered); <-sourceRelease })
+				}
+			}
 			settings.SendBufferSettings.beforeGroupRetainForTest = func() {
-				if reservations.Add(1) == 2 {
+				if recording.Load() && reservations.Add(1) == 2 {
 					budget.SetTotalByteCount(0)
 				}
 			}
@@ -780,9 +1053,16 @@ func TestTcpGroupRecoveryRetainedSynAfterUnwrittenAbaResetsCohort(t *testing.T) 
 			}
 		})
 		t.Cleanup(unpark)
+		t.Cleanup(unparkSource)
 		other := newGroupDispositionQueueFixture(t, nil, nil)
 		syn := groupDispositionControlPacket(100, 500, 64, tcpFlagSyn)
-		f.update.updateSequence(groupRecoveryParsed(t, syn))
+		if f.offer(syn) != 1 {
+			t.Fatal("opening SYN did not reach its real source")
+		}
+		f.requireParked()
+		f.unpark()
+		f.acknowledgeAll(syn)
+		recording.Store(true)
 		f.update.egressFinSeen, f.update.ingressFinSeen = true, true
 		f.update.egressFinSequence, f.update.ingressFinSequence = 130, 600
 		f.update.client.Store(nil)
@@ -793,12 +1073,24 @@ func TestTcpGroupRecoveryRetainedSynAfterUnwrittenAbaResetsCohort(t *testing.T) 
 		old := groupRecoveryPacket(101, 500, 64, tcpFlagAck, make([]byte, 10))
 		middle := groupDispositionControlPacket(900, 700, 64, tcpFlagSyn)
 		prefix := groupRecoveryPacket(101, 500, 64, tcpFlagAck, make([]byte, 20))
-		if f.offer(old) != 1 || f.offer(middle) != 1 || f.offer(prefix, syn) != 2 {
+		if f.offer(old) != 1 {
+			t.Fatal("old-cohort prefix did not reach public admission")
+		}
+		synctest.Wait()
+		select {
+		case <-sourceEntered:
+		default:
+			t.Fatal("old-cohort prefix did not reach its real pre-dequeue barrier")
+		}
+		if f.offer(middle) != 1 {
+			t.Fatal("intervening SYN did not reach public admission")
+		}
+		if count, accepted := f.offerWithResults(prefix, syn); count != 2 || !accepted[0] || !accepted[1] {
 			t.Fatal("candidate ABA groups did not all reach successful public admission")
 		}
 		f.requireParked()
 		other.requireParked()
-		f.unpark()
+		unparkSource()
 		synctest.Wait()
 		select {
 		case <-failed:
@@ -811,7 +1103,7 @@ func TestTcpGroupRecoveryRetainedSynAfterUnwrittenAbaResetsCohort(t *testing.T) 
 		budget.SetTotalByteCount(kib(64))
 		unpark()
 		f.acknowledgeAll(old, prefix, syn)
-		if reservations.Load() != 3 || f.terminal.Load() != 3 || f.update.race == nil {
+		if reservations.Load() != 4 || f.started.Load() != 5 || f.terminal.Load() != 5 || f.update.race == nil {
 			t.Fatal("final retained A group did not follow the actual unfunded B")
 		}
 		f.update.stateLock.Lock()
@@ -835,7 +1127,7 @@ func TestTcpGroupRecoveryRetainedSynAfterUnwrittenAbaResetsCohort(t *testing.T) 
 
 // One source accepted an old A/reset while the other accepted A/B/new A.
 // Completed receipts stay charged until selection, including repeated cohorts.
-func testTcpGroupRecoveryAmbiguousRaceAba(t *testing.T, repeat, closeAtEnd, capacityRefusal bool) {
+func testTcpGroupRecoveryAmbiguousRaceAba(t *testing.T, repeat, closeAtEnd, capacityRefusal bool, beforePromotion ...bool) {
 	t.Helper()
 	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
@@ -996,6 +1288,34 @@ func testTcpGroupRecoveryAmbiguousRaceAba(t *testing.T, repeat, closeAtEnd, capa
 			t.Fatal("old-A reset falsely matched the different source's ABA cohort")
 		}
 		state := f.update.race.clientStates[f.selected]
+		if len(beforePromotion) != 0 && beforePromotion[0] {
+			if !capacityRefusal || state.collapseControl.synNumber != 900 || !state.collapseControl.ambiguousSyn {
+				t.Fatal("pre-promotion ABA control did not retain its exact disposed final-A semantic tail")
+			}
+			firstBudget.SetTotalByteCount(kib(256))
+			synctest.Wait()
+			beforeAdmissions, beforeStarted := admissions.Load(), f.started.Load()
+			accepted := f.offer(syn)
+			synctest.Wait()
+			t.Logf("CANDIDATE_ABA_PRE_PROMOTION_PROOF: aggregate=%d candidate_admissions=%d->%d candidate_started=%d->%d current_syn_order=%d old_A_order=%d", accepted, beforeAdmissions, admissions.Load(), beforeStarted, f.started.Load(), state.collapseControl.synOrder, firstGroups[0].collapseOrder())
+			if accepted != 1 || admissions.Load() != beforeAdmissions+1 || f.started.Load() != beforeStarted+1 {
+				t.Errorf("CANDIDATE_ABA_UNWRITTEN_RETRY_SUPPRESSED: aggregate=%d candidate_admissions=%d->%d candidate_started=%d->%d", accepted, beforeAdmissions, admissions.Load(), beforeStarted, f.started.Load())
+				return
+			}
+			// Decode the candidate's actual reliable wire frame and apply its
+			// real peer ACK before asserting current-cohort suppression.
+			f.acknowledgeAll(syn)
+			if f.update.client.Load() != nil || f.update.race == nil || f.terminal.Load() != beforeStarted+1 {
+				t.Fatal("pre-promotion retry lost its unbound race or actual candidate peer ACK")
+			}
+			admittedCurrent := admissions.Load()
+			f.offer(syn)
+			synctest.Wait()
+			if admissions.Load() != admittedCurrent || len(f.route) != 0 {
+				t.Fatal("current retained final-A cohort did not suppress its next identical retry")
+			}
+			return
+		}
 		if closeAtEnd {
 			finalPhase.Store(true)
 			if f.offer(rst) != 1 {

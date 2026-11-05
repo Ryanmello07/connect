@@ -25,7 +25,9 @@ package connect
 // The GROUP owns the three transports a provider runs (A4). The standby is the
 // full-strategy, family-agnostic transport this product has always run; it
 // dials only after StandbyDelay has elapsed with neither pinned transport
-// connected, and it stands down again when one connects. That covers
+// connected since the group started, or StandbyDelay plus a draw over
+// [0, StandbyJitter) since the pins were lost, and it stands down again when
+// one connects. That covers
 // unprovisioned family names, blocked DNS and censored networks, where the
 // provider is then tagged legacy v4 by the platform. The delay is skipped
 // when no pinned transport can connect soon: every configured pin is held
@@ -458,12 +460,25 @@ func (self *PlatformTransport) updateHold() {
 // (transport_client_limit.go), or by a hold on its refused credential
 // (transport_credential_refusal.go). False means the transport is closing.
 func (self *PlatformTransport) waitDialAdmission(ctx context.Context) bool {
+	admitted, _ := self.waitDialAdmissionParked(ctx)
+	return admitted
+}
+
+// waitDialAdmissionParked is waitDialAdmission that also reports whether the
+// runner parked on a hold. A dial after a park is a fresh start, not a lost
+// connection's re-dial: the hold, not the platform, ended the connection or
+// held back the dial, and holds end per device (see nextDialTime).
+func (self *PlatformTransport) waitDialAdmissionParked(ctx context.Context) (admitted bool, parked bool) {
 	for {
 		held, notify := self.held.Get()
 		if held {
+			parked = true
+			if self.settings.heldParkForTest != nil {
+				self.settings.heldParkForTest()
+			}
 			select {
 			case <-ctx.Done():
-				return false
+				return false, parked
 			case <-notify:
 			}
 			continue
@@ -471,8 +486,9 @@ func (self *PlatformTransport) waitDialAdmission(ctx context.Context) bool {
 		clientLimitStatus, clientLimitNotify := self.clientLimitHold()
 		credentialRefused, credentialRefusalNotify := self.credentialRefused()
 		if !clientLimitStatus.Exceeded && !credentialRefused {
-			return true
+			return true, parked
 		}
+		parked = true
 		if clientLimitStatus.Exceeded && self.settings.clientLimitHoldForTest != nil {
 			self.settings.clientLimitHoldForTest()
 		}
@@ -482,12 +498,17 @@ func (self *PlatformTransport) waitDialAdmission(ctx context.Context) bool {
 		// a change of any hold re-runs every check
 		select {
 		case <-ctx.Done():
-			return false
+			return false, parked
 		case <-notify:
 		case <-clientLimitNotify:
 		case <-credentialRefusalNotify:
 		}
 	}
+}
+
+// heldNow reports whether the owner or the pinned family holds the transport.
+func (self *PlatformTransport) heldNow() bool {
+	return self.held != nil && self.held.Value()
 }
 
 // heldNotify returns the current hold and the channel that closes when it
@@ -535,9 +556,10 @@ func (self *PlatformTransport) runFamilyHoldWatcher() {
 	}
 }
 
-// dialContext tags a dial with the pinned family so the strategy's tls dial
-// helper narrows the network before resolution, and with the attempt observer
-// that classifies each dialer attempt's typed error (see noteDialError).
+// dialContext tags a dial with the transport's settings, with the pinned family
+// so the strategy's tls dial helper narrows the network before resolution, and
+// with the attempt observer that classifies each dialer attempt's typed error
+// (see noteDialError).
 func (self *PlatformTransport) dialContext(ctx context.Context) context.Context {
 	ctx = context.WithValue(ctx, extenderTransportSettingsContextKey{}, self.settings)
 	if !self.pinned() {
@@ -564,18 +586,147 @@ func (self *PlatformTransport) authIntent() int32 {
 // pinned transport uses only its own backoff and never touches the strategy's
 // pacing state, even though it owns its strategy: the intent is that a family
 // that never connects paces nobody but itself.
-func (self *PlatformTransport) nextDialTime(hadConnection bool) (connectTime time.Time, releaseReconnect func(), cancelConnect func()) {
-	releaseReconnect = func() {}
-	cancelConnect = func() {}
+//
+// afterKick is a re-dial a network change asked for. A kick re-dials every
+// transport on the strategy at once -- one per window exit, plus the
+// provider's -- so the fast path's cap would push the exits past the fourth
+// onto the staircase behind each other for seconds. That burst is bounded by
+// the transports themselves, so it takes the fast path's jitter on its own,
+// larger cap (KickReconnectLimit).
+//
+// The release frees a fast-path slot once the dial attempt completes. The
+// cancel gives a staircase step back when the wait ends before the dial, and
+// must not be called once the dial proceeds. A lost connection's spread is
+// not part of this pacing: waitDialPacing waits it out first.
+func (self *PlatformTransport) nextDialTime(hadConnection bool, afterKick bool) (connectTime time.Time, releaseReconnect func(), cancelConnect func()) {
 	if self.pinned() {
-		return time.Now().Add(self.pinnedBackoff.delay()), releaseReconnect, cancelConnect
+		return time.Now().Add(self.pinnedBackoff.delay()), func() {}, func() {}
+	}
+	if afterKick {
+		return self.clientStrategy.nextKickReconnectTime()
 	}
 	if hadConnection {
-		connectTime, releaseReconnect = self.clientStrategy.NextReconnectTime()
-	} else {
-		connectTime, cancelConnect = self.clientStrategy.NextConnectTime()
+		return self.clientStrategy.nextReconnectTime()
 	}
-	return connectTime, releaseReconnect, cancelConnect
+	connectTime, cancelConnect = self.clientStrategy.NextConnectTime()
+	return connectTime, func() {}, cancelConnect
+}
+
+// reconnectJitter is one draw of a lost connection's re-dial spread, uniform
+// in [0, ReconnectJitter). A transport a fixture built without settings
+// draws none.
+func (self *PlatformTransport) reconnectJitter() time.Duration {
+	if self.settings == nil {
+		return 0
+	}
+	return uniformJitter(self.settings.ReconnectJitter, self.settings.reconnectJitterForTest)
+}
+
+// dialWait is how one of a mode runner's waits ended.
+type dialWait int
+
+const (
+	// the wait ran out
+	dialWaitElapsed dialWait = iota
+	// a network change kick landed after the runner's kick generation
+	dialWaitKicked
+	// the owner or the pinned family holds the transport: the runner goes
+	// back to admission, and its next dial is a fresh start
+	dialWaitHeld
+	// the runner's context ended
+	dialWaitClosed
+)
+
+// waitDial waits for `after` unless the runner's context ends, a kick lands
+// after `kickGeneration`, or the transport is or becomes held. The kick
+// monitor fires both for a kick and when the transport becomes held
+// (updateHold), so a wake without a kick is a hold. The subscription comes
+// before the reads, so a kick or a hold that lands as the wait begins is seen.
+func (self *PlatformTransport) waitDial(ctx context.Context, after <-chan time.Time, kickGeneration uint64) dialWait {
+	kick := self.kickedSince(kickGeneration)
+	if self.kicked(kickGeneration) {
+		return dialWaitKicked
+	}
+	if self.heldNow() {
+		return dialWaitHeld
+	}
+	select {
+	case <-ctx.Done():
+		return dialWaitClosed
+	case <-kick:
+		if self.kicked(kickGeneration) {
+			return dialWaitKicked
+		}
+		return dialWaitHeld
+	case <-after:
+		return dialWaitElapsed
+	}
+}
+
+// pacingAfter is the timer of a pre-dial wait.
+func (self *PlatformTransport) pacingAfter(delay time.Duration) <-chan time.Time {
+	if self.settings != nil && self.settings.pacingAfterForTest != nil {
+		return self.settings.pacingAfterForTest(delay)
+	}
+	return time.After(delay)
+}
+
+// waitDialPacing waits out the pacing before a dial. A connection that ran
+// and died without a kick may have died with every other client's in a
+// platform restart, so its re-dial first waits a draw over
+// [0, ReconnectJitter), pinned or not. Before the spread, the fast path's
+// 250 ms jitter, or a pinned transport's zero backoff after a success,
+// re-dialed the whole fleet in the same instant. The spread comes before the
+// strategy's pacing (nextDialTime), so no fast-path slot or staircase step is
+// held through it, and a staircase lead is never stacked on it.
+//
+// A kick during the spread re-dials at once on the kick's path. A kick during
+// the strategy's pacing dials at once, without the pacing the old path
+// earned, as before. A hold during either gives the pacing back and returns
+// dialWaitHeld, so the runner runs admission again instead of dialing while
+// held.
+//
+// On dialWaitElapsed or dialWaitKicked the runner dials, calls release once
+// the dial attempt completes, and calls cancel instead if it gives up before
+// dialing. On dialWaitHeld or dialWaitClosed both were already called.
+// `kickGeneration` advances past a kick the wait consumed.
+func (self *PlatformTransport) waitDialPacing(
+	ctx context.Context,
+	hadConnection bool,
+	afterKick bool,
+	kickGeneration *uint64,
+) (wait dialWait, releaseReconnect func(), cancelConnect func()) {
+	noop := func() {}
+	if hadConnection && !afterKick {
+		if reconnectJitter := self.reconnectJitter(); 0 < reconnectJitter {
+			switch spreadWait := self.waitDial(ctx, self.pacingAfter(reconnectJitter), *kickGeneration); spreadWait {
+			case dialWaitHeld, dialWaitClosed:
+				return spreadWait, noop, noop
+			case dialWaitKicked:
+				// the network changed: re-dial over the new path now
+				self.noteKick()
+				*kickGeneration = self.kickGeneration.Load()
+				afterKick = true
+			}
+		}
+	}
+	connectTime, releaseReconnect, cancelConnect := self.nextDialTime(hadConnection, afterKick)
+	if connectDelay := time.Until(connectTime); 0 < connectDelay {
+		switch pacingWait := self.waitDial(ctx, self.pacingAfter(connectDelay), *kickGeneration); pacingWait {
+		case dialWaitHeld, dialWaitClosed:
+			releaseReconnect()
+			cancelConnect()
+			return pacingWait, noop, noop
+		case dialWaitKicked:
+			// network changed while waiting to dial: any pacing computed for
+			// the old path is meaningless. Dial now over the new one, without
+			// the backoff the old path earned.
+			self.noteKick()
+			*kickGeneration = self.kickGeneration.Load()
+			return dialWaitKicked, releaseReconnect, cancelConnect
+		}
+	}
+	return dialWaitElapsed, releaseReconnect, cancelConnect
 }
 
 // noteDialFailure records a failed connect. A pinned transport's failure is
@@ -826,6 +977,9 @@ type h3DialAttempt struct {
 	quicTransport *quic.Transport
 	conn          *quic.Conn
 	egressPinned  bool
+	// an extender relays the attempt's datagrams and resolves its destination
+	// name itself
+	relayed bool
 	// API alt dials own a separate carrier claim. Ordinary platform attempts
 	// use their long-lived transport's claim instead.
 	budgetReservation      *platformTransportBudgetReservation
@@ -1043,11 +1197,29 @@ type FamilyPlatformTransportGroupSettings struct {
 	// (sleeping or idle by policy) or its last dial failed because its
 	// hostname does not resolve. Any other failure waits out the delay.
 	StandbyDelay time.Duration
+	// StandbyJitter spreads the release after a pinned loss: the delay from
+	// the last pinned disconnect waits a further draw uniform in
+	// [0, StandbyJitter). A platform restart or outage disconnects every
+	// provider's pinned transports in the same instant, and a fixed delay then
+	// released every standby in the fleet together. A group start keeps
+	// StandbyDelay exactly: starts are one device's own events (an app start,
+	// a provide toggle, a policy migration). Non-positive releases at
+	// StandbyDelay exactly after a loss too.
+	StandbyJitter time.Duration
+
+	// Nil outside package tests. Replaces the uniform draw of the release's
+	// spread, given StandbyJitter. Its result is held to [0, StandbyJitter).
+	standbyJitterForTest func(maxJitter time.Duration) time.Duration
 }
 
 func DefaultFamilyPlatformTransportGroupSettings() *FamilyPlatformTransportGroupSettings {
 	return &FamilyPlatformTransportGroupSettings{
 		StandbyDelay: 15 * time.Second,
+		// after a pinned loss the standby releases in [15 s, 20 s): the fleet's
+		// releases spread over 5 s, and a provider whose pins cannot connect
+		// falls back 2.5 s later on average. A pin that cannot resolve still
+		// releases it at once.
+		StandbyJitter: 5 * time.Second,
 	}
 }
 
@@ -1196,6 +1368,7 @@ func NewFamilyPlatformTransportGroup(
 		&standbySettings,
 	)
 	group.standbyActive = !hasPinned
+	// a group start is this device's own event: StandbyDelay exactly
 	group.standbyDueTime = time.Now().Add(groupSettings.StandbyDelay)
 
 	go HandleError(func() {
@@ -1203,6 +1376,14 @@ func NewFamilyPlatformTransportGroup(
 		group.run()
 	}, cancel)
 	return group
+}
+
+// standbyDelayAfterLoss is how long the standby waits from the last pinned
+// disconnect: StandbyDelay, plus a draw uniform in [0, StandbyJitter) so that
+// providers whose pins lost the platform together do not release their
+// standbys together.
+func (self *FamilyPlatformTransportGroup) standbyDelayAfterLoss() time.Duration {
+	return self.settings.StandbyDelay + uniformJitter(self.settings.StandbyJitter, self.settings.standbyJitterForTest)
 }
 
 // run drives the standby from the pinned transports' connected state and fans
@@ -1233,11 +1414,13 @@ func (self *FamilyPlatformTransportGroup) run() {
 				self.standbyDueTime = time.Time{}
 			} else {
 				if self.standbyDueTime.IsZero() {
-					self.standbyDueTime = now.Add(self.settings.StandbyDelay)
+					// the pins were connected and are lost: the loss may be
+					// every provider's at once, so the release spreads
+					self.standbyDueTime = now.Add(self.standbyDelayAfterLoss())
 				}
 				if !self.standbyActive {
 					if !now.Before(self.standbyDueTime) {
-						self.log.Infof("[t]standby transport dials: no pinned transport connected for %s\n", self.settings.StandbyDelay)
+						self.log.Infof("[t]standby transport dials: no pinned transport connected for at least %s\n", self.settings.StandbyDelay)
 						self.standbyTransport.SetEnabled(true)
 						self.standbyActive = true
 					} else if self.pinnedCannotConnectWithLock() {
@@ -1481,6 +1664,12 @@ func (self *PlatformTransport) resolveSingleControlUDPAddr(ctx context.Context, 
 // plain mode uses the socket as is.
 type h3PacketConnWrapper func(ctx context.Context, packetConn net.PacketConn) (net.PacketConn, error)
 
+// False only in this package's tests (transport_public_dns_pump_test.go).
+// DefaultDnsPumpHost, the production default pump host, is the operator's live
+// public host, and no connect test may resolve or dial it. Production binaries
+// never change this.
+var dialPublicDnsPumpHost = true
+
 // h3CarrierDestination is the unresolved host and ports one H3 carrier sends
 // to, before any name resolution.
 //
@@ -1517,6 +1706,9 @@ func (self *PlatformTransport) h3CarrierDestination(
 		}
 		if pumpServerName == "" {
 			return "", nil, fmt.Errorf("H3 DNS pump host is empty")
+		}
+		if pumpServerName == DefaultDnsPumpHost && !dialPublicDnsPumpHost {
+			return "", nil, fmt.Errorf("package tests never dial the public H3 DNS pump host")
 		}
 		return pumpServerName, dnsPorts, nil
 	default:
@@ -1693,6 +1885,24 @@ func (self *PlatformTransport) h3DialCandidatesWithResolver(
 		}
 		return udpAddrs, translated(PacketTranslationModeDnsPump, tld), nil
 	default:
+		// a move's targets, and a target a move left preferred, stand in for
+		// the resolved addresses on the platform's own port, but only while
+		// this carrier dials the platform host. A move redirects the platform
+		// host's edges, never alt's: an alt url keeps the carrier dialing alt
+		// exactly as it would, and the attempt dials no target
+		// (resident_move.go)
+		if override := moveDialOverrideFromContext(ctx); override.matches(serverName) && !self.h3AltRedirected() {
+			udpAddrs := override.udpAddrs(self.ipFamily, self.settings.H3Port)
+			if len(udpAddrs) == 0 {
+				return nil, nil, errResidentMoveNoFamilyTarget
+			}
+			noteMoveDialOverrideUsed(ctx)
+			if self.settings.H3PacketConnFactory != nil {
+				// an injected endpoint is one socket with its own routing
+				return udpAddrs[:1], plain, nil
+			}
+			return udpAddrs, plain, nil
+		}
 		address := net.JoinHostPort(host, strconv.Itoa(ports[0]))
 		if self.settings.resolveH3AddrsForTest != nil {
 			udpAddrs, err := self.settings.resolveH3AddrsForTest(ctx, address, self.ipFamily)
@@ -1795,11 +2005,13 @@ func (self *PlatformTransport) dialH3(
 	// An extender dial has no local address for the peer: the name is resolved
 	// at the extender. Its connection reports the peer it actually relays to,
 	// and quic has to agree with that.
+	relayed := peerAddr != nil
 	if peerAddr == nil {
 		peerAddr = udpAddr
 	}
 	attempt := &h3DialAttempt{
 		udpAddr:                udpAddr,
+		relayed:                relayed,
 		translationReservation: translationClaim,
 		packetConn: capPlatformPacketConn(
 			packetConn,

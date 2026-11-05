@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"fmt"
 	"math"
 	"net"
@@ -120,9 +121,7 @@ func platformWebSocketWriteBatchNextReady(
 }
 
 const (
-	platformH3WriteBatchMaxMessageCount = 16
-	platformH3WriteBatchMaxByteCount    = 64 * 1024
-	DefaultDnsPumpHost                  = "whodis.bringyour.com"
+	DefaultDnsPumpHost = "whodis.bringyour.com"
 )
 
 func transportTypeFromMode(mode TransportMode) TransportType {
@@ -213,12 +212,22 @@ type PlatformTransportReceiveModeStatsSnapshot struct {
 // translation and direct QUIC can behave very differently on a constrained
 // cellular path even though both ultimately use the H3 reader.
 type PlatformTransportReceiveStatsSnapshot struct {
-	H1                    PlatformTransportReceiveModeStatsSnapshot
-	H3                    PlatformTransportReceiveModeStatsSnapshot
-	H3Dns                 PlatformTransportReceiveModeStatsSnapshot
-	H3DnsPump             PlatformTransportReceiveModeStatsSnapshot
+	H1        PlatformTransportReceiveModeStatsSnapshot
+	H3        PlatformTransportReceiveModeStatsSnapshot
+	H3Dns     PlatformTransportReceiveModeStatsSnapshot
+	H3DnsPump PlatformTransportReceiveModeStatsSnapshot
+	// Deprecated: counted speed-test and latency echoes refused by a full H1
+	// control queue, each of which closed its generation. A full queue now
+	// applies backpressure (H1ControlBackpressureMessageCount), so this stays
+	// zero.
 	H1ControlRefusalCount uint64
+	// Deprecated: the bytes of the refused echoes; stays zero.
 	H1ControlRefusalBytes uint64
+	// Speed-test and latency echoes the H1 reader held, and their complete
+	// message bytes, while the writer made room in its full control queue.
+	// This is reliable-carrier backpressure, not loss.
+	H1ControlBackpressureMessageCount uint64
+	H1ControlBackpressureByteCount    uint64
 }
 
 type platformTransportReceiveModeStats struct {
@@ -241,12 +250,12 @@ func (self *platformTransportReceiveModeStats) snapshot() PlatformTransportRecei
 // one PlatformTransport. All counters are monotonic and add no receive-path
 // lock or observer callback.
 type PlatformTransportReceiveStats struct {
-	h1                    platformTransportReceiveModeStats
-	h3                    platformTransportReceiveModeStats
-	h3Dns                 platformTransportReceiveModeStats
-	h3DnsPump             platformTransportReceiveModeStats
-	h1ControlRefusalCount atomic.Uint64
-	h1ControlRefusalBytes atomic.Uint64
+	h1                                platformTransportReceiveModeStats
+	h3                                platformTransportReceiveModeStats
+	h3Dns                             platformTransportReceiveModeStats
+	h3DnsPump                         platformTransportReceiveModeStats
+	h1ControlBackpressureMessageCount atomic.Uint64
+	h1ControlBackpressureByteCount    atomic.Uint64
 }
 
 func (self *PlatformTransportReceiveStats) mode(mode TransportMode) *platformTransportReceiveModeStats {
@@ -284,12 +293,12 @@ func (self *PlatformTransportReceiveStats) recordQueueBackpressure(
 	}
 }
 
-func (self *PlatformTransportReceiveStats) recordH1ControlRefusal(byteCount int) {
+func (self *PlatformTransportReceiveStats) recordH1ControlBackpressure(byteCount int) {
 	if self == nil {
 		return
 	}
-	self.h1ControlRefusalCount.Add(1)
-	self.h1ControlRefusalBytes.Add(uint64(max(0, byteCount)))
+	self.h1ControlBackpressureMessageCount.Add(1)
+	self.h1ControlBackpressureByteCount.Add(uint64(max(0, byteCount)))
 }
 
 func (self *PlatformTransportReceiveStats) Snapshot() PlatformTransportReceiveStatsSnapshot {
@@ -297,12 +306,12 @@ func (self *PlatformTransportReceiveStats) Snapshot() PlatformTransportReceiveSt
 		return PlatformTransportReceiveStatsSnapshot{}
 	}
 	return PlatformTransportReceiveStatsSnapshot{
-		H1:                    self.h1.snapshot(),
-		H3:                    self.h3.snapshot(),
-		H3Dns:                 self.h3Dns.snapshot(),
-		H3DnsPump:             self.h3DnsPump.snapshot(),
-		H1ControlRefusalCount: self.h1ControlRefusalCount.Load(),
-		H1ControlRefusalBytes: self.h1ControlRefusalBytes.Load(),
+		H1:                                self.h1.snapshot(),
+		H3:                                self.h3.snapshot(),
+		H3Dns:                             self.h3Dns.snapshot(),
+		H3DnsPump:                         self.h3DnsPump.snapshot(),
+		H1ControlBackpressureMessageCount: self.h1ControlBackpressureMessageCount.Load(),
+		H1ControlBackpressureByteCount:    self.h1ControlBackpressureByteCount.Load(),
 	}
 }
 
@@ -500,6 +509,17 @@ func noteBackendSuccess() {
 	lastBackendFailNano.Store(0)
 }
 
+// noteBackendNetworkChanged starts a fresh failure streak when the host's
+// network path changes. Failures recorded on the old path -- typically every
+// exit's re-dial finding no route as the path went away -- say nothing about
+// the backend over the new one, and left in place they would hold it
+// "degraded" (no contract requests, no window growth) until the first re-dial
+// on the new path succeeds. A real outage re-trips the gate after
+// backendDegradedFailThreshold fresh failures.
+func noteBackendNetworkChanged() {
+	noteBackendSuccess()
+}
+
 // (ctx, network, address)
 // type DialContextFunc func(ctx context.Context, network string, address string) (net.Conn, error)
 
@@ -520,11 +540,30 @@ type PlatformTransportSettings struct {
 	AuthTimeout          time.Duration
 	ReconnectTimeout     time.Duration
 	PingTimeout          time.Duration
-	WriteTimeout         time.Duration
-	ReadTimeout          time.Duration
-	TransportGenerator   func() (sendTransport Transport, receiveTransport Transport)
-	// SendRouteObserver exposes route ownership to deterministic integration
-	// harnesses. It must not block. Nil retains normal production behavior.
+	// WriteTimeout bounds each carrier write, a ready batch or a ping, from
+	// the instant it begins: one still in progress this long after it began
+	// fails as a timeout, which ends the connection. Native I/O deadlines
+	// preserve a successful write when its goroutine is delayed afterwards.
+	// The H3 DNS modes multiply it by their slow multiple.
+	WriteTimeout time.Duration
+	// ReadTimeout bounds each carrier read the same way, so a peer silent
+	// this long after its last frame is cut off exactly then. A reader that
+	// waits on local receive capacity is not reading. Hybrid H3 leaves its
+	// reliable stream to the QUIC idle timeout.
+	ReadTimeout time.Duration
+	// PingJitter spreads the pings of the many transports one host runs. Each
+	// transport draws one offset below it at construction and pings that far
+	// past the wall-clock ping boundaries, so its ping cadence is unchanged.
+	// Zero, the default, keeps every ping on the wall-clock boundary, which
+	// lets a phone's pings share radio wakeups with its other aligned timers;
+	// on a host that alignment only makes bursts. A host that runs many
+	// transports, such as the proxy, sets it to PingTimeout to spread its
+	// pings evenly. Non-positive aligns.
+	PingJitter         time.Duration
+	TransportGenerator func() (sendTransport Transport, receiveTransport Transport)
+	// SendRouteObserver borrows route identity for deterministic topology
+	// observation. It must not block or send directly: writes use the route
+	// selector so carrier admission cannot be bypassed. Nil is the default.
 	SendRouteObserver func(transport Transport, route Route, connected bool)
 	// ProgressObserver is opt-in bounded, nonblocking H1 physical-I/O metadata.
 	// Nil performs no hashing, clock reads, or diagnostic allocation.
@@ -566,6 +605,9 @@ type PlatformTransportSettings struct {
 	// Non-positive carrier/socket values resolve to the memory-scaled defaults.
 	// H3BudgetByteCount covers the inner carrier; admission also reserves any
 	// required DNS translation and selected outer extender as one complete graph.
+	// H1BudgetByteCount is the connection/reader/scratch base. Mobile
+	// application graphs add their retained queue rows; use
+	// H1MemoryReservationByteCount when composing their actual admission.
 	H1BudgetByteCount                         ByteCount
 	H3BudgetByteCount                         ByteCount
 	H3SocketReadBufferByteCount               ByteCount
@@ -574,6 +616,15 @@ type PlatformTransportSettings struct {
 	H3MaxStreamReceiveWindowByteCount         ByteCount
 	H3InitialConnectionReceiveWindowByteCount ByteCount
 	H3MaxConnectionReceiveWindowByteCount     ByteCount
+	// H3StreamWriteBatchMaxMessageCount and H3StreamWriteBatchMaxByteCount
+	// bound one write on the H3 reliable stream: the writer drains up to this
+	// many ready messages, framed, into one buffer of the byte bound, which it
+	// allocates once the stream carries data. The mobile memory ledger charges
+	// that buffer inside its application row (platformH3ApplicationQueueBytes),
+	// so a larger bound needs a larger row. Non-positive writes one message at
+	// a time.
+	H3StreamWriteBatchMaxMessageCount int
+	H3StreamWriteBatchMaxByteCount    int
 	// PlatformTransportBudgetPriority orders optional Auto-H3 leases when the
 	// aggregate budget cannot hold every caller. Foreground client windows use
 	// the zero value; background/provider transports use the background value.
@@ -600,6 +651,16 @@ type PlatformTransportSettings struct {
 	// backoff after consecutive failed dials (see dialRetryAfter).
 	// Non-positive resolves to one minute.
 	ReconnectMaxTimeout time.Duration
+	// ReconnectJitter spreads the re-dial after a connection that ran and
+	// died without a network change kick: the dial waits a further draw
+	// uniform in [0, ReconnectJitter) past its other pacing, pinned or not
+	// (see nextDialTime). A platform restart or deploy ends every client's
+	// connection in the same instant. Without the spread the fleet re-dialed
+	// within the strategy's fast-path jitter (250 ms), and a pinned transport
+	// at once (2026-11-01). A kick re-dial keeps the fast path, since a
+	// network change is this device's own event. Non-positive re-dials on the
+	// other pacing alone.
+	ReconnectJitter time.Duration
 
 	// MinConnectDelay time.Duration
 	// MaxConnectDelay time.Duration
@@ -628,6 +689,13 @@ type PlatformTransportSettings struct {
 	DnsTlds        [][]byte
 	V2H1Auth       bool
 	FramerSettings *FramerSettings
+	// TransportDelay, when set, offers the per-message delay header on this
+	// transport's connections and publishes their delay stats to the route
+	// manager (DELAY.md). Each edge's answer is recorded there too, for the
+	// client's new P2P generations to follow (§6.1). Nil offers nothing. Only
+	// non-provider client transports set it (D3); a connection declaring
+	// provide intent never offers.
+	TransportDelay *TransportDelaySettings
 
 	PtDnsSlowMultiple int
 
@@ -676,6 +744,60 @@ type PlatformTransportSettings struct {
 	// (transport_client_limit.go). Nil gives the transport a hold of its own.
 	ClientLimitBackoff *ClientLimitBackoff
 
+	// Declares the move capability on every connection -- the H1 header
+	// `X-UR-ResidentMoveVersion` and `Auth.resident_move_version` -- and lets
+	// the transport dial a move's target and prefer it afterwards
+	// (server/connect/MOVE.md §5.2, D2, D10). The platform sends advisory
+	// moves only to a client that declares it. Default true; false is a client
+	// that only migrates by name, and an owner then migrates every move by
+	// name.
+	EnableMove bool
+	// How long a move target whose dial failed stays held: an advisory move
+	// to a held target is declined. One hour by default, long enough that a
+	// broken edge interface does not cost the client a failed dial per move.
+	// Non-positive holds no target.
+	MoveTargetFailHold time.Duration
+	// The client's own floor between moves: an advisory move less than this
+	// long after a completed move is declined. 30 minutes by default.
+	// Non-positive declines none for this reason.
+	MoveClientMinInterval time.Duration
+	// How many recent move ids the client remembers so that a repeated move
+	// frame is dropped. Moves come minutes to hours apart, so the default 32
+	// spans days. Non-positive remembers none, which leaves only the guard
+	// against a move already in progress.
+	MoveIdDedupeCount int
+	// When set, asked before the client accepts an advisory move; true
+	// declines it with `ResidentMoveReasonMobileBackgroundOrMetered`. The sdk
+	// sets it on mobile to decline while the app is in the background or the
+	// active network is metered (D11). Called on the receive path, so it must
+	// not block. Nil declines none.
+	MoveDecline func() bool
+	// The move memory this transport shares with the other transports of its
+	// client and every generation an owner migrates to: the move ids seen,
+	// the last move, the failed targets and the targets preferred for
+	// reconnects (resident_move.go). Nil gives the transport one of its own.
+	ResidentMoveTracker *ResidentMoveTracker
+	// When set, this transport is a move's replacement: its direct dials go to
+	// the move's targets of the dial's family until the owner concludes the
+	// move (resident_move.go). An owner sets it on the replacement's own copy
+	// of the settings only.
+	ResidentMoveDial *ResidentMoveDial
+	// Chooses the edge this transport dials when no move target or preference
+	// applies, for a client that runs on the platform and reads its edge load
+	// (platform_placement.go). Applies with or without `EnableMove`. Nil
+	// resolves the platform host.
+	Placement PlatformPlacement
+	// How long the client keeps the edge a placement chose, so its transports
+	// and reconnects return to the edge that holds its resident. Six hours by
+	// default, the move preference's duration. Non-positive keeps none: every
+	// dial asks the placement.
+	PlacementPreferDuration time.Duration
+	// How long a placed address whose dial failed is not dialed for a
+	// placement again. Ten minutes by default: long enough that a broken edge
+	// interface does not cost every reconnect a failed dial, short enough that
+	// a repaired one is used again. Non-positive holds none.
+	PlacementFailHold time.Duration
+
 	// Nil outside package tests. A barrier here can hold the exact seam after
 	// logical route removal and before connection and writer cleanup.
 	afterRoutesRemovedForTest func()
@@ -689,6 +811,15 @@ type PlatformTransportSettings struct {
 	// Nil outside package tests. The observer borrows one H3 receive message
 	// after the channel accepts its ownership.
 	afterH3ReceiveEnqueueForTest func([]byte)
+	// Nil outside package tests. Called each time a carrier writer arms its
+	// ping timer, so a test can count the timer operations its writes cost.
+	pingTimerArmForTest func()
+	// Nil outside package tests. Pauses after successful stream I/O, before
+	// its worker accounts for completion, to exercise scheduling gaps.
+	afterH3StreamIoForTest func(write bool)
+	// Nil outside package tests. Called each time an authenticated H3
+	// connection installs a stream deadline, with its direction and value.
+	h3StreamDeadlineForTest func(write bool, deadline time.Time)
 	// Nil outside package tests. Replaces one H3 carrier runner so budget lease
 	// preemption can hold its exact teardown boundary without opening a socket.
 	runH3ModeForTest func(context.Context, TransportMode, time.Duration)
@@ -706,14 +837,36 @@ type PlatformTransportSettings struct {
 	// credential refusal hold, right before it waits, so a test can hold the
 	// exact point after which no dial with the refused credential can happen.
 	credentialRefusalHoldForTest func()
+	// Nil outside package tests. Called each time a mode runner parks while a
+	// strict move's replacement holds its carrier, right before it waits, with
+	// the runner's mode (transport_move.go).
+	moveCarrierHoldForTest func(mode TransportMode)
+	// Nil outside package tests. Called each time an inactive-drain watchdog
+	// reads the active mode, with whether that mode supersedes its carrier,
+	// before it waits. It runs on the watchdog and must not block.
+	inactiveDrainDecisionForTest func(mode TransportMode, activeMode TransportMode, superseded bool)
+	// Nil outside package tests. Replaces the uniform draw of a lost
+	// connection's re-dial spread, given ReconnectJitter. Its result is held
+	// to [0, ReconnectJitter).
+	reconnectJitterForTest func(maxJitter time.Duration) time.Duration
+	// Nil outside package tests. Replaces time.After for each wait of a mode
+	// runner's pre-dial pacing (waitDialPacing), given the wait, so a test
+	// can hold a runner at that exact point and decide when the wait ends.
+	pacingAfterForTest func(delay time.Duration) <-chan time.Time
+	// Nil outside package tests. Called each time a mode runner parks because
+	// its owner or its pinned family holds the transport, right before it
+	// waits.
+	heldParkForTest func()
+	// Nil outside package tests. Called each time a connection's watch
+	// (runConnectionWatch) has read the transport's hold and client limit and
+	// is about to wait for a change, with the transport, so a test can change
+	// the hold right after the watch read it.
+	connectionWatchWaitForTest func(transport *PlatformTransport)
 	// The constrained mobile policy composes receive, send, socket, and queue
 	// ownership inside one carrier claim. H1 keeps its independent queue depth.
 	h3RetainedByteAccounting bool
+	h1RetainedByteAccounting bool
 }
-
-// Shared with MultiClient's fallback no-send-ACK liveness bound. Retry/RTO and
-// logical Transfer ACK lifetimes are independent settings, not this interval.
-const defaultPlatformTransportReadTimeout = 30 * time.Second
 
 func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 	tlsConfig, err := DefaultTlsConfig()
@@ -730,7 +883,7 @@ func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 		ReconnectTimeout:          5 * time.Second,
 		PingTimeout:               5 * time.Second,
 		WriteTimeout:              10 * time.Second,
-		ReadTimeout:               defaultPlatformTransportReadTimeout,
+		ReadTimeout:               30 * time.Second, // also MultiClientSettings.BlackholeTimeout's default
 		TransportBufferSize:       32,
 		InactiveDrainTimeout:      30 * time.Second,
 		InactiveDrainMaxTimeout:   60 * time.Second,
@@ -738,6 +891,11 @@ func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 		ModePreferences:           DefaultTransportModePreferences(),
 		PinnedReconnectMaxTimeout: 5 * time.Minute,
 		ReconnectMaxTimeout:       60 * time.Second,
+		// A fleet-wide re-dial spreads over 5 s instead of 250 ms. A window
+		// whose k exits lost their connections together has its first one back
+		// after 5/(k+1) s on average, well inside the window's 20 s exit
+		// verdicts, and one lost connection re-dials within 5 s.
+		ReconnectJitter: 5 * time.Second,
 		// MinConnectDelay:      0,
 		// MaxConnectDelay:      1 * time.Second,
 		ProtocolVersion: DefaultProtocolVersion,
@@ -768,6 +926,19 @@ func DefaultPlatformTransportSettings() *PlatformTransportSettings {
 		QuicVersionPolicy:                         QuicVersionPolicyPreferV2,
 		H3DatagramSettings:                        DefaultH3DatagramSettings(),
 		H3QuicPacketStats:                         &H3QuicPacketStats{},
+
+		// enough ready messages per stream write to amortize it, in a buffer
+		// that fits the mobile ledger's application row with the route queues
+		H3StreamWriteBatchMaxMessageCount: 16,
+		H3StreamWriteBatchMaxByteCount:    64 * 1024,
+
+		EnableMove:            true,
+		MoveTargetFailHold:    1 * time.Hour,
+		MoveClientMinInterval: 30 * time.Minute,
+		MoveIdDedupeCount:     32,
+
+		PlacementPreferDuration: 6 * time.Hour,
+		PlacementFailHold:       10 * time.Minute,
 	}
 	applyPlatformH3MemoryPolicy(settings, MemoryBudget())
 	return settings
@@ -987,6 +1158,7 @@ type PlatformTransport struct {
 	// Claims register synchronously in the constructor, before carrier
 	// goroutines start, so pending H1 demand is visible to every H3 admission.
 	h1BudgetReservation *platformTransportBudgetReservation
+	h1RetainedBudget    *platformH1RetainedBudget
 	h3BudgetReservation *platformTransportBudgetReservation
 	// DNS translation and a selected outer extender draw from this bounded
 	// subdivision of h3BudgetReservation, never from unreserved process space.
@@ -1015,6 +1187,8 @@ type PlatformTransport struct {
 	// transport to come up before closing the old one (CONNECTDRAIN2.md §3.3)
 	registeredCount  atomic.Int64
 	connectedMonitor *Monitor
+	// set at the first registration and never cleared
+	everRegistered atomic.Bool
 
 	// The extender address of each live H1 connection, counted so two
 	// connections through one extender (a make-before-break generation) are
@@ -1039,6 +1213,15 @@ type PlatformTransport struct {
 	// NextConnectTime staircase, since a network change is a legitimate
 	// fresh start.
 	kickMonitor *Monitor
+	// kickGeneration counts kicks. A runner records it when an iteration
+	// starts and compares it at every decision point, so a kick that lands
+	// while the runner is not parked on the monitor (mid-dial, or while the
+	// connection tears down) still acts on that iteration instead of being
+	// missed by a notify channel fetched afterwards. See kickedSince.
+	kickGeneration atomic.Uint64
+	// lastKickNanos is when the last kick landed (unix nanos, zero if never),
+	// for the lower Auto modes' post-kick hold (holdAfterKick).
+	lastKickNanos atomic.Int64
 	// unsubNetworkChange removes this transport from the process
 	// network-change listeners when the run loop exits.
 	unsubNetworkChange func()
@@ -1070,6 +1253,18 @@ type PlatformTransport struct {
 	// the platform definitively refused. The constructor always sets it; read
 	// it through credentialRefused. See transport_credential_refusal.go.
 	credentialRefusalHold *credentialRefusalHold
+
+	// the move memory of this transport's client, shared when the settings
+	// carry one. The constructor always sets it. See transport_move.go.
+	residentMoveTracker *ResidentMoveTracker
+	// set when this transport is a move's replacement. Immutable.
+	residentMoveDial *ResidentMoveDial
+	// the live connections that reach the platform through a relay -- an
+	// extender or a VLESS server -- which a move cannot redirect
+	relayedConnectionCount atomic.Int64
+	// how far past the wall-clock ping boundaries this transport pings, drawn
+	// from PingJitter at construction. Immutable.
+	pingOffset time.Duration
 }
 
 // newPlatformQuicConfig keeps H3's memory and path-MTU behavior explicit and
@@ -1101,7 +1296,13 @@ func newPlatformQuicConfig(
 		MaxIdleTimeout: settings.PingTimeout * 4,
 		// QUIC owns hybrid-carrier liveness. Its keepalive loop is independent
 		// of the application writer, which can legitimately wait behind
-		// quic-go's bounded DATAGRAM queue on a constrained uplink.
+		// quic-go's bounded DATAGRAM queue on a constrained uplink. It sends a
+		// PING once the peer has been quiet this long, at most half the idle
+		// timeout in quic-go, and the idle timeout runs from the first
+		// ack-eliciting packet after the peer's last. So a dead peer is found
+		// within this plus the idle timeout of its last packet: 25s by default.
+		// The application ping cannot stand in for it: one paced from a write
+		// just past a ping boundary goes out nearly two ping intervals later.
 		KeepAlivePeriod:   settings.PingTimeout,
 		Allow0RTT:         !settings.h3RetainedByteAccounting,
 		InitialPacketSize: H3InitialPacketByteCount,
@@ -1126,16 +1327,119 @@ func newPlatformQuicConfig(
 
 // Kick closes the transport's live connection (if any) and skips any pending
 // reconnect backoff so the run loop re-dials immediately over the new path.
-// The transport itself stays up; an in-flight dial is unaffected. Safe to
-// call at any time.
+// An in-flight dial is canceled and retried at once: it was started on the
+// path that just changed. The transport itself stays up. Safe to call at any
+// time.
 func (self *PlatformTransport) Kick() {
+	// generation before notify: a runner that fetched the notify channel
+	// first sees it close, and one that fetches it later sees the generation
+	self.lastKickNanos.Store(time.Now().UnixNano())
+	self.kickGeneration.Add(1)
 	self.kickMonitor.NotifyAll()
+}
+
+// closedKickNotify is the channel kickedSince returns once the kick it asks
+// about has already happened.
+var closedKickNotify = func() chan struct{} {
+	notify := make(chan struct{})
+	close(notify)
+	return notify
+}()
+
+// kickedSince returns a channel that is closed if the transport was kicked
+// after `generation`, and otherwise closes on the next kick or hold change
+// (updateHold shares the monitor). Fetching the channel before reading the
+// generation is what makes it race free against Kick.
+func (self *PlatformTransport) kickedSince(generation uint64) <-chan struct{} {
+	notify := self.kickMonitor.NotifyChannel()
+	if self.kickGeneration.Load() != generation {
+		return closedKickNotify
+	}
+	return notify
+}
+
+// kicked reports whether the transport was kicked after `generation`.
+func (self *PlatformTransport) kicked(generation uint64) bool {
+	return self.kickGeneration.Load() != generation
+}
+
+// cancelOnKick cancels a dial when the transport is kicked after
+// `generation`. The returned stop ends the watch without canceling; call it
+// once the dial returns.
+func (self *PlatformTransport) cancelOnKick(
+	ctx context.Context,
+	generation uint64,
+	cancel context.CancelFunc,
+) (stop func()) {
+	kick := self.kickedSince(generation)
+	stopped := make(chan struct{})
+	go HandleError(func() {
+		select {
+		case <-kick:
+			cancel()
+		case <-ctx.Done():
+		case <-stopped:
+		}
+	})
+	var stopOnce sync.Once
+	return func() {
+		stopOnce.Do(func() {
+			close(stopped)
+		})
+	}
+}
+
+// holdAfterKick parks a lower-preference Auto mode for its ModeInitialDelay
+// after a network change kick, exactly as at startup, so the preferred mode
+// gets the first dial on the new path. Without it every lower mode wakes the
+// moment the preferred connection is kicked (the election falls to None) and
+// races it on the shared dial pacing; a lower mode that wins only carries
+// traffic until the preferred mode reconnects and then drains. The runners
+// call it only when they were standing down: a lower mode that was itself
+// carrying traffic (the preferred one does not work on this network)
+// re-dials at once. Returns false when ctx ends, and true when the hold is
+// over or a better mode became active (the caller re-checks stand down).
+func (self *PlatformTransport) holdAfterKick(ctx context.Context, mode TransportMode) bool {
+	if self.targetMode != TransportModeAuto {
+		return true
+	}
+	delay := self.modeInitialDelay(mode)
+	if delay <= 0 {
+		return true
+	}
+	for {
+		kickNanos := self.lastKickNanos.Load()
+		if kickNanos == 0 {
+			return true
+		}
+		remaining := delay - time.Since(time.Unix(0, kickNanos))
+		if remaining <= 0 {
+			return true
+		}
+		standDown, notify := self.standDown(mode)
+		if standDown {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-notify:
+		case <-time.After(remaining):
+		}
+	}
 }
 
 // IsConnected reports whether the transport has a connection with routes
 // registered on the route manager
 func (self *PlatformTransport) IsConnected() bool {
 	return 0 < self.registeredCount.Load()
+}
+
+// Whether the platform has ever registered this transport, including a
+// registration since lost. A client whose transports never registered cannot
+// have reached any provider.
+func (self *PlatformTransport) EverConnected() bool {
+	return self.everRegistered.Load()
 }
 
 // IsWaitingForBudget reports whether the reservation required by the selected
@@ -1318,7 +1622,12 @@ func (self *PlatformTransport) offerReceive(
 	reliability CarrierReliability,
 	receive chan<- []byte,
 	message []byte,
+	retained ...*platformH1RetainedLane,
 ) (open bool, delivered bool) {
+	if len(retained) != 0 && retained[0] != nil {
+		delivered = self.offerH1Retained(done, receive, message, retained[0], false)
+		return delivered, delivered
+	}
 	switch tryOfferPooledReceive(done, receive, message) {
 	case pooledReceiveOfferDelivered:
 		return true, true
@@ -1342,22 +1651,38 @@ func (self *PlatformTransport) offerReceive(
 	}
 }
 
-// offerH1Control refuses a saturated reliable control queue immediately. A
-// speed-test/latency control message has no Transfer acknowledgement above it,
-// so skipping it would desynchronize state; the caller closes this websocket
-// generation and reconnects instead.
+// Hands one speed-test or latency echo to the H1 writer. The H1 reader is the
+// dedicated reader of one reliable lane, so under the reliable-carrier
+// backpressure contract (CODESTYLE.md) it may retain this one already-read
+// message until the fixed queue has room or the generation ends; TCP then
+// holds the platform to the rate this client can echo. Refusal is not a
+// recoverable boundary here: an echo has no Transfer acknowledgement above it,
+// so skipping one desynchronizes the speed-test mode and the platform's exact
+// byte count, and closing the generation instead killed healthy connections
+// whenever a speed test met an uplink slower than the downlink. Every writer
+// path is deadline-bounded, so a stuck writer still ends the generation. Each
+// wait counts as H1 control backpressure. Takes the echo: false means the
+// generation ended and the echo went back to the pool.
 func (self *PlatformTransport) offerH1Control(
 	done <-chan struct{},
 	controlSend chan<- []byte,
 	message []byte,
 ) bool {
+	if self.h1RetainedBudget != nil {
+		return self.offerH1Retained(done, controlSend, message, &self.h1RetainedBudget.control, true)
+	}
 	switch tryOfferPooledReceive(done, controlSend, message) {
 	case pooledReceiveOfferDelivered:
 		return true
 	case pooledReceiveOfferFull:
-		self.receiveStats.recordH1ControlRefusal(len(message))
-		MessagePoolReturn(message)
-		return false
+		self.receiveStats.recordH1ControlBackpressure(len(message))
+		select {
+		case <-done:
+			MessagePoolReturn(message)
+			return false
+		case controlSend <- message:
+			return true
+		}
 	default:
 		MessagePoolReturn(message)
 		return false
@@ -1366,6 +1691,7 @@ func (self *PlatformTransport) offerH1Control(
 
 func (self *PlatformTransport) setRegistered(registered bool) {
 	if registered {
+		self.everRegistered.Store(true)
 		self.registeredCount.Add(1)
 	} else {
 		self.registeredCount.Add(-1)
@@ -1478,6 +1804,7 @@ func NewPlatformTransportWithTargetMode(
 		kickMonitor:          NewMonitor(),
 		extenderIpCounts:     map[netip.Addr]int{},
 		extenderIpsMonitor:   settings.ExtenderIpsMonitor,
+		pingOffset:           wakeupOffset(settings.PingJitter),
 	}
 	if transport.extenderIpsMonitor == nil {
 		transport.extenderIpsMonitor = NewMonitorValue[uint64](0)
@@ -1490,6 +1817,11 @@ func NewPlatformTransportWithTargetMode(
 	if transport.credentialRefusalHold == nil {
 		transport.credentialRefusalHold = newCredentialRefusalHold()
 	}
+	transport.residentMoveTracker = settings.ResidentMoveTracker
+	if transport.residentMoveTracker == nil {
+		transport.residentMoveTracker = NewResidentMoveTracker()
+	}
+	transport.residentMoveDial = settings.ResidentMoveDial
 	transport.ipFamily = normalizeIpFamily(settings.IpFamily)
 	transport.enabled.Store(!settings.StartDisabled)
 	transport.held = NewMonitorValue(settings.StartDisabled)
@@ -1517,6 +1849,9 @@ func NewPlatformTransportWithTargetMode(
 	h1Enabled := targetMode == TransportModeH1 ||
 		(targetMode == TransportModeAuto &&
 			transport.modePreference(TransportModeH1) != modePreferenceNone)
+	if h1Enabled {
+		transport.h1RetainedBudget = newPlatformH1RetainedBudget(settings)
+	}
 	h3Enabled := targetMode == TransportModeH3 || targetMode == TransportModeH3Dns ||
 		targetMode == TransportModeH3DnsPump ||
 		(targetMode == TransportModeAuto &&
@@ -1882,6 +2217,9 @@ func (self *PlatformTransport) run() {
 	defer func() {
 		self.cancel()
 		self.runWaitGroup.Wait()
+		if retained := self.h1RetainedBudget; retained != nil {
+			retained.receive.waitReleased()
+		}
 		// Keep H1 admission until every mode has closed its native graph.
 		// A separate later defer would release it before this join.
 		self.h1BudgetReservation.Release()
@@ -1970,6 +2308,11 @@ func (self *PlatformTransport) h1MaxMessageByteCount() int64 {
 }
 
 func (self *PlatformTransport) h1BudgetByteCount() ByteCount {
+	return self.settings.H1MemoryReservationByteCount()
+}
+
+// Raw outer tcp/tls has no application routes and retains the base row only.
+func (self *PlatformTransport) h1BaseBudgetByteCount() ByteCount {
 	if 0 < self.settings.H1BudgetByteCount {
 		return self.settings.H1BudgetByteCount
 	}
@@ -1995,6 +2338,13 @@ func (self *PlatformTransport) h3SocketWriteBufferByteCount() ByteCount {
 		return self.settings.H3SocketWriteBufferByteCount
 	}
 	return MemoryScaledByteCount(mib(1), kib(256))
+}
+
+// Tells a test that an H3 connection installed a stream deadline.
+func (self *PlatformTransport) h3StreamDeadlineInstalledForTest(write bool, deadline time.Time) {
+	if self.settings.h3StreamDeadlineForTest != nil {
+		self.settings.h3StreamDeadlineForTest(write, deadline)
+	}
 }
 
 // runInactiveDrain bounds a carrier only after a strictly better mode has
@@ -2023,7 +2373,11 @@ func (self *PlatformTransport) runInactiveDrain(
 	var startWriteCount uint64
 	for {
 		activeMode, notify := self.activeMode()
-		if !self.isBetterMode(activeMode, mode) {
+		superseded := self.isBetterMode(activeMode, mode)
+		if self.settings.inactiveDrainDecisionForTest != nil {
+			self.settings.inactiveDrainDecisionForTest(mode, activeMode, superseded)
+		}
+		if !superseded {
 			supersededSince = time.Time{}
 			select {
 			case <-ctx.Done():
@@ -2088,10 +2442,17 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 	}
 
 	// hadConnection marks the iteration immediately after a connection ran and
-	// died: only that first re-dial takes the reconnect fast path
-	// (NextReconnectTime); a failed re-dial clears it, so retries fall back to
-	// the serialized NextConnectTime pacing.
+	// died: only that first re-dial spreads over ReconnectJitter and takes the
+	// reconnect fast path (waitDialPacing); a failed re-dial clears it, so
+	// retries fall back to the serialized NextConnectTime pacing. A hold also
+	// clears it: a connection the hold closed was not lost, and a dial after a
+	// park in admission is a fresh start. afterKick marks a re-dial that a
+	// network change asked for (see nextDialTime).
 	hadConnection := false
+	afterKick := false
+	// a compulsory move's replacement tries its target once per carrier
+	// (transport_move.go)
+	moveTargetAttempted := false
 
 	for {
 		// stand down while a strictly better mode is active
@@ -2108,8 +2469,22 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				}
 			}
 		}()
-		if !self.waitDialAdmission(self.ctx) {
+		if !hadConnection {
+			// a mode that was standing down lets the preferred mode take a
+			// new path first; one that was carrying traffic re-dials at once
+			if !self.holdAfterKick(self.ctx, TransportModeH1) {
+				return
+			}
+			if standDown, _ := self.standDown(TransportModeH1); standDown {
+				continue
+			}
+		}
+		admitted, parked := self.waitDialAdmissionParked(self.ctx)
+		if !admitted {
 			return
+		}
+		if parked {
+			hadConnection = false
 		}
 		auth := self.authSnapshot()
 		// read after the auth snapshot (transport_client_limit.go)
@@ -2117,25 +2492,45 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 		clientId, _ := auth.ClientId()
 
 		reconnect := NewReconnect(self.settings.ReconnectTimeout)
+		// every kick after this point belongs to this iteration: it skips the
+		// pre-dial wait, cancels the dial, skips the retry wait, or closes the
+		// connection the dial produced (see kickedSince)
+		kickGeneration := self.kickGeneration.Load()
 		// the extender the winning dialer used, zero for a direct dial (K1).
 		// Written by the single dial below and read by the connection it
 		// produced, both on this goroutine.
 		var dialExtenderIp netip.Addr
-		connect := func() (H1MessageConn, error) {
+		// whether a relay (an extender or a VLESS server) carried the winning
+		// dial, written and read like dialExtenderIp
+		dialRelayed := false
+		// the move targets this attempt dials in place of the platform host,
+		// nil to resolve it (transport_move.go). Set right before the dial.
+		var moveAttempt *platformMoveDialAttempt
+		// the delay header rides header auth only, where the first message
+		// after the 101 is the switch point, and never a connection that
+		// declares provide intent (DELAY.md §6, D3)
+		offerTransportDelay := self.settings.V2H1Auth && self.settings.TransportDelay.offered() && !auth.ProvideIntent
+		connect := func(dialCtx context.Context) (H1MessageConn, error) {
 			header := http.Header{}
 			if self.settings.V2H1Auth {
 				header.Add("Authorization", fmt.Sprintf("Bearer %s", auth.ByJwt))
 				header.Add("X-UR-AppVersion", auth.AppVersion)
 				header.Set(ClientInfoHeader, auth.ClientInfo.Json())
 				header.Set("X-UR-StreamLeaseVersion", "1")
+				if self.settings.EnableMove {
+					header.Set(HeaderResidentMoveVersion, residentMoveVersionHeader())
+				}
 				header.Add("X-UR-InstanceId", auth.InstanceId.String())
 				header.Add("X-UR-TransportVersion", fmt.Sprintf("%d", TransportVersion))
 				self.applyIntentHeader(header)
 				applyProvideIntentHeader(header, auth)
+				if offerTransportDelay {
+					applyTransportDelayH1Offer(header)
+				}
 			}
 
 			ws, dialerInfo, err := self.clientStrategy.H1DialContextWithDialer(
-				self.dialContext(self.ctx),
+				moveAttempt.withContext(self.dialContext(dialCtx)),
 				self.platformUrl,
 				header,
 				int(self.h1MaxMessageByteCount()),
@@ -2147,6 +2542,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			}
 			if dialerInfo != nil {
 				dialExtenderIp = dialerInfo.ExtenderIp
+				dialRelayed = dialerInfo.relay
 			}
 			ws.SetReadLimit(self.h1MaxMessageByteCount())
 
@@ -2159,13 +2555,14 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 
 			if !self.settings.V2H1Auth {
 				authBytes, err := EncodeFrame(&protocol.Auth{
-					ByJwt:              auth.ByJwt,
-					AppVersion:         auth.AppVersion,
-					ClientInfo:         auth.ClientInfo.Json(),
-					StreamLeaseVersion: 1,
-					InstanceId:         auth.InstanceId.Bytes(),
-					IpFamily:           self.authIntent(),
-					ProvideIntent:      auth.ProvideIntent,
+					ByJwt:               auth.ByJwt,
+					AppVersion:          auth.AppVersion,
+					ClientInfo:          auth.ClientInfo.Json(),
+					StreamLeaseVersion:  1,
+					InstanceId:          auth.InstanceId.Bytes(),
+					IpFamily:            self.authIntent(),
+					ProvideIntent:       auth.ProvideIntent,
+					ResidentMoveVersion: self.residentMoveVersion(),
 				}, self.settings.ProtocolVersion)
 				if err != nil {
 					return nil, err
@@ -2204,45 +2601,76 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 						return nil, fmt.Errorf("Auth response error.")
 					}
 				}
+				// clear authentication deadlines before publishing the connection
+				if err := ws.SetReadDeadline(time.Time{}); err != nil {
+					return nil, err
+				}
+				if err := ws.SetWriteDeadline(time.Time{}); err != nil {
+					return nil, err
+				}
 			}
 
 			success = true
 			return ws, nil
 		}
 
-		// a transport that was connected and just died takes the reconnect
-		// fast path (small independent jitter, capped concurrency) instead of
-		// the shared serializing staircase; see NextReconnectTime. The release
-		// frees the fast-path slot as soon as the dial attempt completes, on
-		// every exit path.
-		// cancelConnect gives the staircase reservation back if this wait is
-		// cancelled before the dial happens; it must NOT be called once the
-		// dial proceeds — see NextConnectTime. A pinned transport paces
-		// itself and returns no-ops for both.
-		connectTime, releaseReconnect, cancelConnect := self.nextDialTime(hadConnection)
+		// a transport that was connected and just died first spreads its
+		// re-dial over ReconnectJitter, then takes the reconnect fast path
+		// (small independent jitter, capped concurrency) instead of the shared
+		// serializing staircase; see waitDialPacing. The release frees the
+		// fast-path slot as soon as the dial attempt completes, on every exit
+		// path. A pinned transport paces itself.
+		pacing, releaseReconnect, _ := self.waitDialPacing(self.ctx, hadConnection, afterKick, &kickGeneration)
 		hadConnection = false
-		if connectDelay := connectTime.Sub(time.Now()); 0 < connectDelay {
-			select {
-			case <-self.ctx.Done():
-				releaseReconnect()
-				cancelConnect()
-				return
-			case <-self.kickMonitor.NotifyChannel():
-				// network changed while waiting to dial: any pacing computed
-				// for the old path is meaningless — dial now over the new one
-			case <-time.After(connectDelay):
-			}
+		afterKick = false
+		switch pacing {
+		case dialWaitClosed:
+			return
+		case dialWaitHeld:
+			// the transport became held while waiting: admission runs again,
+			// and the pacing was given back
+			continue
 		}
 
+		// The dial has its own context so that a kick can cancel it: it was
+		// started on the path that just changed, and would otherwise run to
+		// its deadline there. The connection it produces keeps the context
+		// (the strategy observes delivery through it), so it ends with this
+		// iteration.
+		dialCtx, cancelDial := context.WithCancel(self.ctx)
+		stopDialKickWatch := self.cancelOnKick(dialCtx, kickGeneration, cancelDial)
+		moveAttempt = self.moveDialAttempt(moveTargetAttempted)
 		var ws H1MessageConn
 		var err error
 		if self.log.V(2).Enabled() {
-			ws, err = TraceWithReturnError(fmt.Sprintf("[t]connect %s", clientId), connect)
+			ws, err = TraceWithReturnError(fmt.Sprintf("[t]connect %s", clientId), func() (H1MessageConn, error) {
+				return connect(dialCtx)
+			})
 		} else {
-			ws, err = connect()
+			ws, err = connect(dialCtx)
 		}
+		stopDialKickWatch()
 		releaseReconnect()
+		// a kick during the dial: the attempt was made on the path that changed
+		kickedDuringDial := self.kicked(kickGeneration)
 		if err != nil {
+			cancelDial()
+			// a hold cancels the dial through the kick monitor
+			// (cancelOnKick), so a dial that failed while the transport is
+			// held is the owner's or the family's stop, not a failure
+			heldDuringDial := self.heldNow()
+			// a dial this transport's teardown, a network change or a hold
+			// canceled says nothing about the move target either
+			closing := false
+			select {
+			case <-self.ctx.Done():
+				closing = true
+			default:
+			}
+			if !closing && !kickedDuringDial && !heldDuringDial && moveAttempt.dialedTargets() {
+				moveTargetAttempted = moveTargetAttempted || moveAttempt.dial != nil
+				self.noteMoveDialFailed(moveAttempt, TransportModeH1, err)
+			}
 			// a definitive refusal of the credential holds it before the next
 			// dial; the backend answered, so it is no dial failure either
 			// (transport_credential_refusal.go)
@@ -2256,8 +2684,10 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			// at once and the burst of canceled dials trips the degraded
 			// threshold with fresh timestamps, so the NEXT session starts
 			// gated. The contract OOB path makes the same carve-out on
-			// client.Done.
-			if self.ctx.Err() == nil && refusal == 0 {
+			// client.Done. A dial the network change canceled, or left on a
+			// path that went away, says nothing about the backend either, and
+			// neither does one the owner's or the family's hold canceled.
+			if self.ctx.Err() == nil && refusal == 0 && !kickedDuringDial && !heldDuringDial {
 				self.noteDialFailure()
 			}
 			// err here is the strategy's flattened "Timeout."; a pinned
@@ -2273,25 +2703,69 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				// throttled at INFO; -v=1 still shows every attempt
 				v.Infof("[t]auth error %s = %s\n", clientId, err)
 			}
-			select {
-			case <-self.ctx.Done():
+			if kickedDuringDial {
+				// network changed during the dial: retry now over the new
+				// path on the reconnect fast path, without the backoff
+				self.noteKick()
+				hadConnection = true
+				afterKick = true
+				continue
+			}
+			switch self.waitDial(self.ctx, self.dialRetryAfter(reconnect), kickGeneration) {
+			case dialWaitClosed:
 				return
-			case <-self.kickMonitor.NotifyChannel():
+			case dialWaitKicked:
 				// network changed: the failed dial was likely on the dead
 				// path — retry now over the new one instead of waiting out
 				// the backoff, and take the reconnect fast path (a network
 				// change is a legitimate fresh start, not staircase churn)
 				self.noteKick()
 				hadConnection = true
-				continue
-			case <-self.dialRetryAfter(reconnect):
-				continue
+				afterKick = true
 			}
+			// after the backoff, or a hold: admission runs again, and the
+			// next dial is no lost connection's re-dial
+			continue
 		}
 
 		// auth succeeded: the backend is reachable
 		self.noteDialSuccess()
+		if kickedDuringDial {
+			// the dial completed just as the network changed, so it may ride
+			// the path that went away: replace it now rather than find out
+			// through the connection's pings
+			ws.Close()
+			cancelDial()
+			hadConnection = true
+			afterKick = true
+			continue
+		}
 
+		// a 101 that selected the delay header switches every message of this
+		// connection to the header wire (DELAY.md §5, §6). From here on every
+		// read and write goes through ws, which stamps and strips the header.
+		// nil keeps the legacy wire.
+		delayH1 := enableTransportDelayH1(ws, newTransportDelay(
+			self.settings.TransportDelay,
+			clientId,
+			TransportTypeH1,
+			self.routeManager.publishTransportDelayStats,
+		))
+		if offerTransportDelay {
+			// the edge's answer, which the client's new P2P generations
+			// follow (DELAY.md §6.1)
+			self.routeManager.noteTransportDelayEdgeAnswer(delayH1 != nil)
+		}
+		if delayH1 != nil {
+			ws = delayH1.conn
+			// re-apply the payload limit through the wrapper, which adds the
+			// header to the WebSocket limit. h1+ bounds the payload itself and
+			// clamps this to its maximum.
+			ws.SetReadLimit(self.h1MaxMessageByteCount())
+		}
+
+		// set when a hold, not the platform or the path, closed the connection
+		var closedByHold atomic.Bool
 		c := func() {
 			defer ws.Close()
 
@@ -2314,14 +2788,22 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			}
 
 			// a network-change kick closes this connection so the loop
-			// re-dials over the new path immediately (see Kick), and a client
-			// limit hold closes it with the rest of the client
-			// (transport_client_limit.go). the ws.Close is what unblocks a
-			// reader/writer parked in a socket call that handleCancel alone
-			// cannot wake.
-			kick := self.kickMonitor.NotifyChannel()
+			// re-dials over the new path immediately (see Kick), and a hold of
+			// the owner or the family, or a client limit hold, closes it with
+			// the rest of the client (transport_client_limit.go). the ws.Close
+			// is what unblocks a reader/writer parked in a socket call that
+			// handleCancel alone cannot wake. The watch is armed from the
+			// iteration's generation, so a kick that landed after the dial
+			// check is not missed.
+			kick := self.kickedSince(kickGeneration)
 			startConnectionWorker(func() {
 				self.runConnectionWatch(handleCtx, kick, func(reason string) {
+					// The kick monitor also fires when the transport becomes
+					// held, so a network change close with no kick is a hold's
+					// that lifted before the watch read it.
+					if reason != connectionCloseNetworkChange || !self.kicked(kickGeneration) {
+						closedByHold.Store(true)
+					}
 					handleCancel()
 					ws.Close()
 				})
@@ -2332,6 +2814,14 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			send := make(chan []byte, self.settings.TransportBufferSize)
 			receive := make(chan []byte, self.settings.TransportBufferSize)
 			controlSend := make(chan []byte, self.settings.TransportBufferSize)
+			var sendLane, receiveLane, controlLane, priorityLane *platformH1RetainedLane
+			if retained := self.h1RetainedBudget; retained != nil {
+				sendLane, receiveLane, controlLane, priorityLane = &retained.send, &retained.receive, &retained.control, &retained.priority
+			}
+			var receiveDone <-chan struct{}
+			if receiveLane != nil {
+				receiveDone = handleCtx.Done()
+			}
 			var ackPrioritySend chan []byte
 			ackPriorityBufferSize := min(
 				max(0, self.settings.H1AckPriorityBufferSize),
@@ -2341,14 +2831,14 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				ackPrioritySend = make(chan []byte, ackPriorityBufferSize)
 			}
 
-			drain := func(c chan []byte) {
+			drain := func(c chan []byte, lane *platformH1RetainedLane) {
 				for {
 					select {
 					case message, ok := <-c:
 						if !ok {
 							return
 						}
-						MessagePoolReturn(message)
+						returnH1RetainedMessage(message, lane)
 					default:
 						return
 					}
@@ -2366,7 +2856,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					defer func() {
 						handleCancel()
 						close(send)
-						drain(send)
+						drain(send, sendLane)
 					}()
 					for {
 						select {
@@ -2378,7 +2868,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 							}
 							select {
 							case <-handleCtx.Done():
-								MessagePoolReturn(message)
+								returnH1RetainedMessage(message, sendLane)
 								return
 							case send <- message:
 							}
@@ -2387,7 +2877,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				}, func() {
 					handleCancel()
 					close(send)
-					drain(send)
+					drain(send, sendLane)
 				})
 			} else {
 				exportedSend = send
@@ -2407,7 +2897,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				receiveTransport = NewReceiveGatewayTransportWithType(TransportTypeH1)
 			}
 
-			self.routeManager.UpdateTransport(sendTransport, []Route{exportedSend})
+			self.routeManager.UpdateTransportWithProperties(sendTransport, []Route{exportedSend}, TransferCarrierProperties{
+				h1SendRetained: sendLane, h1PriorityRetained: priorityLane,
+			})
 			if self.settings.SendRouteObserver != nil {
 				self.settings.SendRouteObserver(sendTransport, exportedSend, true)
 			}
@@ -2416,6 +2908,8 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				[]Route{receive},
 				TransferCarrierProperties{
 					ReceiveReliability: CarrierReliabilityReliable,
+					h1ReceiveRetained:  receiveLane,
+					h1ReceiveDone:      receiveDone,
 				},
 			)
 			// the extender carrying this connection is published for exactly
@@ -2423,16 +2917,24 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 			// the connection rather than the dial (K1, K4). Acquire both before
 			// announcing readiness; withdraw readiness before releasing them.
 			releaseExtenderIp := self.holdExtenderIp(dialExtenderIp)
+			releaseRelayedConnection := self.holdRelayedConnection(dialRelayed)
 			releaseH1ConnectionStats := self.settings.H1ConnectionStats.connected(ws)
 			h1Progress := newH1PhysicalProgress(self.settings.ProgressObserver, clientId, ws)
 			if framed, ok := unobservedH1MessageConn(ws).(*FramedMessageConn); ok {
 				framed.progress = h1Progress
 			}
 			self.setRegistered(true)
+			// a move's replacement arrived at its target once its connection
+			// is published (transport_move.go)
+			if moveAttempt.dialedTargets() {
+				moveTargetAttempted = moveTargetAttempted || moveAttempt.dial != nil
+				self.noteMoveDialArrived(moveAttempt, dialRelayed)
+			}
 
 			defer func() {
 				self.setRegistered(false)
 				releaseH1ConnectionStats()
+				releaseRelayedConnection()
 				releaseExtenderIp()
 				// Stop new priority admissions before retiring the public route.
 				// RemoveTransport then joins any writer that already acquired the
@@ -2454,11 +2956,16 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				// connection worker then closes the remaining reader, watcher,
 				// and socket-writer ownership before completion is published.
 				connectionWaitGroup.Wait()
+				// no reader or writer remains, so the interval in progress is
+				// the connection's last
+				if delayH1 != nil {
+					delayH1.delay.flush()
+				}
 				h1Progress.event("h1_closed", nil, true, nil)
 				// No producer can enqueue after the join, so one deterministic
 				// drain releases every pooled message still sitting in either lane.
-				drain(send)
-				drain(ackPrioritySend)
+				drain(send, sendLane)
+				drain(ackPrioritySend, priorityLane)
 			}()
 			startConnectionWorker(func() {
 				self.runInactiveDrain(
@@ -2475,17 +2982,34 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				defer handleCancel()
 
 				speedTest := false
-				pingTimer := time.NewTimer(0)
-				defer pingTimer.Stop()
-				resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
+				pinger := newPingPacer(
+					self.settings.PingTimeout,
+					self.settings.PingTimeout,
+					self.pingOffset,
+					time.Now(),
+					self.settings.pingTimerArmForTest,
+				)
+				defer pinger.stop()
+				writePing := func() error {
+					if err := ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout)); err != nil {
+						return err
+					}
+					// a WebSocket write timeout cannot be recovered
+					err := ws.WriteMessage(websocket.BinaryMessage, make([]byte, 0))
+					if err != nil {
+						return err
+					}
+					pinger.pinged(time.Now())
+					return nil
+				}
 
-				writeMessage := func(message []byte) error {
+				writeMessage := func(message []byte, lane *platformH1RetainedLane) error {
 					standaloneProgress := h1Progress.prepareWebSocketWrite(message)
 					err := ws.WriteMessage(websocket.BinaryMessage, message)
 					if standaloneProgress {
 						h1Progress.endWrite(err)
 					}
-					MessagePoolReturn(message)
+					returnH1RetainedMessage(message, lane)
 					if err != nil {
 						// note that for websocket a dealine timeout cannot be recovered
 						if ok, suppressed := shouldLogWriteErr(); ok {
@@ -2504,27 +3028,48 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					}
 					return nil
 				}
-				write := func(message []byte) error {
+				write := func(message []byte, lane *platformH1RetainedLane) error {
 					if err := ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout)); err != nil {
-						MessagePoolReturn(message)
+						returnH1RetainedMessage(message, lane)
 						return err
 					}
-					return writeMessage(message)
+					return writeMessage(message, lane)
 				}
-				writePayload := func(message []byte) error {
-					if err := write(message); err != nil {
+				writePayload := func(message []byte, lane *platformH1RetainedLane) error {
+					if err := write(message, lane); err != nil {
 						return err
 					}
 					writeCounter.Add(1)
 					return nil
 				}
-				writeSendMessage := func(message []byte) error {
+				// Writing the start or stop echo moves the writer into or out of
+				// speed-test mode, in step with the reader that queued it.
+				writeControl := func(message []byte) error {
+					if len(message) == 5 {
+						switch message[0] {
+						case TransportControlSpeedStart:
+							speedTest = true
+						case TransportControlSpeedStop:
+							speedTest = false
+						}
+					}
+					if err := write(message, controlLane); err != nil {
+						return err
+					}
+					pinger.wrote(time.Now())
+					return nil
+				}
+				writeSendMessage := func(message []byte, priority bool) error {
+					lane := sendLane
+					if priority {
+						lane = priorityLane
+					}
 					if len(message) <= 16 {
 						self.log.Infof("[ts]send message must be >16 bytes (%d)\n", len(message))
-						MessagePoolReturn(message)
+						returnH1RetainedMessage(message, lane)
 						return nil
 					}
-					if err := writeMessage(message); err != nil {
+					if err := writeMessage(message, lane); err != nil {
 						return err
 					}
 					writeCounter.Add(1)
@@ -2538,24 +3083,25 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					firstPriority bool,
 				) (sendOpen bool, err error) {
 					if framed, ok := unobservedH1MessageConn(ws).(*FramedMessageConn); ok {
-						return writeH1FramedReadyBatch(handleCtx, framed, send, ackPrioritySend, firstMessage, firstPriority, self.settings.WriteTimeout, func() { writeCounter.Add(1) })
+						return writeH1FramedReadyBatch(handleCtx, framed, send, ackPrioritySend, firstMessage, firstPriority, self.settings.WriteTimeout, func() { writeCounter.Add(1) }, self.h1RetainedBudget)
 					}
-					if writeBatchConn == nil {
-						if err := ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout)); err != nil {
-							MessagePoolReturn(firstMessage)
-							return true, err
-						}
-						return true, writeSendMessage(firstMessage)
-					}
-
+					// One native deadline bounds the entire ready batch.
 					if err := ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout)); err != nil {
-						MessagePoolReturn(firstMessage)
+						lane := sendLane
+						if firstPriority {
+							lane = priorityLane
+						}
+						returnH1RetainedMessage(firstMessage, lane)
 						return true, err
 					}
+					if writeBatchConn == nil {
+						return true, writeSendMessage(firstMessage, firstPriority)
+					}
+
 					writeBatchConn.BeginWriteBatch()
 					h1Progress.beginWebSocketBatch()
 					defer h1Progress.finishWebSocketBatch()
-					if err = writeSendMessage(firstMessage); err != nil {
+					if err = writeSendMessage(firstMessage, firstPriority); err != nil {
 						writeBatchConn.AbortWriteBatch()
 						return true, err
 					}
@@ -2591,7 +3137,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 							sendOpen = false
 							break drainReady
 						}
-						if err = writeSendMessage(message); err != nil {
+						if err = writeSendMessage(message, priority); err != nil {
 							writeBatchConn.AbortWriteBatch()
 							return true, err
 						}
@@ -2621,13 +3167,28 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					// selects below also include the lane so a newly arriving ACK
 					// wakes an otherwise idle writer.
 					if ackPrioritySend != nil && !speedTest {
+						// A pending control echo goes first. The pass below takes
+						// the next ACK and comes round again, so a lane that is
+						// ready every time, as on a slow uplink, kept the selects
+						// below, which drain controlSend, from ever running, and
+						// the reader waits on a full control queue. Control echoes
+						// are a handful of small messages outside a speed test, so
+						// serving them first cannot starve the lane.
+						select {
+						case message, ok := <-controlSend:
+							if !ok || writeControl(message) != nil {
+								return
+							}
+							continue
+						default:
+						}
 						select {
 						case message := <-ackPrioritySend:
 							if speedTest {
 								if len(message) <= 16 {
 									self.log.Infof("[ts]send message must be >16 bytes (%d)\n", len(message))
-									MessagePoolReturn(message)
-								} else if writePayload(message) != nil {
+									returnH1RetainedMessage(message, priorityLane)
+								} else if writePayload(message, priorityLane) != nil {
 									return
 								}
 							} else {
@@ -2636,7 +3197,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 									return
 								}
 							}
-							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
+							pinger.wrote(time.Now())
 							continue
 						default:
 						}
@@ -2649,48 +3210,33 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 						select {
 						case <-handleCtx.Done():
 							return
-						case <-pingTimer.C:
-							if err := ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout)); err != nil {
+						case <-pinger.timer.C:
+							if pinger.fired(time.Now()) && writePing() != nil {
 								return
 							}
-							if err := ws.WriteMessage(websocket.BinaryMessage, make([]byte, 0)); err != nil {
-								// note that for websocket a dealine timeout cannot be recovered
-								return
-							}
-							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
 						case message, ok := <-controlSend:
-							if !ok {
+							if !ok || writeControl(message) != nil {
 								return
 							}
-							if len(message) == 5 {
-								switch message[0] {
-								case TransportControlSpeedStop:
-									speedTest = false
-								}
-							}
-							if write(message) != nil {
-								return
-							}
-							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
 						case message, ok := <-send:
 							if !ok {
 								return
 							}
 							if len(message) <= 16 {
 								self.log.Infof("[ts]send message must be >16 bytes (%d)\n", len(message))
-								MessagePoolReturn(message)
-							} else if writePayload(message) != nil {
+								returnH1RetainedMessage(message, sendLane)
+							} else if writePayload(message, sendLane) != nil {
 								return
 							}
-							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
+							pinger.wrote(time.Now())
 						case message := <-ackPrioritySend:
 							if len(message) <= 16 {
 								self.log.Infof("[ts]send message must be >16 bytes (%d)\n", len(message))
-								MessagePoolReturn(message)
-							} else if writePayload(message) != nil {
+								returnH1RetainedMessage(message, priorityLane)
+							} else if writePayload(message, priorityLane) != nil {
 								return
 							}
-							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
+							pinger.wrote(time.Now())
 						}
 					} else {
 						select {
@@ -2708,36 +3254,21 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 							if err != nil || !sendOpen {
 								return
 							}
-							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
+							pinger.wrote(time.Now())
 						case message := <-ackPrioritySend:
 							sendOpen, err := writeReadySendBatch(message, true)
 							if err != nil || !sendOpen {
 								return
 							}
-							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
-						case <-pingTimer.C:
-							if err := ws.SetWriteDeadline(time.Now().Add(self.settings.WriteTimeout)); err != nil {
+							pinger.wrote(time.Now())
+						case <-pinger.timer.C:
+							if pinger.fired(time.Now()) && writePing() != nil {
 								return
 							}
-							if err := ws.WriteMessage(websocket.BinaryMessage, make([]byte, 0)); err != nil {
-								// note that for websocket a dealine timeout cannot be recovered
-								return
-							}
-							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
 						case message, ok := <-controlSend:
-							if !ok {
+							if !ok || writeControl(message) != nil {
 								return
 							}
-							if len(message) == 5 {
-								switch message[0] {
-								case TransportControlSpeedStart:
-									speedTest = true
-								}
-							}
-							if write(message) != nil {
-								return
-							}
-							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
 						}
 					}
 				}
@@ -2752,10 +3283,16 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					close(receive)
 					close(controlSend)
 
-					drain(receive)
-					drain(controlSend)
+					drain(receive, receiveLane)
+					drain(controlSend, controlLane)
 				}()
 				speedTest := false
+				var speedTestId uint32
+				// The reader's time between reads, which is almost all spent
+				// handing the last message onward, censors the next delay
+				// sample: the next message waited in the socket for a local
+				// reason (DELAY.md §4.2). Zero when there is no delay header.
+				var handoffStartTime time.Time
 
 				for {
 					select {
@@ -2764,11 +3301,17 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 					default:
 					}
 
+					if !handoffStartTime.IsZero() {
+						delayH1.noteHandoff(time.Since(handoffStartTime))
+					}
 					if err := ws.SetReadDeadline(time.Now().Add(self.settings.ReadTimeout)); err != nil {
 						h1Progress.event("h1_read_deadline_error", nil, false, err)
 						return
 					}
 					messageType, message, err := ReadH1PooledMessage(ws, self.h1MaxMessageByteCount())
+					if delayH1 != nil {
+						handoffStartTime = time.Now()
+					}
 					if err != nil {
 						h1Progress.event("h1_read_error", nil, false, err)
 						if self.log.V(2).Enabled() {
@@ -2798,6 +3341,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 								switch message[0] {
 								case TransportControlSpeedStart:
 									speedTest = true
+									speedTestId = binary.BigEndian.Uint32(message[1:5])
 									// echo
 									if !self.offerH1Control(handleCtx.Done(), controlSend, message) {
 										return
@@ -2833,8 +3377,9 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 							}
 							continue
 						}
-						if speedTest {
-							// speed test echo
+						if speedTest && IsTransportSpeedTestProbe(message, speedTestId) {
+							// Echo only this test's probes. The platform interleaves
+							// real Transfer frames, which still belong to receive.
 							if !self.offerH1Control(handleCtx.Done(), controlSend, message) {
 								return
 							}
@@ -2846,6 +3391,7 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 							CarrierReliabilityReliable,
 							receive,
 							message,
+							receiveLane,
 						)
 						if h1Progress != nil {
 							endTransferProgress(h1Progress.observer, readProgress, "h1_receive_end", delivered, nil)
@@ -2877,8 +3423,8 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 				close(receive)
 				close(controlSend)
 
-				drain(receive)
-				drain(controlSend)
+				drain(receive, receiveLane)
+				drain(controlSend, controlLane)
 			})
 
 			select {
@@ -2892,18 +3438,32 @@ func (self *PlatformTransport) runH1(initialTimeout time.Duration) {
 		} else {
 			c()
 		}
-		// the connection ran and died: the next dial is a reconnect
-		hadConnection = true
+		cancelDial()
+		// the connection ran and died: the next dial is a reconnect, unless a
+		// hold closed it, which is no loss
+		hadConnection = !closedByHold.Load()
+		if self.kicked(kickGeneration) {
+			// a network change closed this connection (or landed as it
+			// closed): re-dial now over the new path. The reconnect timer runs
+			// from the connection's start, so waiting it out would hold back
+			// any connection younger than ReconnectTimeout
+			hadConnection = true
+			afterKick = true
+			continue
+		}
 
-		select {
-		case <-self.ctx.Done():
+		switch self.waitDial(self.ctx, reconnect.After(), kickGeneration) {
+		case dialWaitClosed:
 			return
-		case <-self.kickMonitor.NotifyChannel():
+		case dialWaitKicked:
 			// a kick arriving after the connection already died skips the
-			// residual backoff — the fast-path re-dial starts now. (the kick
-			// that killed the connection closed the previous notify channel;
-			// this arm arms a fresh one, so one kick fires exactly once here.)
-		case <-reconnect.After():
+			// residual backoff — the fast-path re-dial starts now
+			hadConnection = true
+			afterKick = true
+		case dialWaitHeld:
+			// admission parks the runner, and the dial after it is a fresh
+			// start
+			hadConnection = false
 		}
 	}
 }
@@ -2928,10 +3488,16 @@ func (self *PlatformTransport) runH3(
 	}
 
 	// hadConnection marks the iteration immediately after a connection ran and
-	// died: only that first re-dial takes the reconnect fast path
-	// (NextReconnectTime); a failed re-dial clears it, so retries fall back to
-	// the serialized NextConnectTime pacing.
+	// died: only that first re-dial spreads over ReconnectJitter and takes the
+	// reconnect fast path (waitDialPacing); a failed re-dial clears it, so
+	// retries fall back to the serialized NextConnectTime pacing. A hold also
+	// clears it (see the h1 loop). afterKick marks a re-dial that a network
+	// change asked for (see nextDialTime).
 	hadConnection := false
+	afterKick := false
+	// a compulsory move's replacement tries its target once per carrier
+	// (transport_move.go)
+	moveTargetAttempted := false
 
 	for {
 		// wait until we are back in the specific pt mode or auto mode
@@ -2952,7 +3518,25 @@ func (self *PlatformTransport) runH3(
 		if ctx.Err() != nil {
 			return
 		}
-		if !self.waitDialAdmission(ctx) {
+		if !hadConnection {
+			// see the h1 loop: only a mode that was standing down holds
+			if !self.holdAfterKick(ctx, ptMode) {
+				return
+			}
+			if standDown, _ := self.standDown(ptMode); standDown {
+				continue
+			}
+		}
+		admitted, parked := self.waitDialAdmissionParked(ctx)
+		if !admitted {
+			return
+		}
+		if parked {
+			hadConnection = false
+		}
+		// a strict move's replacement dials nothing that cannot reach its
+		// target (transport_move.go)
+		if !self.waitMoveCarrierAdmission(ctx, ptMode) {
 			return
 		}
 		auth := self.authSnapshot()
@@ -2961,6 +3545,13 @@ func (self *PlatformTransport) runH3(
 		clientId, _ := auth.ClientId()
 
 		reconnect := NewReconnect(self.settings.ReconnectTimeout)
+		// every kick after this point belongs to this iteration (see the h1
+		// loop and kickedSince)
+		kickGeneration := self.kickGeneration.Load()
+		// the move targets this attempt dials in place of the platform host,
+		// nil to resolve it (transport_move.go). Only plain H3 can use a
+		// target. Set right before the dial.
+		var moveAttempt *platformMoveDialAttempt
 
 		type ConnStream struct {
 			conn           *quic.Conn
@@ -2969,6 +3560,9 @@ func (self *PlatformTransport) runH3(
 			sendDatagram   func([]byte) error
 			attempt        *h3DialAttempt
 			useH3Datagrams bool
+			// both lanes carry the delay header after the auth exchange
+			// (transport_delay_h3.go)
+			useTransportDelay bool
 		}
 
 		connect := func(attemptCtx context.Context) (*ConnStream, error) {
@@ -2978,15 +3572,17 @@ func (self *PlatformTransport) runH3(
 			// the frame form of the h1 provide intent header
 			// (transport_provide_intent.go)
 			authMessage := &protocol.Auth{
-				ByJwt:              auth.ByJwt,
-				AppVersion:         auth.AppVersion,
-				ClientInfo:         auth.ClientInfo.Json(),
-				StreamLeaseVersion: 1,
-				InstanceId:         auth.InstanceId.Bytes(),
-				IpFamily:           self.authIntent(),
-				ProvideIntent:      auth.ProvideIntent,
+				ByJwt:               auth.ByJwt,
+				AppVersion:          auth.AppVersion,
+				ClientInfo:          auth.ClientInfo.Json(),
+				StreamLeaseVersion:  1,
+				InstanceId:          auth.InstanceId.Bytes(),
+				IpFamily:            self.authIntent(),
+				ProvideIntent:       auth.ProvideIntent,
+				ResidentMoveVersion: self.residentMoveVersion(),
 			}
 			SetH3DatagramAuthOffer(authMessage, self.settings.EnableH3Datagrams)
+			SetTransportDelayH3Offer(authMessage, self.settings.TransportDelay, auth.ProvideIntent)
 			authBytes, err := EncodeFrame(authMessage, self.settings.ProtocolVersion)
 			if err != nil {
 				return nil, err
@@ -3015,7 +3611,10 @@ func (self *PlatformTransport) runH3(
 
 			// the candidate addresses in dial order, and how each socket is
 			// wrapped for the mode. A pending family requires a confirmed
-			// handshake race even when only one address is ready so far.
+			// handshake race even when only one address is ready so far. A
+			// move's targets stand in for the resolved addresses, while the
+			// server name stays the platform host (transport_move.go).
+			attemptCtx = moveAttempt.withContext(attemptCtx)
 			candidates, wrapPacketConn, source, err := self.h3DialCandidatesProgressive(attemptCtx, ptMode, serverName)
 			if err != nil {
 				return nil, err
@@ -3076,6 +3675,7 @@ func (self *PlatformTransport) runH3(
 			}
 			stream.SetReadDeadline(time.Now().Add(time.Duration(slowMultiple) * self.settings.AuthTimeout))
 			useH3Datagrams := false
+			useTransportDelay := false
 			if responseBytes, err := framer.Read(stream); err != nil {
 				return nil, err
 			} else {
@@ -3089,7 +3689,7 @@ func (self *PlatformTransport) runH3(
 					return nil, fmt.Errorf("Auth response error: got %T.", responseMessage)
 				}
 				connectionState := conn.ConnectionState()
-				useH3Datagrams, responseErr = ValidateH3DatagramAuthResponse(
+				useH3Datagrams, responseErr = negotiateH3DatagramAuthResponse(
 					authMessage,
 					authResponse,
 					self.settings.EnableH3Datagrams,
@@ -3099,41 +3699,49 @@ func (self *PlatformTransport) runH3(
 				if responseErr != nil {
 					return nil, responseErr
 				}
+				useTransportDelay, responseErr = negotiateTransportDelayH3AuthResponse(
+					authMessage,
+					authResponse,
+				)
+				if responseErr != nil {
+					return nil, responseErr
+				}
+				if authMessage.TransportDelayVersion != 0 {
+					// the edge's answer, which the client's new P2P
+					// generations follow (DELAY.md §6.1)
+					self.routeManager.noteTransportDelayEdgeAnswer(useTransportDelay)
+				}
 			}
+			// clear authentication deadlines before publishing the connection
+			streamWriter.SetWriteDeadline(time.Time{})
+			stream.SetReadDeadline(time.Time{})
 
 			success = true
 			return &ConnStream{
-				conn:           conn,
-				stream:         stream,
-				streamWriter:   streamWriter,
-				sendDatagram:   sendDatagram,
-				attempt:        attempt,
-				useH3Datagrams: useH3Datagrams,
+				conn:              conn,
+				stream:            stream,
+				streamWriter:      streamWriter,
+				sendDatagram:      sendDatagram,
+				attempt:           attempt,
+				useH3Datagrams:    useH3Datagrams,
+				useTransportDelay: useTransportDelay,
 			}, nil
 		}
 
-		// a transport that was connected and just died takes the reconnect
-		// fast path (small independent jitter, capped concurrency) instead of
-		// the shared serializing staircase; see NextReconnectTime. The release
-		// frees the fast-path slot as soon as the dial attempt completes, on
-		// every exit path.
-		// cancelConnect gives the staircase reservation back if this wait is
-		// cancelled before the dial happens; it must NOT be called once the
-		// dial proceeds — see NextConnectTime. A pinned transport paces
-		// itself and returns no-ops for both.
-		connectTime, releaseReconnect, cancelConnect := self.nextDialTime(hadConnection)
+		// a transport that was connected and just died first spreads its
+		// re-dial, then takes the reconnect fast path; see the h1 loop and
+		// waitDialPacing. cancelConnect gives the staircase reservation back
+		// if this runner gives up before the dial happens; it must NOT be
+		// called once the dial proceeds -- see NextConnectTime.
+		pacing, releaseReconnect, cancelConnect := self.waitDialPacing(ctx, hadConnection, afterKick, &kickGeneration)
 		hadConnection = false
-		if connectDelay := connectTime.Sub(time.Now()); 0 < connectDelay {
-			select {
-			case <-ctx.Done():
-				releaseReconnect()
-				cancelConnect()
-				return
-			case <-self.kickMonitor.NotifyChannel():
-				// network changed while waiting to dial: any pacing computed
-				// for the old path is meaningless — dial now over the new one
-			case <-time.After(connectDelay):
-			}
+		afterKick = false
+		switch pacing {
+		case dialWaitClosed:
+			return
+		case dialWaitHeld:
+			// see the h1 loop: admission runs again
+			continue
 		}
 		attemptCtx, releaseAttempt, acquired := self.h3Gate.Acquire(ctx, ptMode)
 		if !acquired {
@@ -3148,19 +3756,46 @@ func (self *PlatformTransport) runH3(
 			continue
 		}
 
+		// a kick cancels the dial, as in the h1 loop; the connection keeps
+		// the context until this iteration ends
+		dialCtx, cancelDial := context.WithCancel(attemptCtx)
+		stopDialKickWatch := self.cancelOnKick(dialCtx, kickGeneration, cancelDial)
+		moveAttempt = nil
+		if ptMode == TransportModeH3 {
+			moveAttempt = self.moveDialAttempt(moveTargetAttempted)
+		}
 		var connStream *ConnStream
 		var err error
 		if self.log.V(2).Enabled() {
 			connStream, err = TraceWithReturnError(fmt.Sprintf("[t]connect %s", clientId), func() (*ConnStream, error) {
-				return connect(attemptCtx)
+				return connect(dialCtx)
 			})
 		} else {
-			connStream, err = connect(attemptCtx)
+			connStream, err = connect(dialCtx)
 		}
+		stopDialKickWatch()
 		releaseReconnect()
+		// a kick during the dial: the attempt was made on the path that changed
+		kickedDuringDial := self.kicked(kickGeneration)
 		if err != nil {
 			attemptCanceled := attemptCtx.Err() != nil
+			cancelDial()
 			releaseAttempt()
+			// a hold cancels the dial through the kick monitor (see the h1
+			// loop): no failure
+			heldDuringDial := self.heldNow()
+			// a dial this transport's teardown, a network change or a hold
+			// canceled says nothing about the move target either
+			closing := false
+			select {
+			case <-ctx.Done():
+				closing = true
+			default:
+			}
+			if !closing && !attemptCanceled && !kickedDuringDial && !heldDuringDial && moveAttempt.dialedTargets() {
+				moveTargetAttempted = moveTargetAttempted || moveAttempt.dial != nil
+				self.noteMoveDialFailed(moveAttempt, ptMode, err)
+			}
 			// the platform may close for the client limit or refuse the
 			// credential right after the handshake, before the auth exchange
 			// completes. That is no backend failure: the loop parks in
@@ -3178,8 +3813,10 @@ func (self *PlatformTransport) runH3(
 			// at once and the burst of canceled dials trips the degraded
 			// threshold with fresh timestamps, so the NEXT session starts
 			// gated. The contract OOB path makes the same carve-out on
-			// client.Done.
-			if ctx.Err() == nil && refusal == 0 {
+			// client.Done. A dial the network change canceled, or left on a
+			// path that went away, says nothing about the backend either, and
+			// neither does one a hold canceled.
+			if ctx.Err() == nil && refusal == 0 && !kickedDuringDial && !heldDuringDial {
 				if !attemptCanceled {
 					self.noteDialFailure()
 					// the h3 resolve error reaches here typed, unlike the
@@ -3197,27 +3834,48 @@ func (self *PlatformTransport) runH3(
 				// throttled at INFO; -v=1 still shows every attempt
 				v.Infof("[t]auth error %s = %s\n", clientId, err)
 			}
-			select {
-			case <-ctx.Done():
-				return
-			case <-self.kickMonitor.NotifyChannel():
-				// network changed: retry now over the new path and take the
-				// reconnect fast path (see the h1 loop above)
+			if kickedDuringDial {
+				// network changed during the dial: retry now over the new
+				// path on the reconnect fast path, without the backoff
 				self.noteKick()
 				hadConnection = true
-				continue
-			case <-self.dialRetryAfter(reconnect):
+				afterKick = true
 				continue
 			}
+			switch self.waitDial(ctx, self.dialRetryAfter(reconnect), kickGeneration) {
+			case dialWaitClosed:
+				return
+			case dialWaitKicked:
+				// network changed: retry now over the new path and take
+				// the reconnect fast path (see the h1 loop above)
+				self.noteKick()
+				hadConnection = true
+				afterKick = true
+			}
+			// after the backoff, or a hold: admission runs again (see the
+			// h1 loop above)
+			continue
 		}
 
 		// auth succeeded: the backend is reachable
 		self.noteDialSuccess()
+		if kickedDuringDial {
+			// the dial completed just as the network changed: replace it now
+			// (see the h1 loop above)
+			connStream.attempt.close()
+			cancelDial()
+			releaseAttempt()
+			hadConnection = true
+			afterKick = true
+			continue
+		}
 
 		conn := connStream.conn
 		stream := connStream.stream
 		streamWriter := connStream.streamWriter
 
+		// set when a hold, not the platform or the path, closed the connection
+		var closedByHold atomic.Bool
 		c := func() {
 			// Keep the complete dial owner through success, including any
 			// pre-socket DNS lease; copying only its socket/QUIC fields would
@@ -3243,20 +3901,46 @@ func (self *PlatformTransport) runH3(
 			}
 
 			// a network-change kick closes this connection so the loop
-			// re-dials over the new path immediately (see Kick), and a client
-			// limit hold closes it with the rest of the client
-			// (transport_client_limit.go). closing the QUIC connection is what
-			// unblocks a reader/writer parked in a stream call that
-			// handleCancel alone cannot wake.
-			kick := self.kickMonitor.NotifyChannel()
+			// re-dials over the new path immediately (see Kick), and a hold of
+			// the owner or the family, or a client limit hold, closes it with
+			// the rest of the client (transport_client_limit.go). closing the
+			// QUIC connection is what unblocks a reader/writer parked in a
+			// stream call that handleCancel alone cannot wake. Armed from the
+			// iteration's generation, as in the h1 loop.
+			kick := self.kickedSince(kickGeneration)
 			startConnectionWorker(func() {
 				self.runConnectionWatch(handleCtx, kick, func(reason string) {
+					// a network change close with no kick is a hold's (see the
+					// h1 loop)
+					if reason != connectionCloseNetworkChange || !self.kicked(kickGeneration) {
+						closedByHold.Store(true)
+					}
 					handleCancel()
 					conn.CloseWithError(0, reason)
 				})
 			})
 
 			framer := NewFramer(self.framerSettings)
+			// The negotiated delay header rides every stream frame and DATAGRAM
+			// message of this generation (transport_delay_h3.go); nil keeps the
+			// legacy wire. The flush is deferred first so it runs after the
+			// teardown below has joined every lane.
+			var delayH3 *TransportDelayH3
+			var streamFraming h3StreamFraming = framer
+			if connStream.useTransportDelay {
+				delayH3 = newTransportDelayH3(
+					newTransportDelay(
+						self.settings.TransportDelay,
+						clientId,
+						transportTypeFromMode(ptMode),
+						self.routeManager.publishTransportDelayStats,
+					),
+					self.framerSettings,
+				)
+				defer delayH3.flush()
+				streamFraming = delayH3
+			}
+			delayHeaderByteCount := delayH3.HeaderByteCount()
 			var datagramFragmenter *H3DatagramFragmenter
 			var datagramReassembler *H3DatagramReassembler
 			if connStream.useH3Datagrams {
@@ -3343,9 +4027,11 @@ func (self *PlatformTransport) runH3(
 				sendCarrierProperties.UnreliableFlowIsolation = true
 				sendCarrierProperties.UnreliableFlowReserve = true
 				sendCarrierProperties.unreliableForMessageByteCount = func(messageByteCount int) bool {
-					return self.h3DatagramSettings.UseDatagramForPath(
+					// the delay header rides inside the envelope
+					return self.h3DatagramSettings.UseDatagramForPathWithHeader(
 						messageByteCount,
 						int(maxDatagramByteCount.Load()),
+						delayHeaderByteCount,
 					)
 				}
 			}
@@ -3375,10 +4061,21 @@ func (self *PlatformTransport) runH3(
 					},
 				)
 			}
+			// a connection an extender relays is published for exactly its
+			// lifetime, as the h1 loop does (transport_move.go)
+			relayed := connStream.attempt.relayed
+			releaseRelayedConnection := self.holdRelayedConnection(relayed)
 			self.setRegistered(true)
+			// a move's replacement arrived at its target once its connection
+			// is published (transport_move.go)
+			if moveAttempt.dialedTargets() {
+				moveTargetAttempted = moveTargetAttempted || moveAttempt.dial != nil
+				self.noteMoveDialArrived(moveAttempt, relayed)
+			}
 
 			defer func() {
 				self.setRegistered(false)
+				releaseRelayedConnection()
 				self.routeManager.RemoveTransport(sendTransport)
 				if self.settings.SendRouteObserver != nil {
 					self.settings.SendRouteObserver(sendTransport, send, false)
@@ -3419,13 +4116,13 @@ func (self *PlatformTransport) runH3(
 			streamInput := (<-chan []byte)(send)
 			if connStream.useH3Datagrams {
 				streamQueueMessageCount := min(
-					H3HybridStreamQueueMessageCount,
+					self.h3DatagramSettings.HybridStreamQueueMessageCount,
 					max(1, self.h3TransportBufferSize()),
 				)
 				streamSend = make(chan []byte, streamQueueMessageCount)
 				streamSendBudget = NewH3HybridStreamSendBudget(
 					streamQueueMessageCount,
-					H3HybridStreamQueueByteCount,
+					self.h3DatagramSettings.HybridStreamQueueByteCount(),
 					self.h3DatagramStats,
 				)
 				streamInput = streamSend
@@ -3439,15 +4136,21 @@ func (self *PlatformTransport) runH3(
 
 			// Allocated only if this generation actually selects the reliable data
 			// lane. A small-message-only hybrid keeps the former DATAGRAM memory
-			// profile instead of pinning the 64 KiB stream batch eagerly.
+			// profile instead of pinning the stream batch eagerly. One writer
+			// calls this at a time, so both buffers are reused across batches.
 			var writeBatchStorage []byte
+			var messageStorage [][]byte
+			writeBatchMaxByteCount := max(0, self.settings.H3StreamWriteBatchMaxByteCount)
 			writeReadySendBatch := func(
 				firstMessage []byte,
 			) (sendOpen bool, pendingMessage []byte, err error) {
-				var messageStorage [platformH3WriteBatchMaxMessageCount][]byte
+				if messageStorage == nil {
+					messageStorage = make([][]byte, max(1, self.settings.H3StreamWriteBatchMaxMessageCount))
+				}
 				messages := messageStorage[:1]
 				messages[0] = firstMessage
-				batchByteCount := len(firstMessage) + 4
+				// each frame takes its length prefix and any delay header
+				batchByteCount := len(firstMessage) + 4 + delayHeaderByteCount
 				sendOpen = true
 			drainReady:
 				for len(messages) < cap(messages) {
@@ -3460,8 +4163,8 @@ func (self *PlatformTransport) runH3(
 							sendOpen = false
 							break drainReady
 						}
-						framedByteCount := len(message) + 4
-						if platformH3WriteBatchMaxByteCount < batchByteCount+framedByteCount {
+						framedByteCount := len(message) + 4 + delayHeaderByteCount
+						if writeBatchMaxByteCount < batchByteCount+framedByteCount {
 							pendingMessage = message
 							break drainReady
 						}
@@ -3472,20 +4175,23 @@ func (self *PlatformTransport) runH3(
 					}
 				}
 
-				streamWriter.SetWriteDeadline(
-					time.Now().Add(time.Duration(slowMultiple) * self.settings.WriteTimeout),
-				)
+				writeDeadline := time.Now().Add(time.Duration(slowMultiple) * self.settings.WriteTimeout)
+				streamWriter.SetWriteDeadline(writeDeadline)
+				self.h3StreamDeadlineInstalledForTest(true, writeDeadline)
 				if self.settings.beforeH3StreamWriteForTest != nil {
 					self.settings.beforeH3StreamWriteForTest()
 				}
 				if writeBatchStorage == nil {
-					writeBatchStorage = make([]byte, platformH3WriteBatchMaxByteCount)
+					writeBatchStorage = make([]byte, writeBatchMaxByteCount)
 				}
-				err = framer.WriteBatchWithStorage(
+				err = streamFraming.WriteBatchWithStorage(
 					streamWriter,
 					messages,
 					writeBatchStorage,
 				)
+				if err == nil && self.settings.afterH3StreamIoForTest != nil {
+					self.settings.afterH3StreamIoForTest(true)
+				}
 				if err == nil {
 					writeCounter.Add(uint64(len(messages)))
 					for _, message := range messages {
@@ -3500,16 +4206,27 @@ func (self *PlatformTransport) runH3(
 				for _, message := range messages {
 					releaseStreamMessage(message)
 				}
+				// the next batch reuses the storage; hold no returned message
+				clear(messages)
 				return
 			}
 			sendDatagramMessage := func(message []byte) (useStream bool, sendErr error) {
 				currentMaxDatagramByteCount := int(maxDatagramByteCount.Load())
 				var nextMaxDatagramByteCount int
-				useStream, nextMaxDatagramByteCount, sendErr = datagramFragmenter.SendHybrid(
-					message,
-					currentMaxDatagramByteCount,
-					connStream.sendDatagram,
-				)
+				if delayH3 != nil {
+					useStream, nextMaxDatagramByteCount, sendErr = delayH3.SendHybrid(
+						datagramFragmenter,
+						message,
+						currentMaxDatagramByteCount,
+						connStream.sendDatagram,
+					)
+				} else {
+					useStream, nextMaxDatagramByteCount, sendErr = datagramFragmenter.SendHybrid(
+						message,
+						currentMaxDatagramByteCount,
+						connStream.sendDatagram,
+					)
+				}
 				if nextMaxDatagramByteCount != currentMaxDatagramByteCount {
 					maxDatagramByteCount.Store(int64(nextMaxDatagramByteCount))
 				}
@@ -3548,9 +4265,15 @@ func (self *PlatformTransport) runH3(
 					}()
 				}
 
-				pingTimer := time.NewTimer(0)
-				defer pingTimer.Stop()
-				resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
+				// writes only note their time; the timer re-arms when it fires
+				pinger := newPingPacer(
+					self.settings.PingTimeout,
+					self.settings.PingTimeout,
+					self.pingOffset,
+					time.Now(),
+					self.settings.pingTimerArmForTest,
+				)
+				defer pinger.stop()
 
 				var pendingMessage []byte
 				defer func() {
@@ -3570,14 +4293,25 @@ func (self *PlatformTransport) runH3(
 								return
 							}
 							message = nextMessage
-						case <-pingTimer.C:
-							streamWriter.SetWriteDeadline(time.Now().Add(time.Duration(slowMultiple) * self.settings.WriteTimeout))
+						case <-pinger.timer.C:
+							now := time.Now()
+							if !pinger.fired(now) {
+								continue
+							}
+							writeDeadline := now.Add(time.Duration(slowMultiple) * self.settings.WriteTimeout)
+							streamWriter.SetWriteDeadline(writeDeadline)
+							self.h3StreamDeadlineInstalledForTest(true, writeDeadline)
 							// Reuse the reliable writer's scratch if already allocated;
 							// heartbeat-only hybrid lanes keep their lazy memory shape.
-							if err := framer.WriteBatchWithStorage(streamWriter, [][]byte{nil}, writeBatchStorage); err != nil {
+							// A negotiated heartbeat is stamped like any stream write.
+							err := streamFraming.WriteBatchWithStorage(streamWriter, [][]byte{nil}, writeBatchStorage)
+							if err == nil && self.settings.afterH3StreamIoForTest != nil {
+								self.settings.afterH3StreamIoForTest(true)
+							}
+							if err != nil {
 								return
 							}
-							resetWakeupTimer(pingTimer, self.settings.PingTimeout, self.settings.PingTimeout)
+							pinger.pinged(time.Now())
 							continue
 						}
 					}
@@ -3593,11 +4327,7 @@ func (self *PlatformTransport) runH3(
 					if self.log.V(2).Enabled() {
 						self.log.Infof("[ts]%s->stream\n", clientId)
 					}
-					resetWakeupTimer(
-						pingTimer,
-						self.settings.PingTimeout,
-						self.settings.PingTimeout,
-					)
+					pinger.wrote(time.Now())
 				}
 			}, handleCancel)
 
@@ -3643,9 +4373,10 @@ func (self *PlatformTransport) runH3(
 							if !ok {
 								return
 							}
-							useDatagram := self.h3DatagramSettings.UseDatagramForPath(
+							useDatagram := self.h3DatagramSettings.UseDatagramForPathWithHeader(
 								len(message),
 								int(maxDatagramByteCount.Load()),
+								delayHeaderByteCount,
 							)
 							if useDatagram {
 								useStream, err := sendDatagramMessage(message)
@@ -3679,6 +4410,12 @@ func (self *PlatformTransport) runH3(
 				reliability CarrierReliability,
 				receive chan<- []byte,
 			) bool {
+				// a reader held here leaves its next frame waiting for a local
+				// reason, which censors that frame's delay sample
+				var handoffStartTime time.Time
+				if delayH3 != nil {
+					handoffStartTime = time.Now()
+				}
 				open, delivered := self.offerReceive(
 					handleCtx.Done(),
 					ptMode,
@@ -3686,6 +4423,9 @@ func (self *PlatformTransport) runH3(
 					receive,
 					message,
 				)
+				if delayH3 != nil {
+					delayH3.NoteHandoff(reliability, time.Since(handoffStartTime))
+				}
 				if delivered {
 					readCounter.Add(1)
 					if self.settings.afterH3ReceiveEnqueueForTest != nil {
@@ -3716,7 +4456,7 @@ func (self *PlatformTransport) runH3(
 						return
 					}
 					for {
-						message, err := framer.Read(stream)
+						message, err := streamFraming.Read(stream)
 						if err != nil {
 							return
 						}
@@ -3763,14 +4503,23 @@ func (self *PlatformTransport) runH3(
 						if err != nil {
 							return
 						}
-						message = datagramReassembler.Accept(datagram, time.Now())
+						if delayH3 != nil {
+							message = delayH3.Accept(datagramReassembler, datagram, time.Now())
+						} else {
+							message = datagramReassembler.Accept(datagram, time.Now())
+						}
 						if message == nil {
 							continue
 						}
 					} else {
-						stream.SetReadDeadline(time.Now().Add(time.Duration(slowMultiple) * self.settings.ReadTimeout))
+						readDeadline := time.Now().Add(time.Duration(slowMultiple) * self.settings.ReadTimeout)
+						stream.SetReadDeadline(readDeadline)
+						self.h3StreamDeadlineInstalledForTest(false, readDeadline)
 						var err error
-						message, err = framer.Read(stream)
+						message, err = streamFraming.Read(stream)
+						if err == nil && self.settings.afterH3StreamIoForTest != nil {
+							self.settings.afterH3StreamIoForTest(false)
+						}
 						if err != nil {
 							self.log.Infof("[tr]%s<- error = %s\n", clientId, err)
 							return
@@ -3813,18 +4562,30 @@ func (self *PlatformTransport) runH3(
 		} else {
 			c()
 		}
+		cancelDial()
 		releaseAttempt()
-		// the connection ran and died: the next dial is a reconnect
-		hadConnection = true
+		// the connection ran and died: the next dial is a reconnect, unless a
+		// hold closed it (see the h1 loop above)
+		hadConnection = !closedByHold.Load()
+		if self.kicked(kickGeneration) {
+			// a network change closed this connection: re-dial now over the
+			// new path (see the h1 loop above)
+			hadConnection = true
+			afterKick = true
+			continue
+		}
 
-		select {
-		case <-ctx.Done():
+		switch self.waitDial(ctx, reconnect.After(), kickGeneration) {
+		case dialWaitClosed:
 			return
-		case <-self.kickMonitor.NotifyChannel():
+		case dialWaitKicked:
 			// a kick arriving after the connection already died skips the
 			// residual backoff — the fast-path re-dial starts now (see the
 			// h1 loop above)
-		case <-reconnect.After():
+			hadConnection = true
+			afterKick = true
+		case dialWaitHeld:
+			hadConnection = false
 		}
 	}
 }

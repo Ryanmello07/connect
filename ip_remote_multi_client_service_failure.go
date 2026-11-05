@@ -29,6 +29,25 @@ type destinationServiceFailure struct {
 	count uint32
 }
 
+// Ordinary fresh TCP affinity cannot bypass a current failure of this exact
+// service. The parent stateLock owns this read; pins and established flows keep
+// their existing policy, and missing or expired history supplies no veto.
+func (self *RemoteUserNatMultiClient) affinityDonorServiceFailedWithLock(update *multiClientChannelUpdate, client *multiClientChannel, now time.Time) bool {
+	if update == nil || update.pinned || update.receivedInbound.Load() {
+		return false
+	}
+	path := update.ipPath
+	if path == nil || path.Protocol != IpProtocolTcp || !path.Syn || path.Ack {
+		return false
+	}
+	key, ok := destinationServiceFailureKeyFor(path, client)
+	if !ok {
+		return false
+	}
+	failure, failed := self.destinationServiceFailures[key]
+	return failed && now.Sub(failure.time) < destinationServiceFailureTtl
+}
+
 func destinationServiceFailureKeyFor(
 	ipPath *IpPath,
 	client *multiClientChannel,
@@ -69,6 +88,11 @@ func (self *RemoteUserNatMultiClient) recordDestinationServiceFailureWithLock(
 	if !ok {
 		return
 	}
+	// A receive callback may outlive removal's prune. Both decisions
+	// serialize on the parent lock, so a done channel cannot reinsert a key.
+	if client.ctx != nil && client.IsDone() {
+		return
+	}
 	if self.destinationServiceFailures == nil {
 		self.destinationServiceFailures = map[destinationServiceFailureKey]destinationServiceFailure{}
 	}
@@ -97,6 +121,23 @@ func (self *RemoteUserNatMultiClient) recordDestinationServiceFailureWithLock(
 		}
 	}
 	self.destinationServiceFailures[key] = destinationServiceFailure{time: now, count: 1}
+}
+
+// Releases this retired channel generation's cache roots without provider
+// events or flow migration.
+func (self *RemoteUserNatMultiClient) clearDestinationServiceFailures(client *multiClientChannel) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.clearDestinationServiceFailuresWithLock(client)
+}
+
+// The caller holds the parent stateLock.
+func (self *RemoteUserNatMultiClient) clearDestinationServiceFailuresWithLock(client *multiClientChannel) {
+	for key := range self.destinationServiceFailures {
+		if key.client == client {
+			delete(self.destinationServiceFailures, key)
+		}
+	}
 }
 
 func (self *RemoteUserNatMultiClient) clearDestinationServiceFailure(

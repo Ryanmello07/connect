@@ -133,9 +133,7 @@ func (self *ExtenderServer) relayDatagram(
 		select {
 		case <-relayCtx.Done():
 		case <-idle.C:
-			self.reportError("datagram relay idle", fmt.Errorf(
-				"no datagram in either direction for %s", extenderDatagramIdleTimeout,
-			))
+			self.reportError("datagram relay idle", extenderFixedError("no datagram in either direction within the idle timeout"))
 		}
 		clientConn.Close()
 		forwardConn.Close()
@@ -147,23 +145,26 @@ func (self *ExtenderServer) relayDatagram(
 
 // dialDatagramForward opens the udp socket to the destination, through the
 // same egress seam the stream relay and the reverse proxy use so a test that
-// injects one observes all three.
+// injects one observes all three. A udp dial only resolves the name, under
+// the same ForwardDialTimeout as the stream forward's dial.
 func (self *ExtenderServer) dialDatagramForward(
 	ctx context.Context,
 	network string,
 	destination string,
 ) (net.Conn, error) {
-	forwardConn, err := self.dialPacketContext()(ctx, network, destination)
+	dialCtx, dialCancel := self.forwardDialContext(ctx)
+	defer dialCancel()
+	forwardConn, err := self.dialPacketContext()(dialCtx, network, destination)
 	if err != nil {
 		if forwardConn != nil {
 			forwardConn.Close()
 		}
-		self.reportError("datagram forward dial", err)
+		self.reportError(ExtenderErrorStageDatagramForwardDial, err)
 		return nil, err
 	}
 	if forwardConn == nil {
 		err = fmt.Errorf("datagram forward dial returned nil connection")
-		self.reportError("datagram forward dial", err)
+		self.reportError(ExtenderErrorStageDatagramForwardDial, err)
 		return nil, err
 	}
 	return forwardConn, nil

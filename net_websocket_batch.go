@@ -28,12 +28,31 @@ type webSocketDeadlineError struct {
 // write. A control frame that arrives inside a ready-only batch joins that
 // byte-stream batch in arrival order. Read, deadlines, and Close retain
 // net.Conn's concurrent contract and can interrupt a blocked delegated write.
+//
+// Gorilla installs its stored write deadline again before every frame, even
+// mid-batch, and on a socket each installation takes the poller's locks and,
+// when the deadline moves, its deadline timer, a timer heap modify (server
+// CPUOPT2.md §9). So a write deadline equal to the last one forwarded, zero
+// included, is not forwarded again. SetDeadline is always forwarded, and every
+// forwarded write deadline, a WriteControl's included, replaces the remembered
+// one.
 type WebSocketWriteBatchConn struct {
 	conn          net.Conn
 	stateLock     sync.Mutex
 	writeBuffer   []byte
 	batching      bool
 	deadlineError atomic.Pointer[webSocketDeadlineError]
+	// writeDeadlineLock serializes write deadline installations so that
+	// writeDeadline, the last one forwarded, is the one the socket holds while
+	// writeDeadlineKnown. It is not stateLock, which a blocked delegated
+	// write holds and which a deadline must be able to interrupt.
+	writeDeadlineLock  sync.Mutex
+	writeDeadline      time.Time
+	writeDeadlineKnown bool
+
+	// observes each explicit batch as one physical write (transport_delay_h1.go).
+	// Set before the writer starts.
+	writeBatchObserver webSocketWriteBatchObserver
 
 	// Tests place batch activation and a concurrent control write at one exact
 	// boundary. Nil in production.
@@ -49,10 +68,24 @@ func NewWebSocketWriteBatchConn(conn net.Conn) *WebSocketWriteBatchConn {
 	}
 }
 
+// webSocketWriteBatchObserver is told when an explicit batch begins and ends.
+// Its calls run outside stateLock, so it may take its own locks and write.
+type webSocketWriteBatchObserver interface {
+	beginWriteBatch()
+	endWriteBatch(err error)
+}
+
+func (self *WebSocketWriteBatchConn) setWriteBatchObserver(observer webSocketWriteBatchObserver) {
+	self.writeBatchObserver = observer
+}
+
 // Starts one explicit ready-only batch on the connection's single writer.
 func (self *WebSocketWriteBatchConn) BeginWriteBatch() {
 	if self.beforeBeginWriteBatchForTest != nil {
 		self.beforeBeginWriteBatchForTest()
+	}
+	if self.writeBatchObserver != nil {
+		self.writeBatchObserver.beginWriteBatch()
 	}
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -75,11 +108,16 @@ func (self *WebSocketWriteBatchConn) BeginWriteBatch() {
 
 // Discards bytes that have not reached the delegated connection.
 func (self *WebSocketWriteBatchConn) AbortWriteBatch() {
-	self.stateLock.Lock()
-	defer self.stateLock.Unlock()
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
 
-	self.batching = false
-	self.writeBuffer = self.writeBuffer[:0]
+		self.batching = false
+		self.writeBuffer = self.writeBuffer[:0]
+	}()
+	if self.writeBatchObserver != nil {
+		self.writeBatchObserver.endWriteBatch(errWebSocketWriteBatchAborted)
+	}
 }
 
 // Writes retained bytes while the state lock keeps concurrent control writes
@@ -103,6 +141,14 @@ func (self *WebSocketWriteBatchConn) flushWriteBufferWithLock() error {
 
 // Ends the active batch and writes every retained complete frame byte.
 func (self *WebSocketWriteBatchConn) FlushWriteBatch() error {
+	err := self.flushWriteBatch()
+	if self.writeBatchObserver != nil {
+		self.writeBatchObserver.endWriteBatch(err)
+	}
+	return err
+}
+
+func (self *WebSocketWriteBatchConn) flushWriteBatch() error {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
@@ -181,11 +227,32 @@ func (self *WebSocketWriteBatchConn) observeDeadlineError(err error) error {
 }
 
 // Sets both deadlines, preserving any earlier terminal installation failure.
+// Always forwarded; the write deadline it sets is the one later write
+// deadlines compare with, including a past deadline replaced before I/O.
 func (self *WebSocketWriteBatchConn) SetDeadline(deadline time.Time) error {
 	if failure := self.deadlineError.Load(); failure != nil {
 		return failure.err
 	}
-	return self.observeDeadlineError(self.conn.SetDeadline(deadline))
+	err := func() error {
+		self.writeDeadlineLock.Lock()
+		defer self.writeDeadlineLock.Unlock()
+		err := self.conn.SetDeadline(deadline)
+		self.rememberWriteDeadlineWithLock(deadline, err)
+		return err
+	}()
+	return self.observeDeadlineError(err)
+}
+
+// Remembers the write deadline the socket holds after an installation of
+// deadline returned err.
+func (self *WebSocketWriteBatchConn) rememberWriteDeadlineWithLock(deadline time.Time, err error) {
+	if err != nil {
+		self.writeDeadline = time.Time{}
+		self.writeDeadlineKnown = false
+		return
+	}
+	self.writeDeadline = deadline
+	self.writeDeadlineKnown = true
 }
 
 // A rejected read bound closes this owned full-duplex connection.
@@ -197,9 +264,22 @@ func (self *WebSocketWriteBatchConn) SetReadDeadline(deadline time.Time) error {
 }
 
 // Gorilla ignores this result; the terminal latch also prevents its next Write.
+// A deadline equal to the last one forwarded is already the socket's and is
+// not forwarded again. A new operation may replace an expired deadline
+// when the earlier I/O succeeded; only an actual write error is terminal.
 func (self *WebSocketWriteBatchConn) SetWriteDeadline(deadline time.Time) error {
 	if failure := self.deadlineError.Load(); failure != nil {
 		return failure.err
 	}
-	return self.observeDeadlineError(self.conn.SetWriteDeadline(deadline))
+	err := func() error {
+		self.writeDeadlineLock.Lock()
+		defer self.writeDeadlineLock.Unlock()
+		if self.writeDeadlineKnown && deadline.Equal(self.writeDeadline) {
+			return nil
+		}
+		err := self.conn.SetWriteDeadline(deadline)
+		self.rememberWriteDeadlineWithLock(deadline, err)
+		return err
+	}()
+	return self.observeDeadlineError(err)
 }

@@ -738,6 +738,14 @@ func (self *p2pSetupFailureStreak) Recover() bool {
 	return true
 }
 
+// Hands the ready header reader's result to the receive route worker: the
+// frames delivered ahead of the peer's marker and the generation's delay
+// state.
+type p2pReadyHeaderRead struct {
+	prefetched     [][]byte
+	transportDelay *p2pTransportDelay
+}
+
 func (self *P2pTransport) run() {
 	defer self.cancel()
 	defer close(self.done)
@@ -768,7 +776,13 @@ func (self *P2pTransport) run() {
 		// We arbitrarily choose the sender (peer is destination) as active.
 		switch self.peerType {
 		case PeerTypeDestination:
-			conn, err = self.webRtcManager.NewP2pConnActive(self.ctx, NewTransferPath(self.client.ClientId(), self.peerId, self.streamId))
+			// the active side offers the delay header when its client does
+			// and the client's edges accept it (transport_delay_p2p.go)
+			conn, err = self.webRtcManager.newP2pConnActiveWithTransportDelay(
+				self.ctx,
+				NewTransferPath(self.client.ClientId(), self.peerId, self.streamId),
+				self.client.transportDelayP2pOffer(),
+			)
 		case PeerTypeSource:
 			conn, err = self.webRtcManager.NewP2pConnPassive(self.ctx, NewTransferPath(self.client.ClientId(), self.peerId, self.streamId))
 		default:
@@ -870,11 +884,13 @@ func (self *P2pTransport) run() {
 			// before the receive transport starts. Because the channel is
 			// reliable-unordered, that reader also boundedly prefetched any
 			// transfer frames delivered ahead of the marker.
-			headerRead := make(chan [][]byte)
+			headerRead := make(chan p2pReadyHeaderRead)
 			setupReady := make(chan struct{})
 			var routeWorkers sync.WaitGroup
 			var p2pSendTransport *P2pSendTransport
 			var p2pReceiveTransport *P2pReceiveTransport
+			// nil keeps the legacy wire; set by the ready header reader
+			var transportDelay *p2pTransportDelay
 			sendRouteRetired := make(chan struct{})
 			routeWorkers.Add(2)
 
@@ -889,11 +905,11 @@ func (self *P2pTransport) run() {
 					return
 				}
 
-				var prefetched [][]byte
+				var ready p2pReadyHeaderRead
 				select {
 				case <-handleCtx.Done():
 					return
-				case prefetched = <-headerRead:
+				case ready = <-headerRead:
 				}
 
 				var messageHandler func([]byte) bool
@@ -907,8 +923,9 @@ func (self *P2pTransport) run() {
 					conn,
 					self.streamId,
 					self.settings,
-					prefetched,
+					ready.prefetched,
 					messageHandler,
+					ready.transportDelay,
 				)
 				if self.settings.afterReceiveTransportForTest != nil {
 					self.settings.afterReceiveTransportForTest(p2pReceiveTransport)
@@ -986,13 +1003,21 @@ func (self *P2pTransport) run() {
 					self.client.log.V(1).Infof("[p2p]s(%s) ready header read err = %s\n", self.streamId, err)
 					return
 				}
+				// Both descriptions applied before the data channel opened, so
+				// the delay header negotiation is settled. Every message after
+				// "rdy" in both directions, including the prefetched frames,
+				// carries the header when it was negotiated (DELAY.md §6.1).
+				transportDelay = self.newP2pTransportDelay(conn)
 				select {
 				case <-handleCtx.Done():
 					for _, message := range prefetched {
 						MessagePoolReturn(message)
 					}
 					return
-				case headerRead <- prefetched:
+				case headerRead <- p2pReadyHeaderRead{
+					prefetched:     prefetched,
+					transportDelay: transportDelay,
+				}:
 				}
 				// Our header was already written before the other goroutine
 				// waited on headerRead, and the peer's header is now consumed:
@@ -1002,7 +1027,7 @@ func (self *P2pTransport) run() {
 				// streak.
 				close(setupReady)
 
-				t, route := newP2pSendTransportForPeer(
+				t, route := newP2pSendTransportForPeerWithDelay(
 					handleCtx,
 					handleCancel,
 					conn,
@@ -1011,6 +1036,7 @@ func (self *P2pTransport) run() {
 					self.settings,
 					self.endpointProbe,
 					sendRouteRetired,
+					transportDelay,
 				)
 				p2pSendTransport = t.(*P2pSendTransport)
 				if self.settings.afterSendTransportForTest != nil {
@@ -1103,6 +1129,8 @@ func (self *P2pTransport) run() {
 			if p2pReceiveTransport != nil {
 				<-p2pReceiveTransport.done
 			}
+			// the generation's lanes are quiet; publish its last interval
+			transportDelay.flush()
 		}
 
 		c()
@@ -1191,6 +1219,9 @@ type P2pSendTransport struct {
 	testingAfterProbeSendDrain           func()
 
 	settings *P2pTransportSettings
+	// Stamps every physical message when the generation negotiated the delay
+	// header. Nil keeps the legacy wire.
+	delay *p2pTransportDelay
 }
 
 // NewP2pSendTransport creates one caller-owned send route.
@@ -1248,6 +1279,31 @@ func newP2pSendTransportForPeer(
 	endToEndReadinessRequired bool,
 	routeRetired <-chan struct{},
 ) (Transport, Route) {
+	return newP2pSendTransportForPeerWithDelay(
+		ctx,
+		cancel,
+		conn,
+		peerId,
+		streamId,
+		settings,
+		endToEndReadinessRequired,
+		routeRetired,
+		nil,
+	)
+}
+
+// Builds one send generation that stamps the delay header when delay is set.
+func newP2pSendTransportForPeerWithDelay(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	conn net.Conn,
+	peerId Id,
+	streamId Id,
+	settings *P2pTransportSettings,
+	endToEndReadinessRequired bool,
+	routeRetired <-chan struct{},
+	delay *p2pTransportDelay,
+) (Transport, Route) {
 	send := make(chan []byte, settings.ChannelBufferSize)
 	p2pSendTransport := &P2pSendTransport{
 		transportId:               NewId(),
@@ -1261,6 +1317,7 @@ func newP2pSendTransportForPeer(
 		endToEndReadinessRequired: endToEndReadinessRequired,
 		routeRetired:              routeRetired,
 		settings:                  settings,
+		delay:                     delay,
 	}
 	p2pSendTransport.probeSendAdmission.open = true
 	if endToEndReadinessRequired {
@@ -1359,6 +1416,61 @@ func (self *P2pSendTransport) takePendingProbe(probeBurst int) []byte {
 	}
 }
 
+// The legacy writer's physical write deadline (CPUOPT2 §9.2 finding 1). Each
+// install is a timer change on the SCTP stream, so a busy carrier should not
+// install one per message. A write keeps the installed deadline while it is
+// still ahead: an earlier write armed it WriteTimeout after it started, so it
+// is never later than this write's own. Once it has passed, the next write
+// installs its own, WriteTimeout after it starts. A busy carrier installs
+// about one deadline per WriteTimeout.
+//
+// A kept deadline is earlier than the write's own, so it can fire before the
+// write has had its whole WriteTimeout. That write then installs its own
+// deadline and is written again (extendToOwn): a timed-out SCTP write sent
+// nothing, since the stream rolls the message back. So a blocked physical
+// write still fails exactly WriteTimeout after it starts, as when every write
+// installed its own deadline.
+//
+// One writer at a time owns a value.
+type p2pWriteDeadline struct {
+	timeout time.Duration
+	// zero until the first write, and after a write with its own deadline
+	deadline time.Time
+}
+
+func newP2pWriteDeadline(timeout time.Duration) p2pWriteDeadline {
+	return p2pWriteDeadline{
+		timeout: timeout,
+	}
+}
+
+// The deadline for a write that starts at now, and whether it changed and
+// must be installed before the write.
+func (self *p2pWriteDeadline) next(now time.Time) (time.Time, bool) {
+	if !self.deadline.IsZero() && now.Before(self.deadline) {
+		return self.deadline, false
+	}
+	self.deadline = now.Add(self.timeout)
+	return self.deadline, true
+}
+
+// After a write that started at start timed out under the installed deadline,
+// the write's own deadline, and whether that is later, so the write must
+// install it and be written again.
+func (self *p2pWriteDeadline) extendToOwn(start time.Time) (time.Time, bool) {
+	own := start.Add(self.timeout)
+	if self.deadline.IsZero() || !self.deadline.Before(own) {
+		return self.deadline, false
+	}
+	self.deadline = own
+	return own, true
+}
+
+// Forgets the installed deadline after a write installed its own.
+func (self *p2pWriteDeadline) clear() {
+	self.deadline = time.Time{}
+}
+
 func (self *P2pSendTransport) run() {
 	var legacyQueue *p2pLegacySendQueue
 	defer close(self.done)
@@ -1403,17 +1515,53 @@ func (self *P2pSendTransport) run() {
 	}()
 
 	var pairRecorded atomic.Bool
+	// The physical writes are serialized, by this goroutine before the legacy
+	// queue exists and then by the queue's handoff, so they share one
+	// installed deadline.
+	legacyWriteDeadline := newP2pWriteDeadline(self.settings.WriteTimeout)
 	writeLegacy := func(transferFrameBytes []byte, deadline time.Time) error {
-		if deadline.IsZero() {
-			deadline = time.Now().Add(self.settings.WriteTimeout)
+		writeStart := time.Now()
+		ownDeadline := !deadline.IsZero()
+		installDeadline := true
+		if ownDeadline {
+			// a write with its own deadline replaces the installed one, so the
+			// next write arms afresh
+			legacyWriteDeadline.clear()
+		} else {
+			deadline, installDeadline = legacyWriteDeadline.next(writeStart)
 		}
 		progressObserver := self.settings.ProgressObserver
 		progress := beginTransferProgress(progressObserver, TransferProgressEvent{
 			Stage: "p2p_write_begin", PeerId: self.transportId, SequenceId: self.streamId,
 			TransportType: TransportTypeP2p, QueueLength: len(self.send), QueueCapacity: cap(self.send),
 		}, transferFrameBytes)
-		self.conn.SetWriteDeadline(deadline)
-		nw, err := self.conn.Write(transferFrameBytes)
+		if installDeadline {
+			self.conn.SetWriteDeadline(deadline)
+		}
+		var nw int
+		var err error
+		for {
+			if self.delay != nil {
+				// one SCTP message is one physical write, stamped here for the
+				// send worker and the legacy queue worker alike
+				nw, err = self.delay.writeLegacy(self.conn, transferFrameBytes)
+			} else {
+				nw, err = self.conn.Write(transferFrameBytes)
+			}
+			var timeoutErr interface{ Timeout() bool }
+			if ownDeadline || nw != 0 || !errors.As(err, &timeoutErr) || !timeoutErr.Timeout() {
+				break
+			}
+			// A deadline kept from an earlier write ran out before this write
+			// had its own WriteTimeout. One SCTP message is all or nothing, so
+			// the timed-out write sent nothing and is written again under its
+			// own deadline.
+			ownWriteDeadline, retry := legacyWriteDeadline.extendToOwn(writeStart)
+			if !retry {
+				break
+			}
+			self.conn.SetWriteDeadline(ownWriteDeadline)
+		}
 		if nw < len(transferFrameBytes) && err == nil {
 			err = io.ErrShortWrite
 		}
@@ -1431,6 +1579,14 @@ func (self *P2pSendTransport) run() {
 		}
 		return nil
 	}
+	// The delay header shares each physical message's size bounds: the
+	// SCTP message and fast-path message caps, and the legacy queue's slab,
+	// which keeps the stamped copy of a queued message in the slab's pool
+	// class.
+	maxMessageByteCount := self.settings.MaxMessageByteCount - self.delay.headerByteCount()
+	legacyQueueMessageByteCount := p2pLegacySendSlabByteCount -
+		p2pLegacySendHeaderByteCount -
+		self.delay.headerByteCount()
 	probeBurst := 0
 	for {
 		transferFrameBytes, ok := self.nextSend(&probeBurst)
@@ -1443,7 +1599,7 @@ func (self *P2pSendTransport) run() {
 			// becomes one whole SCTP user message the peer reads back whole, so
 			// the SCTP message boundary frames each TransferFrame natively — no
 			// length prefix. Enforce the max message size up front.
-			if len(transferFrameBytes) > self.settings.MaxMessageByteCount {
+			if len(transferFrameBytes) > maxMessageByteCount {
 				DefaultLogger().V(1).Infof("[p2p]s(%s) send message too large = %d\n", self.streamId, len(transferFrameBytes))
 				MessagePoolReturn(transferFrameBytes)
 				return
@@ -1464,7 +1620,14 @@ func (self *P2pSendTransport) run() {
 							return
 						}
 					}
-					fragmentCount, err := fastConn.WriteFastPathMessage(transferFrameBytes)
+					var fragmentCount int
+					var err error
+					if self.delay != nil {
+						// stamped after classification, inside the envelope
+						fragmentCount, err = self.delay.writeFast(fastConn, transferFrameBytes)
+					} else {
+						fragmentCount, err = fastConn.WriteFastPathMessage(transferFrameBytes)
+					}
 					if err == nil {
 						if stats := self.settings.DataPlaneStats; stats != nil && !probeMessage {
 							if pairRecorded.CompareAndSwap(false, true) {
@@ -1499,7 +1662,7 @@ func (self *P2pSendTransport) run() {
 
 			if legacyQueue == nil && self.settings.LegacySendQueueByteCount > 0 &&
 				!probeMessage && smallPacketPoolSize < messageByteCount &&
-				messageByteCount+p2pLegacySendHeaderByteCount <= p2pLegacySendSlabByteCount {
+				messageByteCount <= legacyQueueMessageByteCount {
 				var budget *TransferMemoryBudget
 				if owner, ok := self.conn.(p2pLegacySendMemoryBudget); ok {
 					budget = owner.legacySendMemoryBudget()
@@ -1522,7 +1685,12 @@ func (self *P2pSendTransport) run() {
 				if probeMessage || messagePoolIsSmallUnordered(transferFrameBytes) {
 					err = legacyQueue.enqueuePriority(transferFrameBytes, deadline)
 				} else {
-					err = legacyQueue.enqueue(transferFrameBytes, deadline, messageByteCount <= smallPacketPoolSize)
+					err = legacyQueue.enqueue(
+						transferFrameBytes,
+						deadline,
+						messageByteCount <= smallPacketPoolSize ||
+							legacyQueueMessageByteCount < messageByteCount,
+					)
 				}
 			} else {
 				err = writeLegacy(transferFrameBytes, deadline)
@@ -1627,6 +1795,9 @@ type P2pReceiveTransport struct {
 	prefetched     [][]byte
 
 	settings *P2pTransportSettings
+	// Strips and accounts the header of every message read after "rdy" when
+	// the generation negotiated it. Nil keeps the legacy wire.
+	delay *p2pTransportDelay
 	// Test-only barrier reached after reliable immediate admission finds a full
 	// route and before the cancellation-bounded wait begins.
 	beforeReliableReceiveWaitForTest func()
@@ -1670,10 +1841,13 @@ func newP2pReceiveTransport(
 		prefetched,
 		messageHandler,
 		false,
+		nil,
 	)
 	return transport, transport.receive
 }
 
+// delay, when set, strips the header of the prefetched frames and of every
+// later message on both lanes.
 func newP2pReceiveTransportWithLanes(
 	ctx context.Context,
 	cancel context.CancelFunc,
@@ -1682,6 +1856,7 @@ func newP2pReceiveTransportWithLanes(
 	settings *P2pTransportSettings,
 	prefetched [][]byte,
 	messageHandler func([]byte) bool,
+	delay *p2pTransportDelay,
 ) (*P2pReceiveTransport, []p2pReceiveRouteLane) {
 	transport, lanes := newP2pReceiveTransportCore(
 		ctx,
@@ -1692,6 +1867,7 @@ func newP2pReceiveTransportWithLanes(
 		prefetched,
 		messageHandler,
 		true,
+		delay,
 	)
 	return transport, lanes
 }
@@ -1705,6 +1881,7 @@ func newP2pReceiveTransportCore(
 	prefetched [][]byte,
 	messageHandler func([]byte) bool,
 	splitLanes bool,
+	delay *p2pTransportDelay,
 ) (*P2pReceiveTransport, []p2pReceiveRouteLane) {
 	receive := make(chan []byte)
 	unreliableReceive := receive
@@ -1726,6 +1903,7 @@ func newP2pReceiveTransportCore(
 		messageHandler:             messageHandler,
 		prefetched:                 prefetched,
 		settings:                   settings,
+		delay:                      delay,
 	}
 	go HandleError(p2pReceiveTransport.run, cancel)
 	lanes := []p2pReceiveRouteLane{{
@@ -1985,9 +2163,19 @@ func (self *P2pReceiveTransport) run() {
 	prefetched := self.prefetched
 	self.prefetched = nil
 	for messageIndex, message := range prefetched {
+		if self.delay != nil {
+			// strip before classification; the frame was sent after "rdy"
+			if message = self.delay.receiveLegacy(message, true); message == nil {
+				continue
+			}
+		}
 		if self.messageHandler != nil && self.messageHandler(message) {
 			MessagePoolReturn(message)
 			continue
+		}
+		var handoffStartTime time.Time
+		if self.delay != nil {
+			handoffStartTime = time.Now()
 		}
 		if !self.offerReceive(
 			message,
@@ -2000,6 +2188,9 @@ func (self *P2pReceiveTransport) run() {
 				MessagePoolReturn(remaining)
 			}
 			return
+		}
+		if self.delay != nil {
+			self.delay.noteLegacyHandoff(time.Since(handoffStartTime))
 		}
 	}
 
@@ -2038,6 +2229,10 @@ func (self *P2pReceiveTransport) run() {
 			initialReadByteCount,
 			maxReadByteCount,
 		)
+		if 0 < len(transferFrameBytes) && self.delay != nil {
+			// strip before classification sees the message
+			transferFrameBytes = self.delay.receiveLegacy(transferFrameBytes, false)
+		}
 		if 0 < len(transferFrameBytes) {
 			probeMessage := isP2pStreamProbe(transferFrameBytes)
 			if self.messageHandler != nil && self.messageHandler(transferFrameBytes) {
@@ -2052,8 +2247,17 @@ func (self *P2pReceiveTransport) run() {
 				continue
 			}
 			// The route owns the exact slice only when immediate admission wins.
+			var handoffStartTime time.Time
+			if self.delay != nil {
+				handoffStartTime = time.Now()
+			}
 			if !self.offerReceive(transferFrameBytes, false, 0, probeMessage, true) {
 				return
+			}
+			if self.delay != nil {
+				// the reliable lane waits for its route; a long wait censors
+				// the next message's delay sample (DELAY.md §4.2)
+				self.delay.noteLegacyHandoff(time.Since(handoffStartTime))
 			}
 		}
 		if err != nil {
@@ -2080,13 +2284,21 @@ func (self *P2pReceiveTransport) runFast(conn webRtcFastPathConn) {
 			if !ok {
 				return
 			}
-			probeMessage := isP2pStreamProbe(received.message)
-			if self.messageHandler != nil && self.messageHandler(received.message) {
-				MessagePoolReturn(received.message)
+			message := received.message
+			if self.delay != nil {
+				// strip before classification. The datagram handoff below
+				// never waits, so this lane notes no handoff.
+				if message = self.delay.receiveFast(message, received.fragmentCount); message == nil {
+					continue
+				}
+			}
+			probeMessage := isP2pStreamProbe(message)
+			if self.messageHandler != nil && self.messageHandler(message) {
+				MessagePoolReturn(message)
 				continue
 			}
 			if !self.offerReceive(
-				received.message,
+				message,
 				true,
 				received.fragmentCount,
 				probeMessage,

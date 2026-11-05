@@ -102,6 +102,11 @@ type transferQueue[T transferQueueItem] struct {
 	floorRegistered   bool
 	lifetimeBudget    bool
 
+	// Optional retained controls share this queue's existing local window.
+	// Their detached ledger never holds a queue or source back-reference.
+	retainedControl       *transferQueueRetainedControl
+	retainedControlClosed bool
+
 	cmp TransferQueueCmpFunction[T]
 }
 
@@ -231,6 +236,19 @@ func (self *transferQueue[T]) CanAddWithQueueByteCount(
 	queueByteCount ByteCount,
 	maxByteCount ByteCount,
 ) bool {
+	return self.CanAddWithQueueByteCountAndCredit(byteCount, queueByteCount, maxByteCount, 0)
+}
+
+// CanAddWithQueueByteCountAndCredit is CanAddWithQueueByteCount for an
+// arrival whose retained bytes were already reserved, up to creditByteCount,
+// by the owner that promised to admit it. The window test is the same
+// transferQueueWindowAdmits predicate a receive hold commits against.
+func (self *transferQueue[T]) CanAddWithQueueByteCountAndCredit(
+	byteCount ByteCount,
+	queueByteCount ByteCount,
+	maxByteCount ByteCount,
+	creditByteCount ByteCount,
+) bool {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
@@ -238,7 +256,7 @@ func (self *transferQueue[T]) CanAddWithQueueByteCount(
 	if len(self.orderedItems) == 0 && !self.lifetimeBudget {
 		return true
 	}
-	if maxByteCount <= self.byteCount+byteCount {
+	if !transferQueueWindowAdmits(self.windowByteCountWithLock(), byteCount, maxByteCount) {
 		return false
 	}
 	if self.budget == nil {
@@ -251,7 +269,18 @@ func (self *transferQueue[T]) CanAddWithQueueByteCount(
 		self.queueByteCount+1,
 	)
 	borrowTargetByteCount := max(0, probeByteCount-self.minByteCount)
-	return borrowTargetByteCount-self.borrowedByteCount <= self.budget.Available()
+	needByteCount := borrowTargetByteCount - self.borrowedByteCount
+	if needByteCount <= creditByteCount {
+		return true
+	}
+	return needByteCount-creditByteCount <= self.budget.Available()
+}
+
+// transferQueueWindowAdmits is the per-sequence window test: a queue holding
+// byteCount protocol bytes can take an arrival of arrivalByteCount more only
+// while the total stays strictly below maxByteCount.
+func transferQueueWindowAdmits(byteCount ByteCount, arrivalByteCount ByteCount, maxByteCount ByteCount) bool {
+	return byteCount+arrivalByteCount < maxByteCount
 }
 
 // Clear removes every item, releasing all borrowed budget. The items are
@@ -267,6 +296,8 @@ func (self *transferQueue[T]) Clear() []T {
 	clear(self.messageIdItems)
 	clear(self.sequenceNumberItems)
 	self.updateByteCountWithLock(-self.byteCount, -self.queueByteCount)
+	// Outstanding control leases release independently after teardown.
+	self.retainedControlClosed = true
 	// Teardown drops the queue wholesale, so its guaranteed floor is no longer
 	// spoken for and the pool may lend those bytes to the queues that remain.
 	if self.budget != nil && self.floorRegistered {

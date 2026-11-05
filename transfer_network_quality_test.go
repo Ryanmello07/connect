@@ -12,10 +12,13 @@ import (
 	"github.com/urnetwork/connect/protocol"
 )
 
-func newNetworkQualityTestClient(t *testing.T) *Client {
+func newNetworkQualityTestClient(t *testing.T, configure ...func(*ClientSettings)) *Client {
 	t.Helper()
 	settings := DefaultClientSettings()
 	settings.EncryptionSettings.Mode = EncryptionModeOff
+	for _, configure := range configure {
+		configure(settings)
+	}
 	client := NewClient(context.Background(), NewId(), NewNoContractClientOob(), settings)
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -75,15 +78,15 @@ func TestClientNetworkQualityCallbackIsNonblockingAndQuietCoalesced(t *testing.T
 	at := time.Unix(1700000000, 0)
 	returned := make(chan struct{})
 	go func() {
-		state.dispatchLocal(at)
+		state.dispatchLocal(at, 0)
 		close(returned)
 	}()
 	awaitNetworkQualityTestValue(t, entered)
 	awaitNetworkQualityTestValue(t, returned)
 
-	state.dispatchLocal(at.Add(time.Second))
-	state.dispatchLocal(at.Add(4 * time.Second))
-	state.dispatchLocal(at.Add(10 * time.Second))
+	state.dispatchLocal(at.Add(time.Second), 0)
+	state.dispatchLocal(at.Add(4*time.Second), 0)
+	state.dispatchLocal(at.Add(10*time.Second), 0)
 	close(release)
 	if generation := awaitNetworkQualityTestValue(t, applied); generation != 1 {
 		t.Fatalf("first generation = %d", generation)
@@ -156,7 +159,7 @@ func TestClientNetworkQualityFrequentCallbacksAreIdempotentWithStatistics(t *tes
 	}
 
 	callbackAt := time.Unix(1700000000, 0)
-	state.dispatchLocal(callbackAt)
+	state.dispatchLocal(callbackAt, 0)
 	awaitNetworkQualityTestValue(t, applyEntered)
 
 	const statisticsReaderCount = 32
@@ -185,7 +188,7 @@ func TestClientNetworkQualityFrequentCallbacksAreIdempotentWithStatistics(t *tes
 		callbacks.Add(1)
 		go func() {
 			defer callbacks.Done()
-			state.dispatchLocal(callbackAt.Add(time.Duration(index+1) * time.Nanosecond))
+			state.dispatchLocal(callbackAt.Add(time.Duration(index+1)*time.Nanosecond), 0)
 		}()
 	}
 	callbacks.Wait()
@@ -211,8 +214,8 @@ func TestClientNetworkQualityFrequentCallbacksAreIdempotentWithStatistics(t *tes
 		}
 	}
 
-	quietAt := stormLastNotification.Add(windowQualityRemeasureInterval + time.Nanosecond)
-	state.dispatchLocal(quietAt)
+	quietAt := stormLastNotification.Add(state.quietInterval + time.Nanosecond)
+	state.dispatchLocal(quietAt, 0)
 	if generation := awaitNetworkQualityTestValue(t, appliedGenerations); generation != 2 {
 		t.Fatalf("post-quiet callback applied generation %d, want 2", generation)
 	}
@@ -351,6 +354,23 @@ func TestClientNetworkQualityRefusedNotificationRemainsPending(t *testing.T) {
 	}
 }
 
+// A non-positive quiet interval starts a local generation on every later hint.
+func TestClientNetworkQualityNonPositiveQuietIntervalCoalescesNothing(t *testing.T) {
+	client := newNetworkQualityTestClient(t, func(settings *ClientSettings) {
+		settings.SendBufferSettings.WindowQualityRemeasureInterval = 0
+	})
+	state := client.networkQuality
+	at := time.Unix(1700000000, 0)
+	state.dispatchLocal(at, 0)
+	state.dispatchLocal(at.Add(time.Second), 0)
+	state.stateLock.Lock()
+	generation := state.localGeneration
+	state.stateLock.Unlock()
+	if generation != 2 {
+		t.Fatalf("a non-positive quiet interval coalesced a hint: generation %d, want 2", generation)
+	}
+}
+
 func TestClientNetworkQualityWireIsBoundedAndHiddenFromGenericReceive(t *testing.T) {
 	client := newNetworkQualityTestClient(t)
 	payload := encodeNetworkQualityMessage(NewId(), 1)
@@ -406,5 +426,71 @@ func TestClientNetworkQualityCloseUnregistersGlobalListener(t *testing.T) {
 	state.stateLock.Unlock()
 	if generation != 0 {
 		t.Fatalf("closed client received global generation %d", generation)
+	}
+}
+
+// A window client hears its exit on the exit's return lane, and that reply lane
+// is a companion contract toward the exit, which an exit with no stream provide
+// key refuses. Its own forward lane is the one it has permission for, so a hint
+// rides that, and no companion sequence opens for it.
+func TestClientNetworkQualityLiveForwardLaneWinsOverObservedReplyLane(t *testing.T) {
+	client := newNetworkQualityTestClient(t)
+	peerId := NewId()
+	frame, err := ToFrame(&protocol.SimpleMessage{Content: "forward"}, DefaultProtocolVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !client.SendWithTimeout(frame, peerId, func(error) {}, -1) {
+		MessagePoolReturn(frame.MessageBytes)
+		t.Fatal("the forward send must enqueue")
+	}
+	client.observeNetworkQualityPeer(TransferPath{SourceId: peerId}, Peer{
+		ProvideMode: protocol.ProvideMode_Stream,
+		TransferKey: TransferKey{
+			CompanionContract:   true,
+			EncryptionCompanion: true,
+		},
+	})
+
+	client.networkQuality.queuePeerNotifications(7)
+
+	client.networkQuality.stateLock.Lock()
+	pending, found := client.networkQuality.pendingPeerNotifications[peerId]
+	client.networkQuality.stateLock.Unlock()
+	if !found {
+		t.Fatal("the exit was left out of the fanout")
+	}
+	if pending.peer.transferOptions.CompanionContract || pending.peer.transferKey.CompanionContract {
+		t.Fatalf("the hint rides a companion contract toward an exit with a live forward lane: %+v", pending.peer)
+	}
+}
+
+// With a forward and a companion sequence to one peer, the forward lane is chosen
+// whatever order the map yields them in.
+func TestSendBufferNetworkQualityPeersPrefersForwardLane(t *testing.T) {
+	client := newNetworkQualityTestClient(t)
+	peerId := NewId()
+	send := func(opts ...any) {
+		t.Helper()
+		frame, err := ToFrame(&protocol.SimpleMessage{Content: "lane"}, DefaultProtocolVersion)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !client.SendWithTimeout(frame, peerId, func(error) {}, -1, opts...) {
+			MessagePoolReturn(frame.MessageBytes)
+			t.Fatal("the send must enqueue")
+		}
+	}
+	send(CompanionContract())
+	send()
+	// map iteration order varies per range, so ask enough times to see both orders
+	for range 64 {
+		peer, found := client.sendBuffer.networkQualityPeers()[peerId]
+		if !found {
+			t.Fatal("the peer was left out")
+		}
+		if peer.transferOptions.CompanionContract {
+			t.Fatalf("chose the companion lane over the forward lane: %+v", peer)
+		}
 	}
 }

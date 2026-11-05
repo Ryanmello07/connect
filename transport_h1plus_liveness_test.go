@@ -33,6 +33,8 @@ type h1LivenessConn struct {
 	writeTimedOut        atomic.Bool
 	closeOnce            sync.Once
 	closed               chan struct{}
+	// Tests pause only after the delegated socket operation succeeded.
+	afterIoForTest atomic.Pointer[func(write bool, n int)]
 }
 
 // Successful deadline installation delegates to the same bounded pipe.
@@ -58,7 +60,13 @@ func (self *h1LivenessConn) Read(message []byte) (int, error) {
 	if self.readRejected.Load() {
 		self.readsAfterRejection.Add(1)
 	}
-	return self.Conn.Read(message)
+	n, err := self.Conn.Read(message)
+	if err == nil {
+		if hook := self.afterIoForTest.Load(); hook != nil {
+			(*hook)(false, n)
+		}
+	}
+	return n, err
 }
 
 // The ordinary failure case tests the real writer's existing terminal path.
@@ -72,6 +80,11 @@ func (self *h1LivenessConn) Write(message []byte) (int, error) {
 	self.writesInProgress.Add(1)
 	defer self.writesInProgress.Add(-1)
 	n, err := self.Conn.Write(message)
+	if err == nil {
+		if hook := self.afterIoForTest.Load(); hook != nil {
+			(*hook)(true, n)
+		}
+	}
 	var timeout net.Error
 	if errors.As(err, &timeout) && timeout.Timeout() {
 		self.writeTimedOut.Store(true)
@@ -87,23 +100,81 @@ func (self *h1LivenessConn) Close() error {
 }
 
 // Each fixture owns its strategy, transport budget, peer, and both pipe ends.
+// stateLock guards payloadMessages, which the peer reader appends to.
 type h1LivenessFixture struct {
-	transport       *PlatformTransport
-	routes          *RouteManager
-	send            Route
-	stats           *H1PlusStats
-	connectionStats *H1ConnectionStats
-	client          *h1LivenessConn
-	peer            *FramedMessageConn
-	peerDone        chan struct{}
-	peerReadBlocked chan struct{}
-	peerReadResume  chan struct{}
-	heartbeats      atomic.Int64
-	payloads        atomic.Int64
-	registered      atomic.Int64
-	withdrawn       atomic.Int64
-	strategy        *ClientStrategy
-	cancel          context.CancelFunc
+	transport        *PlatformTransport
+	routes           *RouteManager
+	send             Route
+	writer           MultiRouteWriter
+	stats            *H1PlusStats
+	connectionStats  *H1ConnectionStats
+	client           *h1LivenessConn
+	peer             H1MessageConn // H1+, or WebSocket with EnableH1Plus off
+	webSocket        bool
+	peerDone         chan struct{}
+	peerReadBlocked  chan struct{}
+	peerReadResume   chan struct{}
+	heartbeats       atomic.Int64
+	payloads         atomic.Int64
+	payloadByteCount atomic.Int64
+	registered       atomic.Int64
+	withdrawn        atomic.Int64
+	strategy         *ClientStrategy
+	cancel           context.CancelFunc
+	stateLock        sync.Mutex
+	payloadMessages  [][]byte
+	// when the peer read each heartbeat
+	heartbeatTimes []time.Time
+}
+
+// The non-empty messages the peer has read, in the order it read them.
+func (self *h1LivenessFixture) payloadMessagesSnapshot() [][]byte {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return append([][]byte(nil), self.payloadMessages...)
+}
+
+// When the peer read each heartbeat, in order.
+func (self *h1LivenessFixture) heartbeatTimesSnapshot() []time.Time {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return append([]time.Time(nil), self.heartbeatTimes...)
+}
+
+// Hands the hijacked pipe to the WebSocket upgrader with the request reader,
+// which has buffered nothing past the request.
+type h1LivenessHijackWriter struct {
+	header http.Header
+	conn   net.Conn
+	reader *bufio.Reader
+}
+
+// The upgrader sets its response headers here before it hijacks.
+func (self *h1LivenessHijackWriter) Header() http.Header {
+	return self.header
+}
+
+// The upgrader writes its response to the hijacked connection, never here.
+func (self *h1LivenessHijackWriter) Write(message []byte) (int, error) {
+	return 0, errors.New("synthetic upgrade wrote outside the hijacked connection")
+}
+
+// Only a failed upgrade sets a status, and that fails the fixture anyway.
+func (self *h1LivenessHijackWriter) WriteHeader(int) {}
+
+// Returns the pipe and the request reader.
+func (self *h1LivenessHijackWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return self.conn, bufio.NewReadWriter(self.reader, bufio.NewWriter(self.conn)), nil
+}
+
+// Takes the message on admission through the same selector as real clients.
+// The observer's raw route is retained only for topology assertions.
+func (self *h1LivenessFixture) sendMessage(t *testing.T, message []byte) {
+	t.Helper()
+	if accepted, err := self.writer.WriteDetailed(self.transport.ctx, message, 0); !accepted || err != nil {
+		MessagePoolReturn(message)
+		t.Fatalf("synthetic h1 selector admission: accepted=%t err=%v", accepted, err)
+	}
 }
 
 // Call inside a synctest bubble after priming the package's lazy pool outside.
@@ -117,6 +188,13 @@ func newH1LivenessFixture(t *testing.T, configure ...func(*PlatformTransportSett
 // keeping that peer's sole writer available for independent heartbeats.
 func newH1LivenessFixtureWithBackpressure(t *testing.T, pausePeer bool, writeTimeout time.Duration, configure ...func(*PlatformTransportSettings)) *h1LivenessFixture {
 	t.Helper()
+	return newH1LivenessFixtureWithRoutes(t, pausePeer, writeTimeout, nil, configure...)
+}
+
+// A real Client may supply its owned route manager while the physical owner
+// keeps its independent cancellation lifetime, as in provider migration.
+func newH1LivenessFixtureWithRoutes(t *testing.T, pausePeer bool, writeTimeout time.Duration, routes *RouteManager, configure ...func(*PlatformTransportSettings)) *h1LivenessFixture {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	client, peer := net.Pipe()
 	fixture := &h1LivenessFixture{
@@ -128,7 +206,7 @@ func newH1LivenessFixtureWithBackpressure(t *testing.T, pausePeer bool, writeTim
 		peerReadResume:  make(chan struct{}),
 		cancel:          cancel,
 	}
-	ready := make(chan *FramedMessageConn, 1)
+	ready := make(chan H1MessageConn, 1)
 	peerError := make(chan error, 1)
 	go func() {
 		defer close(fixture.peerDone)
@@ -139,30 +217,51 @@ func newH1LivenessFixtureWithBackpressure(t *testing.T, pausePeer bool, writeTim
 			peerError <- err
 			return
 		}
-		if request.Header.Get("Upgrade") != H1FramerProtocol {
-			peerError <- errors.New("synthetic peer did not receive H1+ upgrade")
+		var peerConn H1MessageConn
+		switch request.Header.Get("Upgrade") {
+		case H1FramerProtocol:
+			if _, err := fmt.Fprintf(peer, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: %s\r\n\r\n", H1FramerProtocol); err != nil {
+				peerError <- err
+				return
+			}
+			framed, err := NewFramedMessageConn(&httpUpgradeConn{Conn: peer, reader: reader}, H1FramerProtocol, 65535, nil)
+			if err != nil {
+				peerError <- err
+				return
+			}
+			peerConn = framed
+		case "websocket":
+			upgrader := websocket.Upgrader{}
+			ws, err := upgrader.Upgrade(&h1LivenessHijackWriter{header: http.Header{}, conn: peer, reader: reader}, request, nil)
+			if err != nil {
+				peerError <- err
+				return
+			}
+			ws.SetReadLimit(65535)
+			fixture.webSocket = true
+			peerConn = ws
+		default:
+			peerError <- errors.New("synthetic peer did not receive an H1+ or WebSocket upgrade")
 			return
 		}
-		if _, err := fmt.Fprintf(peer, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: %s\r\n\r\n", H1FramerProtocol); err != nil {
-			peerError <- err
-			return
-		}
-		framed, err := NewFramedMessageConn(&httpUpgradeConn{Conn: peer, reader: reader}, H1FramerProtocol, 65535, nil)
-		if err != nil {
-			peerError <- err
-			return
-		}
-		ready <- framed
+		ready <- peerConn
 		messageCount := 0
 		for {
-			_, message, err := framed.ReadMessage()
+			_, message, err := peerConn.ReadMessage()
 			if err != nil {
 				return
 			}
 			if len(message) == 0 {
 				fixture.heartbeats.Add(1)
+				fixture.stateLock.Lock()
+				fixture.heartbeatTimes = append(fixture.heartbeatTimes, time.Now())
+				fixture.stateLock.Unlock()
 			} else {
 				fixture.payloads.Add(1)
+				fixture.payloadByteCount.Add(int64(len(message)))
+				fixture.stateLock.Lock()
+				fixture.payloadMessages = append(fixture.payloadMessages, append([]byte(nil), message...))
+				fixture.stateLock.Unlock()
 			}
 			messageCount++
 			if pausePeer && messageCount == 1 {
@@ -197,7 +296,7 @@ func newH1LivenessFixtureWithBackpressure(t *testing.T, pausePeer bool, writeTim
 		},
 	}
 	fixture.strategy = NewClientStrategy(ctx, strategySettings)
-	settings := DefaultPlatformTransportSettings()
+	settings := testingDefaultPlatformTransportSettings()
 	settings.Log = NewNoopLogger()
 	settings.EnableH1Plus = true
 	settings.V2H1Auth = true
@@ -222,11 +321,16 @@ func newH1LivenessFixtureWithBackpressure(t *testing.T, pausePeer bool, writeTim
 	for _, apply := range configure {
 		apply(settings)
 	}
-	fixture.routes = NewRouteManagerWithLogger(ctx, "synthetic-h1-liveness", NewNoopLogger())
+	fixture.routes = routes
+	if fixture.routes == nil {
+		fixture.routes = NewRouteManagerWithLogger(ctx, "synthetic-h1-liveness", NewNoopLogger())
+	}
+	fixture.writer = fixture.routes.OpenMultiRouteWriter(DestinationId(NewId()))
 	fixture.transport = NewPlatformTransportWithTargetMode(ctx, fixture.strategy, fixture.routes,
 		"ws://liveness.example/endpoint", &ClientAuth{ByJwt: "synthetic-test-token", InstanceId: NewId()},
 		TransportModeH1, settings)
 	t.Cleanup(func() {
+		fixture.routes.CloseMultiRouteWriter(fixture.writer)
 		fixture.cancel()
 		fixture.client.Close()
 		peer.Close()
@@ -242,10 +346,13 @@ func newH1LivenessFixtureWithBackpressure(t *testing.T, pausePeer bool, writeTim
 	case err := <-peerError:
 		t.Fatalf("synthetic upgrade: %v", err)
 	default:
-		t.Fatal("synthetic H1+ upgrade did not complete without a timer")
+		t.Fatal("synthetic H1 upgrade did not complete without a timer")
 	}
 	fixture.assertConnected(t)
-	if fixture.stats.Snapshot().Accepted != 1 {
+	if fixture.webSocket != !settings.EnableH1Plus {
+		t.Fatal("synthetic owner did not select the configured H1 carrier")
+	}
+	if settings.EnableH1Plus && fixture.stats.Snapshot().Accepted != 1 {
 		t.Fatal("synthetic owner did not select H1+")
 	}
 	return fixture
@@ -254,8 +361,12 @@ func newH1LivenessFixtureWithBackpressure(t *testing.T, pausePeer bool, writeTim
 // Readiness is checked at both the live carrier and actual route publication.
 func (self *h1LivenessFixture) assertConnected(t *testing.T) {
 	t.Helper()
+	connectionStats := H1ConnectionStatsSnapshot{H1PlusConnectionCount: 1}
+	if self.webSocket {
+		connectionStats = H1ConnectionStatsSnapshot{WebSocketConnectionCount: 1}
+	}
 	if !self.transport.IsConnected() || !self.routes.HasActiveTransport() ||
-		self.connectionStats.Snapshot() != (H1ConnectionStatsSnapshot{H1PlusConnectionCount: 1}) ||
+		self.connectionStats.Snapshot() != connectionStats ||
 		self.registered.Load() != 1 || self.withdrawn.Load() != 0 {
 		t.Fatal("healthy H1+ carrier was not registered exactly once")
 	}
@@ -511,9 +622,12 @@ func TestH1PlusLivenessSpeedPayloadDeadlineReturnsOwner(t *testing.T) {
 			t.Fatal("speed-mode control was not echoed before the failure")
 		}
 		fixture.client.failWriteDeadline.Store(true)
+		// a later instant, so the payload installs a deadline of its own: the
+		// batch conn does not forward one identical to the echo's again
+		time.Sleep(time.Nanosecond)
 		message := MessagePoolGet(64)
 		witness := MessagePoolShareReadOnly(message)
-		fixture.send <- message
+		fixture.sendMessage(t, message)
 		synctest.Wait()
 		fixture.assertWithdrawn(t)
 		if !MessagePoolReturn(witness) {
@@ -535,7 +649,7 @@ func TestH1PlusLivenessReadyBatchDeadlineAlreadyFailsClosed(t *testing.T) {
 		fixture.client.failWriteDeadline.Store(true)
 		message := MessagePoolGet(64)
 		witness := MessagePoolShareReadOnly(message)
-		fixture.send <- message
+		fixture.sendMessage(t, message)
 		synctest.Wait()
 		fixture.assertWithdrawn(t)
 		if !MessagePoolReturn(witness) {

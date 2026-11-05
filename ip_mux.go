@@ -40,6 +40,16 @@ type ipPacketGroupSend = func(
 	timeout time.Duration,
 ) bool
 
+// Takes every original group packet and borrows admitted during the call.
+// Observed indexes refer to original members; the result counts admissions.
+type ipNativePacketGroupSend = func(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	group *ipPacketGroup,
+	timeout time.Duration,
+	admitted func(int),
+) int
+
 // ipMuxOnSend lets a concrete mux claim and terminate a send-path packet. It
 // returns true if it handled the packet, or false to forward it upstream.
 type ipMuxOnSend = func(source TransferPath, provideMode protocol.ProvideMode, packet []byte, timeout time.Duration) bool
@@ -67,6 +77,8 @@ type IpMux struct {
 
 	tun            *Tun
 	localAddresses []netip.Addr
+	// Close requests pump cancellation; the owner joins it separately.
+	pumpDone chan struct{}
 
 	onSend      ipMuxOnSend
 	onSendGroup ipMuxOnSendGroup
@@ -78,8 +90,10 @@ type IpMux struct {
 	provideMode protocol.ProvideMode
 	sendTimeout time.Duration
 
-	stateLock         sync.Mutex
-	upstream          IpMuxSend
+	stateLock sync.Mutex
+	upstream  IpMuxSend
+	// Stack-originated packets alone may use ready-only remote admission.
+	pumpUpstream      IpMuxSend
 	upstreamGroupSend ipPacketGroupSend
 
 	receivers      *CallbackList[ReceivePacketFunction]
@@ -114,6 +128,7 @@ func NewIpMux(
 		log:            loggerOrDefault(log),
 		tun:            tun,
 		localAddresses: tun.LocalAddresses(),
+		pumpDone:       make(chan struct{}),
 		onSend:         onSend,
 		onPump:         onPump,
 		source:         source,
@@ -130,9 +145,28 @@ func NewIpMux(
 // because the upstream (e.g. a RemoteUserNatMultiClient) is created with the mux's
 // Receive as its callback, so the two have a circular dependency.
 func (self *IpMux) SetUpstream(upstream IpMuxSend) {
+	self.setUpstreams(upstream, nil, nil)
+}
+
+// Publish one route's ordinary, group and pump senders together. Generic
+// replacement clears both optional capabilities before a new snapshot.
+func (self *IpMux) setUpstreams(upstream IpMuxSend, groupUpstream ipPacketGroupSend, pumpUpstream IpMuxSend) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	self.upstream = upstream
+	self.upstreamGroupSend = groupUpstream
+	self.pumpUpstream = pumpUpstream
+}
+
+// The internal TCP endpoint owns retransmission after a refused native offer.
+// Copy the callback under the route lock and invoke it after unlocking.
+func (self *IpMux) getPumpUpstream() IpMuxSend {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.pumpUpstream != nil {
+		return self.pumpUpstream
+	}
+	return self.upstream
 }
 
 // Installs the exact-flow classifier used by the batch path. Construction is
@@ -206,24 +240,40 @@ func (self *IpMux) SendPacket(source TransferPath, provideMode protocol.ProvideM
 	return upstream(source, provideMode, packet, timeout)
 }
 
-// Consumes a packet burst after grouping it by exact directional flow. Each
-// group is classified once at the routing boundary while content-aware
-// observers still inspect its packets in order.
+// Consumes a packet burst grouped by exact directional flow and TCP SYN
+// generation. Each generation is classified/admitted as a whole; a later SYN
+// cannot move its old-generation prefix to a replacement NAT identity.
 func (self *IpMux) SendPacketBatch(
 	source TransferPath,
 	provideMode protocol.ProvideMode,
 	packets [][]byte,
 	timeout time.Duration,
 ) int {
+	upstream, upstreamGroupSend := self.getUpstreams()
+	return self.sendPacketBatchWithUpstreams(source, provideMode, packets, timeout, upstream, upstreamGroupSend, nil, false)
+}
+
+// Takes a burst under one immutable upstream snapshot. Native callbacks keep
+// local interception unchanged and refuse remote pressure without a continuation.
+func (self *IpMux) sendPacketBatchWithUpstreams(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	packets [][]byte,
+	timeout time.Duration,
+	upstream IpMuxSend,
+	upstreamGroupSend ipPacketGroupSend,
+	nativeGroupSend ipNativePacketGroupSend,
+	nativeIngress bool,
+) int {
 	groups, rejectedPackets := groupIpPackets(packets)
+	groups = splitAffinitySynGroups(groups, nil)
 	for _, packet := range rejectedPackets {
 		MessagePoolReturn(packet)
 	}
 	sentPacketCount := 0
-	upstream, upstreamGroupSend := self.getUpstreams()
 	batch := ipPacketGroupBatch{
 		timeout:   timeout,
-		readyPass: 1 < len(groups) && timeout != 0,
+		readyPass: !nativeIngress && 1 < len(groups) && timeout != 0,
 		send: func(group *ipPacketGroup, sendTimeout time.Duration) bool {
 			return upstreamGroupSend(source, provideMode, group, sendTimeout)
 		},
@@ -276,6 +326,10 @@ func (self *IpMux) SendPacketBatch(
 					MessagePoolReturn(packet)
 				}
 			}
+			continue
+		}
+		if nativeGroupSend != nil {
+			sentPacketCount += nativeGroupSend(source, provideMode, group, timeout, nil)
 			continue
 		}
 		if upstreamGroupSend != nil {
@@ -481,6 +535,7 @@ func ipPacketSourceDestinationAddrs(packet []byte) (netip.Addr, netip.Addr, bool
 // terminates client TCP on the stack, will also emit client-bound replies here and
 // will need to route stack output by destination.
 func (self *IpMux) pump() {
+	defer close(self.pumpDone)
 	for {
 		packet, err := self.tun.Read()
 		if err != nil {
@@ -495,7 +550,7 @@ func (self *IpMux) pump() {
 			if self.onPump != nil && self.onPump(packet) {
 				return
 			}
-			upstream := self.getUpstream()
+			upstream := self.getPumpUpstream()
 			if upstream != nil && upstream(self.source, self.provideMode, packet, self.sendTimeout) {
 				// A successful send transfers packet ownership upstream.
 				return

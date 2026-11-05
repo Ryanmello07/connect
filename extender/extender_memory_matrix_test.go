@@ -30,7 +30,7 @@ func TestExtenderMobileMemoryLiveCompositionMatrix(t *testing.T) {
 	for _, inner := range []connect.TransportMode{connect.TransportModeH1, connect.TransportModeH3, connect.TransportModeH3Dns, connect.TransportModeH3DnsPump} {
 		for _, outer := range []string{connect.ExtenderCarrierTcp, connect.ExtenderCarrierQuic, connect.ExtenderCarrierDns} {
 			t.Run(string(inner)+"/"+outer, func(t *testing.T) {
-				ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+				ctx, cancel := context.WithTimeout(t.Context(), testMemoryExchangeTimeout)
 				defer cancel()
 				fixture, port, packetDestination := newExtenderMemoryFixture(t, ctx, inner)
 				strategySettings := connect.DefaultClientStrategySettings()
@@ -41,6 +41,9 @@ func TestExtenderMobileMemoryLiveCompositionMatrix(t *testing.T) {
 				strategy := connect.NewClientStrategy(ctx, strategySettings)
 				defer strategy.Close()
 				settings := connect.DefaultPlatformTransportSettingsWithMemoryTarget(20 * 1024 * 1024)
+				// no re-dial spread after a lost connection: these tests do
+				// not exercise it
+				settings.ReconnectJitter = 0
 				settings.EnableH3Datagrams = false
 				settings.ModeInitialDelay = 0
 				settings.PingTimeout = 30 * time.Second
@@ -71,6 +74,8 @@ func TestExtenderMobileMemoryLiveCompositionMatrix(t *testing.T) {
 				routeManager := connect.NewRouteManager(ctx, "extender-memory-matrix")
 				reader := routeManager.OpenMultiRouteReader(connect.DestinationId(connect.NewId()))
 				defer routeManager.CloseMultiRouteReader(reader)
+				writer := routeManager.OpenMultiRouteWriter(connect.DestinationId(connect.NewId()))
+				defer routeManager.CloseMultiRouteWriter(writer)
 				transport := connect.NewPlatformTransportWithTargetMode(ctx, strategy, routeManager, "wss://127.0.0.1/ws",
 					&connect.ClientAuth{ByJwt: "memory", InstanceId: connect.NewId(), AppVersion: "test"}, inner, settings)
 				defer func() {
@@ -80,16 +85,15 @@ func TestExtenderMobileMemoryLiveCompositionMatrix(t *testing.T) {
 						t.Error(err)
 					}
 				}()
-				var route connect.Route
 				select {
-				case route = <-routes:
+				case <-routes:
 				case <-ctx.Done():
 					if err, ok := fixture.nextError(); ok {
 						t.Fatalf("carrier did not connect: %v; extender: %v", ctx.Err(), err)
 					}
 					t.Fatal(ctx.Err())
 				}
-				want := settings.H1BudgetByteCount
+				want := settings.H1MemoryReservationByteCount()
 				if inner != connect.TransportModeH1 {
 					want = settings.H3BudgetByteCount
 					if inner != connect.TransportModeH3 {
@@ -127,13 +131,11 @@ func TestExtenderMobileMemoryLiveCompositionMatrix(t *testing.T) {
 						t.Fatal(err)
 					}
 					expected := bytes.Clone(message)
-					select {
-					case route <- message:
-					case <-ctx.Done():
+					if accepted, err := writer.WriteDetailed(ctx, message, -1); !accepted || err != nil {
 						connect.MessagePoolReturn(message)
-						t.Fatal(ctx.Err())
+						t.Fatalf("composed carrier selector: accepted=%t err=%v", accepted, err)
 					}
-					response, err := reader.Read(ctx, 5*time.Second)
+					response, err := reader.Read(ctx, -1)
 					if err != nil {
 						t.Fatalf("bidirectional exchange %d: %v", i, err)
 					}
@@ -163,6 +165,12 @@ func TestExtenderMobileMemoryLiveCompositionMatrix(t *testing.T) {
 		}
 	}
 }
+
+// How long a live memory graph has to connect and echo its four payloads. It only
+// bounds a hang: on the dns carrier each payload is many small packets, so a machine
+// that is busy can take most of a minute, and a read that gave up sooner would come
+// back empty and read as a changed payload.
+const testMemoryExchangeTimeout = 3 * time.Minute
 
 func newExtenderMemoryFixture(t *testing.T, ctx context.Context, inner connect.TransportMode) (*extenderFixture, int, string) {
 	t.Helper()

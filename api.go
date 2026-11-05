@@ -334,6 +334,10 @@ type ProviderSpec struct {
 	LocationGroupId *Id  `json:"location_group_id,omitempty"`
 	ClientId        *Id  `json:"client_id,omitempty"`
 	BestAvailable   bool `json:"best_available,omitempty"`
+	// TransportHint coerces the transports of a fixed `ClientId` spec, a
+	// pinned stay (EXTENDER.md K10). Client-side only: never sent, and not part
+	// of the spec fingerprint.
+	TransportHint *TransportHint `json:"-"`
 }
 
 // LocationCoordinates is a wgs84 point. Zero is a valid coordinate — absence
@@ -371,10 +375,37 @@ type FindProviders2Args struct {
 	// v4-capable, which is every provider an older server knows, so an older
 	// client keeps today's behavior. See ip_family.go.
 	IpFamily IpFamilyFilter `json:"ip_family,omitempty"`
+	// Asks only for providers whose latest provide advertised post-quantum
+	// encryption sessions (`Provide.post_quantum_encryption`); a provider that
+	// never advertised it, as every provider before the field did not, is left
+	// out. A client whose window clients require end-to-end encryption asks
+	// with `RequireModernProvider` instead and leaves this unset. An older
+	// server ignores it.
+	PostQuantumEncryption bool `json:"post_quantum_encryption,omitempty"`
+	// Keeps only modern providers in every draw, providers named by a
+	// `ClientId` spec included. A provider is modern when the platform's
+	// capability probe measured it within the last seven days negotiating
+	// end-to-end post-quantum encryption with resizable transfer windows, or,
+	// for a provider holding only a Network key, which the probe cannot reach,
+	// when its latest provide declared post-quantum encryption. A client whose
+	// window clients require end-to-end encryption sets it. With neither this
+	// nor `PostQuantumEncryption` set, the request is the capability-blind
+	// discovery of an older client. An older server ignores it.
+	RequireModernProvider bool `json:"require_modern_provider,omitempty"`
+	// Asks for the requested targets only. Unset, as before the field, a city
+	// or region target the platform holds no admitted provider for is
+	// answered from its region, then its country, and each provider found
+	// there carries its `Match`. An older server answers exactly either way.
+	Strict bool `json:"strict,omitempty"`
 }
 
 type FindProviders2Result struct {
 	Providers []*FindProvidersProvider `json:"providers"`
+	// The platform's override of the strict window handover
+	// (`MultiClientSettings.StrictWindowHandover`): false turns it off, true
+	// leaves it to the host's setting, and absent, as from an older server,
+	// overrides nothing. See MultiClientGeneratorWithStrictWindowHandoverOverride.
+	WindowStrictHandover *bool `json:"window_strict_handover,omitempty"`
 }
 
 type FindProvidersProvider struct {
@@ -395,6 +426,11 @@ type FindProvidersProvider struct {
 	// IpFamily is the provider's proven address-family category. Empty from
 	// an older server, which the client treats as v4-only (legacy).
 	IpFamily IpFamily `json:"ip_family,omitempty"`
+	// Match is the level the provider was found at because the requested
+	// city or region had no admitted provider: "region" or "country". Empty
+	// for a provider of the requested target itself, a provider named by
+	// client id, a `Strict` request, and from an older server.
+	Match string `json:"match,omitempty"`
 }
 
 func (self *BringYourApi) FindProviders2(findProviders2 *FindProviders2Args, callback FindProviders2Callback) {

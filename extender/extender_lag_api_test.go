@@ -405,6 +405,8 @@ type lagTestSession struct {
 	writeLock sync.Mutex
 	pongDelay atomic.Int64
 	dropPongs atomic.Bool
+	// while set, the browser's answer to the extender's close waits for this to close
+	closeAnswerHold atomic.Pointer[chan struct{}]
 
 	rtts     chan testLagMessage
 	messages chan testLagMessage
@@ -444,6 +446,13 @@ func (self *lagApiFixture) openSession(ticketText string, origin string) *lagTes
 			return nil
 		}
 		return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(time.Second))
+	})
+	conn.SetCloseHandler(func(code int, text string) error {
+		if closeAnswerHold := session.closeAnswerHold.Load(); closeAnswerHold != nil {
+			<-*closeAnswerHold
+		}
+		conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(code, ""), time.Now().Add(time.Second))
+		return nil
 	})
 	go func() {
 		defer close(session.done)
@@ -1385,6 +1394,62 @@ func TestLagApiPingCadence(t *testing.T) {
 	}
 }
 
+// Amendment 22: while a load runs, the pings go back to back, one in flight,
+// no closer than lagApiLoadPingInterval; the report's minute keeps only those
+// on the ticket's cadence, so it stays inside A7's bounds.
+func TestLagApiLoadPingsFast(t *testing.T) {
+	fixture := newLagApiDurationFixture(t, nil)
+	fixture.setTimings(func(timings *lagApiTimings) {
+		timings.reportBefore = 500 * time.Millisecond
+		timings.reportAfter = 500 * time.Millisecond
+		timings.reportWindow = 5 * time.Second
+	})
+	ticketText := fixture.ticket(func(body *protocol.LagTicketBody) {
+		body.DownloadMs = 1000
+		body.UploadMs = 1000
+	})
+	session := fixture.openHelloSession(ticketText)
+	// idle: 4 a second
+	if rtts := session.rttsFor(1100 * time.Millisecond); len(rtts) < 3 || 6 < len(rtts) {
+		t.Fatalf("%d idle rtts in 1.1 s", len(rtts))
+	}
+
+	load := session.runLoad(lagTestLoadOptions{uploadByteCount: testLagDurationByteCount})
+	if load.result.Type != "loadResult" {
+		t.Fatalf("result %+v", load.result.raw)
+	}
+	// the load's 2 s at the ticket's cadence would be 8 pings
+	rtts := []testLagMessage{}
+	for len(session.rtts) > 0 {
+		rtts = append(rtts, <-session.rtts)
+	}
+	// twice that cadence is plenty to tell them apart, and a busy machine answers
+	// back to back pings far slower than an idle one
+	if len(rtts) < 16 {
+		t.Errorf("%d rtts during the load", len(rtts))
+	}
+	for i := 1; i < len(rtts); i += 1 {
+		if gap := rtts[i].T - rtts[i-1].T; gap < int64(lagApiLoadPingInterval/time.Millisecond)-1 {
+			t.Errorf("pings %d ms apart during the load", gap)
+		}
+	}
+
+	body := fixture.nextReport(5 * time.Second)
+	if len(body.PingOffsetMs) < 10 || 600 < len(body.PingOffsetMs) {
+		t.Fatalf("%d pings in the report", len(body.PingOffsetMs))
+	}
+	for i := 1; i < len(body.PingOffsetMs); i += 1 {
+		if body.PingMicros[i] == 0 {
+			continue
+		}
+		// the loop keeps a ping 218.75 ms after the last at the least, and each offset
+		// is whole milliseconds rounded down, so such a gap can read as 218
+		if gap := body.PingOffsetMs[i] - body.PingOffsetMs[i-1]; gap < 250-250/8-1 {
+			t.Errorf("report pings %d ms apart", gap)
+		}
+	}
+}
+
 // M4: a ping with no pong within the loss timeout is lost and the next goes at
 // once; with no pong at all for the pong timeout the session ends, and its
 // report holds the lost pings (M8).
@@ -1734,6 +1799,68 @@ func TestLagApiReportOnClose(t *testing.T) {
 	})
 }
 
+// M8: the read side answers a browser's close and only then ends the session, so
+// the loop can write into a close already sent, which load's back to back pings
+// make likely on a busy host. That is still the browser closing. Here the extender's
+// answer goes out and the browser's own close frame waits, which holds the session
+// in that window until the loop has tried to ping through it.
+func TestLagApiReportsABrowserCloseTheLoopWritesInto(t *testing.T) {
+	fixture := newLagApiFixture(t, nil)
+	fixture.setTimings(func(timings *lagApiTimings) {
+		timings.pingLost = 100 * time.Millisecond
+	})
+	session := fixture.openHelloSession(fixture.ticket(nil))
+	closeAnswerRelease := make(chan struct{})
+	releaseCloseAnswer := sync.OnceFunc(func() { close(closeAnswerRelease) })
+	defer releaseCloseAnswer()
+	session.closeAnswerHold.Store(&closeAnswerRelease)
+
+	session.load("download")
+	waitFor(t, func() bool {
+		return fixture.api.loadCountNow() == 1
+	})
+	response := fixture.get(fmt.Sprintf("/lag/v1/down?session=%s&stream=0", session.hello.Session), testLagOrigin)
+	defer response.Body.Close()
+	buffer := make([]byte, 64*1024)
+	if _, err := io.ReadFull(response.Body, buffer); err != nil {
+		t.Fatal(err)
+	}
+
+	sessionId, ok := parseLagApiSessionId(session.hello.Session)
+	if !ok {
+		t.Fatalf("session id %q", session.hello.Session)
+	}
+	fixture.api.stateLock.Lock()
+	serverSession := fixture.api.sessions[sessionId]
+	fixture.api.stateLock.Unlock()
+	if serverSession == nil {
+		t.Fatal("the session is not open")
+	}
+	err := serverSession.conn.WriteControl(
+		websocket.CloseMessage,
+		websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
+		time.Now().Add(time.Second),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// a ping that begins from here finds the close sent, whatever was in flight
+	inFlightAtClose := serverSession.inFlight.Load()
+	waitFor(t, func() bool {
+		inFlight := serverSession.inFlight.Load()
+		return serverSession.ctx.Err() != nil || (inFlight != nil && inFlight != inFlightAtClose)
+	})
+	if serverSession.ctx.Err() != nil {
+		t.Error("the loop's write into the sent close ended the session ahead of the browser")
+	}
+
+	releaseCloseAnswer()
+	body := fixture.nextReport(5 * time.Second)
+	if body.EndReason != protocol.LagEndReason_LAG_END_CLIENT_CLOSED {
+		t.Errorf("closed report %v", body.EndReason)
+	}
+}
+
 // M6: a mismatch ends the load, not the session: loadResult upload_mismatch,
 // unverified, the stream closed with 4400, and the session goes on pinging.
 func TestLagApiUploadMismatchEndsLoad(t *testing.T) {
@@ -1799,8 +1926,11 @@ func TestLagApiUploadedAt(t *testing.T) {
 	}
 	first := load.uploaded[0]
 	last := load.uploaded[len(load.uploaded)-1]
+	// the messages end at 560 ms if nothing holds them up. At only has to stop short of
+	// the 1000 the progress's own time would give, since a busy machine can hold them
+	// up by a few hundred ms
 	if *last.Ms != 1000 || last.Bytes < 2*6*lagApiBufferByteCount || 2*8*lagApiBufferByteCount < last.Bytes ||
-		*last.At <= *first.At || 800 <= *last.At {
+		*last.At <= *first.At || 1000 <= *last.At {
 		t.Errorf("first progress %+v, last %+v", first.raw, last.raw)
 	}
 }

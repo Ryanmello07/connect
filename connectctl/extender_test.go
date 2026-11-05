@@ -22,6 +22,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/urnetwork/connect"
+	"github.com/urnetwork/connect/extender"
 	"github.com/urnetwork/connect/gossip"
 	"github.com/urnetwork/connect/protocol"
 )
@@ -96,6 +97,16 @@ type testExtenderOperator struct {
 
 	stateLock   sync.Mutex
 	issueSerial int
+	// signs the camouflage key an activation posts into its record, as an
+	// operator with phase 14b does; nil ignores it, as one without does
+	signCamouflageKey bool
+	// has the record require tcp-camouflage-v1 when it carries a key, as an
+	// operator does for an extender in its capability cohort
+	requireCamouflage bool
+	// the clock and lifetime of a record; nil and zero are the real clock and
+	// the fixture's two weeks
+	now            func() time.Time
+	recordLifetime time.Duration
 }
 
 func newTestExtenderOperator(t *testing.T) *testExtenderOperator {
@@ -167,9 +178,29 @@ func (self *testExtenderOperator) activateResult(
 
 	self.stateLock.Lock()
 	self.issueSerial += 1
-	issueTime := time.Now().Add(time.Duration(self.issueSerial) * time.Millisecond)
+	now := time.Now
+	if self.now != nil {
+		now = self.now
+	}
+	recordLifetime := 14 * 24 * time.Hour
+	if 0 < self.recordLifetime {
+		recordLifetime = self.recordLifetime
+	}
+	issueTime := now().Add(time.Duration(self.issueSerial) * time.Millisecond)
+	var realityPublicKey []byte
+	var requiredCapabilities []string
+	if self.signCamouflageKey && args.RealityPublicKeyHex != "" {
+		var keyErr error
+		if realityPublicKey, keyErr = connect.ParseExtenderRealityPublicKeyHex(args.RealityPublicKeyHex); keyErr != nil {
+			self.stateLock.Unlock()
+			return nil, keyErr
+		}
+		if self.requireCamouflage {
+			requiredCapabilities = []string{connect.ExtenderCapabilityTcpCamouflageV1}
+		}
+	}
 	self.stateLock.Unlock()
-	expireTime := issueTime.Add(14 * 24 * time.Hour)
+	expireTime := issueTime.Add(recordLifetime)
 
 	addresses := []*protocol.ExtenderAddress{}
 	for _, recordIp := range []string{testExtenderIpv4, testExtenderIpv6} {
@@ -194,6 +225,9 @@ func (self *testExtenderOperator) activateResult(
 		IssueTimeMs:  uint64(issueTime.UnixMilli()),
 		ExpireTimeMs: uint64(expireTime.UnixMilli()),
 		NetworkHost:  testExtenderNetworkHost,
+
+		RealityPublicKey:     realityPublicKey,
+		RequiredCapabilities: requiredCapabilities,
 	})
 	if err != nil {
 		return nil, err
@@ -315,6 +349,15 @@ func extenderCommandServesAndActivates(t *testing.T, loopbackIp string) {
 		},
 		packetConnFactory:      testLoopbackPacketConn,
 		configureNetworkClient: testHermeticNetworkClient,
+		// The peer probes below judge who the pinger is. The gate's rtt check
+		// compares two separate round trips of this machine, and on a busy one
+		// either can wait out the scheduler while the other does not, by more than
+		// any tolerance, so here it takes any claim. The extender's own tests cover
+		// the check (extender.TestExtenderProbeGate).
+		configureServer: func(settings *extender.ExtenderSettings) {
+			settings.ProbeRttTolerance = 24 * time.Hour
+			settings.ProbeAttestationTimeout = 60 * time.Second
+		},
 		onStart: func(run *extenderRun) {
 			runs <- run
 		},
@@ -467,7 +510,7 @@ func extenderPeerProbes(
 	if run.peerPinger == nil {
 		t.Fatal("the extender runs no peer pinger")
 	}
-	newPeer := func() *connect.ExtenderProbeAttestor {
+	newPeer := func(signHold time.Duration) *connect.ExtenderProbeAttestor {
 		seed, err := connect.NewExtenderKeySeed()
 		if err != nil {
 			t.Fatal(err)
@@ -476,13 +519,21 @@ func extenderPeerProbes(
 		if err != nil {
 			t.Fatal(err)
 		}
+		sign := connect.NewExtenderPeerProbeSigner(privateKey)
 		return connect.NewExtenderProbeExtenderAttestor(
 			privateKey.Public().(ed25519.PublicKey),
-			connect.NewExtenderPeerProbeSigner(privateKey),
+			func(data []byte) []byte {
+				time.Sleep(signHold)
+				return sign(data)
+			},
 		)
 	}
-	knownPeer := newPeer()
-	unknownPeer := newPeer()
+	// A claim is measured before it is signed, so holding the signature holds the
+	// frame past the default tolerance after the claim is fixed. A busy machine does
+	// that now and then; here every run does, and the known peer must still be
+	// co-signed.
+	knownPeer := newPeer(250 * time.Millisecond)
+	unknownPeer := newPeer(0)
 	record, err := connect.SignExtenderRecord(operator.rootPrivateKey, &protocol.ExtenderRecordBody{
 		PublicKey: knownPeer.ExtenderPublicKey,
 		Addresses: []*protocol.ExtenderAddress{

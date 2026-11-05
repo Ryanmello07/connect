@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"slices"
 	"sync"
 	"time"
 )
@@ -15,17 +16,25 @@ import (
 // One sequence owns this pacer, including recovery writes. Waiting at burst
 // boundaries and actual dispatch bounds late wakes too. Idle time never
 // accumulates permission for a window-sized burst.
+//
+// The service lock guards the service counters and the receiver hold: a
+// sibling's flight read sums them while this lane is receiver-held.
 type windowBurstPacer struct {
-	service               *windowPacingService
-	serviceSequenceId     Id
-	timer                 *time.Timer
-	rate                  ByteCount
-	estimateRate          ByteCount
-	rateUpdated           time.Time
-	probeRate             ByteCount
-	probeLimit            ByteCount
-	serviceSent           ByteCount
-	serviceAcked          ByteCount
+	service           *windowPacingService
+	serviceSequenceId Id
+	timer             *time.Timer
+	rate              ByteCount
+	estimateRate      ByteCount
+	rateUpdated       time.Time
+	probeRate         ByteCount
+	probeLimit        ByteCount
+	serviceSent       ByteCount
+	serviceAcked      ByteCount
+	// Original bytes of the one reservation not yet written.
+	serviceReserved ByteCount
+	// The receiver held this lane's last cumulative head longer than the
+	// service residence, so its unacknowledged bytes wait there.
+	receiverHeld          bool
 	serviceClosed         bool
 	afterWaitForTest      func()
 	afterAdmissionForTest func()
@@ -370,10 +379,18 @@ func (self *windowBurstPacer) waitForServiceReservation(ctx context.Context, byt
 		if self.service == nil {
 			self.service = &windowPacingService{}
 		}
+		now := time.Now()
+		self.service.stateLock.Lock()
+		congestion := resend
 		if !resend {
 			self.serviceSent += ByteCount(byteCount)
+			self.serviceReserved = ByteCount(byteCount)
+		} else if self.receiverHeld {
+			// An unqueued path pins a held lane's retry on its receiver.
+			congestion = !self.service.unqueuedWithLock(self.service.roundTripEvidenceWithLock(now))
 		}
-		self.service.reserve(time.Now(), byteCount, self.rate, self.estimateRate, self.probeRate, self.probeLimit, resend, &self.waiter)
+		self.service.reserveWithLock(now, byteCount, self.rate, self.estimateRate, self.probeRate, self.probeLimit, resend, congestion, &self.waiter)
+		self.service.stateLock.Unlock()
 		*reservation = windowPacingReservation{started: true, active: true, byteCount: byteCount, resend: resend}
 	}
 	byteCount, resend = reservation.byteCount, reservation.resend
@@ -441,6 +458,7 @@ func (self *windowBurstPacer) releaseServiceReservation(reservation *windowPacin
 	}
 	if !reservation.resend {
 		self.service.reservedByteCount -= ByteCount(reservation.byteCount)
+		self.serviceReserved = 0
 	}
 	reservation.active, reservation.complete = false, admitted
 	self.service.stateLock.Unlock()
@@ -494,6 +512,16 @@ func (self *windowBurstPacer) waitUntilChangedForWrite(ctx context.Context, dead
 		recovery, err := start.recoveryDeadline(now)
 		if err != nil {
 			return err
+		}
+		if start != nil && !start.recovery && start.owner != nil && start.owner.pendingRecovery != nil && self.service != nil {
+			// This worker cannot repair its older tail until the current
+			// original returns. That dependency makes a drain impossible;
+			// abandon only the measurement, keeping its cooldown and debt.
+			self.service.stateLock.Lock()
+			if self.service.writes[start.sequenceId].pending && !self.service.drainUntil.IsZero() {
+				self.service.abortDrainWithLock()
+			}
+			self.service.stateLock.Unlock()
 		}
 		routeUpdate, err := start.pacingRoute()
 		if err != nil {
@@ -551,6 +579,11 @@ func (self *windowBurstPacer) waitUntilChangedForWrite(ctx context.Context, dead
 // Logical sequences to one destination share serialization capacity and one
 // opening probe. References are protected by SendBuffer.mutex; all timing and
 // delivery methods below are safe for concurrent use.
+//
+// The lanes share one carrier, so they share its clock, probe, delivery and
+// flight. A lane whose receiver stops draining keeps its place on the clock,
+// but while the path shows no queue, neither its held window nor its retries
+// are evidence about the carrier its siblings are paced by.
 type windowPacingService struct {
 	stateLock                sync.Mutex
 	references               int
@@ -635,8 +668,14 @@ type windowPacingService struct {
 	heldPacingRate          ByteCount
 	qualityChangedAt        time.Time
 	qualityLastNotification time.Time
+	// the newest network path generation the service accepted (see
+	// networkQualityChangedOnPath)
+	qualityPathGeneration   uint64
 	qualityRoundTripPending bool
 	qualityServiceMeasured  bool
+	// Lanes whose receiver is holding their delivered bytes. Their flight is
+	// receiver residence, not this carrier's queue; at most one per lane.
+	receiverHeldLanes []*windowBurstPacer
 }
 
 // Admission and statistics read the same discovery state and held pace.
@@ -938,14 +977,33 @@ type windowServiceSample struct {
 	receiverLastAtNanos  int64
 	receiverBytes        ByteCount
 	supply               windowServiceSupply
+	// The first raw checkpoint is excluded from a within-sample numerator.
+	// Keep the selected bytes' evidence separately instead of subtracting
+	// extrema or completeness from the whole sample after aggregation.
+	afterFirst windowServiceCoverage
+}
+
+// A value summary owns only its included bytes and clocks. Samples retain one
+// suffix summary, so tied or reordered first checkpoints need no event list.
+type windowServiceCoverage struct {
+	firstAtNanos         int64
+	lastAtNanos          int64
+	bytes                ByteCount
+	receiverFirstAtNanos int64
+	receiverLastAtNanos  int64
+	receiverBytes        ByteCount
+	supply               windowServiceSupply
 }
 
 // Offer coverage is separate from raw delivery ownership. Missing production
 // offers stay distinct from legacy observations that never carried this proof.
 type windowServiceSupply struct {
+	// Kept only for one exact confirmed original, never a merged prefix.
+	readyAtNanos       int64
+	readyLane          Id
 	earliestSentNanos  int64
 	latestSentNanos    int64
-	maximumOfferGap   time.Duration
+	maximumOfferGap    time.Duration
 	minimumPath        time.Duration
 	maximumGap         time.Duration
 	receiverMaximumGap time.Duration
@@ -955,25 +1013,71 @@ type windowServiceSupply struct {
 	headFirstAtNanos   int64
 	headLastMinAtNanos int64
 	headMaximumAtNanos int64
+	headMaximumGap     time.Duration
 	recorded           bool
 	complete           bool
 	rawClock           bool
 	headComplete       bool
 }
 
-// Merge bounded provenance before changing either summary's raw endpoints.
-// Receiver clocks reuse the existing sample fields, including feedback summaries.
+// Copy full provenance without the suffix, queue flags or bucket placement.
+func (self windowServiceSample) coverage() windowServiceCoverage {
+	return windowServiceCoverage{
+		firstAtNanos: self.firstAtNanos, lastAtNanos: self.lastAtNanos, bytes: self.bytes,
+		receiverFirstAtNanos: self.receiverFirstAtNanos, receiverLastAtNanos: self.receiverLastAtNanos,
+		receiverBytes: self.receiverBytes, supply: self.supply,
+	}
+}
+
+// The excluded checkpoint still anchors elapsed time and the first arrival
+// gap. It never lends its physical offer to the selected byte numerator.
+func (self windowServiceSample) coverageAfterFirst() windowServiceCoverage {
+	selected := self.afterFirst
+	if selected.bytes > 0 {
+		selected.supply.maximumGap = max(selected.supply.maximumGap, time.Duration(selected.firstAtNanos-self.firstAtNanos))
+		if self.receiverBytes == self.bytes && selected.receiverBytes == selected.bytes {
+			selected.supply.receiverMaximumGap = max(selected.supply.receiverMaximumGap, time.Duration(selected.receiverFirstAtNanos-self.receiverFirstAtNanos))
+		}
+	}
+	return selected
+}
+
+// Merge the suffix before callers update the sample's raw endpoints or bytes.
+// An earlier first checkpoint selects all old bytes; an equal one selects only
+// both suffixes; a later incoming checkpoint selects all its bytes.
 func (self *windowServiceSample) mergeSupply(other windowServiceSample) {
 	if other.bytes <= 0 {
 		return
 	}
 	if self.bytes <= 0 {
-		self.supply = other.supply
-		self.receiverFirstAtNanos, self.receiverLastAtNanos = other.receiverFirstAtNanos, other.receiverLastAtNanos
-		self.receiverBytes = other.receiverBytes
+		self.afterFirst = other.afterFirst
+	} else if other.firstAtNanos < self.firstAtNanos {
+		selected := other.afterFirst
+		selected.merge(self.coverage())
+		self.afterFirst = selected
+	} else if other.firstAtNanos == self.firstAtNanos {
+		self.afterFirst.merge(other.afterFirst)
+	} else {
+		self.afterFirst.merge(other.coverage())
+	}
+	all := self.coverage()
+	all.merge(other.coverage())
+	self.supply = all.supply
+	self.receiverFirstAtNanos, self.receiverLastAtNanos = all.receiverFirstAtNanos, all.receiverLastAtNanos
+	self.receiverBytes = all.receiverBytes
+}
+
+// Merge bounded provenance before advancing either summary's raw endpoints.
+func (self *windowServiceCoverage) merge(other windowServiceCoverage) {
+	if other.bytes <= 0 {
+		return
+	}
+	if self.bytes <= 0 {
+		*self = other
 		return
 	}
 	self.supply.recorded = self.supply.recorded || other.supply.recorded
+	self.supply.readyAtNanos, self.supply.readyLane = 0, Id{}
 	self.supply.complete = self.supply.complete && other.supply.complete
 	offerGap := max(int64(0), other.supply.earliestSentNanos-self.supply.latestSentNanos,
 		self.supply.earliestSentNanos-other.supply.latestSentNanos)
@@ -983,6 +1087,20 @@ func (self *windowServiceSample) mergeSupply(other windowServiceSample) {
 	self.supply.minimumPath = max(self.supply.minimumPath, other.supply.minimumPath)
 	self.supply.rawClock = self.supply.rawClock && other.supply.rawClock
 	self.supply.headComplete = self.supply.headComplete && other.supply.headComplete
+	// Preserve gaps between exact heads in their own clock. An expanded
+	// head denominator can contain many continuous checkpoints; its whole
+	// extent is not one gap. Overlapping arrival summaries cannot reconstruct
+	// interior order, so retain their full head extent conservatively.
+	headGap := int64(0)
+	if self.lastAtNanos < other.firstAtNanos {
+		headGap = max(int64(0), other.supply.headFirstAtNanos-self.supply.headLastMinAtNanos)
+	} else if other.lastAtNanos < self.firstAtNanos {
+		headGap = max(int64(0), self.supply.headFirstAtNanos-other.supply.headLastMinAtNanos)
+	} else {
+		headGap = max(self.supply.headMaximumAtNanos, other.supply.headMaximumAtNanos) -
+			min(self.supply.headFirstAtNanos, other.supply.headFirstAtNanos)
+	}
+	self.supply.headMaximumGap = max(self.supply.headMaximumGap, other.supply.headMaximumGap, time.Duration(headGap))
 	self.supply.headMaximumAtNanos = max(self.supply.headMaximumAtNanos, other.supply.headMaximumAtNanos)
 	gap := max(int64(0), other.firstAtNanos-self.lastAtNanos, self.firstAtNanos-other.lastAtNanos)
 	self.supply.maximumGap = max(self.supply.maximumGap, other.supply.maximumGap, time.Duration(gap))
@@ -1012,13 +1130,21 @@ func (self *windowServiceSample) mergeSupply(other windowServiceSample) {
 		self.receiverLastAtNanos = max(self.receiverLastAtNanos, other.receiverLastAtNanos)
 	}
 	self.receiverBytes += other.receiverBytes
+	self.firstAtNanos = min(self.firstAtNanos, other.firstAtNanos)
+	self.lastAtNanos = max(self.lastAtNanos, other.lastAtNanos)
+	self.bytes += other.bytes
 }
 
-// Continuous samples retain the existing rule. A discontinuous interval needs
-// all credited offers before its left endpoint in the selected clock, or an
+// Continuous confirmed samples retain the existing rule. Discontinuous intervals
+// need all credited offers before their left endpoint in the selected clock, or an
 // exact selected tail whose own queue covers the entire interval, not one gap.
 // That queue uses its own captured baseline, separately from whole-credit supply.
 func (self windowServiceSupply) covers(receiverStart int64, span int64, interval time.Duration, receiverTimed bool) bool {
+	// Close replies cannot replace missing confirmed physical supply.
+	// Legacy and unknown-baseline cold samples retain their fallback.
+	if self.recorded && !self.complete && self.minimumPath > 0 {
+		return false
+	}
 	gap := self.maximumGap
 	if receiverTimed {
 		gap = self.receiverMaximumGap
@@ -1054,6 +1180,22 @@ func (self windowServiceSupply) continuousOfferSpan(span, headStart, offerStart 
 	return max(span, self.headMaximumAtNanos-headStart, self.latestSentNanos-offerStart)
 }
 
+// Two exact original heads can be sparse because local pacing held ready
+// demand. Ready time bounds source idle, but never shortens the physical or
+// receiver denominator. Only the same acquired carrier lane may use it.
+func (self windowServiceSupply) pacedOfferSpan(span, headStart, offerStart int64, lane Id, interval time.Duration) int64 {
+	if span <= 0 || interval <= 0 || interval > time.Duration(math.MaxInt64)/2 ||
+		!self.recorded || !self.complete || !self.headComplete || headStart <= 0 ||
+		self.headMaximumAtNanos <= headStart || offerStart <= 0 ||
+		self.earliestSentNanos < offerStart || self.latestSentNanos != self.earliestSentNanos ||
+		self.readyAtNanos <= 0 || self.readyAtNanos > self.earliestSentNanos ||
+		lane == (Id{}) || self.readyLane != lane ||
+		self.readyAtNanos-offerStart > int64(2*interval) {
+		return 0
+	}
+	return max(span, self.headMaximumAtNanos-headStart, self.latestSentNanos-offerStart)
+}
+
 // A head boundary may prove preoffering without granting byte retiming.
 // It may only lengthen the already-selected denominator; a fully retimed
 // interval keeps its shorter exact clock, never a new raw-arrival floor.
@@ -1065,6 +1207,14 @@ func (self windowServiceSupply) qualifiedSpan(span, receiverStart, headStart int
 	if self.headComplete && headStart > 0 {
 		if self.headMaximumAtNanos <= headStart {
 			return 0
+		}
+		// Raw ACK continuity cannot cover extra receiver-head time. Use the
+		// actual head-clock gaps, including the excluded left checkpoint,
+		// rather than treating a continuous train's entire extent as idle.
+		headSpan := self.headMaximumAtNanos - headStart
+		if !receiverTimed && headSpan > span {
+			self.maximumGap = max(self.maximumGap, self.headMaximumGap,
+				time.Duration(self.headFirstAtNanos-headStart))
 		}
 		span = max(span, self.headMaximumAtNanos-headStart)
 		receiverStart = headStart
@@ -1083,9 +1233,17 @@ func (self windowServiceSupply) qualifiedSpan(span, receiverStart, headStart int
 func (self *windowPacingService) reserve(now time.Time, byteCount int, rate, estimateRate, probeRate, probeLimit ByteCount, resend bool, waiter *windowPacingWaiter) time.Time {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	return self.reserveWithLock(now, byteCount, rate, estimateRate, probeRate, probeLimit, resend, resend, waiter)
+}
+
+// A pacer charges its own service counters inside the same critical section.
+// Its retry is congestion evidence unless its receiver holds the lane on an
+// unqueued path.
+func (self *windowPacingService) reserveWithLock(now time.Time, byteCount int, rate, estimateRate, probeRate, probeLimit ByteCount, resend, congestion bool, waiter *windowPacingWaiter) time.Time {
 	// A recovery write is congestion evidence; it ends discovery and
-	// releases the held pace.
-	if resend {
+	// releases the held pace. A receiver-held lane's retry on an unqueued
+	// path is explained by its receiver's wait, not by the shared carrier.
+	if congestion {
 		if self.queueObservedAt.IsZero() {
 			self.queueObservedAt = now
 		}
@@ -1414,11 +1572,12 @@ func (self *windowPacingService) observeAckSampleWithLock(credit windowServiceAc
 	bytes, receiverTiming := credit.bytes, credit.receiverTiming
 	self.serviceEpochByteBase -= bytes
 	timing := self.roundTripEvidenceWithLock(at)
-	ackSample := windowServiceSample{firstAtNanos: at.UnixNano(), lastAtNanos: at.UnixNano(), bytes: bytes,
+	ackSample := windowServiceSample{firstAtNanos: at.UnixNano(), firstBytes: bytes, lastAtNanos: at.UnixNano(), bytes: bytes,
 		supply: windowServiceSupply{recorded: credit.offerRecorded,
+			readyAtNanos: credit.readyAtNanos, readyLane: credit.readyLane,
 			complete: credit.offerRecorded && credit.offerComplete && credit.firstSentAtNanos > 0 &&
 				credit.lastSentAtNanos >= credit.firstSentAtNanos && timing.minimum > 0,
-			rawClock:        !credit.receiverTimingObserved,
+			rawClock:          !credit.receiverTimingObserved,
 			earliestSentNanos: credit.firstSentAtNanos, latestSentNanos: credit.lastSentAtNanos,
 			maximumOfferGap: credit.maximumOfferGap, minimumPath: timing.minimum}}
 	headAtNanos := credit.receiverHeadAtNanos
@@ -1528,6 +1687,8 @@ func (self *windowPacingService) observeAckSampleWithLock(credit windowServiceAc
 		self.feedbackCycleHeadAtNanos = min(self.feedbackCycleHeadAtNanos, ackSample.supply.headLastMinAtNanos)
 		for _, cycle := range []*windowServiceSample{&self.feedbackCycle, &self.feedbackComplete} {
 			if cycle.firstAtNanos == at.UnixNano() && cycle.firstBytes == 0 {
+				cycle.supply.headMaximumGap = max(cycle.supply.headMaximumGap,
+					time.Duration(cycle.supply.headFirstAtNanos-self.feedbackCycleHeadAtNanos))
 				cycle.supply.headFirstAtNanos = self.feedbackCycleHeadAtNanos
 				cycle.supply.headComplete = cycle.supply.headComplete && self.feedbackCycleHeadAtNanos > 0
 			}
@@ -1591,9 +1752,16 @@ func (self *windowPacingService) completeFeedbackCycleWithLock() {
 	completeDrain := self.drained && self.total >= self.drainedSent ||
 		!self.feedbackDrainAt.IsZero() && self.feedbackDrainPending == 0 && cycle.lastAtNanos <= self.feedbackDrainAt.UnixNano()
 	if completeDrain {
+		// The new boundary owns no bytes, so every real credit is selected.
+		// Repeated completion must not merge that synthetic checkpoint back.
+		if cycle.firstBytes > 0 {
+			cycle.afterFirst = cycle.coverage()
+		}
 		cycle.supply.maximumGap = max(cycle.supply.maximumGap, time.Duration(cycle.firstAtNanos-self.feedbackCycleBefore.UnixNano()))
 		cycle.receiverBytes = 0
 		cycle.firstAtNanos, cycle.firstBytes = self.feedbackCycleBefore.UnixNano(), 0
+		cycle.supply.headMaximumGap = max(cycle.supply.headMaximumGap,
+			time.Duration(cycle.supply.headFirstAtNanos-self.feedbackCycleHeadAtNanos))
 		cycle.supply.headFirstAtNanos = self.feedbackCycleHeadAtNanos
 		cycle.supply.headComplete = cycle.supply.headComplete && self.feedbackCycleHeadAtNanos > 0
 	}
@@ -1835,7 +2003,7 @@ func (self *windowPacingService) measureEvidenceWithLock(horizon time.Duration, 
 			}
 		}
 	}
-	observeRate := func(bytes ByteCount, span, atNanos int64, intervalLimited, firstQueued bool, supply windowServiceSupply, receiverStart, headStart int64, receiverTimed bool, offerStart int64) bool {
+	observeRate := func(bytes ByteCount, span, atNanos int64, intervalLimited, firstQueued bool, supply windowServiceSupply, receiverStart, headStart int64, receiverTimed bool, offerStart int64, readyLane Id) bool {
 		proofAtNanos := atNanos
 		offerOnly := false
 		if qualified := supply.qualifiedSpan(span, receiverStart, headStart, interval, receiverTimed); qualified > 0 {
@@ -1846,7 +2014,17 @@ func (self *windowPacingService) measureEvidenceWithLock(horizon time.Duration, 
 				// for an independently covered pair with this right endpoint.
 				return false
 			}
-			span = supply.continuousOfferSpan(span, headStart, offerStart, interval)
+			offerSpan := supply.continuousOfferSpan(span, headStart, offerStart, interval)
+			if offerSpan <= 0 {
+				if hold <= 0 {
+					return false
+				}
+				offerSpan = supply.pacedOfferSpan(span, headStart, offerStart, readyLane, interval)
+				if offerSpan <= 0 || byteRate(bytes, offerSpan) <= hold {
+					return false
+				}
+			}
+			span = offerSpan
 			offerOnly = true
 			// An offered train measures delivery from below, even when its
 			// own cadence limits it. Only independent old-pace flight may
@@ -1900,7 +2078,8 @@ func (self *windowPacingService) measureEvidenceWithLock(horizon time.Duration, 
 				} else if newer.supply.rawClock {
 					receiverStart = newer.firstAtNanos
 				}
-				observeRate(newer.bytes-newer.firstBytes, span, newer.lastAtNanos, newer.queued || compression > 0 && newer.receiverBytes != newer.bytes, newer.firstQueued, newer.supply, receiverStart, newer.supply.headFirstAtNanos, newer.receiverBytes == newer.bytes, 0)
+				selected := newer.coverageAfterFirst()
+				observeRate(newer.bytes-newer.firstBytes, span, newer.lastAtNanos, newer.queued || compression > 0 && newer.receiverBytes != newer.bytes, newer.firstQueued, selected.supply, receiverStart, newer.supply.headFirstAtNanos, newer.receiverBytes == newer.bytes, 0, Id{})
 			} else {
 				invalidReceiverAt = max(invalidReceiverAt, newer.lastAtNanos)
 			}
@@ -1928,6 +2107,7 @@ func (self *windowPacingService) measureEvidenceWithLock(horizon time.Duration, 
 			receiverStart := int64(0)
 			headStart := int64(0)
 			offerStart := int64(0)
+			readyLane := Id{}
 			if samples[j].supply.headComplete {
 				headStart = samples[j].supply.headLastMinAtNanos
 			}
@@ -1935,6 +2115,9 @@ func (self *windowPacingService) measureEvidenceWithLock(horizon time.Duration, 
 			// to its excluded endpoint. Keep that ambiguity explicit.
 			if samples[j].firstAtNanos == samples[j].lastAtNanos && samples[j].supply.complete {
 				offerStart = samples[j].supply.latestSentNanos
+				if samples[j].supply.readyAtNanos > 0 {
+					readyLane = samples[j].supply.readyLane
+				}
 			}
 			if receiverTimed && samples[j].receiverBytes == samples[j].bytes {
 				receiverStart = samples[j].receiverLastAtNanos
@@ -1948,11 +2131,16 @@ func (self *windowPacingService) measureEvidenceWithLock(horizon time.Duration, 
 				receiverSpan = newer.receiverLastAtNanos - samples[j].receiverFirstAtNanos
 				firstQueued = samples[j].firstQueued
 				candidateBytes += samples[j].bytes - samples[j].firstBytes
-				combined := coverage
-				combined.mergeSupply(*samples[j])
+				combined := coverage.coverage()
+				combined.merge(samples[j].coverageAfterFirst())
 				candidateSupply = combined.supply
+				candidateSupply.maximumGap = max(candidateSupply.maximumGap, time.Duration(combined.firstAtNanos-samples[j].firstAtNanos))
+				if receiverTimed && combined.receiverBytes == combined.bytes {
+					candidateSupply.receiverMaximumGap = max(candidateSupply.receiverMaximumGap, time.Duration(combined.receiverFirstAtNanos-samples[j].receiverFirstAtNanos))
+				}
 				headStart = 0
 				offerStart = 0
+				readyLane = Id{}
 				if samples[j].supply.headComplete {
 					headStart = samples[j].supply.headFirstAtNanos
 				}
@@ -1970,7 +2158,7 @@ func (self *windowPacingService) measureEvidenceWithLock(horizon time.Duration, 
 				}
 				if span <= 0 {
 					invalidReceiverAt = max(invalidReceiverAt, newer.lastAtNanos)
-				} else if observeRate(candidateBytes, span, newer.lastAtNanos, queued || samples[j].queued || compression > 0 && !receiverTimed, firstQueued, candidateSupply, receiverStart, headStart, receiverTimed, offerStart) {
+				} else if observeRate(candidateBytes, span, newer.lastAtNanos, queued || samples[j].queued || compression > 0 && !receiverTimed, firstQueued, candidateSupply, receiverStart, headStart, receiverTimed, offerStart, readyLane) {
 					offerSet = false
 					break
 				}
@@ -2071,7 +2259,8 @@ func (self *windowPacingService) measureEvidenceWithLock(horizon time.Duration, 
 				if cycle.supply.rawClock {
 					receiverStart = cycle.firstAtNanos
 				}
-				if observeRate(cycle.bytes-cycle.firstBytes, span, cycle.lastAtNanos, cycle.queued, cycle.queued, cycle.supply, receiverStart, cycle.supply.headFirstAtNanos, false, 0) {
+				selected := cycle.coverageAfterFirst()
+				if observeRate(cycle.bytes-cycle.firstBytes, span, cycle.lastAtNanos, cycle.queued, cycle.queued, selected.supply, receiverStart, cycle.supply.headFirstAtNanos, false, 0, Id{}) {
 					completedFallback = true
 					break
 				}
@@ -2321,18 +2510,24 @@ func (self *windowPacingService) backloggedWithLock(rate, flightRate ByteCount, 
 		return false
 	}
 	bound := self.flightBoundAtWithLock(flightRate, timing.residence)
+	unqueued := self.unqueuedWithLock(timing)
+	// A lower delivery estimate can shrink its own flight allowance after a
+	// permission-limited or compressed turn. Historical bytes do not let that
+	// lower bound revoke an admitted faster pace without queue residence.
+	if (float64(max(self.total, self.drainedSent)) < bound || rate < self.heldPacingRate) && unqueued {
+		return false
+	}
+	return self.carrierFlightWithLock(unqueued) > bound
+}
+
+// The latest round trip is within the backlog margin of the path minimum.
+// Receiver-timed samples already exclude compression; legacy ones include it.
+func (self *windowPacingService) unqueuedWithLock(timing windowReceiverRoundTripEstimate) bool {
 	compression := self.compression
 	if timing.count > 0 {
 		compression = 0
 	}
-	// A lower delivery estimate can shrink its own flight allowance after a
-	// permission-limited or compressed turn. Historical bytes do not let that
-	// lower bound revoke an admitted faster pace without queue residence.
-	if (float64(max(self.total, self.drainedSent)) < bound || rate < self.heldPacingRate) &&
-		timing.latest <= timing.minimum+compression+2*time.Millisecond {
-		return false
-	}
-	return self.outstandingWithLock() > bound
+	return timing.latest <= timing.minimum+compression+2*time.Millisecond
 }
 
 // Reserved bytes are still local. Cumulative delivery of every sibling tail
@@ -2340,6 +2535,47 @@ func (self *windowPacingService) backloggedWithLock(rate, flightRate ByteCount, 
 // later application catches up to that bound without crediting it twice.
 func (self *windowPacingService) outstandingWithLock() float64 {
 	return float64(max(0, self.sent-max(self.total, self.drainedSent)-self.reservedByteCount))
+}
+
+// On an unqueued path, a receiver-held lane's written, unacknowledged bytes
+// wait at its receiver, not on the shared carrier, so they leave the
+// ACK-applied term. Lanes share one service residence, the smallest receiver
+// wait among them, so the flight bound cannot cover one lane whose receiver
+// stopped draining. The drained checkpoint still bounds every lane's flight
+// written since that proof. A queued path keeps every lane's flight: a hole
+// repaired after carrier loss also waits at the receiver, and that queue
+// must still slow every lane.
+func (self *windowPacingService) carrierFlightWithLock(unqueued bool) float64 {
+	if !unqueued || len(self.receiverHeldLanes) == 0 {
+		return self.outstandingWithLock()
+	}
+	applied := self.sent - self.total - self.reservedByteCount
+	for _, lane := range self.receiverHeldLanes {
+		applied -= max(0, lane.serviceSent-lane.serviceAcked-lane.serviceReserved)
+	}
+	return float64(max(0, min(applied, self.sent-self.drainedSent-self.reservedByteCount)))
+}
+
+// Each cumulative head decides again, so a lane returns to carrier flight
+// on the first head its receiver releases within the residence. One residence
+// is the path minimum plus the smallest receiver wait; a longer wait leaves
+// more of the lane's flight at its receiver than on the path. Without a path
+// measurement there is no residence to compare, so the hold stays as it was.
+func (self *windowPacingService) observeReceiverHoldWithLock(lane *windowBurstPacer, receiverDelay time.Duration, at time.Time) {
+	residence := self.roundTripEvidenceWithLock(at).residence
+	if residence <= 0 {
+		return
+	}
+	held := receiverDelay > residence
+	if held == lane.receiverHeld {
+		return
+	}
+	lane.receiverHeld = held
+	if held {
+		self.receiverHeldLanes = append(self.receiverHeldLanes, lane)
+	} else {
+		self.receiverHeldLanes = slices.DeleteFunc(self.receiverHeldLanes, func(other *windowBurstPacer) bool { return other == lane })
+	}
 }
 
 // Physical flight contains propagation plus one permitted burst. Its byte
@@ -2392,6 +2628,10 @@ func (self *windowBurstPacer) close() {
 		}
 		if self.service.roundTripProbe.sequenceId == self.serviceSequenceId {
 			self.service.roundTripProbe = windowPacingRoundTripProbe{}
+		}
+		if self.receiverHeld {
+			self.receiverHeld = false
+			self.service.receiverHeldLanes = slices.DeleteFunc(self.service.receiverHeldLanes, func(other *windowBurstPacer) bool { return other == self })
 		}
 		self.service.notifyDrainWithLock()
 		self.serviceSent = 0

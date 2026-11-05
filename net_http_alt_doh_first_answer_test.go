@@ -39,7 +39,7 @@ func checkAltDohFirstAnswer(t *testing.T, readyIpv6 bool, whodis bool) {
 			},
 		}
 		budget := NewPlatformTransportBudget(64*1024*1024, 4)
-		transportSettings := DefaultPlatformTransportSettings()
+		transportSettings := testingDefaultPlatformTransportSettings()
 		transportSettings.PlatformTransportBudget = budget
 		dialCtx := context.WithValue(ctx, extenderTransportSettingsContextKey{}, transportSettings)
 		strategy := &ClientStrategy{
@@ -117,7 +117,7 @@ func TestAltDohFirstAnswerLateFamilyRetainsWhodisPorts(t *testing.T) {
 		}
 		done := make(chan outcome, 1)
 		go func() {
-			candidates, source, err := strategy.altDialCandidatesProgressive(ctx, true)
+			candidates, source, err := strategy.altDialCandidatesProgressive(ctx, true, "")
 			done <- outcome{candidates: candidates, source: source, err: err}
 		}()
 		synctest.Wait()

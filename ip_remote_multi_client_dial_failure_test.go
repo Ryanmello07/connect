@@ -27,9 +27,13 @@ func dialFailureTestParent(t *testing.T, rerace bool, egressIpPath *IpPath) (
 
 	settings := DefaultMultiClientSettings()
 	settings.DialFailureRerace = rerace
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
 
 	captured := &[]*receivePacket{}
 	parent = &RemoteUserNatMultiClient{
+		ctx:                ctx,
+		cancel:             cancel,
 		settings:           settings,
 		ip4PathUpdates:     map[Ip4Path]*multiClientChannelUpdate{},
 		ip6PathUpdates:     map[Ip6Path]*multiClientChannelUpdate{},
@@ -45,8 +49,9 @@ func dialFailureTestParent(t *testing.T, rerace bool, egressIpPath *IpPath) (
 		})
 	})
 
-	sourceClient = &multiClientChannel{settings: settings}
-	update = &multiClientChannelUpdate{ipPath: egressIpPath}
+	sourceClient = &multiClientChannel{ctx: ctx, settings: settings}
+	update = newMultiClientChannelUpdate(ctx, egressIpPath)
+	t.Cleanup(update.Close)
 	update.client.Store(sourceClient)
 
 	switch egressIpPath.Version {
@@ -188,6 +193,9 @@ func TestDialFailureReraceOffForwards(t *testing.T) {
 
 		parent.clientDialFailureSignal(client, &signalPath)
 
+		if len(parent.affinityDeliveries) != 0 || update.affinityDelivery.Load() != 0 {
+			t.Errorf("%s: forwarding retained an application delivery lease", label)
+		}
 		if update.client.Load() != client {
 			t.Errorf("%s: rerace off must not unbind the flow", label)
 		}
@@ -486,9 +494,11 @@ func TestSynWaitHandshakeTrips(t *testing.T) {
 	tcpPath.Syn = true
 
 	if update.synWaitExceeded(client, tcpPath, 0) {
-		t.Fatal("the first probe must only start the clock, never trip")
+		t.Fatal("a local offer without admission must not trip")
 	}
-	// a zero timeout is already exceeded by the second probe
+	update.client.Store(client)
+	update.startSynWait(client, update.client.loadSelection(), tcpPath)
+	// A zero timeout is exceeded by a probe after accepted custody.
 	if !update.synWaitExceeded(client, tcpPath, 0) {
 		t.Error("a retransmitting handshake past the timeout did not trip")
 	}
@@ -505,8 +515,10 @@ func TestSynWaitTCPHandshakeNeverExhaustsResponseBudget(t *testing.T) {
 	tcpPath.Syn = true
 
 	if update.synWaitExceeded(client, tcpPath, time.Hour) {
-		t.Fatal("the first SYN tripped the silence clock")
+		t.Fatal("the unadmitted first SYN tripped the silence clock")
 	}
+	update.client.Store(client)
+	update.startSynWait(client, update.client.loadSelection(), tcpPath)
 	for range dialProbeMaxSends {
 		if update.synWaitExceeded(client, tcpPath, time.Hour) {
 			t.Fatal("a SYN inside a deliberately wide timeout tripped the silence clock")
@@ -527,7 +539,8 @@ func TestSynWaitStreamIsExempt(t *testing.T) {
 	client := &multiClientChannel{settings: DefaultMultiClientSettings()}
 	udpPath := udpTestPath(4)
 
-	update.synWaitExceeded(client, udpPath, 0) // starts the clock at count 1
+	update.client.Store(client)
+	update.startSynWait(client, update.client.loadSelection(), udpPath) // accepted custody starts at count 1
 	for range dialProbeMaxSends - 1 {
 		update.synWaitExceeded(client, udpPath, time.Hour) // burn the budget, no trip
 	}
@@ -539,9 +552,11 @@ func TestSynWaitStreamIsExempt(t *testing.T) {
 	// a re-race onto another exit re-keys clock and budget, so the flow is
 	// judged fresh where it actually dials fresh
 	other := &multiClientChannel{settings: DefaultMultiClientSettings()}
+	update.client.Store(other)
 	if update.synWaitExceeded(other, udpPath, 0) {
-		t.Fatal("first probe on a fresh exit must only start the clock")
+		t.Fatal("an unadmitted probe on a fresh exit inherited a clock")
 	}
+	update.startSynWait(other, update.client.loadSelection(), udpPath)
 	if !update.synWaitExceeded(other, udpPath, 0) {
 		t.Error("the re-keyed budget did not allow a fresh handshake to trip")
 	}

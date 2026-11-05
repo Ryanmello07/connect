@@ -90,7 +90,7 @@ func runUnreachableFixedWindow(t *testing.T, generator *unreachableFixedGenerato
 	window.generator = generator
 	window.clientChannelArgs = make(chan *multiClientChannelArgs)
 	window.contractStatusCallbacks = NewCallbackList[*contractStatusCallbackWorker]()
-	window.budgetFailThrottle = newLogThrottle(evaluationFailureLogInterval)
+	window.budgetFailThrottle = newLogThrottle(DefaultMultiClientSettings().EvaluationFailureLogInterval)
 	window.backendDegradedForTest = func() bool { return false }
 	generator.cancel = cancel
 	if refuse {
@@ -349,7 +349,7 @@ func TestFixedCandidateDeferredOfferKeepsSiblingDemand(t *testing.T) {
 		window.clientChannelArgs <- &multiClientChannelArgs{Destination: destination, FixedDestination: true, deferredClientArgs: true}
 	}
 	window.settings.EvaluationPoolMultiple = 1
-	added := window.expand(WindowSizeSettings{WindowSizeMin: 2, WindowSizeMax: 2, WindowSizeHardMax: 2}, 0, 0, 2, 2, 1, 0)
+	added := window.expand(WindowSizeSettings{WindowSizeMin: 2, WindowSizeMax: 2, WindowSizeHardMax: 2}, 0, 0, 2, 2, 1, 0, windowExpandPassPlan{})
 	if added != 0 || calls != 1 || retired != 1 {
 		t.Fatalf("deferred offer consumed demand: added=%d calls=%d retired=%d", added, calls, retired)
 	}

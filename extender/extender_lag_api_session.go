@@ -34,6 +34,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -66,6 +67,12 @@ const (
 	lagApiDefaultStreamCount  = 4
 	lagApiDefaultMaxByteCount = 2 * 1024 * 1024 * 1024
 )
+
+// While a load runs, the pings go out back to back, one in flight, as fast as
+// the path answers, so the page sees the load's latency in detail
+// (lag.dev/PLAN.md amendment 22). This floor keeps a path a few ms long from
+// sending the page hundreds of rtt messages a second.
+const lagApiLoadPingInterval = 10 * time.Millisecond
 
 // The most bytes one control message from the browser may hold.
 const lagApiMaxControlMessageByteCount = 4 * 1024
@@ -379,8 +386,7 @@ func (self *lagApiLoad) uploadVerified() bool {
 	if self.upload == nil {
 		return false
 	}
-	firstByteTime, _, end := self.upload.state()
-	return !firstByteTime.IsZero() && end != lagApiPhaseEndMismatch
+	return self.upload.verified()
 }
 
 // One measurement session (M4).
@@ -540,7 +546,7 @@ func (self *extenderLagApi) serveSession(w http.ResponseWriter, r *http.Request,
 	// an admission is one action of its subnet (M3, EXTENDER.md A12),
 	// counted before the ticket is so much as read
 	if limit, _ := self.server.admitAction(r.RemoteAddr, false); limit != extenderAdmitted {
-		self.server.reportError(extenderAdmissionStage(limit), fmt.Errorf("the source is over its admission limit"))
+		self.server.reportError(extenderAdmissionStage(limit), extenderFixedError("the source is over its admission limit"))
 		self.refuseSession(conn, lagApiErrorSessions)
 		return
 	}
@@ -1068,10 +1074,22 @@ func (self *lagApiSession) write(message any) bool {
 	}
 	self.conn.SetWriteDeadline(time.Now().Add(self.api.timings.writeTimeout))
 	if err := self.conn.WriteMessage(websocket.TextMessage, messageBytes); err != nil {
-		self.api.server.reportError("lag write", err)
-		return false
+		return self.writeFailed("lag write", err)
 	}
 	return true
+}
+
+// Reports a failed write on the control connection, and whether the session goes
+// on. A close already sent has failed nothing: the read side sends one answering the
+// browser's close and ends the session right after, and the extender's own end sends
+// one once the session is ending. Taken for a failed write, the browser closing would
+// end the load as an error (M8).
+func (self *lagApiSession) writeFailed(stage string, err error) bool {
+	if errors.Is(err, websocket.ErrCloseSent) {
+		return true
+	}
+	self.api.server.reportError(stage, err)
+	return false
 }
 
 // Wakes the loop after a phase changed. Never blocks.
@@ -1158,6 +1176,22 @@ func (self *lagApiSession) run() {
 	var lossC <-chan time.Time
 	inFlightPayload := ""
 	var inFlightSendTime time.Time
+
+	// the load's pings come faster than the ticket's interval; the minute the
+	// report carries keeps only those on the ticket's cadence, so it stays
+	// inside A7's bounds and the ring's room. A lost ping is always kept.
+	var keptPingTime time.Time
+	keepPing := func(ping lagApiPing) {
+		if !ping.lost && !keptPingTime.IsZero() && ping.sendTime.Sub(keptPingTime) < self.pingInterval-self.pingInterval/8 {
+			return
+		}
+		keptPingTime = ping.sendTime
+		self.pings.add(ping)
+	}
+	loading := func() bool {
+		load := self.load
+		return load != nil && !load.settled
+	}
 
 	// the load: the wait for the upload after the download, the upload's
 	// progress, the wait for the browser's done, and the report's minute
@@ -1307,7 +1341,7 @@ func (self *lagApiSession) run() {
 			}
 			return true
 		}
-		uploadFirstByteTime, uploadEndedTime, uploadEnd := load.upload.state()
+		uploadFirstByteTime, uploadEndedTime, uploadEnd, uploadFinal := load.upload.settlementState()
 		switch uploadEnd {
 		case lagApiPhaseRunning:
 			if !uploadFirstByteTime.IsZero() && !load.progressStarted {
@@ -1316,9 +1350,9 @@ func (self *lagApiSession) run() {
 			}
 		case lagApiPhaseEndTime:
 			// reads that arrive past the end still count for what they carry
-			// from before it; the phase wakes the loop once its window is
-			// final, at most lagSpreadMax after the end (amendment 15)
-			if !load.upload.windowFinal() {
+			// from before it, at most lagSpreadMax after the end (amendment
+			// 15). Settlement also waits for those bytes' sampled verification.
+			if !uploadFinal {
 				return true
 			}
 			endReason := protocol.LagEndReason_LAG_END_COMPLETE
@@ -1382,6 +1416,11 @@ func (self *lagApiSession) run() {
 			self.load = load
 			self.publishWithLock()
 			self.stateLock.Unlock()
+			// the load's pings go back to back from now: a ping waiting out
+			// the ticket's interval goes at once
+			if pingC != nil {
+				pingTimer.Reset(0)
+			}
 		case "upload":
 			if load == nil || load.settled || load.upload != nil {
 				return true
@@ -1457,8 +1496,7 @@ func (self *lagApiSession) run() {
 			inFlightSendTime = time.Now()
 			self.inFlight.Store(&lagApiInFlightPing{payload: inFlightPayload, sendTime: inFlightSendTime})
 			if err := self.conn.WriteControl(websocket.PingMessage, payload, inFlightSendTime.Add(timings.writeTimeout)); err != nil {
-				self.api.server.reportError("lag ping", err)
-				ok = false
+				ok = self.writeFailed("lag ping", err)
 				break
 			}
 			lossTimer.Reset(timings.pingLost)
@@ -1473,14 +1511,18 @@ func (self *lagApiSession) run() {
 			lossTimer.Stop()
 			lossC = nil
 			rtt := pong.arrivalTime.Sub(inFlightSendTime)
-			self.pings.add(lagApiPing{sendTime: inFlightSendTime, rtt: rtt})
+			keepPing(lagApiPing{sendTime: inFlightSendTime, rtt: rtt})
 			ms := math.Round(float64(rtt)/float64(time.Millisecond)*100) / 100
 			ok = self.write(&lagApiRttMessage{
 				Type: "rtt",
 				T:    inFlightSendTime.Sub(self.startTime).Milliseconds(),
 				Ms:   &ms,
 			})
-			nextPingTime := inFlightSendTime.Add(self.pingInterval)
+			interval := self.pingInterval
+			if loading() {
+				interval = lagApiLoadPingInterval
+			}
+			nextPingTime := inFlightSendTime.Add(interval)
 			if nextPingTime.Before(pong.arrivalTime) {
 				nextPingTime = pong.arrivalTime
 			}
@@ -1493,7 +1535,7 @@ func (self *lagApiSession) run() {
 			// finds it as one or the other
 			self.addLostPing(lagApiInFlightPing{payload: inFlightPayload, sendTime: inFlightSendTime}, timings.pongTimeout)
 			self.inFlight.Store(nil)
-			self.pings.add(lagApiPing{sendTime: inFlightSendTime, lost: true})
+			keepPing(lagApiPing{sendTime: inFlightSendTime, lost: true})
 			ok = self.write(&lagApiRttMessage{
 				Type: "rtt",
 				T:    inFlightSendTime.Sub(self.startTime).Milliseconds(),

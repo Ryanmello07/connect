@@ -14,6 +14,7 @@ import (
 	mathrand "math/rand"
 	"net"
 	"net/netip"
+	"runtime/debug"
 	"slices"
 	"strings"
 
@@ -84,6 +85,11 @@ type DestinationStats struct {
 	// find-providers2. nil for fixed client-id and restored-identity
 	// destinations, which bypass discovery.
 	Location *ProviderLocation
+	// The level find-providers2 found the provider at when the requested city
+	// or region had none of its own (`FindProvidersProvider.Match`,
+	// normalized; see location_match.go). Exact for fixed and restored
+	// destinations and for older servers.
+	LocationMatch LocationMatch
 	// IpFamily is the destination provider's proven address-family
 	// category from find-providers2. Legacy (empty) for fixed and restored
 	// destinations and for older servers; legacy carries v4 only.
@@ -141,11 +147,10 @@ type MultiClientGeneratorReadTimeout interface {
 	ClientReadTimeout(client *Client) (time.Duration, bool)
 }
 
-// Evaluation cadence and the freshness of comparative ACK evidence are not
-// liveness deadlines. Keep their original values when the no-send-ACK bound
-// follows a longer transport read interval.
+// The freshness of comparative ACK evidence is not a liveness deadline. Keep
+// its original value when the no-send-ACK bound follows a longer transport
+// read interval, as MultiClientSettings.BlackholePollInterval does.
 const (
-	blackholePollInterval         = 1250 * time.Millisecond
 	blackholeAckFreshnessInterval = 5 * time.Second
 )
 
@@ -178,10 +183,31 @@ type MultiClientGeneratorWithClientId interface {
 	NextDestinationsForClientId(clientId Id, excludeDestinations []MultiHopId, rankMode string) (map[MultiHopId]DestinationStats, error)
 }
 
+// An optional generator capability: narrow discovery to modern providers
+// (`FindProviders2Args.RequireModernProvider`), those the platform's
+// capability probe measured within the last seven days negotiating end-to-end
+// post-quantum encryption with resizable transfer windows, or, holding only a
+// Network key, that declared post-quantum encryption. The multi client sets it
+// from its performance profile before any window discovers under the profile.
+// Under `PostQuantumEncryption` every window client runs
+// `EncryptionModeRequired`, so a provider that cannot seal a session can never
+// carry its traffic; asking for modern providers keeps a provider without
+// evidence that it negotiates the session from being dialed and evaluated at
+// all. It narrows only the requests the generator makes: fixed `ClientId`
+// destinations and restored window identities bypass discovery and are not
+// filtered. The window clients' required gate still decides every send, and a
+// modern provider that fails to seal costs a failed dial, never plaintext. A
+// generator without the capability discovers as before.
+type MultiClientGeneratorWithPostQuantumEncryption interface {
+	SetPostQuantumEncryption(postQuantumEncryption bool)
+}
+
 func DefaultMultiClientSettings() *MultiClientSettings {
 	return &MultiClientSettings{
-		SequenceBufferSize:  defaultTransferBufferSize,
-		SequenceIdleTimeout: 120 * time.Second,
+		// the queue depth of a default client's transfer buffers
+		// (DefaultClientSettings)
+		SequenceBufferSize:  32,
+		SequenceIdleTimeout: 5 * time.Minute,
 		// tcp connections are routinely idle between requests and users still
 		// consider them open; traditional vpns hold nat state for 5-30 minutes
 		TcpSequenceIdleTimeout: 600 * time.Second,
@@ -235,24 +261,29 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// ~CPingRestTimeout+CPingTimeout instead of ~2x CPingTimeout
 		CPingRestTimeout: 10 * time.Second,
 		// a lower ack timeout helps cycle through bad providers faster
-		AckTimeout:              30 * time.Second,
-		BlackholeTimeout:        defaultPlatformTransportReadTimeout,
+		AckTimeout: 30 * time.Second,
+		// the platform transport's default ReadTimeout
+		// (DefaultPlatformTransportSettings), which the API generator uses per
+		// client instead
+		BlackholeTimeout:        30 * time.Second,
 		BlackholeReceiveTimeout: 20 * time.Second,
-		MaxFlowsPerExit:         16,
-		// Legacy/explicit affinity keeps its exit as it grows; ordinary fresh
-		// flows race by default (FreshFlowAffinity is false).
+		// an evaluation cadence, not a liveness deadline; see the field
+		BlackholePollInterval: 1250 * time.Millisecond,
+		// a backstop only: every input an idle channel's verdicts wait on,
+		// its carrier included, wakes the parked loop when it changes
+		BlackholeIdlePollInterval: 10 * time.Second,
+		MaxFlowsPerExit:           16,
+		// Eligible affinity keeps its exit as it grows; expiration makes later
+		// fresh flows reconsider the provider without moving existing flows.
 		AffinityStickyPastCap: true,
-		// Ordinary fresh flows do not inherit a site/IP donor. Affinity state is
-		// still collected as a bounded measurement key, and explicit app/host
-		// pins remain strict opt-ins to one-egress behavior.
-		FreshFlowAffinity: false,
+		AffinityMaxTime:       time.Minute,
 		// Fresh TLS races learn from peak inner-TCP ACK progress relative to
 		// each provider's advertised bandwidth prior.
 		PerformanceAwareAffinity: true,
 		// Sticky sites retain one egress IP, but idle H1 state is trimmed once
 		// the site has grown well beyond an ordinary browser connection set.
 		MaxStickyFlowsPerExit: 64,
-		StickyFlowIdleTimeout: 30 * time.Second,
+		StickyFlowIdleTimeout: 5 * time.Minute,
 		// a benched site keeps its exit through the early bench;
 		// see the field comments
 		QuarantineGroupFollow:   false,
@@ -269,6 +300,7 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// engaged well before the shortest receive verdict (20s) can mature
 		// on evidence collected during the silence
 		UplinkStalenessGate:                       5 * time.Second,
+		UplinkStalenessMaxHold:                    60 * time.Second,
 		WindowResizeTimeout:                       15 * time.Second,
 		StatsWindowGraceperiod:                    30 * time.Second,
 		StatsWindowMaxEstimatedByteCountPerSecond: mib(16),
@@ -290,10 +322,26 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// half as often per failure down to once per 2.5-5 minutes
 		FixedDestinationRetryMin: 15 * time.Second,
 		FixedDestinationRetryMax: 5 * time.Minute,
+		// a discovery window whose expansion admits nothing expands again
+		// after 5-10s, then half as often per such pass down to once per 1-2
+		// minutes
+		DiscoveryExpandRetryMin:        10 * time.Second,
+		DiscoveryExpandRetryMax:        2 * time.Minute,
+		DiscoveryDemandListingsPerPass: 3,
+		DiscoveryDemandListingInterval: time.Second,
 		// long enough for a slow-but-alive platform API round trip; a hung
 		// API must never wedge the enumerate/expand machinery
-		WindowGeneratorTimeout:      20 * time.Second,
-		IpFamilyStarvedRetryTimeout: defaultIpFamilyStarvedRetryTimeout,
+		WindowGeneratorTimeout: 20 * time.Second,
+		// long enough that a region with no v6-capable provider is not polled
+		// on every resize pass, short enough that a provider coming online is
+		// picked up within a minute
+		IpFamilyStarvedRetryTimeout: 60 * time.Second,
+		// long enough to cover an outage of a few minutes, counted from the
+		// loss, and short enough that a provider the window has not seen for
+		// longer is found again through discovery like any other
+		RecentExitMemoryTimeout: 5 * time.Minute,
+		// the egress-dial lines' cadence (controlDialLogInterval)
+		EvaluationFailureLogInterval: 5 * time.Second,
 		// WindowMaxScale:              4.0,
 		// WindowExpandMaxOvershotScale: 2.0,
 		// WindowRevisitTimeout:      2 * time.Minute,
@@ -347,7 +395,10 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// the outage amplification in
 		// https://github.com/urnetwork/connect/issues/181. Two keeps the
 		// losing-first-pick cover for the moment the backend recovers; the
-		// bound lifts on the first successful backend round-trip.
+		// bound lifts on the first successful backend round-trip. The same
+		// bound applies to a race whose candidates include a client the
+		// platform is rate limiting (contractRateLimitHeldChannels), for as
+		// long as its hold runs.
 		// 0 disables the degraded bound.
 		MultiRaceDegradedClientCount: 2,
 
@@ -399,7 +450,8 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// false is the convict-immediately A/B comparison point
 		BusyProbe: true,
 		// 0 derives max(1s, SendStallTimeout/2) = 1.5s at the bar above
-		BusyProbeBudget: 0,
+		BusyProbeBudget:             0,
+		BusyProbeSendErrorThreshold: 2,
 		// 2s of excess timer delay is far outside any scheduling jitter a
 		// running process sees and far inside the shortest doze window, so the
 		// detector fires on real suspends and on nothing else
@@ -407,7 +459,8 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// one full uplink-gate window (5s) of grace after wake: long enough for
 		// the transports to re-register and the first return packets to land,
 		// short enough that a genuinely dead exit is still convicted promptly
-		SchedulerPauseRecoveryTimeout: 5 * time.Second,
+		SchedulerPauseRecoveryTimeout:  5 * time.Second,
+		SchedulerPauseDetectorSettings: DefaultSchedulerPauseDetectorSettings(),
 		// Keep exact accepted ownership for the flow lifetime. Elapsed time
 		// alone must not multiply an inner TCP retry into another Transfer Pack.
 		// A positive runtime override retains the optional timed-escape policy.
@@ -435,6 +488,20 @@ func DefaultMultiClientSettings() *MultiClientSettings {
 		// qualification as a +1 demerit for unproven providers, and expand's
 		// admit selection prefers qualified candidates.
 		ProviderProbe: true,
+		// joiners, settings changes and evictions wake the prober, and the
+		// recheck covers an exit held from a due probe, so the bound is a
+		// backstop
+		ProberScanMaxInterval: time.Minute,
+		// the joiner bound of the 5s scan this replaced: the exits a window
+		// forms with at the start of a session share one sweep
+		ProberJoinDelay: 5 * time.Second,
+		// the 5s scan this replaced, kept only while an exit is held from a
+		// due probe, so an exit whose flows end is re-probed as promptly as
+		// before the sleep
+		ProberRecheckInterval: 5 * time.Second,
+		// see the field comments
+		ProberAttemptMinInterval: time.Minute,
+		ProberReprobeInterval:    10 * time.Minute,
 		// a tcp handshake through a provider to a live site completes well
 		// inside this on any network worth keeping; past it the answer is not
 		// coming, and a probe that waits longer only delays a sweep
@@ -538,6 +605,42 @@ type MultiClientSettings struct {
 	// takes precedence over a transient ownership overshoot. Mobile low-memory
 	// profiles opt in because their process has a strict memory envelope.
 	StrictWindowSizeHardMax bool
+	// Makes a strict window (StrictWindowSizeHardMax) plan with its
+	// admission gate's inputs (see
+	// ip_remote_multi_client_strict_handover.go). A pass builds only the
+	// candidates admission would accept, so a window at its hard max builds
+	// nothing, and the enumerator lists and mints nothing for it. At the hard
+	// max, a warned client that the capacity collapse test would remove
+	// (flowless, or past the collapse deadline) hands its slot to the next
+	// evaluated candidate in one atomic swap, so lifetime rotation completes
+	// without the window ever holding more than its hard max or fewer than
+	// its minimum. Fixed destinations and non-strict windows are unaffected.
+	//
+	// Off by default, which keeps building candidates the hard max refuses
+	// and keeps warned clients in their slots, as before. A host opts in: the
+	// proxy service turns it on for its hosted devices, and an app release
+	// turns it on only once the owner approves it for apps (CPUOPT3 D2, owner
+	// question 5).
+	StrictWindowHandover bool
+	// Holds a discovery window's refill while the payer's balance refuses
+	// its contracts (see ip_remote_multi_client_balance_hold.go). After a
+	// refusal with InsufficientBalance, an expansion step sends one contract
+	// probe through the generator (MultiClientGeneratorBalanceProbe) instead
+	// of building candidates, on the same expansion backoff. A granted
+	// contract or a probe that cannot answer releases it, and the window
+	// expands as before. No timing bound changes. Fixed destinations, and
+	// generators without the probe, are unaffected.
+	//
+	// Off by default, which keeps building candidates whose contracts the
+	// balance refuses. A host opts in: the proxy service turns it on for its
+	// hosted devices (server CPUOPT4.md, Part B #1).
+	OutOfBalanceRefillProbe bool
+	// When set, the process's counters of what the windows do with their
+	// window clients (see
+	// ip_remote_multi_client_window_client_stats.go). A host that runs many
+	// devices in one process (the proxy service) sets one instance on all of
+	// them and exports it. Nil counts nothing.
+	WindowClientStats *WindowClientStats
 	// ClientNackInitialLimit int
 	// ClientNackMaxLimit int
 	// ClientNackScale float64
@@ -578,6 +681,23 @@ type MultiClientSettings struct {
 	// Zero disables this verdict. Neither this interval nor its persistent
 	// no-progress clock changes Transfer resend pacing or ACK lifetime.
 	BlackholeTimeout time.Duration
+	// BlackholePollInterval is how often a channel's health loop
+	// (detectBlackhole) judges the channel while it holds evidence: a send
+	// outstanding or in the stats window, an unanswered connect, a quarantine
+	// or a carrier down. A verdict acts within this much of its bound. It is
+	// an evaluation cadence, not a liveness deadline, so it keeps its value
+	// when the no-send-ACK bound follows a longer transport read interval.
+	// Must be positive.
+	BlackholePollInterval time.Duration
+	// BlackholeIdlePollInterval is how often the health loop of a channel
+	// holding none of that evidence wakes anyway. Every verdict needs a send,
+	// and the first send of a run, an error, a change of the channel's
+	// carrier (RouteManager.ActiveTransportNotify) and the channel's end each
+	// wake the loop at once, so a carrier lost while nothing is sent starts
+	// its retirement hold (StatsWindowKeepUnhealthyDuration) at the loss, as
+	// it did when the loop judged every poll; this poll is only a backstop.
+	// Non-positive never parks: the loop judges every BlackholePollInterval.
+	BlackholeIdlePollInterval time.Duration
 	// BlackholeReceiveTimeout bounds the weaker of the two blackhole signals:
 	// the provider is acknowledging our sends, so it is demonstrably alive,
 	// but nothing has come back from the destination. That is ambiguous -- a
@@ -639,9 +759,14 @@ type MultiClientSettings struct {
 	// Ack delivery. A reliable carrier, or a fresh uplink, keeps that verdict on
 	// its own fast signal. The gate only applies while at least two channels are
 	// actively talking (see sendingChannelCount), and stops applying after
-	// uplinkStalenessMaxHold of continuous staleness so a genuinely dead
+	// UplinkStalenessMaxHold of continuous staleness so a genuinely dead
 	// window can still be recycled. 0 disables the gate entirely.
 	UplinkStalenessGate time.Duration
+	// Maximum continuous uplink-staleness hold. The 60-second default lets
+	// network changes recover before ordinary verdicts recycle a dead window.
+	// Non-positive permits immediate verdicts while preserving freshness
+	// rebasing. The independent scheduler-pause recovery hold still applies.
+	UplinkStalenessMaxHold time.Duration
 	// MaxFlowsPerExit bounds how many live flows may be pinned to one exit.
 	//
 	// Providers are split-tcp, so removing an exit destroys every flow on it.
@@ -677,9 +802,8 @@ type MultiClientSettings struct {
 	MaxFlowsPerExit int
 
 	// AffinityStickyPastCap exempts hard affinity-group inheritance from the
-	// flow cap. It applies to explicit pins and legacy A/B runs with
-	// FreshFlowAffinity enabled; ordinary production flows race and remain
-	// capped normally.
+	// flow cap. It applies to explicit pins and ordinary donors while their
+	// originating connection creation remains inside AffinityMaxTime.
 	//
 	// This exists because the cap veto was observed splitting a busy site's
 	// egress ip exactly when the site was busiest: flow 17 of a video session
@@ -692,28 +816,21 @@ type MultiClientSettings struct {
 	// false restores the veto, the A/B comparison point.
 	AffinityStickyPastCap bool
 
-	// FreshFlowAffinity lets an ordinary NEW flow directly inherit the exit of
-	// another flow in the same IP/domain affinity group. Existing flows never
-	// use this switch: their exact TCP/UDP tuple remains on its committed exit.
-	// Explicit app/host pins also bypass it because the user selected stable
-	// egress semantics for those flows.
-	//
-	// The production default is false. With hard inheritance disabled, each
-	// fresh flow reaches the health- and performance-weighted provider race,
-	// preventing one long-lived page connection from pinning every later media
-	// connection to the same mediocre or challenged exit. DestinationAffinity
-	// may remain enabled: its bounded groups are still useful measurement keys
-	// and do not themselves assign an exit. True restores legacy hard site/IP
-	// affinity for controlled A/B tests.
-	FreshFlowAffinity bool
+	// Ordinary new flows may inherit an IP/domain donor only while its
+	// originating connection creation is younger than this cap. Inherited flows
+	// and DNS hints preserve that origin; activity never renews it. Zero or
+	// negative disables ordinary inheritance, not the existing TCP/UDP binding.
+	// Explicit app/host pins exempt age only: fresh adoption still requires
+	// positive current health, lifetime, carrier and family compatibility.
+	// Established pinned connections retain their existing stable-egress owner.
+	AffinityMaxTime time.Duration
 
 	// PerformanceAwareAffinity weights fresh TCP/443 placement using a bounded,
 	// session-local peak rate from cumulative inner-TCP ACK progress. An
 	// unmeasured provider starts at its advertised EstimatedBytesPerSecond (the
 	// null hypothesis). The score removes materially slower candidates from a
 	// fresh full-field race while preserving equal candidates and failing open.
-	// When FreshFlowAffinity is explicitly enabled for an A/B run, the same
-	// score also vetoes a materially slow live/history donor.
+	// The same score also vetoes a materially slow age-eligible donor.
 	//
 	// This never moves an established flow, never inspects TLS plaintext, and
 	// does not apply to explicit app pins. The measurement table is bounded and
@@ -722,7 +839,7 @@ type MultiClientSettings struct {
 	PerformanceAwareAffinity bool
 
 	// MaxStickyFlowsPerExit is the steady-state bound for an exit that grows
-	// past MaxFlowsPerExit through explicit or legacy hard affinity. It does not
+	// past MaxFlowsPerExit through pins or age-eligible affinity. It does not
 	// split that affinity group: when the bound is exceeded, the shared flow
 	// reaper retires only the oldest TCP flows that have been idle for at least
 	// StickyFlowIdleTimeout. Active bursts may exceed the bound temporarily;
@@ -741,16 +858,14 @@ type MultiClientSettings struct {
 	// configured.
 	StickyFlowIdleTimeout time.Duration
 
-	// ScoredAffinityDonor makes the learner load-bearing on the legacy hard
-	// affinity path. It is inert for ordinary production flows while
-	// FreshFlowAffinity is false, but remains available for controlled A/B runs
-	// and still applies to explicit affinity groups.
+	// ScoredAffinityDonor ranks age-eligible hard affinity donors and explicit
+	// affinity groups. AffinityMaxTime<=0 leaves only explicit pins eligible.
 	//
 	// READ THIS WITH scoredPlacementReorder's header. That function scores
 	// the RACE field, and the race is the LAST of four placement steps in
 	// sendUpdate -- reached only when the flow's own hard affinity groups, its
 	// app pin, and the destination bridge have all declined to donate. With
-	// legacy FreshFlowAffinity enabled, most flows never get there. The step
+	// a live age-eligible donor, flows need not get there. The step
 	// that carries them in that mode,
 	// inheritAffinityClient{4,6}WithLock, picked its donor by
 	// `createTime.After(mostRecentCreateTime)`: pure recency, with no
@@ -861,6 +976,23 @@ type MultiClientSettings struct {
 	// ip_remote_multi_client_fixed_retry.go. Nonpositive Min disables pacing.
 	FixedDestinationRetryMin time.Duration
 	FixedDestinationRetryMax time.Duration
+	// DiscoveryExpandRetryMin / Max pace the expansion of a discovery window
+	// after consecutive passes that admitted no candidate, doubling from Min
+	// to Max with jitter; an admission, a lost exit or a network change ends
+	// the pacing.
+	// See ip_remote_multi_client_discovery_retry.go. Nonpositive Min disables
+	// pacing.
+	DiscoveryExpandRetryMin time.Duration
+	DiscoveryExpandRetryMax time.Duration
+	// DiscoveryDemandListingsPerPass bounds additional discovery calls in one
+	// existing acquisition. The default is 3; positive values are capped at 3
+	// to bound platform work, and non-positive values disable extra reads.
+	// A nonempty demand result may mint once, using an existing request slot.
+	DiscoveryDemandListingsPerPass int
+	// DiscoveryDemandListingInterval is the minimum time between additional
+	// discovery calls. The default and enforced floor are one second, including
+	// for zero or negative values. It never shortens a platform retry or rest.
+	DiscoveryDemandListingInterval time.Duration
 	// WindowGeneratorTimeout bounds each generator call the window's
 	// enumerate/expand machinery makes (NextDestinations, NewClientArgs,
 	// NewClientArgsForDestination). The generator wraps a platform API that
@@ -874,8 +1006,22 @@ type MultiClientSettings struct {
 	WindowGeneratorTimeout time.Duration
 	// IpFamilyStarvedRetryTimeout is how long a window waits before asking
 	// the platform for a family again after a family-filtered discovery
-	// returned nothing (IPV6.md B2). 0 uses the default of one minute.
+	// returned nothing (IPV6.md B2). Non-positive uses the default
+	// (DefaultMultiClientSettings).
 	IpFamilyStarvedRetryTimeout time.Duration
+	// RecentExitMemoryTimeout is how long, from the loss, a window remembers an
+	// exit it lost to an outage of ours, so the rounds that re-form the window
+	// ask the platform for that provider by client id ahead of discovery
+	// (ip_remote_multi_client_recent_exits.go). An older entry is never used.
+	// Non-positive disables the memory: lost exits are replaced by discovery
+	// alone. The user's Fixed IP keeps its own re-dial and does not read this.
+	RecentExitMemoryTimeout time.Duration
+	// EvaluationFailureLogInterval is the per-line-shape emission floor for a
+	// window's unconditional evaluation-failure lines: client create, ping,
+	// budget and empty-enumerate failures. A hung window retries
+	// continuously, and one line per shape per interval keeps the signal
+	// without the flood. Non-positive logs every line.
+	EvaluationFailureLogInterval time.Duration
 	// WindowMaxScale              float64
 	// WindowExpandMaxOvershotScale float64
 	// WindowRevisitTimeout      time.Duration
@@ -918,10 +1064,9 @@ type MultiClientSettings struct {
 
 	ProtocolVersion int
 
-	// DestinationAffinity creates bounded IP/domain grouping state. With the
-	// default FreshFlowAffinity=false those groups are measurement keys only;
-	// they do not assign ordinary new flows. Explicit pins and controlled
-	// legacy A/B runs may still consume them as hard affinity.
+	// DestinationAffinity creates IP/domain grouping state for bounded-age
+	// donor reuse and performance measurement. AffinityMaxTime<=0 disables
+	// ordinary donor reuse while preserving measurement keys and explicit pins.
 	DestinationAffinity bool
 
 	DefaultPerformanceProfile *PerformanceProfile
@@ -1004,13 +1149,11 @@ type MultiClientSettings struct {
 	// our sendStalled bar and the verdict stays convictSendStalls, the probe
 	// only decides whether that verdict is deserved.
 	//
-	// What it buys: a stalled exit and a merely CONGESTED exit are the same
-	// observation -- bytes committed, no acks -- and today both are convicted
-	// at the 3s bar. An exit whose upstream is saturated (or whose send window
-	// is full of the very data the stall is about) answers a control ping in a
-	// couple of rtts, because the ping rides the transport rather than the
-	// blocked flow. Asking is cheap and the answer is decisive, so the fast
-	// 3-4s rescue is kept without paying for it in false removals.
+	// A positive control-ping ACK proves reachability when flow ACKs are stale.
+	// The ping can share local admission and serialization with stalled data;
+	// local refusal is not remote evidence. Successful admission alone also
+	// does not establish a physical write. An unanswered bounded evaluation
+	// holds; carrier read and terminal Transfer failures keep their authority.
 	//
 	// The interposition is confined to the send-stall path. The no-send-ack
 	// verdict, the transport-down hold, and the cping loop keep their exact
@@ -1019,12 +1162,14 @@ type MultiClientSettings struct {
 	// false (the zero value) is today's behavior: the bar trips, the exit is
 	// convicted, nothing is asked.
 	BusyProbe bool
-	// BusyProbeBudget is how long a busy probe waits for its ack before the
-	// stall verdict stands. 0 derives max(1s, SendStallTimeout/2) -- 1.5s at
-	// the shipped 3s bar -- which keeps total detection inside ~4.5s while
-	// leaving a congested-but-alive exit several rtts to answer. Only consulted
-	// when BusyProbe is on.
+	// Bounds one busy-probe evaluation, not remote silence. Non-positive derives
+	// max(1s, SendStallTimeout/2), or 1.5s at the default stall bar. An unanswered
+	// admitted probe retains its single owner without keeping the suspect demerit.
 	BusyProbeBudget time.Duration
+	// Consecutive nonnil admission errors required by the compatibility policy.
+	// Default 2 preserves that policy; non-positive disables this conviction.
+	// Known false/nil local refusals never contribute.
+	BusyProbeSendErrorThreshold int
 
 	// SchedulerPauseTolerance is how much later than armed a timer may fire
 	// before the host is judged to have been suspended (doze, the app freezer,
@@ -1047,6 +1192,15 @@ type MultiClientSettings struct {
 	// first verdict pass after wake cannot convict on a window whose history
 	// was accumulated before the host stopped. 0 rebases without holding.
 	SchedulerPauseRecoveryTimeout time.Duration
+	// Timing for this client's private detector. Nil uses the default settings.
+	// A supplied shared detector owns its settings instead. Copied at creation;
+	// per-client tolerance and recovery hold remain runtime reliability settings.
+	SchedulerPauseDetectorSettings *SchedulerPauseDetectorSettings
+	// SchedulerPauseDetector, when set, is the detector this client shares
+	// with the other clients of its host instead of running its own. A host
+	// that runs many clients (the proxy service) sets one detector on all of
+	// them. Nil runs a detector per client.
+	SchedulerPauseDetector *SchedulerPauseDetector
 
 	// SoftVerdictDemote changes what a soft classification against a loaded
 	// exit does. The core invariant it enforces: an exit carrying live flows
@@ -1139,6 +1293,41 @@ type MultiClientSettings struct {
 	// default on this fork, and is inert on its own: something has to call
 	// probeExit, and the sweep that does lands in the next package.
 	ProviderProbe bool
+	// ProberScanMaxInterval is the longest the prober sleeps between scans of
+	// the windows. It otherwise sleeps until the next exit falls due; a window
+	// admitting an exit, a reliability settings change and a qualification
+	// record evicted from the table wake it (see ProberJoinDelay); and an exit
+	// held from a due probe is rechecked (see ProberRecheckInterval). So this
+	// is a backstop, not a detection bound. Non-positive leaves the sleep
+	// unbounded.
+	ProberScanMaxInterval time.Duration
+	// ProberJoinDelay is how long after a window admits an exit, the
+	// reliability settings change, or a qualification record is evicted, the
+	// prober scans. Exits admitted together share one sweep, whose result line
+	// tells a pool of bad providers from a phone that was away only when it
+	// judges them together. Non-positive scans at once.
+	ProberJoinDelay time.Duration
+	// How often the prober scans while an exit due for a probe is held from it
+	// by something whose end nothing signals: flows it carries (its traffic is
+	// the better evidence until they end), or its own pass still in flight
+	// past the attempt floor. Each such exit is then probed within this much
+	// of its hold ending, as the periodic scan the sleep replaced probed it,
+	// while an exit whose proof is fresh costs no scan before it falls due.
+	// Non-positive leaves the end of a hold to ProberScanMaxInterval.
+	ProberRecheckInterval time.Duration
+	// ProberAttemptMinInterval is the per-exit floor between probe pass
+	// attempts, keyed on the attempt rather than the recorded pass: a pass
+	// that sends nothing (transport refusing, every registration colliding)
+	// records nothing in the qualification table by design, and without this
+	// floor the prober would retry such an exit at every scan. Non-positive
+	// has no floor: such an exit is retried at the next scan.
+	ProberAttemptMinInterval time.Duration
+	// ProberReprobeInterval is how often an idle exit with a stale (or no)
+	// qualification is asked again. Half of these passes advance the rotation
+	// over the table; loaded exits never wait on this, their own receive
+	// progress refreshes them for free (see touchQualificationOnReceive).
+	// Non-positive asks again as often as ProberAttemptMinInterval allows.
+	ProberReprobeInterval time.Duration
 
 	// DataOnlyProviderProbe lets an application-owned, finite probe evaluate
 	// one explicitly fixed provider with its real traffic. It is effective
@@ -1358,6 +1547,8 @@ type MultiClientSettings struct {
 	ProviderPolicyPreferenceTtl time.Duration
 	// nil disables activity association (`IpAssoc`)
 	IpAssocSettings *IpAssocSettings
+	// Nil in production; installed before the owned association worker starts.
+	afterIpAssocShedForTest func(closed bool)
 
 	RemoteUserNatMultiClientMonitorSettings
 }
@@ -1502,6 +1693,8 @@ type receivePacket struct {
 	IpPath      *IpPath
 	Packet      []byte
 	Pooled      bool
+	// Exact local flow generation; old queued control cannot target a renewal.
+	generation *multiClientChannelUpdate
 	// tcpControl preserves the wire-direction flags and sequence numbers that
 	// IpPath.Reverse intentionally drops before application delivery.
 	tcpControl tcpControlObservation
@@ -1511,14 +1704,16 @@ type receivePacket struct {
 }
 
 type tcpControlObservation struct {
-	sequenceNumber    uint32
-	ackSequenceNumber uint32
-	payloadByteCount  uint32
-	ack               bool
-	fin               bool
-	rst               bool
-	valid             bool
-	syn               bool
+	sequenceNumber     uint32
+	ackSequenceNumber  uint32
+	payloadByteCount   uint32
+	windowSize         uint16
+	ack                bool
+	fin                bool
+	rst                bool
+	valid              bool
+	syn                bool
+	windowScaleEnabled bool
 }
 
 type pendingIngressTcpControl struct {
@@ -1531,14 +1726,16 @@ func tcpControlFromIpPath(ipPath *IpPath) tcpControlObservation {
 		return tcpControlObservation{}
 	}
 	return tcpControlObservation{
-		sequenceNumber:    ipPath.SequenceNumber,
-		ackSequenceNumber: ipPath.AckSequenceNumber,
-		payloadByteCount:  uint32(max(0, ipPath.TcpPayloadByteCount)),
-		ack:               ipPath.Ack,
-		fin:               ipPath.Fin,
-		rst:               ipPath.Rst,
-		valid:             true,
-		syn:               ipPath.Syn,
+		sequenceNumber:     ipPath.SequenceNumber,
+		ackSequenceNumber:  ipPath.AckSequenceNumber,
+		payloadByteCount:   uint32(max(0, ipPath.TcpPayloadByteCount)),
+		windowSize:         ipPath.TcpWindowSize,
+		ack:                ipPath.Ack,
+		fin:                ipPath.Fin,
+		rst:                ipPath.Rst,
+		valid:              true,
+		syn:                ipPath.Syn,
+		windowScaleEnabled: ipPath.TcpWindowScaleEnabled,
 	}
 }
 
@@ -1590,6 +1787,18 @@ type RemoteUserNatMultiClient struct {
 	// flow, which otherwise makes short-lived web traffic grow the tunnel's
 	// runtime footprint for the full (intentionally long) TCP idle timeout.
 	flowReaperWake chan struct{}
+	flowReaperDone chan struct{}
+	// Pending SYN retries use the existing parent worker and intrusive owners.
+	synRetryHead                  *tcpSynRetry
+	synRetryTail                  *tcpSynRetry
+	beforeSynRetryDispatchForTest func(*multiClientChannelUpdate)
+	// Credited capacity subscriptions share the existing reaper and parent lock.
+	synRetryReadyHead                 *tcpSynRetryReadiness
+	synRetryReadyTail                 *tcpSynRetryReadiness
+	synRetryReadyCount                int
+	synRetryReadinessRefusals         atomic.Uint64
+	beforeSynRetryReadinessForTest    func(*multiClientChannelUpdate)
+	beforeSynRetryReadinessArmForTest func(*multiClientChannelUpdate)
 
 	settings *MultiClientSettings
 	log      Logger
@@ -1624,6 +1833,11 @@ type RemoteUserNatMultiClient struct {
 	affinityIp4Paths map[Ip4Path]map[Ip4Path]time.Time
 	affinityIp6Paths map[Ip6Path]map[Ip6Path]time.Time
 	clientUpdates    map[*multiClientChannel]map[*multiClientChannelUpdate]bool
+	// At most one live source-offer reservation per exact incumbent tuple.
+	// The synchronous sender owns its finite deadline and always joins it.
+	affinityTransitions map[*multiClientChannelUpdate]*multiClientAffinityTransition
+	// Currently executing TCP app callbacks only; entries end at callback return.
+	affinityDeliveries map[ipPacketFlowKey]multiClientAffinityDeliveryOwner
 	// qualification is the provider-qualification table: what each provider's
 	// probes have proven, keyed by destination so it survives the channel
 	// incarnations that come and go for one provider. Guarded by stateLock
@@ -1651,7 +1865,7 @@ type RemoteUserNatMultiClient struct {
 
 	// affinityPerformance is the bounded session-local per-(site/IP,provider)
 	// completed TCP ACK-rate evidence used to weight a fresh provider race (and
-	// to veto a legacy hard donor in A/B mode). Its leaf lock is never held
+	// to veto a materially slower age-eligible donor). Its leaf lock is never held
 	// across parent/window locks or I/O. The map stays nil until the first
 	// completed measured flow; still-open evidence uses clientUpdates directly
 	// and retains no second index.
@@ -1749,11 +1963,22 @@ type RemoteUserNatMultiClient struct {
 	priorsStore atomic.Pointer[PriorsStore]
 	// Nil test seams make whole-group candidate admission deterministic without
 	// changing production selection or adding synchronization to the send path.
-	groupRaceCandidatesForTest func(*parsedPacketGroup) []*multiClientChannel
-	sendClientPathForTest      func(*IpPath, flowPin, func(*multiClientChannelUpdate, *multiClientChannel))
+	groupRaceCandidatesForTest   func(*parsedPacketGroup) []*multiClientChannel
+	sendClientPathForTest        func(*IpPath, flowPin, func(*multiClientChannelUpdate, *multiClientChannel))
+	beforePacketGroupGateForTest func(*multiClientChannelUpdate, *multiClientChannel, *parsedPacketGroup)
+	// Runs after preliminary donor checks, before the final health snapshot.
+	beforeAffinityAdoptionForTest func(*multiClientChannel)
 	// backendDegradedForTest replaces the process-wide isBackendDegraded read
 	// that bounds the race field. Production leaves it unset.
 	backendDegradedForTest func() bool
+	// Runs in clientDialFailure under the parent lock, just before the flow's
+	// standing is settled, so a test can commit the flow's first answer at that
+	// exact point. Production leaves it unset.
+	beforeDialFailureStandingForTest func(*multiClientChannelUpdate)
+	// Runs in sendClientPath once a send left the flow committed to nothing,
+	// before the previous client's entry for it is dropped, so a test can
+	// commit the flow at that exact point. Production leaves it unset.
+	beforeUncommittedSendBookkeepingForTest func(*multiClientChannelUpdate)
 	// appPinClients is the cross-version half of an app pin: the exit an
 	// app's flows are currently placed on, keyed by app id. The affinity
 	// groups are per-ip-version by construction (separate path maps), so a
@@ -1772,6 +1997,21 @@ type RemoteUserNatMultiClient struct {
 	serverNamesLearnedUnsub func()
 	packetStatsCounters     *packetStatsCounters
 	packetStatsCallbacks    *CallbackList[PacketStatsFunction]
+	// set by any change an epoch would report (a counted packet, a collected
+	// block action, a new packet stats listener) and taken by the epoch
+	// worker; the wake lets a parked worker resume (see runEventEpoch)
+	eventEpochChanged atomic.Bool
+	eventEpochWake    chan struct{}
+	// Observes each wake of the event epoch worker. Nil in production.
+	eventEpochWakeForTest atomic.Pointer[func()]
+	// wakes a sleeping prober (runProber) for a joiner or a settings change
+	proberWake chan struct{}
+	// Nil outside focused tests. Runs at the start of each prober scan
+	// (runProber). Set before the loop starts.
+	proberScanForTest func()
+	// every window client's transport delay stats pass through here unchanged
+	// (DELAY.md §9, D9)
+	transportDelayStatsCallbacks *CallbackList[TransportDelayStatsFunction]
 
 	// reliabilityMetrics measures what a provider failure actually costs the
 	// user -- how many flows die with an exit, and how long the destinations
@@ -1961,6 +2201,41 @@ func (self *RemoteUserNatMultiClient) MemorySnapshot() MultiClientMemorySnapshot
 	snapshot.FlowCount = len(self.flowUpdates)
 	self.stateLock.Unlock()
 	return snapshot
+}
+
+// Owner-lifetime diagnostic evidence, distinct from MemorySnapshot's live clients.
+// A retired client's final callbacks retain the same bounded window counters.
+func (self *RemoteUserNatMultiClient) AckRouteWriteLifetimeFailures() (quality, speed *AckRouteWriteFailureStatsSnapshot) {
+	if self == nil {
+		return nil, nil
+	}
+	if window := self.windows[WindowTypeQuality]; window != nil {
+		quality = window.ackRouteWriteFailures.load(false).snapshot()
+	}
+	if window := self.windows[WindowTypeSpeed]; window != nil {
+		speed = window.ackRouteWriteFailures.load(false).snapshot()
+	}
+	return quality, speed
+}
+
+// Lazily owns one fixed counter set only for opted-in clients. The mutex is
+// construction/snapshot-only; packet callbacks retain the immutable pointer.
+type ackRouteWriteFailureOwner struct {
+	stateLock sync.Mutex
+	counters  *ackRouteWriteFailureCounters
+}
+
+// Concurrent constructors share one counter set; disabled callers never create it.
+func (self *ackRouteWriteFailureOwner) load(create bool) *ackRouteWriteFailureCounters {
+	if self == nil {
+		return nil
+	}
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if create && self.counters == nil {
+		self.counters = &ackRouteWriteFailureCounters{}
+	}
+	return self.counters
 }
 
 // ServerNameLookup resolves a destination IP to the server name(s) previously observed
@@ -2551,36 +2826,50 @@ func NewRemoteUserNatMultiClient(
 	localUserNat := NewLocalUserNat(cancelCtx, "multi local", localUserNatSettings)
 
 	multiClient := &RemoteUserNatMultiClient{
-		ctx:                        cancelCtx,
-		cancel:                     cancel,
-		log:                        log,
-		generator:                  generator,
-		settings:                   settings,
-		defaultReliabilitySettings: ReliabilitySettingsFrom(settings),
-		windows:                    map[WindowType]*multiClientWindow{},
-		securityPolicyStats:        securityPolicyStats,
-		securityPolicy:             settings.SecurityPolicyGenerator(cancelCtx, securityPolicyStats),
-		provideMode:                provideMode,
-		ip4PathUpdates:             map[Ip4Path]*multiClientChannelUpdate{},
-		ip6PathUpdates:             map[Ip6Path]*multiClientChannelUpdate{},
-		flowUpdates:                map[*multiClientChannelUpdate]bool{},
-		affinityIp4Paths:           map[Ip4Path]map[Ip4Path]time.Time{},
-		affinityIp6Paths:           map[Ip6Path]map[Ip6Path]time.Time{},
-		clientUpdates:              map[*multiClientChannel]map[*multiClientChannelUpdate]bool{},
-		qualification:              map[MultiHopId]*providerQualification{},
-		destinationServiceFailures: map[destinationServiceFailureKey]destinationServiceFailure{},
-		localUserNat:               localUserNat,
-		blockActionCache:           newBlockActionCache(settings.BlockActionDecisionTtl, settings.BlockActionDecisionMaxCount),
-		policyLocalHints:           newPolicyHintCache(settings.PolicyHintTtl, settings.PolicyHintMaxCount, nil),
-		blockActionCollector:       newBlockActionCollector(settings.BlockActionAggMaxCount, log),
-		blockActionIgnoreCache:     newBlockActionIgnoreCache(settings.BlockActionDecisionTtl, settings.BlockActionDecisionMaxCount),
-		packetStatsCounters:        &packetStatsCounters{},
-		packetStatsCallbacks:       NewCallbackList[PacketStatsFunction](),
-		reliabilityMetrics:         newReliabilityMetrics(),
-		flowReaperWake:             make(chan struct{}, 1),
+		ctx:                          cancelCtx,
+		cancel:                       cancel,
+		log:                          log,
+		generator:                    generator,
+		settings:                     settings,
+		defaultReliabilitySettings:   ReliabilitySettingsFrom(settings),
+		windows:                      map[WindowType]*multiClientWindow{},
+		securityPolicyStats:          securityPolicyStats,
+		securityPolicy:               settings.SecurityPolicyGenerator(cancelCtx, securityPolicyStats),
+		provideMode:                  provideMode,
+		ip4PathUpdates:               map[Ip4Path]*multiClientChannelUpdate{},
+		ip6PathUpdates:               map[Ip6Path]*multiClientChannelUpdate{},
+		flowUpdates:                  map[*multiClientChannelUpdate]bool{},
+		affinityIp4Paths:             map[Ip4Path]map[Ip4Path]time.Time{},
+		affinityIp6Paths:             map[Ip6Path]map[Ip6Path]time.Time{},
+		clientUpdates:                map[*multiClientChannel]map[*multiClientChannelUpdate]bool{},
+		qualification:                map[MultiHopId]*providerQualification{},
+		destinationServiceFailures:   map[destinationServiceFailureKey]destinationServiceFailure{},
+		localUserNat:                 localUserNat,
+		blockActionCache:             newBlockActionCache(settings.BlockActionDecisionTtl, settings.BlockActionDecisionMaxCount),
+		policyLocalHints:             newPolicyHintCache(settings.PolicyHintTtl, settings.PolicyHintMaxCount, nil),
+		blockActionCollector:         newBlockActionCollector(settings.BlockActionAggMaxCount, log),
+		blockActionIgnoreCache:       newBlockActionIgnoreCache(settings.BlockActionDecisionTtl, settings.BlockActionDecisionMaxCount),
+		packetStatsCounters:          &packetStatsCounters{},
+		packetStatsCallbacks:         NewCallbackList[PacketStatsFunction](),
+		eventEpochWake:               make(chan struct{}, 1),
+		proberWake:                   make(chan struct{}, 1),
+		transportDelayStatsCallbacks: NewCallbackList[TransportDelayStatsFunction](),
+		reliabilityMetrics:           newReliabilityMetrics(),
+		flowReaperWake:               make(chan struct{}, 1),
+		flowReaperDone:               make(chan struct{}),
 	}
+	// every count recorded through the counters wakes a parked event epoch
+	multiClient.packetStatsCounters.changed = multiClient.eventEpochChange
 	if settings.IpAssocSettings != nil {
-		multiClient.ipAssoc = NewIpAssoc(cancelCtx, settings.IpAssocSettings)
+		cache := multiClient.blockActionCache
+		afterShed := cache.clear
+		if hook := settings.afterIpAssocShedForTest; hook != nil {
+			afterShed = func() {
+				cache.clear()
+				hook(cancelCtx.Err() != nil)
+			}
+		}
+		multiClient.ipAssoc = newIpAssoc(cancelCtx, settings.IpAssocSettings, afterShed)
 	}
 	multiClient.providerPolicyPreference = newProviderPolicyPreference(
 		SecurityPolicyGeneration(multiClient.securityPolicy),
@@ -2605,6 +2894,8 @@ func NewRemoteUserNatMultiClient(
 		serverNameLookup:    nil,
 		blocker:             nil,
 	})
+	// before the windows below start discovering under the profile
+	multiClient.syncGeneratorPostQuantumEncryption()
 	multiClient.blockActionState.Store(&blockActionState{
 		version: 0,
 		matcher: nil,
@@ -2631,17 +2922,21 @@ func NewRemoteUserNatMultiClient(
 		multiClient.clientDialFailureSignal,
 		multiClient.securityPolicy,
 		multiClient.removeClient,
+		multiClient.clearDestinationServiceFailures,
 		WindowTypeQuality,
 		effectivePerformanceProfile,
 		settings,
 		multiClient.reliabilitySettings,
 		multiClient.uplinkGate,
+		multiClient.uplinkLastIngress,
 		multiClient.reliabilityMetricsRef,
 		multiClient.clientFlowCount,
 		multiClient.providerQualified,
 		multiClient.receivingChannelCount,
 		multiClient.recordProbePass,
 		multiClient.providerPolicyPreference,
+		multiClient.publishTransportDelayStats,
+		multiClient.clientAdded,
 	)
 	multiClient.windows[WindowTypeQuality].clientMigrateFunc = multiClient.migrateClientFlows
 	if _, fixed := generator.FixedDestinationSize(); !fixed {
@@ -2655,17 +2950,21 @@ func NewRemoteUserNatMultiClient(
 			multiClient.clientDialFailureSignal,
 			multiClient.securityPolicy,
 			multiClient.removeClient,
+			multiClient.clearDestinationServiceFailures,
 			WindowTypeSpeed,
 			effectivePerformanceProfile,
 			settings,
 			multiClient.reliabilitySettings,
 			multiClient.uplinkGate,
+			multiClient.uplinkLastIngress,
 			multiClient.reliabilityMetricsRef,
 			multiClient.clientFlowCount,
 			multiClient.providerQualified,
 			multiClient.receivingChannelCount,
 			multiClient.recordProbePass,
 			multiClient.providerPolicyPreference,
+			multiClient.publishTransportDelayStats,
+			multiClient.clientAdded,
 		)
 		multiClient.windows[WindowTypeSpeed].clientMigrateFunc = multiClient.migrateClientFlows
 	}
@@ -2718,29 +3017,59 @@ func NewRemoteUserNatMultiClient(
 	// client built with a zero tolerance never runs the goroutine -- while the
 	// runtime toggle is honored per pass inside. Not wired to `cancel` for the
 	// same reason as the prober: an exculpatory aide must never be able to tear
-	// down the tunnel it exists to protect.
+	// down the tunnel it exists to protect. A client given a shared detector
+	// subscribes to it for its life instead.
 	if 0 < settings.SchedulerPauseTolerance {
-		go HandleError(multiClient.runSchedulerPauseDetector)
+		detector := settings.SchedulerPauseDetector
+		if detector == nil {
+			detector = NewSchedulerPauseDetectorWithSettings(multiClient.ctx, settings.SchedulerPauseDetectorSettings)
+		}
+		detector.subscribe(multiClient)
+		context.AfterFunc(multiClient.ctx, func() {
+			detector.unsubscribe(multiClient)
+		})
 	}
 
 	return multiClient
 }
 
-// flushes block action and packet stats events to listeners on the event epoch
+// flushes block action and packet stats events to listeners an epoch after a
+// change. It arms one timer for its life. An epoch that takes no change parks
+// the worker until the next change wakes it (eventEpochChange), and the flush
+// then follows one epoch later, so every change is reported within one epoch
+// of it while an idle client costs no wakeups.
 func (self *RemoteUserNatMultiClient) runEventEpoch() {
 	defer self.cancel()
 
 	var lastPacketStats *PacketStats
+	epochTimer := time.NewTimer(self.settings.EventEpoch)
+	defer epochTimer.Stop()
 	for {
 		select {
 		case <-self.ctx.Done():
 			return
-		case <-time.After(self.settings.EventEpoch):
+		case <-epochTimer.C:
 		}
+		if wake := self.eventEpochWakeForTest.Load(); wake != nil {
+			(*wake)()
+		}
+
+		// Take the flag before the flush and the compare, so a change that
+		// lands during this pass raises it for the next one. Drain the wake
+		// first: a wake the drain drops was sent by a raise that this take or
+		// an earlier one covers, and a raise the take misses sends its wake
+		// after the drain, so the park below still sees it.
+		select {
+		case <-self.eventEpochWake:
+		default:
+		}
+		changed := self.eventEpochChanged.Swap(false)
 
 		self.blockActionCollector.flush()
 
-		if callbacks := self.packetStatsCallbacks.Get(); 0 < len(callbacks) {
+		// an epoch with no new packets compares the counters in place, and
+		// builds a snapshot only to report a change
+		if callbacks := self.packetStatsCallbacks.Get(); 0 < len(callbacks) && !self.packetStatsCounters.unchangedSince(lastPacketStats) {
 			packetStats := self.packetStatsCounters.snapshot()
 			if !packetStatsEqual(packetStats, lastPacketStats) {
 				lastPacketStats = packetStats
@@ -2751,6 +3080,28 @@ func (self *RemoteUserNatMultiClient) runEventEpoch() {
 				}
 			}
 		}
+		if !changed {
+			// nothing changed for a whole epoch
+			select {
+			case <-self.ctx.Done():
+				return
+			case <-self.eventEpochWake:
+			}
+		}
+		epochTimer.Reset(self.settings.EventEpoch)
+	}
+}
+
+// eventEpochChange marks the event epoch changed and wakes a parked epoch
+// worker. Called after the change it reports. Once the flag is up it costs one
+// atomic load, so a packet pays nothing more while traffic moves.
+func (self *RemoteUserNatMultiClient) eventEpochChange() {
+	if self.eventEpochChanged.Load() || !self.eventEpochChanged.CompareAndSwap(false, true) {
+		return
+	}
+	select {
+	case self.eventEpochWake <- struct{}{}:
+	default:
 	}
 }
 
@@ -2763,6 +3114,7 @@ func (self *RemoteUserNatMultiClient) localReceivePacket(
 ) {
 	self.packetStatsCounters.localIngressPacketCount.Add(1)
 	self.packetStatsCounters.localIngressByteCount.Add(int64(len(packet)))
+	self.eventEpochChange()
 	if self.ipAssoc != nil && !self.blockActionIgnored(ipPath) {
 		// the local user nat delivers the flow's egress-oriented path
 		// (the remote endpoint is the destination)
@@ -2957,12 +3309,29 @@ func (self *RemoteUserNatMultiClient) SetPerformanceProfile(performanceProfile *
 			blocker:             prev.blocker,
 		})
 	}()
+	// before the reset windows discover again
+	self.syncGeneratorPostQuantumEncryption()
 	for _, window := range self.windows {
 		window.SetPerformanceProfile(performanceProfile)
 		// reset the window
 		window.shuffle()
 	}
 	return nil
+}
+
+// syncGeneratorPostQuantumEncryption tells a generator that can narrow its
+// discovery (`MultiClientGeneratorWithPostQuantumEncryption`) whether the
+// profile in force requires post-quantum encryption. It reads the stored
+// config rather than a caller's profile, so whichever of two concurrent
+// setters runs it last leaves the generator agreeing with the last stored
+// profile. It runs with no lock held.
+func (self *RemoteUserNatMultiClient) syncGeneratorPostQuantumEncryption() {
+	generator, ok := self.generator.(MultiClientGeneratorWithPostQuantumEncryption)
+	if !ok {
+		return
+	}
+	performanceProfile := self.config.Load().performanceProfile
+	generator.SetPostQuantumEncryption(performanceProfile != nil && performanceProfile.PostQuantumEncryption)
 }
 
 func (self *RemoteUserNatMultiClient) SetLocalSecurityBypass(localSecurityBypass bool) {
@@ -3027,7 +3396,8 @@ func (self *RemoteUserNatMultiClient) invalidateServerNames(addrs []netip.Addr) 
 		self.blockActionCache.delete(key)
 		self.blockActionIgnoreCache.delete(key)
 		if self.ipAssoc != nil {
-			for _, member := range self.ipAssoc.GetClusterAddrs(key) {
+			_, members := self.ipAssoc.clusterMembers(key)
+			for _, member := range members {
 				memberKey := member.Unmap()
 				if memberKey != key {
 					self.blockActionCache.delete(memberKey)
@@ -3111,7 +3481,7 @@ type ReliabilitySettings struct {
 	BlackholeReceiveTimeout  time.Duration
 	MaxFlowsPerExit          int
 	AffinityStickyPastCap    bool
-	FreshFlowAffinity        bool
+	AffinityMaxTime          time.Duration
 	PerformanceAwareAffinity bool
 	MaxStickyFlowsPerExit    int
 	StickyFlowIdleTimeout    time.Duration
@@ -3121,6 +3491,7 @@ type ReliabilitySettings struct {
 	GroupFollowWindow          time.Duration
 	DialFailureRerace          bool
 	UplinkStalenessGate        time.Duration
+	UplinkStalenessMaxHold     time.Duration
 	SoftVerdictDemote          bool
 	RemovalBudgetCount         int
 	RemovalBudgetWindow        time.Duration
@@ -3199,7 +3570,7 @@ func ReliabilitySettingsFrom(settings *MultiClientSettings) *ReliabilitySettings
 		BlackholeReceiveTimeout:    settings.BlackholeReceiveTimeout,
 		MaxFlowsPerExit:            settings.MaxFlowsPerExit,
 		AffinityStickyPastCap:      settings.AffinityStickyPastCap,
-		FreshFlowAffinity:          settings.FreshFlowAffinity,
+		AffinityMaxTime:            settings.AffinityMaxTime,
 		PerformanceAwareAffinity:   settings.PerformanceAwareAffinity,
 		MaxStickyFlowsPerExit:      settings.MaxStickyFlowsPerExit,
 		StickyFlowIdleTimeout:      settings.StickyFlowIdleTimeout,
@@ -3208,6 +3579,7 @@ func ReliabilitySettingsFrom(settings *MultiClientSettings) *ReliabilitySettings
 		GroupFollowWindow:          settings.GroupFollowWindow,
 		DialFailureRerace:          settings.DialFailureRerace,
 		UplinkStalenessGate:        settings.UplinkStalenessGate,
+		UplinkStalenessMaxHold:     settings.UplinkStalenessMaxHold,
 		SoftVerdictDemote:          settings.SoftVerdictDemote,
 		RemovalBudgetCount:         settings.RemovalBudgetCount,
 		RemovalBudgetWindow:        settings.RemovalBudgetWindow,
@@ -3329,7 +3701,7 @@ func scoredPlacementEnabled(r *ReliabilitySettings) bool {
 // configurations (before and after the store), so clearing an override logs the
 // restoration rather than a misleading "everything went to zero".
 //
-// LightClassifier and FreshFlowAffinity are the two knobs this function must
+// LightClassifier and AffinityMaxTime are the two knobs this function must
 // do more than report on. Every other field here is read fresh from
 // reliabilitySettings() at the point it is consulted (e.g.
 // scoredPlacementEnabled, benchDuration), so swapping the override is the
@@ -3345,8 +3717,8 @@ func scoredPlacementEnabled(r *ReliabilitySettings) bool {
 // construction (maybeInstallLightClassifier, called once from
 // NewRemoteUserNatMultiClient) is unaffected by this and stays as the first
 // install for a session that starts with the knob already on.
-// FreshFlowAffinity is still read directly on placement, but its enabled mode
-// retains DNS-exit channel hints. A true->false edge clears those references
+// AffinityMaxTime is still read directly on placement, but its enabled mode
+// retains DNS-exit channel hints. A positive->nonpositive edge clears them
 // after releasing the settings leaf lock; otherwise disabling hard affinity
 // could retain an hour of state that no production decision will consume.
 //
@@ -3378,7 +3750,7 @@ func (self *RemoteUserNatMultiClient) SetReliabilitySettings(reliabilitySettings
 	after := self.reliabilitySettings()
 
 	classifierChanged := before.LightClassifier != after.LightClassifier
-	hardAffinityChanged := before.FreshFlowAffinity != after.FreshFlowAffinity
+	hardAffinityChanged := (before.AffinityMaxTime > 0) != (after.AffinityMaxTime > 0)
 	if classifierChanged {
 		if after.LightClassifier {
 			self.setFlowClassifierUnlogged(NewLightClassifier(self.serverNameResolver))
@@ -3389,17 +3761,22 @@ func (self *RemoteUserNatMultiClient) SetReliabilitySettings(reliabilitySettings
 	self.reliabilitySettingsLock.Unlock()
 	if hardAffinityChanged {
 		self.stateLock.Lock()
-		if !after.FreshFlowAffinity {
+		// A newer concurrent override may have won while this setter waited
+		// for the routing lock. Reconcile its policy, not this stale snapshot.
+		enabled := self.reliabilitySettings().AffinityMaxTime > 0
+		if !enabled {
 			clear(self.dnsExitHints)
 			clear(self.dnsAddressExitHints)
 		}
-		self.rebuildAffinityDonorIndexesWithLock(after.FreshFlowAffinity)
+		self.rebuildAffinityDonorIndexesWithLock(enabled)
 		self.stateLock.Unlock()
 	}
 	// SequenceIdleTimeout and TcpSequenceIdleTimeout are runtime reliability
 	// knobs. Wake the shared reaper so a shorter override applies immediately;
 	// a longer one is harmlessly rechecked before any flow is detached.
 	self.notifyFlowReaper()
+	// the prober honors ProviderProbe and the probe knobs from its next scan
+	self.wakeProber()
 
 	log := loggerOrDefault(self.log)
 	if classifierChanged {
@@ -3465,9 +3842,9 @@ func (self *RemoteUserNatMultiClient) destinationAffinityIpPathWithLock(ipPath *
 	// back to plain per-ip affinity rather than panicking
 	if self.reliabilitySettings().ClusterAffinityFallback && self.ipAssoc != nil {
 		if addr, ok := ipAssocAddr(ipPath.DestinationIp); ok {
-			// GetClusterAddrs is a lock-free atomic load, safe to call with the
-			// parent stateLock held
-			if rep, ok := clusterAffinityRepresentative(self.ipAssoc.GetClusterAddrs(addr)); ok {
+			// Immutable members use one lock-free atomic publication load.
+			_, members := self.ipAssoc.clusterMembers(addr)
+			if rep, ok := clusterAffinityRepresentative(members); ok {
 				destinationIp = rep.AsSlice()
 			}
 		}
@@ -3790,12 +4167,9 @@ var demotionLogThrottle = newLogThrottle(classifyLogInterval)
 // that influence by spending a guard, over the minority of flows that race
 // at all.
 //
-// In legacy FreshFlowAffinity A/B mode, the learner is instead made
-// load-bearing at ScoredAffinityDonor, on
-// inheritAffinityClient{4,6}WithLock. With the production default off,
-// ordinary fresh flows skip that hard-donor step and reach this full race;
-// explicit pins retain their requested stable-exit semantics. See the two
-// settings' field comments for the full argument.
+// The learner also ranks age-eligible donors through ScoredAffinityDonor on
+// inheritAffinityClient{4,6}WithLock. Expired or disabled ordinary affinity
+// reaches this full race; explicit pins retain stable-exit semantics.
 //
 // classifyOrUnknown is nil-safe, so an unset flowClassifier (every build by
 // default -- LightClassifier, Task 2's install knob, is zero-value-off)
@@ -4166,13 +4540,10 @@ func (self *RemoteUserNatMultiClient) inheritAffinityClient4WithLock(update *mul
 	// group's egress ip is worth more than the cap, which continues to gate
 	// every placement that would put a NEW site on the exit
 	reliabilitySettings := self.reliabilitySettings()
-	if update == nil || (!update.pinned && !reliabilitySettings.FreshFlowAffinity) {
-		// Ordinary fresh flows race. The group remains registered so completed
-		// flows can contribute bounded IP/domain performance evidence, but a
-		// live page connection is no longer a hard placement shortcut for a
-		// later media connection.
+	if update == nil || (!update.pinned && reliabilitySettings.AffinityMaxTime <= 0) {
 		return donorRefused, false
 	}
+	now := time.Now()
 	sticky := reliabilitySettings.AffinityStickyPastCap
 	follow := reliabilitySettings.QuarantineGroupFollow
 	window := reliabilitySettings.GroupFollowWindow
@@ -4189,17 +4560,29 @@ func (self *RemoteUserNatMultiClient) inheritAffinityClient4WithLock(update *mul
 	var mostRecentCreateTime time.Time
 	var bestBias float64
 	var bestProviderId string
+	var winnerClient *multiClientChannel
+	var winnerSelection *multiClientAffinitySelection
 	winnerVerdict, scattered := donorRefused, false
 	for copyIp4Path, createTime := range paths {
 		copyUpdate, ok := self.ip4PathUpdates[copyIp4Path]
 		if !ok {
 			continue
 		}
-		c := copyUpdate.client.Load()
+		selection := copyUpdate.client.loadSelection()
+		var c *multiClientChannel
+		if selection != nil {
+			c = selection.client
+		}
+		if !update.pinned && !selection.eligible(c, now, reliabilitySettings.AffinityMaxTime) {
+			continue
+		}
 		// a donor downgraded to v4-only after this group formed still
 		// carries its established flows, but must not receive new ones of
 		// a version it no longer carries (IPV6.md B3, B5)
 		if c == nil || c.IsDone() || !c.supportsIpVersion(4) || (!sticky && self.clientAtFlowCapWithLock(c)) {
+			continue
+		}
+		if self.affinityDonorServiceFailedWithLock(update, c, now) {
 			continue
 		}
 		// off: the legacy short-circuit, preserved exactly -- a donor no more
@@ -4212,6 +4595,9 @@ func (self *RemoteUserNatMultiClient) inheritAffinityClient4WithLock(update *mul
 		}
 		switch verdict := c.affinityDonorEligible(follow, window); verdict {
 		case donorEligible, donorQuarantineFollowed:
+			if !c.positiveAffinityHealth() {
+				continue
+			}
 			if !update.pinned && !self.affinityPerformanceAllowsFlowDonor(c, copyUpdate, update.ipPath) {
 				continue
 			}
@@ -4230,13 +4616,18 @@ func (self *RemoteUserNatMultiClient) inheritAffinityClient4WithLock(update *mul
 					continue
 				}
 			}
+			winnerClient, winnerSelection = c, selection
 			bestBias, bestProviderId = bias, providerId
 			mostRecentCreateTime = createTime
-			update.client.Store(c)
 			winnerVerdict = verdict
 		case donorQuarantineScattered:
 			scattered = true
 		}
+	}
+	// Publish only the final winner. Provisional candidates must not lower
+	// the new update's immutable lineage origin or become its own donor.
+	if winnerClient == nil || !self.adoptAffinityClientWithLock(update, winnerClient, winnerSelection) {
+		return donorRefused, scattered
 	}
 	return winnerVerdict, scattered
 }
@@ -4248,9 +4639,10 @@ func (self *RemoteUserNatMultiClient) inheritAffinityClient6WithLock(update *mul
 	// see inheritAffinityClient4WithLock for the sticky, follow, pin, and
 	// caller-side-counting rationale
 	reliabilitySettings := self.reliabilitySettings()
-	if update == nil || (!update.pinned && !reliabilitySettings.FreshFlowAffinity) {
+	if update == nil || (!update.pinned && reliabilitySettings.AffinityMaxTime <= 0) {
 		return donorRefused, false
 	}
+	now := time.Now()
 	sticky := reliabilitySettings.AffinityStickyPastCap
 	follow := reliabilitySettings.QuarantineGroupFollow
 	window := reliabilitySettings.GroupFollowWindow
@@ -4262,15 +4654,27 @@ func (self *RemoteUserNatMultiClient) inheritAffinityClient6WithLock(update *mul
 	var mostRecentCreateTime time.Time
 	var bestBias float64
 	var bestProviderId string
+	var winnerClient *multiClientChannel
+	var winnerSelection *multiClientAffinitySelection
 	winnerVerdict, scattered := donorRefused, false
 	for copyIp6Path, createTime := range paths {
 		copyUpdate, ok := self.ip6PathUpdates[copyIp6Path]
 		if !ok {
 			continue
 		}
-		c := copyUpdate.client.Load()
+		selection := copyUpdate.client.loadSelection()
+		var c *multiClientChannel
+		if selection != nil {
+			c = selection.client
+		}
+		if !update.pinned && !selection.eligible(c, now, reliabilitySettings.AffinityMaxTime) {
+			continue
+		}
 		// see the v4 twin: a downgraded donor takes no new v6 flows
 		if c == nil || c.IsDone() || !c.supportsIpVersion(6) || (!sticky && self.clientAtFlowCapWithLock(c)) {
+			continue
+		}
+		if self.affinityDonorServiceFailedWithLock(update, c, now) {
 			continue
 		}
 		if !scored && !createTime.After(mostRecentCreateTime) {
@@ -4278,6 +4682,9 @@ func (self *RemoteUserNatMultiClient) inheritAffinityClient6WithLock(update *mul
 		}
 		switch verdict := c.affinityDonorEligible(follow, window); verdict {
 		case donorEligible, donorQuarantineFollowed:
+			if !c.positiveAffinityHealth() {
+				continue
+			}
 			if !update.pinned && !self.affinityPerformanceAllowsFlowDonor(c, copyUpdate, update.ipPath) {
 				continue
 			}
@@ -4294,13 +4701,17 @@ func (self *RemoteUserNatMultiClient) inheritAffinityClient6WithLock(update *mul
 					continue
 				}
 			}
+			winnerClient, winnerSelection = c, selection
 			bestBias, bestProviderId = bias, providerId
 			mostRecentCreateTime = createTime
-			update.client.Store(c)
 			winnerVerdict = verdict
 		case donorQuarantineScattered:
 			scattered = true
 		}
+	}
+	// See the v4 twin: no binding is published during the ranking scan.
+	if winnerClient == nil || !self.adoptAffinityClientWithLock(update, winnerClient, winnerSelection) {
+		return donorRefused, scattered
 	}
 	return winnerVerdict, scattered
 }
@@ -4318,11 +4729,9 @@ func (self *RemoteUserNatMultiClient) bookGroupLedger(placed bool, followWinner 
 }
 
 // domainAffinityAliases collapses the CDN constellations one service operates
-// onto one bounded measurement group. With ordinary hard affinity disabled by
-// default, this lets a weak media endpoint inform the next fresh connection
-// without pinning the constellation to its page connection. Explicit pins and
-// legacy FreshFlowAffinity A/B runs also use the canonical key when stable
-// one-egress semantics are intentionally requested.
+// onto one bounded measurement and affinity group. Ordinary provider reuse is
+// healthy-only and expires with the originating creation. Explicit pins use
+// the same canonical key but retain their separate stable-egress policy.
 //
 // Values must be canonical (never themselves keys); the anchor test walks the
 // table.
@@ -4349,8 +4758,7 @@ var domainAffinityAliases = map[string]string{
 	"nflxso.net":    "netflix.com",
 	// bloomberg: player assets and manifests are served across the publisher
 	// domain and its bwbx media/static constellation. Share bounded performance
-	// evidence by default; only an explicit pin or legacy A/B mode hard-binds
-	// the group to one egress IP.
+	// evidence and young healthy provider selections across the group.
 	"bwbx.io": "bloomberg.com",
 	// twitch
 	"ttvnw.net": "twitch.tv",
@@ -4367,8 +4775,8 @@ var domainAffinityAliases = map[string]string{
 
 // affinityNameForServerName is the one place a server name becomes an affinity
 // group name: base domain (a.foo.com, b.c.foo.com and foo.com all collapse to
-// foo.com), then the constellation alias. It is a measurement key by default
-// and a hard-placement key only for explicit or legacy affinity.
+// foo.com), then the constellation alias. The measurement key also scopes
+// age-bounded ordinary reuse and explicit stable-egress pins.
 func affinityNameForServerName(serverName string) string {
 	affinityName := serverName
 	if rootDomain, err := publicsuffix.EffectiveTLDPlusOne(serverName); err == nil {
@@ -4488,8 +4896,18 @@ func (self *RemoteUserNatMultiClient) sendClientPath(ipPath *IpPath, pin flowPin
 	if previousClient == nil {
 		return
 	}
+	if self.beforeUncommittedSendBookkeepingForTest != nil {
+		self.beforeUncommittedSendBookkeepingForTest(update)
+	}
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	// Re-read under the lock: an answer can adopt the flow back onto the
+	// previous client after the read above, and the entry its bindClientFlow
+	// recorded must survive, or removeClient never tears the flow down and the
+	// flow cap never counts it.
+	if update.client.Load() == previousClient {
+		return
+	}
 	if updates, ok := self.clientUpdates[previousClient]; ok {
 		delete(updates, update)
 		if len(updates) == 0 {
@@ -4503,9 +4921,9 @@ func (self *RemoteUserNatMultiClient) sendClientPath(ipPath *IpPath, pin flowPin
 // A tcp connection is routinely idle between requests -- ssh sessions,
 // websockets, push channels -- and the application still considers it open.
 // Traditional vpns hold tcp nat state for 5-30 minutes, so a 2 minute bound
-// resets connections users have every reason to think are alive. Udp has no
-// equivalent notion of an open connection and its mappings are conventionally
-// short lived, so it keeps the tighter bound.
+// resets connections users have every reason to think are alive. The default
+// retains TCP for ten idle minutes and other protocols for five. Explicit
+// runtime overrides remain authoritative; affinity expiry does not reap flows.
 func (self *RemoteUserNatMultiClient) sequenceIdleTimeout(ipPath *IpPath) time.Duration {
 	return sequenceIdleTimeoutWithSettings(ipPath, self.reliabilitySettings())
 }
@@ -4634,6 +5052,14 @@ func (self *RemoteUserNatMultiClient) detachIdleFlows(now time.Time) (
 			delete(self.flowUpdates, update)
 			continue
 		}
+		if transition := self.affinityTransitions[update]; transition != nil {
+			deadline := transition.deadline
+			if deadline.Before(now.Add(time.Second)) {
+				deadline = now.Add(time.Second)
+			}
+			rememberDeadline(deadline)
+			continue
+		}
 		deadline := update.activityTime.Add(sequenceIdleTimeoutWithSettings(update.ipPath, reliabilitySettings))
 		if !stickyTrim[update] && !update.IsDone() && now.Before(deadline) {
 			rememberDeadline(deadline)
@@ -4693,7 +5119,7 @@ func (self *RemoteUserNatMultiClient) finishRetiredFlows(retired []retiredMultiC
 			self.recordFlowReward(flow.update.ipPath, flow.update.pinAppId, flow.client, flow.client.flowCount())
 		}
 		if flow.shouldSignal && self.ctx.Err() == nil {
-			self.rstFlow(flow.update.ipPath, flow.client, flow.update.sourceRstSequence())
+			self.rstFlow(flow.update.ipPath, flow.client, flow.update.sourceRstSequence(), flow.update)
 		}
 		// The update was cancelled while it was detached so in-flight work cannot
 		// resurrect it. Close now clears race state and returns pooled packets;
@@ -4720,6 +5146,7 @@ func (self *RemoteUserNatMultiClient) finishQuarantinedTcpFlows(retired []retire
 					ProvideMode: protocol.ProvideMode_Network,
 					IpPath:      flow.update.ipPath,
 					Packet:      packet,
+					generation:  flow.update,
 				})
 			}
 		}
@@ -4737,11 +5164,23 @@ func stopFlowReaperTimer(timer *time.Timer) {
 }
 
 func (self *RemoteUserNatMultiClient) runFlowReaper() {
+	defer func() {
+		self.discardSynRetryReadiness()
+		self.discardSynRetries()
+		if self.flowReaperDone != nil {
+			close(self.flowReaperDone)
+		}
+	}()
 	timer := time.NewTimer(time.Hour)
 	stopFlowReaperTimer(timer)
 	defer timer.Stop()
 
 	for {
+		self.drainSynRetryReadiness()
+		self.drainSynRetries()
+		if self.ctx.Err() != nil {
+			return
+		}
 		retired, nextDelay, hasNext := self.detachIdleFlows(time.Now())
 		self.finishRetiredFlows(retired)
 		if 0 < len(retired) {
@@ -4790,17 +5229,14 @@ func (self *RemoteUserNatMultiClient) teardownSourcePacket(ipPath *IpPath, sourc
 	return nil, false
 }
 
-func (self *RemoteUserNatMultiClient) rstFlow(ipPath *IpPath, client *multiClientChannel, sourceRstSequence uint32) {
+func (self *RemoteUserNatMultiClient) rstFlow(ipPath *IpPath, client *multiClientChannel, sourceRstSequence uint32, generation *multiClientChannelUpdate) {
 	// Bare fixture channels have no underlying transfer client. Production
 	// channels always do; keeping the source reset below independent also
 	// makes local recovery robust if a channel loses its transport first.
 	if client != nil && client.client != nil {
 		// rst to destination
 		if packet, ok := ipOosRst(ipPath); ok {
-			client.Send(&parsedPacket{
-				packet: packet,
-				ipPath: ipPath,
-			}, 0)
+			generation.sendAffinityControl(client, packet, 0)
 		}
 	}
 	// teardown to source
@@ -4810,6 +5246,7 @@ func (self *RemoteUserNatMultiClient) rstFlow(ipPath *IpPath, client *multiClien
 			ProvideMode: protocol.ProvideMode_Network,
 			IpPath:      ipPath,
 			Packet:      packet,
+			generation:  generation,
 		})
 	}
 }
@@ -4838,7 +5275,13 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath, pin flowPin) (
 		ip4Path := ipPath.ToIp4Path()
 		var previousClient *multiClientChannel
 		update, ok := self.ip4PathUpdates[ip4Path]
+		if self.affinityTransitions[update] != nil {
+			return nil, nil, nil
+		}
 		if !ok || update.IsDone() {
+			if self.affinityDeliveryActiveWithLock(ipPath) {
+				return nil, nil, nil
+			}
 			update = newMultiClientChannelUpdate(self.ctx, ipPath)
 			self.reliabilityMetrics.flowOpened()
 			self.ip4PathUpdates[ip4Path] = update
@@ -4866,13 +5309,12 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath, pin flowPin) (
 			// follow window (see inheritAffinityClient4WithLock).
 			update.pinned = pin.pinned()
 			update.pinAppId = pin.appId
-			hardAffinity := update.pinned || self.reliabilitySettings().FreshFlowAffinity
+			hardAffinity := update.pinned || self.reliabilitySettings().AffinityMaxTime > 0
 			if pin.appId != "" {
 				affinityIpPaths = []*IpPath{{ServerName: appAffinityName(pin.appId)}}
 			}
-			// DNS topology is a hard placement input only for explicit pins or
-			// the legacy A/B mode. Ordinary fresh flows skip the lookup and
-			// reach the provider race.
+			// DNS placement carries the originating connection's age, not the
+			// answer's refresh time. Disabled ordinary affinity skips lookup.
 			if pin.appId == "" && hardAffinity {
 				self.inheritDnsExitHintWithLock(update, ipPath, affinityIpPaths)
 			}
@@ -4917,7 +5359,9 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath, pin flowPin) (
 					pinnedFollowWindow(reliabilitySettings.GroupFollowWindow),
 					reliabilitySettings.AffinityStickyPastCap,
 				); donor != nil && donor.supportsIpVersion(4) {
-					update.client.Store(donor)
+					// The app's canonical provider is a pin, not a new race.
+					// Missing origin cannot authorize a later ordinary donor.
+					self.adoptAffinityClientWithLock(update, donor, nil)
 				}
 			}
 
@@ -4961,7 +5405,13 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath, pin flowPin) (
 		ip6Path := ipPath.ToIp6Path()
 		var previousClient *multiClientChannel
 		update, ok := self.ip6PathUpdates[ip6Path]
+		if self.affinityTransitions[update] != nil {
+			return nil, nil, nil
+		}
 		if !ok || update.IsDone() {
+			if self.affinityDeliveryActiveWithLock(ipPath) {
+				return nil, nil, nil
+			}
 			update = newMultiClientChannelUpdate(self.ctx, ipPath)
 			self.reliabilityMetrics.flowOpened()
 			self.ip6PathUpdates[ip6Path] = update
@@ -4978,11 +5428,11 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath, pin flowPin) (
 			// see the v4 twin for the pin rationale
 			update.pinned = pin.pinned()
 			update.pinAppId = pin.appId
-			hardAffinity := update.pinned || self.reliabilitySettings().FreshFlowAffinity
+			hardAffinity := update.pinned || self.reliabilitySettings().AffinityMaxTime > 0
 			if pin.appId != "" {
 				affinityIpPaths = []*IpPath{{ServerName: appAffinityName(pin.appId)}}
 			}
-			// See the v4 twin: ordinary flows skip hard DNS placement.
+			// See the v4 twin for age-bounded DNS placement.
 			if pin.appId == "" && hardAffinity {
 				self.inheritDnsExitHintWithLock(update, ipPath, affinityIpPaths)
 			}
@@ -5017,7 +5467,8 @@ func (self *RemoteUserNatMultiClient) sendUpdate(ipPath *IpPath, pin flowPin) (
 					pinnedFollowWindow(reliabilitySettings.GroupFollowWindow),
 					reliabilitySettings.AffinityStickyPastCap,
 				); donor != nil && donor.supportsIpVersion(6) {
-					update.client.Store(donor)
+					// Cross-family app convergence is still inherited placement.
+					self.adoptAffinityClientWithLock(update, donor, nil)
 				}
 			}
 
@@ -5139,6 +5590,7 @@ func (self *RemoteUserNatMultiClient) updateClient(update *multiClientChannelUpd
 // migrate; their own re-race already covers them), and rebindable flows with
 // no live under-cap replacement -- keeps the teardown-with-signal behavior.
 func (self *RemoteUserNatMultiClient) removeClient(client *multiClientChannel) {
+	var synRetryReleases []*multiClientChannelUpdate
 	// Replacement candidates are gathered BEFORE the parent-locked section.
 	// The gather reads each window's ordered offer (the window's own lock)
 	// and each candidate's stats clock (the channel's lock, heavyweight
@@ -5194,6 +5646,7 @@ func (self *RemoteUserNatMultiClient) removeClient(client *multiClientChannel) {
 				delete(self.demotionStates, key)
 			}
 		}
+		self.clearDestinationServiceFailuresWithLock(client)
 		// likewise above the early return: drop the exit from every flow's
 		// record of the exits that failed it, whatever the flow is bound to,
 		// so a long-lived flow (a udp stream may never idle) does not keep
@@ -5220,6 +5673,14 @@ func (self *RemoteUserNatMultiClient) removeClient(client *multiClientChannel) {
 				self.log.Errorf("[multi]update associated with incorrect client")
 				continue
 			}
+			if transition := self.affinityTransitions[update]; transition != nil {
+				transition.retireFor = "removed"
+				if self.clientUpdates[client] == nil {
+					self.clientUpdates[client] = map[*multiClientChannelUpdate]bool{}
+				}
+				self.clientUpdates[client][update] = true
+				continue
+			}
 			// established (receivedInbound) is load-bearing twice over: it
 			// is the proof there is a connection to migrate, and it is the
 			// guard that exempts the flow from the dial-failure inference --
@@ -5244,7 +5705,15 @@ func (self *RemoteUserNatMultiClient) removeClient(client *multiClientChannel) {
 		teardownUpdates = append(teardownUpdates, unplaced...)
 
 		for _, update := range teardownUpdates {
+			update.stateLock.Lock()
+			update.discoveryAttemptStamp.Add(1)
+			update.sourceReset.Store(true)
+			update.clearSynRetryWithLock()
 			update.client.Store(nil)
+			if update.synRetryReleased.Load() != nil {
+				synRetryReleases = append(synRetryReleases, update)
+			}
+			update.stateLock.Unlock()
 
 			// the update's ipPath is egress-oriented, so the remote
 			// endpoint the user is waiting on is the destination.
@@ -5264,11 +5733,16 @@ func (self *RemoteUserNatMultiClient) removeClient(client *multiClientChannel) {
 					ProvideMode: protocol.ProvideMode_Network,
 					IpPath:      update.ipPath,
 					Packet:      packet,
+					generation:  update,
 				}
 				rstPackets = append(rstPackets, rstPacket)
 			}
 		}
 	}()
+
+	for _, update := range synRetryReleases {
+		update.releaseSynRetryMemory()
+	}
 
 	// recorded outside stateLock -- the metrics take their own lock, and
 	// nesting them under the parent lock would put the recovery tracker on the
@@ -5498,6 +5972,12 @@ func (self *RemoteUserNatMultiClient) migrateClientFlows(client *multiClientChan
 				if update.ipPath == nil || update.ipPath.Protocol != IpProtocolTcp {
 					continue
 				}
+				if transition := self.affinityTransitions[update]; transition != nil {
+					if transition.retireFor != "removed" {
+						transition.retireFor = "bench"
+					}
+					continue
+				}
 
 				// Detach the exact generation before signaling the source. A SYN
 				// that follows the RST then creates a clean generation and races a
@@ -5517,6 +5997,8 @@ func (self *RemoteUserNatMultiClient) migrateClientFlows(client *multiClientChan
 				}
 				delete(self.flowUpdates, update)
 				delete(updates, update)
+				update.discoveryAttemptStamp.Add(1)
+				update.sourceReset.Store(true)
 				update.client.Store(nil)
 				if update.cancel != nil {
 					update.cancel()
@@ -5773,7 +6255,7 @@ func (self *RemoteUserNatMultiClient) rebindFlowsWithLock(
 	// this rebind; see the record in assign
 	rebindRecordedPins := map[string]bool{}
 	assign := func(update *multiClientChannelUpdate, replacement *multiClientChannel) {
-		update.client.Store(replacement)
+		update.selectAffinityClient(replacement)
 		updates, ok := self.clientUpdates[replacement]
 		if !ok {
 			updates = map[*multiClientChannelUpdate]bool{}
@@ -5971,6 +6453,16 @@ type MultiClientGeneratorTransportMigrator interface {
 	MigrateClientTransport(client *Client, args *MultiClientGeneratorClientArgs, migrateTime time.Time)
 }
 
+// An optional capability of a transport migrator for server-directed moves
+// (server/connect/MOVE.md): it receives the whole `ResidentMigrate` -- kind,
+// targets, deadline and preference -- instead of the migrate time alone. A
+// migrator without it migrates every move by name at its migrate time. The
+// same rules as `MigrateClientTransport` hold: return promptly and
+// deduplicate.
+type MultiClientGeneratorTransportMover interface {
+	MoveClientTransport(client *Client, args *MultiClientGeneratorClientArgs, move *ResidentMove)
+}
+
 // MultiClientGeneratorWithExtenderIps is an optional generator capability: the
 // extender addresses carrying one window client's live platform transport
 // (K1). The generator owns the transports, so it is the only layer that can
@@ -6021,7 +6513,7 @@ func (self *RemoteUserNatMultiClient) smtpBlockActionParts(
 	config := self.config.Load()
 	blockerActive := config.blocker != nil && config.blocker.Enabled()
 	if !ignored && (blockActionState.matcher != nil || self.blockActionCollector.hasCallbacks() || blockerActive) {
-		decision = self.blockActionDecision(blockActionState, config.blocker, blockerActive, ipPath)
+		decision = self.blockActionDecision(blockActionState, config.blocker, blockerActive, ipPath, config)
 	}
 	if decision != nil {
 		match = decision.match
@@ -6055,10 +6547,12 @@ func (self *RemoteUserNatMultiClient) sendSmtpLocal(
 			reason = BlockActionReasonBlocker
 		}
 		self.blockActionCollector.add(decision, block, local, match, reason, byteCount)
+		self.eventEpochChange()
 	}
 	if block {
 		self.packetStatsCounters.blockEgressPacketCount.Add(1)
 		self.packetStatsCounters.blockEgressByteCount.Add(int64(byteCount))
+		self.eventEpochChange()
 		return false
 	}
 	if !local || self.localUserNat == nil {
@@ -6068,6 +6562,7 @@ func (self *RemoteUserNatMultiClient) sendSmtpLocal(
 	if success {
 		self.packetStatsCounters.localEgressPacketCount.Add(1)
 		self.packetStatsCounters.localEgressByteCount.Add(int64(byteCount))
+		self.eventEpochChange()
 	}
 	return success
 }
@@ -6087,6 +6582,7 @@ func (self *RemoteUserNatMultiClient) rejectSmtpPacket(
 	}
 	self.packetStatsCounters.blockEgressPacketCount.Add(1)
 	self.packetStatsCounters.blockEgressByteCount.Add(int64(byteCount))
+	self.eventEpochChange()
 	self.logSparseSendDrop("smtp encryption", &self.sendSmtpDropCount, errSmtpEncryptionRequired)
 	deliverTcpPolicyReset(self.deliverReceivePacket, source, provideMode, ipPath, packet)
 }
@@ -6168,6 +6664,18 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 	packet []byte,
 	timeout time.Duration,
 ) bool {
+	return self.sendPacketWithPolicy(source, provideMode, packet, timeout, false)
+}
+
+// Takes on success; native input changes only remote admission, after local
+// policy classification. Fragment, SMTP and local ownership remain unchanged.
+func (self *RemoteUserNatMultiClient) sendPacketWithPolicy(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	packet []byte,
+	timeout time.Duration,
+	nativeIngress bool,
+) bool {
 	if isIpFragmentPacket(packet) {
 		result := self.egressIpv4Fragments.processOwned(
 			source,
@@ -6176,12 +6684,13 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 			packet,
 		)
 		if result.packet != nil {
-			if self.sendReassembledUdpFragments(
+			if self.sendReassembledUdpFragmentsWithPolicy(
 				source,
 				provideMode,
 				result.packet,
 				result.fragments,
 				timeout,
+				nativeIngress,
 			) {
 				result.fragments = nil
 			}
@@ -6256,7 +6765,7 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 	blockerActive := config.blocker != nil && config.blocker.Enabled()
 	var decision *blockActionDecision
 	if !ignored && (blockActionState.matcher != nil || self.blockActionCollector.hasCallbacks() || blockerActive) {
-		decision = self.blockActionDecision(blockActionState, config.blocker, blockerActive, ipPath)
+		decision = self.blockActionDecision(blockActionState, config.blocker, blockerActive, ipPath, config)
 	}
 	var match *blockActionMatch
 	blockerBlock := false
@@ -6276,11 +6785,13 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 	byteCount := ByteCount(len(packet))
 	if decision != nil && self.blockActionCollector.hasCallbacks() {
 		self.blockActionCollector.add(decision, block, local, match, blockActionReason(r, securityReason, blockerBlock, match), byteCount)
+		self.eventEpochChange()
 	}
 
 	if block {
 		self.packetStatsCounters.blockEgressPacketCount.Add(1)
 		self.packetStatsCounters.blockEgressByteCount.Add(int64(byteCount))
+		self.eventEpochChange()
 		if reject {
 			self.deliverPolicyReject(source, provideMode, ipPath, packet)
 		}
@@ -6291,6 +6802,7 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 		if success {
 			self.packetStatsCounters.localEgressPacketCount.Add(1)
 			self.packetStatsCounters.localEgressByteCount.Add(int64(byteCount))
+			self.eventEpochChange()
 		}
 		return success
 	}
@@ -6304,7 +6816,7 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 		pin.appId = self.flowOwnerAppId(ipPath, *lookupPtr)
 	}
 
-	parsedPacket := &parsedPacket{
+	parsed := &parsedPacket{
 		packet:  packet,
 		ipPath:  ipPath,
 		payload: payload,
@@ -6315,9 +6827,18 @@ func (self *RemoteUserNatMultiClient) SendPacket(
 			byteCount,
 		),
 	}
-	success := self.sendPacket(source, provideMode, parsedPacket, timeout)
+	success := false
+	if nativeIngress {
+		success = self.sendNativeParsedPacketGroup(source, provideMode, &parsedPacketGroup{
+			packets: []parsedPacket{*parsed}, ipPath: parsed.ipPath,
+			pin: parsed.pin, byteCount: ByteCount(len(packet)),
+			transportAttribution: parsed.transportAttribution,
+		})
+	} else {
+		success = self.sendPacket(source, provideMode, parsed, timeout)
+	}
 	if success {
-		parsedPacket.transportAttribution.admit()
+		parsed.transportAttribution.admit()
 	}
 	return success
 }
@@ -6333,6 +6854,19 @@ func (self *RemoteUserNatMultiClient) sendReassembledUdpFragments(
 	reassembled []byte,
 	fragments [][]byte,
 	timeout time.Duration,
+) bool {
+	return self.sendReassembledUdpFragmentsWithPolicy(source, provideMode, reassembled, fragments, timeout, false)
+}
+
+// Fragment custody is unchanged; the reassembled policy decision chooses the
+// local timeout or a single ready remote offer for the exact original fragments.
+func (self *RemoteUserNatMultiClient) sendReassembledUdpFragmentsWithPolicy(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	reassembled []byte,
+	fragments [][]byte,
+	timeout time.Duration,
+	nativeIngress bool,
 ) bool {
 	if len(fragments) == 0 {
 		return false
@@ -6358,7 +6892,7 @@ func (self *RemoteUserNatMultiClient) sendReassembledUdpFragments(
 	blockerActive := config.blocker != nil && config.blocker.Enabled()
 	var decision *blockActionDecision
 	if !ignored && (blockActionState.matcher != nil || self.blockActionCollector.hasCallbacks() || blockerActive) {
-		decision = self.blockActionDecision(blockActionState, config.blocker, blockerActive, ipPath)
+		decision = self.blockActionDecision(blockActionState, config.blocker, blockerActive, ipPath, config)
 	}
 	var match *blockActionMatch
 	blockerBlock := false
@@ -6381,11 +6915,13 @@ func (self *RemoteUserNatMultiClient) sendReassembledUdpFragments(
 		byteCount += fragmentByteCount
 		if decision != nil && self.blockActionCollector.hasCallbacks() {
 			self.blockActionCollector.add(decision, block, local, match, actionReason, fragmentByteCount)
+			self.eventEpochChange()
 		}
 	}
 	if block {
 		self.packetStatsCounters.blockEgressPacketCount.Add(int64(len(fragments)))
 		self.packetStatsCounters.blockEgressByteCount.Add(int64(byteCount))
+		self.eventEpochChange()
 		if reject {
 			self.deliverPolicyReject(source, provideMode, ipPath, reassembled)
 		}
@@ -6402,6 +6938,7 @@ func (self *RemoteUserNatMultiClient) sendReassembledUdpFragments(
 		}
 		self.packetStatsCounters.localEgressPacketCount.Add(int64(len(fragments)))
 		self.packetStatsCounters.localEgressByteCount.Add(int64(byteCount))
+		self.eventEpochChange()
 		return true
 	}
 
@@ -6429,15 +6966,22 @@ func (self *RemoteUserNatMultiClient) sendReassembledUdpFragments(
 			byteCount,
 		),
 	}
-	if !self.sendParsedPacketGroup(source, provideMode, parsedGroup, timeout) {
+	success := false
+	if nativeIngress {
+		success = self.sendNativeParsedPacketGroup(source, provideMode, parsedGroup)
+	} else {
+		success = self.sendParsedPacketGroup(source, provideMode, parsedGroup, timeout)
+	}
+	if !success {
 		return false
 	}
 	parsedGroup.transportAttribution.admit()
 	return true
 }
 
-// Consumes a packet burst after grouping it by exact directional flow. One
-// group is accepted or rejected as a unit; malformed packets are returned.
+// Consumes a packet burst grouped by exact directional flow and TCP SYN
+// generation. Each group is accepted or rejected as a unit; an old prefix
+// and a following new-SYN segment have independent indexed outcomes.
 func (self *RemoteUserNatMultiClient) SendPacketBatch(
 	source TransferPath,
 	provideMode protocol.ProvideMode,
@@ -6475,6 +7019,19 @@ func (self *RemoteUserNatMultiClient) sendPacketBatch(
 	timeout time.Duration,
 	accepted []bool,
 ) int {
+	return self.sendPacketBatchWithPolicy(source, provideMode, packets, timeout, accepted, false)
+}
+
+// Takes all originals. Native policy is per invocation, not cached on a flow,
+// so ordinary blocking callers retain their original timeout and ordering.
+func (self *RemoteUserNatMultiClient) sendPacketBatchWithPolicy(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	packets [][]byte,
+	timeout time.Duration,
+	accepted []bool,
+	nativeIngress bool,
+) int {
 	containsFragments := false
 	for _, packet := range packets {
 		if isIpFragmentPacket(packet) {
@@ -6483,7 +7040,7 @@ func (self *RemoteUserNatMultiClient) sendPacketBatch(
 		}
 	}
 	if !containsFragments {
-		return self.sendCompletePacketBatch(source, provideMode, packets, timeout, accepted)
+		return self.sendCompletePacketBatchWithPolicy(source, provideMode, packets, timeout, accepted, nativeIngress)
 	}
 
 	// Preserve wire order around a fragmented datagram. Ordinary contiguous
@@ -6498,12 +7055,13 @@ func (self *RemoteUserNatMultiClient) sendPacketBatch(
 			if accepted != nil {
 				completeAccepted = accepted[completeStart:end]
 			}
-			acceptedCount += self.sendCompletePacketBatch(
+			acceptedCount += self.sendCompletePacketBatchWithPolicy(
 				source,
 				provideMode,
 				packets[completeStart:end],
 				timeout,
 				completeAccepted,
+				nativeIngress,
 			)
 		}
 	}
@@ -6512,7 +7070,7 @@ func (self *RemoteUserNatMultiClient) sendPacketBatch(
 			continue
 		}
 		flushComplete(i)
-		if self.SendPacket(source, provideMode, packet, timeout) {
+		if self.sendPacketWithPolicy(source, provideMode, packet, timeout, nativeIngress) {
 			acceptedCount++
 			if accepted != nil {
 				accepted[i] = true
@@ -6531,6 +7089,19 @@ func (self *RemoteUserNatMultiClient) sendCompletePacketBatch(
 	timeout time.Duration,
 	accepted []bool,
 ) int {
+	return self.sendCompletePacketBatchWithPolicy(source, provideMode, packets, timeout, accepted, false)
+}
+
+// Native input has no pending remote continuation; each exact-flow group is
+// offered once, while the existing local protocol timeout stays authoritative.
+func (self *RemoteUserNatMultiClient) sendCompletePacketBatchWithPolicy(
+	source TransferPath,
+	provideMode protocol.ProvideMode,
+	packets [][]byte,
+	timeout time.Duration,
+	accepted []bool,
+	nativeIngress bool,
+) int {
 	// The legacy hot path retains neither this map nor per-group indexes;
 	// even ipPacketGroup's allocation size is unchanged by diagnostics.
 	var packetIndexes map[*ipPacketGroup][]int
@@ -6543,6 +7114,7 @@ func (self *RemoteUserNatMultiClient) sendCompletePacketBatch(
 		self.settings.PacketGroupMaxByteCount,
 		packetIndexes,
 	)
+	groups = splitAffinitySynGroups(groups, packetIndexes)
 	for _, packet := range rejectedPackets {
 		MessagePoolReturn(packet)
 	}
@@ -6550,7 +7122,7 @@ func (self *RemoteUserNatMultiClient) sendCompletePacketBatch(
 	sentPacketCount := 0
 	batch := ipPacketGroupBatch{
 		timeout:   timeout,
-		readyPass: 1 < len(groups) && timeout != 0,
+		readyPass: !nativeIngress && 1 < len(groups) && timeout != 0,
 		send: func(group *ipPacketGroup, sendTimeout time.Duration) bool {
 			return self.sendPacketGroup(source, provideMode, group, sendTimeout)
 		},
@@ -6575,7 +7147,7 @@ func (self *RemoteUserNatMultiClient) sendCompletePacketBatch(
 			// Preserve that per-packet result instead of applying the ordinary
 			// all-or-nothing flow-group transaction.
 			for packetIndex, packet := range group.packets {
-				if self.SendPacket(source, provideMode, packet, timeout) {
+				if self.sendPacketWithPolicy(source, provideMode, packet, timeout, nativeIngress) {
 					sentPacketCount += 1
 					if accepted != nil {
 						accepted[packetIndexes[group][packetIndex]] = true
@@ -6584,6 +7156,15 @@ func (self *RemoteUserNatMultiClient) sendCompletePacketBatch(
 					MessagePoolReturn(packet)
 				}
 			}
+			continue
+		}
+		if nativeIngress {
+			var admitted func(int)
+			if accepted != nil {
+				indexes := packetIndexes[group]
+				admitted = func(index int) { accepted[indexes[index]] = true }
+			}
+			sentPacketCount += self.sendNativePacketGroupWithResults(source, provideMode, group, timeout, admitted)
 			continue
 		}
 		batch.offer(group)
@@ -6631,7 +7212,7 @@ func (self *RemoteUserNatMultiClient) sendPacketGroup(
 	blockerActive := config.blocker != nil && config.blocker.Enabled()
 	var decision *blockActionDecision
 	if !ignored && (blockActionState.matcher != nil || self.blockActionCollector.hasCallbacks() || blockerActive) {
-		decision = self.blockActionDecision(blockActionState, config.blocker, blockerActive, ipPath)
+		decision = self.blockActionDecision(blockActionState, config.blocker, blockerActive, ipPath, config)
 	}
 	var match *blockActionMatch
 	blockerBlock := false
@@ -6687,10 +7268,12 @@ func (self *RemoteUserNatMultiClient) sendPacketGroup(
 				ByteCount(len(packet)),
 			)
 		}
+		self.eventEpochChange()
 	}
 	if block {
 		self.packetStatsCounters.blockEgressPacketCount.Add(int64(len(group.packets)))
 		self.packetStatsCounters.blockEgressByteCount.Add(int64(group.byteCount))
+		self.eventEpochChange()
 		if reject {
 			self.deliverPolicyReject(source, provideMode, ipPath, group.packets[len(group.packets)-1])
 		}
@@ -6750,6 +7333,7 @@ func (self *RemoteUserNatMultiClient) sendPreparedPacketGroup(
 		}
 		self.packetStatsCounters.localEgressPacketCount.Add(int64(len(group.packets)))
 		self.packetStatsCounters.localEgressByteCount.Add(int64(group.byteCount))
+		self.eventEpochChange()
 		return true
 	}
 	if parsedGroup == nil || !self.sendParsedPacketGroupAttempt(
@@ -6764,37 +7348,41 @@ func (self *RemoteUserNatMultiClient) sendPreparedPacketGroup(
 // the cached override match, blocker match, and server names for a
 // destination. the external lookups (server names, cluster) run outside the
 // cache lock
-func (self *RemoteUserNatMultiClient) blockActionDecision(state *blockActionState, blocker Blocker, blockerActive bool, ipPath *IpPath) *blockActionDecision {
+func (self *RemoteUserNatMultiClient) blockActionDecision(state *blockActionState, blocker Blocker, blockerActive bool, ipPath *IpPath, configs ...*multiClientConfig) *blockActionDecision {
 	addr, ok := ipAssocAddr(ipPath.DestinationIp)
 	if !ok {
 		return nil
 	}
 
+	// Capture invalidation before source ownership so a pre-shed snapshot
+	// cannot obtain a post-shed cache token.
+	cacheEpoch := self.blockActionCache.epoch.Load()
 	var clusterVersion uint64
+	var members []netip.Addr
 	if self.ipAssoc != nil {
-		clusterVersion = self.ipAssoc.ClusterVersion()
+		clusterVersion, members = self.ipAssoc.clusterMembers(addr)
 	}
 	now := time.Now()
 
-	if decision := self.blockActionCache.get(addr, state.version, clusterVersion, blockerActive, now); decision != nil {
-		return decision
-	}
-
-	// decisions are made on the cluster level.
-	// a destination with no cluster is a cluster of itself
-	clusterIps := []netip.Addr{addr}
-	if self.ipAssoc != nil {
-		if members := self.ipAssoc.GetClusterAddrs(addr); 0 < len(members) {
-			clusterIps = members
+	// Packet callers bind the immutable config they sampled before entering
+	// this method. An old caller cannot acquire a post-replacement cache epoch.
+	if len(configs) == 0 || self.config.Load() == configs[0] {
+		if decision := self.blockActionCache.get(addr, state.version, clusterVersion, blockerActive, now); decision != nil {
+			return decision
 		}
 	}
-	slices.SortFunc(clusterIps, func(a netip.Addr, b netip.Addr) int {
-		return a.Compare(b)
-	})
+
+	// A published cluster is already ordered and immutable; singleton state
+	// belongs to this decision. No per-destination cluster backing is copied.
+	clusterIps := members
+	if len(clusterIps) == 0 {
+		clusterIps = []netip.Addr{addr}
+	}
 
 	decision := &blockActionDecision{
 		overridesVersion: state.version,
 		clusterVersion:   clusterVersion,
+		cacheEpoch:       cacheEpoch,
 		blockerEnabled:   blockerActive,
 		expireTime:       now.Add(self.blockActionCache.ttl),
 		clusterKey:       clusterIps[0],
@@ -6815,8 +7403,13 @@ func (self *RemoteUserNatMultiClient) blockActionDecision(state *blockActionStat
 			}
 		}
 		if match != nil {
-			// the match extends over the destination's entire cluster
-			state.matcher.matchAddr(match, member, memberServerNames)
+			// the match extends over the destination's entire cluster,
+			// except that a local route stays with the destination
+			if member == addr {
+				state.matcher.matchAddr(match, member, memberServerNames)
+			} else {
+				state.matcher.matchClusterMember(match, member, memberServerNames)
+			}
 		}
 		if blockerActive && member == addr {
 			// the blocker matches the destination itself: its ip and its own
@@ -6832,7 +7425,14 @@ func (self *RemoteUserNatMultiClient) blockActionDecision(state *blockActionStat
 	if match != nil && match.any() {
 		decision.match = match
 	}
-	self.blockActionCache.put(addr, decision)
+	// Retired overrides or a changed blocker may finish for this caller but
+	// cannot establish reusable cache ownership.
+	current := self.blockActionState.Load()
+	if (len(configs) == 0 || self.config.Load() == configs[0]) &&
+		(current == nil || current.version == state.version) &&
+		(blocker == nil && !blockerActive || blocker != nil && blocker.Enabled() == blockerActive) {
+		self.blockActionCache.putForSource(addr, decision, self.ipAssoc)
+	}
 	return decision
 }
 
@@ -6953,16 +7553,50 @@ func (self *RemoteUserNatMultiClient) TcpCollapseDropCount() uint64 {
 	return self.tcpCollapseDropCount.Load()
 }
 
+// AddTransportDelayStatsCallback subscribes to the per-interval delay stats of
+// every window client's transports, passed through unchanged (DELAY.md §9).
+// Callbacks run on transport goroutines and must not block.
+func (self *RemoteUserNatMultiClient) AddTransportDelayStatsCallback(callback TransportDelayStatsFunction) func() {
+	callbackId := self.transportDelayStatsCallbacks.Add(callback)
+	return func() {
+		self.transportDelayStatsCallbacks.Remove(callbackId)
+	}
+}
+
+func (self *RemoteUserNatMultiClient) publishTransportDelayStats(stats *TransportDelayStats) {
+	for _, callback := range self.transportDelayStatsCallbacks.Get() {
+		HandleError(func() {
+			callback(stats)
+		})
+	}
+}
+
 // AddPacketStatsCallback registers a listener fired on the event epoch when the
 // packet stats change
 func (self *RemoteUserNatMultiClient) AddPacketStatsCallback(packetStatsCallback PacketStatsFunction) func() {
 	callbackId := self.packetStatsCallbacks.Add(packetStatsCallback)
+	// wake a parked epoch: the first listener is owed the counters as they
+	// stand
+	self.eventEpochChange()
 	return func() {
 		self.packetStatsCallbacks.Remove(callbackId)
 	}
 }
 
 func (self *RemoteUserNatMultiClient) canSendPacket(
+	sendPacket *parsedPacket,
+	update *multiClientChannelUpdate,
+	currentClient *multiClientChannel,
+) bool {
+	if sendPacket.ipPath.Protocol != IpProtocolTcp || !self.settings.TcpCollapsePrevention {
+		return true
+	}
+	update.stateLock.Lock()
+	defer update.stateLock.Unlock()
+	return self.canSendPacketWithLock(sendPacket, update, currentClient)
+}
+
+func (self *RemoteUserNatMultiClient) canSendPacketWithLock(
 	sendPacket *parsedPacket,
 	update *multiClientChannelUpdate,
 	currentClient *multiClientChannel,
@@ -6981,20 +7615,20 @@ func (self *RemoteUserNatMultiClient) canSendPacket(
 			currentClient.ipPacketTransferAckRequired(ipPath)
 		if self.settings.TcpCollapsePrevention && transferAckRequired {
 			// limit sender tcp collapse
-			// As soon as a packet is sent to a client, Transfer either commits it
-			// end to end or the client is dropped. Inner retransmits do not need to
-			// be sent again while that exact Transfer item is still recovering.
+			// Transfer owns recovery through provider queue admission, not the
+			// provider's later bounded TCP reorder decision. A real inner ACK
+			// permits one covered retry spanning its now-in-order frontier.
 			// By default elapsed time cannot revoke that ownership: an admitted
 			// new SYN generation, flow clear, or ownership invalidation can. The
 			// optional positive hold below preserves the timed-escape policy.
 			if ipPath.Rst {
 				allow = true
-			} else if update.canUpdateSequenceForClient(sendPacket, currentClient) {
+			} else if update.canUpdateSequenceForClientWithLock(sendPacket, currentClient, true) {
 				// sequence state is guarded by the per-flow `stateLock`, not
 				// the parent `stateLock`
 				allow = true
 			} else if tcpCollapseMaxHold := self.reliabilitySettings().TcpCollapseMaxHold; 0 < tcpCollapseMaxHold &&
-				update.releaseSequenceHold(tcpCollapseMaxHold) {
+				update.releaseSequenceHoldWithLock(tcpCollapseMaxHold) {
 				// Explicit positive overrides permit an aged duplicate. This
 				// read-only offer does not consume the escape on queue refusal.
 				allow = true
@@ -7008,19 +7642,60 @@ func (self *RemoteUserNatMultiClient) canSendPacket(
 	return
 }
 
-// Applies collapse prevention once to a group. If any member can advance the
-// flow, the whole ordered group stays intact; a fully redundant group drops.
+// Compatibility callers supply an explicit owner. All members still share
+// one flow lock; production selection uses the receipt-returning gate below.
 func (self *RemoteUserNatMultiClient) canSendPacketGroup(
-	sendPacketGroup *parsedPacketGroup,
+	group *parsedPacketGroup,
 	update *multiClientChannelUpdate,
-	currentClient *multiClientChannel,
+	client *multiClientChannel,
 ) bool {
-	for packetIndex := range sendPacketGroup.packets {
-		if self.canSendPacket(&sendPacketGroup.packets[packetIndex], update, currentClient) {
+	if group.ipPath.Protocol != IpProtocolTcp || !self.settings.TcpCollapsePrevention {
+		return len(group.packets) != 0
+	}
+	update.stateLock.Lock()
+	defer update.stateLock.Unlock()
+	if group.onlyPureTcpAcks() {
+		return true
+	}
+	for index := range group.packets {
+		if self.canSendPacketWithLock(&group.packets[index], update, client) {
 			return true
 		}
 	}
 	return false
+}
+
+// Applies collapse prevention once to a group. If any member can advance the
+// flow, the whole ordered group stays intact; a fully redundant group drops.
+func (self *RemoteUserNatMultiClient) canSendPacketGroupSelection(
+	sendPacketGroup *parsedPacketGroup,
+	update *multiClientChannelUpdate,
+) (*multiClientAffinitySelection, bool) {
+	if (sendPacketGroup.ipPath.Protocol != IpProtocolTcp || !self.settings.TcpCollapsePrevention) && !sendPacketGroup.isSynRetry() {
+		return update.client.loadSelection(), len(sendPacketGroup.packets) != 0
+	}
+	update.stateLock.Lock()
+	defer update.stateLock.Unlock()
+	selection := update.client.loadSelection()
+	if sendPacketGroup.isSynRetry() && (!sendPacketGroup.validSynRetryWithLock(update) || selection != nil || !self.synRetryDispatchEligibleWithLock(update, sendPacketGroup.synRetry.raceOrder)) {
+		if self.ctx.Err() == nil && sendPacketGroup.validSynRetryWithLock(update) {
+			update.synRetry.preserveRaceRequestWithLock(sendPacketGroup.synRetry.raceOrder)
+		}
+		return selection, false
+	}
+	if sendPacketGroup.onlyPureTcpAcks() {
+		return selection, true
+	}
+	var currentClient *multiClientChannel
+	if selection != nil {
+		currentClient = selection.client
+	}
+	for packetIndex := range sendPacketGroup.packets {
+		if self.canSendPacketWithLock(&sendPacketGroup.packets[packetIndex], update, currentClient) {
+			return selection, true
+		}
+	}
+	return selection, false
 }
 
 func (self *RemoteUserNatMultiClient) sendPacket(
@@ -7046,7 +7721,8 @@ func (self *RemoteUserNatMultiClient) sendPacket(
 // multiRaceClientCount is how many of the orderedCount race candidates one
 // cold-start race dials: all of them, truncated to configuredCount when that is
 // set (MultiRaceClientCount), and further to degradedCount while the backend is
-// degraded (MultiRaceDegradedClientCount). A zero count leaves its bound off.
+// degraded or a candidate's client is rate limited
+// (MultiRaceDegradedClientCount). A zero count leaves its bound off.
 func multiRaceClientCount(orderedCount int, configuredCount int, degradedCount int, degraded bool) int {
 	count := orderedCount
 	if 0 < configuredCount && configuredCount < count {
@@ -7088,7 +7764,15 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 	completeObservations bool,
 	batchAdmission *ipPacketGroupAdmission,
 ) (success bool) {
+	nativeIngress := batchAdmission != nil && batchAdmission.nativeIngress || sendPacketGroup.isSynRetry()
+	if nativeIngress {
+		// This is a ready offer, not a shorter delivery or recovery deadline.
+		timeout = 0
+	}
 	defer func() {
+		if !success {
+			sendPacketGroup.collapseAdmission.releaseTcpRecovery()
+		}
 		if observations := sendPacketGroup.admissionObservations; observations != nil {
 			if completeObservations {
 				observations.complete(success)
@@ -7103,12 +7787,20 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 	firstPacket := &sendPacketGroup.packets[0]
 	ipPath := sendPacketGroup.ipPath
 	var sentUpdate *multiClientChannelUpdate
-	self.sendClientPath(ipPath, sendPacketGroup.pin, func(update *multiClientChannelUpdate, currentClient *multiClientChannel) {
+	self.sendAffinityClientPath(sendPacketGroup, timeout, func(update *multiClientChannelUpdate, currentClient *multiClientChannel, affinityTimeout time.Duration) {
+		timeout = affinityTimeout
 		defer update.releaseCollapseClaims()
 		sentUpdate = update
 		enterTime := time.Now()
-		for packetIndex := range sendPacketGroup.packets {
-			update.noteConnectAttempt(sendPacketGroup.packets[packetIndex].ipPath)
+		if !sendPacketGroup.isSynRetry() {
+			for packetIndex := range sendPacketGroup.packets {
+				path := sendPacketGroup.packets[packetIndex].ipPath
+				update.noteConnectAttempt(path)
+				if path.Protocol == IpProtocolTcp && path.Syn && !path.Ack {
+					sendPacketGroup.prepareSynRetry(source, provideMode, self, update, path)
+				}
+			}
+			self.requestDiscoveryForSourceSyn(update, ipPath)
 		}
 
 		// Client-side dial-failure inference. A connection attempt
@@ -7143,13 +7835,27 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 			// round.
 			if self.clientDialFailure(currentClient, ipPath, false) {
 				currentClient = nil
+				// Guarded inference withdrew the incumbent. Replacement admission
+				// is an ordinary race, not a reuse of that former selection.
+				sendPacketGroup.affinitySynReuse = false
 			}
 		}
-		if !self.canSendPacketGroup(sendPacketGroup, update, currentClient) {
+		if self.beforePacketGroupGateForTest != nil {
+			self.beforePacketGroupGateForTest(update, currentClient, sendPacketGroup)
+		}
+		gateSelection, canSend := self.canSendPacketGroupSelection(sendPacketGroup, update)
+		if gateSelection == nil || gateSelection.client != currentClient {
+			sendPacketGroup.affinitySynReuse = false
+		}
+		currentClient = nil
+		if gateSelection != nil {
+			currentClient = gateSelection.client
+		}
+		if !canSend {
 			if batchAdmission != nil {
 				batchAdmission.stop = true
 			}
-			self.tcpCollapseDropCount.Add(uint64(len(sendPacketGroup.packets)))
+			self.recordCollapsedPacketGroup(sendPacketGroup, batchAdmission)
 			return
 		}
 		// Passing the gate is only an offer. Neither SYN generation nor the
@@ -7159,7 +7865,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 		// Generation response ownership is also required when duplicate
 		// suppression is disabled: a new SYN may receive its reply inline.
 		if ipPath.Protocol == IpProtocolTcp {
-			if !sendPacketGroup.prepareCollapseAdmission(update, self) {
+			if !sendPacketGroup.prepareCollapseAdmissionWithRefusal(update, batchAdmission, self) {
 				if batchAdmission != nil {
 					batchAdmission.stop = true
 				}
@@ -7171,17 +7877,39 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 		// transition. Provider selection also calls this helper when its original
 		// nil snapshot becomes stale because another sender committed the flow.
 		sendBoundClient := func(client *multiClientChannel, sendTimeout time.Duration) bool {
-			if client == nil {
+			selection := update.client.loadSelection()
+			if selection != gateSelection {
+				selection, canSend = self.canSendPacketGroupSelection(sendPacketGroup, update)
+				gateSelection = selection
+				sendPacketGroup.affinitySynReuse = false
+			}
+			if selection == nil {
 				return false
 			}
+			if !canSend {
+				if batchAdmission != nil {
+					batchAdmission.stop = true
+				}
+				self.recordCollapsedPacketGroup(sendPacketGroup, batchAdmission)
+				return true
+			}
+			client = selection.client
+			sendPacketGroup.completionSelection = selection
 			sendPacketGroup.prepareAdmissionObservations(client)
 			var err error
 			success, err = client.SendGroupDetailed(sendPacketGroup, sendTimeout)
+			if !success && err == nil && update.client.loadSelection() != selection {
+				sendPacketGroup.affinitySynReuse = false
+				return false
+			}
 			if success {
 				// sequence state is guarded by the per-flow `stateLock`
-				update.commitSequenceGroupForClient(sendPacketGroup, client)
+				update.commitSequenceGroupForClient(sendPacketGroup, client, selection)
+				if dialProbePacket(ipPath) && sendPacketGroup.completionFlags.Load()&groupCompletionAdmitted != 0 {
+					update.startSynWait(client, selection, ipPath)
+				}
 			} else if err != nil {
-				if batchAdmission != nil && batchAdmission.probing &&
+				if (nativeIngress || batchAdmission != nil && batchAdmission.probing) &&
 					errors.Is(err, ErrEncryptionRequiredNotEstablished) {
 					// A readiness visit cannot turn the caller's still-live
 					// encryption wait into a provider reset.
@@ -7205,9 +7933,24 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 				// RST for a flow that is alive somewhere else. The swap
 				// failing means someone already moved this flow: there is
 				// nothing to reset and nothing to tell the app.
-				if !update.client.CompareAndSwap(client, nil) {
+				// A reset flow is dead to the app. The flow lock makes the
+				// unbind and the mark one step for the receive path's
+				// adoption, so no late answer can adopt the flow being reset.
+				unbound := func() bool {
+					update.stateLock.Lock()
+					defer update.stateLock.Unlock()
+					if selection == nil || selection.client != client || !update.client.clearSelection(selection) {
+						return false
+					}
+					update.discoveryAttemptStamp.Add(1)
+					update.sourceReset.Store(true)
+					update.clearSynRetryWithLock()
+					return true
+				}()
+				if !unbound {
 					return true
 				}
+				update.releaseSynRetryMemory()
 
 				self.log.Infof("[multi]reset error = %s\n", err)
 
@@ -7219,6 +7962,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 						ProvideMode: protocol.ProvideMode_Network,
 						IpPath:      update.ipPath,
 						Packet:      packet,
+						generation:  update,
 					}
 					rstPackets = append(rstPackets, rstPacket)
 				}
@@ -7266,6 +8010,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 		// 	return
 		// }
 
+		collapseStopped := false
 		raceClients := func(orderedClients []*multiClientChannel, sendTimeout time.Duration) {
 			// sendClientPath deliberately snapshots without holding the parent
 			// lock through admission. A concurrent sender can therefore bind this
@@ -7274,6 +8019,20 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 			// snapshot would otherwise wait forever without sending the packet.
 			if sendBoundClient(update.client.Load(), sendTimeout) {
 				return
+			}
+			if ipPath.Protocol == IpProtocolTcp && self.settings.TcpCollapsePrevention {
+				update.stateLock.Lock()
+				freshClients, collapsed := self.filterOwnedRaceSynCandidatesWithLock(sendPacketGroup, update, orderedClients)
+				update.stateLock.Unlock()
+				orderedClients = freshClients
+				if collapsed && len(orderedClients) == 0 {
+					collapseStopped = true
+					if batchAdmission != nil {
+						batchAdmission.stop = true
+					}
+					self.recordCollapsedPacketGroup(sendPacketGroup, batchAdmission)
+					return
+				}
 			}
 			switch len(orderedClients) {
 			case 0:
@@ -7293,8 +8052,18 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 						committedClient = client
 						return
 					}
+					if sendPacketGroup.isSynRetry() {
+						if sendPacketGroup.synRetry.raceOrder == 0 {
+							if update.race != nil {
+								return
+							}
+						} else if len(self.freshSynRetryCandidatesWithLock(sendPacketGroup, update, orderedClients)) != 1 {
+							return
+						}
+					}
 					if update.race == nil {
 						update.initRaceWithLock()
+						update.race.clientLimit = 1
 						// the race commits on the send: a signal that beats
 						// the commit undoes it (withdrawRaceCandidateWithLock)
 						update.race.single = true
@@ -7306,6 +8075,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 						race.clientStates[client] = state
 					}
 					state.pendingSendCount += 1
+					race.pendingSendCount += 1
 				}()
 				if committedClient != nil {
 					sendBoundClient(committedClient, sendTimeout)
@@ -7315,7 +8085,11 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 					return
 				}
 
+				if sendPacketGroup.isSynRetry() {
+					sendPacketGroup.noteSynRetryReadinessWidth(1)
+				}
 				sendPacketGroup.prepareAdmissionObservations(client)
+				sendPacketGroup.completionSelection = nil
 				// A one-candidate formation still has an initial race/probe
 				// attempt. Keep that first group reliable; once committed,
 				// sendBoundClient applies the ordinary NoAck UDP policy.
@@ -7324,13 +8098,18 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 				var abandonedClients []*multiClientChannel
 				var receivePackets []*receivePacket
 				var returnPackets []*receivePacket
+				var committedSelection *multiClientAffinitySelection
+				commitOnSend := false
+				retryRequested := false
 				connectSucceeded := false
 				func() {
 					update.stateLock.Lock()
 					defer update.stateLock.Unlock()
+					race.pendingSendCount -= 1
 					if update.race != race {
 						return
 					}
+					retryRequested = race.synRetryPending
 					state := race.clientStates[client]
 					if state == nil {
 						return
@@ -7348,15 +8127,29 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 					}
 					state.sentPacketCount += 1
 					race.sentPacketCount += 1
+					// A response-requiring singleton cannot revoke the other
+					// wide-race candidates. Send-only/ordinary data retains its
+					// existing immediate commitment and NoAck policy.
+					commitOnSend = race.single || !dialProbeAwaitsResponse(ipPath, state.sentPacketCount)
+					if !commitOnSend {
+						return
+					}
 					receivePackets, abandonedClients, returnPackets, connectSucceeded =
 						update.commitRaceClientWithLock(client)
+					committedSelection = update.client.loadSelection()
 				}()
+				if retryRequested {
+					self.enqueueSynRetryForRace(update, race.collapseOrder)
+				}
 				if !sent {
 					return
 				}
 
 				success = true
-				update.commitSequenceGroupForClient(sendPacketGroup, client)
+				if !commitOnSend {
+					return
+				}
+				update.commitSequenceGroupForClient(sendPacketGroup, client, committedSelection)
 				if connectSucceeded {
 					client.addConnectSuccess(update.ipPath.Version)
 					self.clearDestinationServiceFailure(client, update.ipPath)
@@ -7366,10 +8159,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 				if 0 < len(abandonedClients) {
 					if rstPacket, ok := ipOosRst(update.ipPath); ok {
 						for _, abandonedClient := range abandonedClients {
-							abandonedClient.Send(&parsedPacket{
-								packet: rstPacket,
-								ipPath: update.ipPath,
-							}, 0)
+							update.sendAffinityControl(abandonedClient, rstPacket, 0)
 						}
 					}
 				}
@@ -7386,17 +8176,22 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 				// A successful no-response commitment still starts its silence
 				// clock on the first probe. A synchronous response sets
 				// receivedInbound above and makes startSynWait a no-op.
-				if dialProbePacket(ipPath) && update.client.Load() == client {
-					update.startSynWait(client)
+				if dialProbePacket(ipPath) && sendPacketGroup.completionFlags.Load()&groupCompletionAdmitted != 0 {
+					update.startSynWait(client, committedSelection, ipPath)
 				}
 				return
 
 			default:
+				// a client whose contract requests are held races last, and a
+				// race that would still send to one is bounded like one during
+				// an outage (contractRateLimitHeldRaced)
+				raceTime := time.Now()
+				orderedClients = contractRateLimitHeldLast(orderedClients, raceTime)
 				raceOrderedClients := orderedClients[:multiRaceClientCount(
 					len(orderedClients),
 					self.settings.MultiRaceClientCount,
 					self.settings.MultiRaceDegradedClientCount,
-					self.backendDegraded(),
+					self.backendDegraded() || contractRateLimitHeldRaced(orderedClients, self.settings.MultiRaceClientCount, raceTime),
 				)]
 
 				// Publish the race and every candidate before any SendGroup call.
@@ -7407,7 +8202,6 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 				var race *multiClientChannelUpdateRace
 				var committedClient *multiClientChannel
 				var initRace *multiClientChannelUpdateRace
-				var initRaceEarlyComplete <-chan struct{}
 				func() {
 					update.stateLock.Lock()
 					defer update.stateLock.Unlock()
@@ -7415,10 +8209,22 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 						committedClient = client
 						return
 					}
+					if sendPacketGroup.isSynRetry() {
+						if sendPacketGroup.synRetry.raceOrder == 0 {
+							if update.race != nil {
+								return
+							}
+						} else {
+							raceOrderedClients = self.freshSynRetryCandidatesWithLock(sendPacketGroup, update, raceOrderedClients)
+							if len(raceOrderedClients) == 0 {
+								return
+							}
+						}
+					}
 					if update.race == nil {
 						update.initRaceWithLock()
+						update.race.clientLimit = len(raceOrderedClients)
 						initRace = update.race
-						initRaceEarlyComplete = initRace.completeMonitor.NotifyChannel()
 					}
 					race = update.race
 					now := time.Now()
@@ -7429,6 +8235,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 							race.clientStates[client] = state
 						}
 						state.pendingSendCount += 1
+						race.pendingSendCount += 1
 					}
 				}()
 				if committedClient != nil {
@@ -7439,11 +8246,14 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 					return
 				}
 
+				if sendPacketGroup.isSynRetry() {
+					sendPacketGroup.noteSynRetryReadinessWidth(len(raceOrderedClients))
+				}
 				var scheduleOnce sync.Once
 				scheduleRace := func() {
 					if initRace != nil {
 						scheduleOnce.Do(func() {
-							self.scheduleCompleteRace(update.ipPath, initRace, initRaceEarlyComplete)
+							self.scheduleCompleteRace(update.ipPath, initRace)
 						})
 					}
 				}
@@ -7471,12 +8281,15 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 					}
 
 					var abandonedClients []*multiClientChannel
+					retryRequested := false
 					func() {
 						update.stateLock.Lock()
 						defer update.stateLock.Unlock()
+						race.pendingSendCount -= 1
 						if update.race != race {
 							return
 						}
+						retryRequested = race.synRetryPending
 						state := race.clientStates[client]
 						if state == nil {
 							return
@@ -7486,6 +8299,12 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 							if state.pendingSendCount == 0 &&
 								state.sentPacketCount == 0 && len(state.packets) == 0 {
 								delete(race.clientStates, client)
+							}
+							// a race whose every candidate refused carries
+							// nothing; end it as the one-candidate send does,
+							// so the flow races afresh or adopts an answer
+							if len(race.clientStates) == 0 {
+								update.clearRaceWithLock()
 							}
 							return
 						}
@@ -7503,13 +8322,16 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 									abandonedClients = append(abandonedClients, abandonedClient)
 								}
 							}
-							update.client.Store(client)
+							update.selectAffinityClient(client)
 							update.sequenceCommittedRaceOrder = race.collapseOrder
 							update.commitCollapseClaimsWithLock(client)
 							update.clearRaceWithLock()
 						}
 					}()
 
+					if retryRequested {
+						self.enqueueSynRetryForRace(update, race.collapseOrder)
+					}
 					// Start the response deadline only after an admission call
 					// returns. Starting it at registration can expire the race
 					// while a bounded send is still waiting for queue capacity.
@@ -7517,10 +8339,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 					if 0 < len(abandonedClients) {
 						if rstPacket, ok := ipOosRst(update.ipPath); ok {
 							for _, abandonedClient := range abandonedClients {
-								abandonedClient.Send(&parsedPacket{
-									packet: rstPacket,
-									ipPath: update.ipPath,
-								}, 0)
+								update.sendAffinityControl(abandonedClient, rstPacket, 0)
 							}
 						}
 					}
@@ -7562,6 +8381,11 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 			if self.groupRaceCandidatesForTest != nil {
 				return self.groupRaceCandidatesForTest(sendPacketGroup)
 			}
+			// Data, UDP, pinned and already-established traffic retain their
+			// original field without another health walk.
+			preferHealthyWindows := ipPath.Protocol == IpProtocolTcp && ipPath.Syn && !ipPath.Ack &&
+				!sendPacketGroup.pin.pinned() && !update.receivedInbound.Load()
+			var failedFallback, benchedFallback []*multiClientChannel
 			for _, windowType := range self.selectWindowTypes(firstPacket, sendPacketGroup.pin.appId) {
 				if window, ok := self.windows[windowType]; ok {
 					var offerChanged *<-chan struct{}
@@ -7581,6 +8405,16 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 							orderedClients = crossed
 						} else if fallback := window.lastResortClientsForIpVersion(ipPath.Version); 0 < len(fallback) {
 							orderedClients = fallback
+						}
+					}
+					benchedField := false
+					if preferHealthyWindows || sendPacketGroup.isSynRetry() {
+						if healthy := healthyCrossWindowCandidates(orderedClients); 0 < len(healthy) {
+							orderedClients = healthy
+						} else {
+							// The compaction writes nothing when no healthy client
+							// exists, preserving this field's ordinary fallback order.
+							benchedField = true
 						}
 					}
 					orderedClients = self.filterDestinationServiceFailures(orderedClients, ipPath)
@@ -7606,22 +8440,69 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 						// narrows it. See scoredPlacementReorder.
 						orderedClients = self.scoredPlacementReorder(orderedClients, ipPath, sendPacketGroup.pin.appId)
 					}
-					// legacy selection unchanged: with the gate off (every
-					// current build's default), orderedClients is exactly what
-					// raceCandidates returned, untouched.
+					if sendPacketGroup.isSynRetry() && sendPacketGroup.synRetry.raceOrder != 0 {
+						hadOffer := len(orderedClients) != 0
+						update.stateLock.Lock()
+						orderedClients = self.freshSynRetryCandidatesWithLock(sendPacketGroup, update, orderedClients)
+						update.stateLock.Unlock()
+						if len(orderedClients) == 0 {
+							if hadOffer && sendPacketGroup.pin.pinned() {
+								return nil
+							}
+							continue
+						}
+					}
+					if sendPacketGroup.isSynRetry() && (benchedField || self.destinationServiceFailuresExhausted(orderedClients, ipPath)) {
+						// A pin keeps the first nonempty field even when its only
+						// offers have failed. Leave that fallback to a source retry.
+						if sendPacketGroup.pin.pinned() && 0 < len(orderedClients) {
+							return nil
+						}
+						continue
+					}
 					if 0 < len(orderedClients) {
-						return orderedClients
+						// Prefer ordinary healthy offers across permitted windows.
+						// Retain healthy service-failed and benched fields only
+						// when no unfailed healthy offer exists.
+						if !preferHealthyWindows || sendPacketGroup.pin.pinned() || update.receivedInbound.Load() {
+							return orderedClients
+						}
+						if benchedField {
+							if benchedFallback == nil {
+								benchedFallback = orderedClients
+							}
+							continue
+						}
+						if !self.destinationServiceFailuresExhausted(orderedClients, ipPath) {
+							return orderedClients
+						}
+						if failedFallback == nil {
+							failedFallback = orderedClients
+						}
 					}
 				}
 			}
-			return []*multiClientChannel{}
+			if sendPacketGroup.isSynRetry() {
+				return nil
+			}
+			if failedFallback != nil {
+				return failedFallback
+			}
+			return benchedFallback
 		}
 
 		raceClients(coalesceOrderedClients(), 0)
-		if success {
+		if success || collapseStopped {
 			return
 		}
 
+		// one timer for the retries, re-armed for each wait
+		var retryTimer *time.Timer
+		defer func() {
+			if retryTimer != nil {
+				retryTimer.Stop()
+			}
+		}()
 		for {
 			var retryTimeout time.Duration
 			if 0 <= timeout {
@@ -7663,14 +8544,14 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 					return
 				case <-qualityOfferChanged:
 				case <-speedOfferChanged:
-				case <-time.After(retryTimeout):
+				case <-resetOrCreateTimer(&retryTimer, retryTimeout):
 				}
 				continue
 			}
 
 			startTime := time.Now()
 			raceClients(orderedClients, retryTimeout)
-			if success {
+			if success || collapseStopped {
 				return
 			}
 			endTime := time.Now()
@@ -7680,7 +8561,7 @@ func (self *RemoteUserNatMultiClient) sendParsedPacketGroupAttempt(
 				select {
 				case <-update.ctx.Done():
 					return
-				case <-time.After(retryTimeout):
+				case <-resetOrCreateTimer(&retryTimer, retryTimeout):
 				}
 			}
 		}
@@ -7716,14 +8597,6 @@ const (
 	// unsynchronized read-then-write race is benign: losing a store leaves a
 	// stamp at most this much older than the truth.
 	uplinkStampCoarseness = 100 * time.Millisecond
-
-	// uplinkStalenessMaxHold caps how long continuous staleness may hold
-	// verdicts. The gate cannot tell a long network outage from a window
-	// whose every provider is dead -- both are tunnel-wide silence -- so past
-	// this bound it stops applying and the ordinary verdicts recycle the
-	// window. The epoch stays open: the clocks still rebase when receiving
-	// actually resumes, so the recycled channels' replacements start clean.
-	uplinkStalenessMaxHold = 60 * time.Second
 )
 
 // stampUplinkIngress records proof that the local uplink delivers. Called
@@ -7735,6 +8608,18 @@ func (self *RemoteUserNatMultiClient) stampUplinkIngress() {
 		return
 	}
 	self.uplinkLastIngressNanos.Store(nowNanos)
+}
+
+// uplinkLastIngress reads the ingress stamp: when a provider-originated packet
+// last arrived anywhere in the tunnel, at most uplinkStampCoarseness older than
+// the truth. Zero when nothing has arrived yet. A lock-free read, safe from any
+// goroutine; the windows read it through uplinkLastIngressFunc.
+func (self *RemoteUserNatMultiClient) uplinkLastIngress() time.Time {
+	lastNanos := self.uplinkLastIngressNanos.Load()
+	if lastNanos == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, lastNanos)
 }
 
 // sendingChannelCount reports how many channels across all windows currently
@@ -7833,7 +8718,9 @@ func (self *RemoteUserNatMultiClient) receivingChannelCount(exclude *multiClient
 // from. Safe on a bare client; called from every channel's detectBlackhole
 // cadence with no locks held.
 func (self *RemoteUserNatMultiClient) uplinkGate(now time.Time) (stale bool, freshSince time.Time) {
-	gate := self.reliabilitySettings().UplinkStalenessGate
+	reliabilitySettings := self.reliabilitySettings()
+	gate := reliabilitySettings.UplinkStalenessGate
+	maxHold := reliabilitySettings.UplinkStalenessMaxHold
 
 	timeStale := false
 	if 0 < gate {
@@ -7856,60 +8743,60 @@ func (self *RemoteUserNatMultiClient) uplinkGate(now time.Time) (stale bool, fre
 	// (false, uplinkFreshSince), and uplinkFreshSince is zero on a client that
 	// has never been gated or rebased -- the disabled-gate behavior unchanged.
 
-	self.uplinkStateLock.Lock()
-	defer self.uplinkStateLock.Unlock()
+	logState := ""
+	stale, freshSince = func() (bool, time.Time) {
+		self.uplinkStateLock.Lock()
+		defer self.uplinkStateLock.Unlock()
 
-	// the scheduler-pause recovery hold rides out on the same two values the
-	// migration case uses (see notifySchedulerPause): a suspend and a network
-	// migration are the same problem for the verdict layer -- evidence
-	// collected while nothing could arrive -- so they share one hold path
-	// instead of the channels learning about a second one.
-	pauseHold := !self.schedulerPauseHoldUntil.IsZero() && now.Before(self.schedulerPauseHoldUntil)
-
-	if timeStale {
-		if self.uplinkStaleSince.IsZero() {
-			self.uplinkStaleSince = now
-			self.uplinkCapLogged = false
-			// transitions only -- the passes in between are silent
-			loggerOrDefault(self.log).Infof("%s\n", relEvent("uplink", "state", "stale"))
-		}
-		if uplinkStalenessMaxHold <= now.Sub(self.uplinkStaleSince) {
-			// past the cap the gate stops applying so a genuinely dead window
-			// can be recycled. the epoch deliberately stays open: freshSince
-			// must not advance to here, or the recycle the cap exists to
-			// allow would be rebased away.
-			if !self.uplinkCapLogged {
-				self.uplinkCapLogged = true
-				loggerOrDefault(self.log).Infof("%s\n", relEvent(
-					"uplink",
-					"state", "cap",
-					"hold", uplinkStalenessMaxHold,
-				))
+		// Pause recovery and uplink migration share the same verdict hold.
+		pauseHold := !self.schedulerPauseHoldUntil.IsZero() && now.Before(self.schedulerPauseHoldUntil)
+		if timeStale {
+			if self.uplinkStaleSince.IsZero() {
+				self.uplinkStaleSince = now
+				self.uplinkCapLogged = false
+				logState = "stale"
 			}
-			// the cap releases the ingress-staleness hold only. an open
-			// scheduler-pause window is a different, bounded piece of evidence
-			// and keeps holding on its own timer.
-			return pauseHold, self.uplinkFreshSince
+			if maxHold <= now.Sub(self.uplinkStaleSince) {
+				// The epoch remains open at the cap: rebasing here would defer
+				// the recycle this cap permits. Pause recovery remains separate.
+				if !self.uplinkCapLogged {
+					self.uplinkCapLogged = true
+					logState = "cap"
+				}
+				return pauseHold, self.uplinkFreshSince
+			}
+			return true, self.uplinkFreshSince
 		}
-		return true, self.uplinkFreshSince
-	}
 
-	if !self.uplinkStaleSince.IsZero() {
-		// the stale epoch just ended. the receive-verdict clocks rebase from
-		// here, so verdicts held across the epoch restart instead of all
-		// firing at once on unfreeze.
-		self.uplinkStaleSince = time.Time{}
-		self.uplinkFreshSince = now
-		loggerOrDefault(self.log).Infof("%s\n", relEvent("uplink", "state", "fresh"))
+		if !self.uplinkStaleSince.IsZero() {
+			// Rebase held receive verdicts when ingress actually resumes.
+			self.uplinkStaleSince = time.Time{}
+			self.uplinkFreshSince = now
+			logState = "fresh"
+		}
+		return pauseHold, self.uplinkFreshSince
+	}()
+	// A slow sink must not retain the lock the shared pause detector needs.
+	if logState == "cap" {
+		loggerOrDefault(self.log).Infof("%s\n", relEvent("uplink", "state", logState, "hold", maxHold))
+	} else if logState != "" {
+		loggerOrDefault(self.log).Infof("%s\n", relEvent("uplink", "state", logState))
 	}
-	return pauseHold, self.uplinkFreshSince
+	return stale, freshSince
 }
 
-// schedulerPauseProbeInterval is how long the pause detector arms for on each
-// iteration. Short enough that a suspend is noticed on the first wakeup after
-// resume (the hold has to be in place before the channels' 1.25s verdict passes
-// run), long enough that the goroutine costs one wakeup per second.
-const schedulerPauseProbeInterval = 1 * time.Second
+// Detector-owned timing, shared by every client registered with that detector.
+type SchedulerPauseDetectorSettings struct {
+	// Time between probes. The one-second default notices resume before the
+	// ordinary verdict passes without adding more than one wakeup per second.
+	// Non-positive disables probes. A shared detector copies this at creation.
+	ProbeInterval time.Duration
+}
+
+// The private and shared detectors use the same probe cadence.
+func DefaultSchedulerPauseDetectorSettings() *SchedulerPauseDetectorSettings {
+	return &SchedulerPauseDetectorSettings{ProbeInterval: time.Second}
+}
 
 // schedulerPauseDetected is the whole detection rule: a timer armed for
 // `expected` that took `elapsed` to come back was not merely late, it was not
@@ -7938,43 +8825,177 @@ func schedulerPauseElapsed(start time.Time, now time.Time) time.Duration {
 	return now.Sub(start) + max(0, hostSlept(now, start))
 }
 
-// runSchedulerPauseDetector watches for the host stopping underneath us.
-//
-// The instrument is deliberately the crudest one available: arm a timer, see
-// how long it actually took (schedulerPauseElapsed). Everything else this
-// process could measure went away with the cpu -- no packets arrived, no acks
-// landed, no verdict pass ran -- so the only observable left is that wall-clock
-// time passed while we were not running. That is exactly what doze, the app
-// freezer, thermal throttling and a closed lid look like from in here.
-//
-// Plain time.After, NOT WakeupAfter: the wakeup scheduler intentionally
-// coalesces timers to save radio wakeups, and a coalesced fire is precisely the
-// "late" this loop would misread as a suspend.
-//
-// Tied to the multi-client ctx and not to `cancel`: like the prober, a detector
-// failure must never tear down the tunnel.
-func (self *RemoteUserNatMultiClient) runSchedulerPauseDetector() {
+// One pause timer serves a private client or all clients of a host. Every
+// client judges the same readings with its own tolerance and recovery hold.
+// Holds are applied before logs are queued, and logging never runs on the
+// timer goroutine. One separate worker owns at most one pending log per live
+// registration, coalescing repeated pauses while an external sink is slow.
+// Safe for concurrent subscription, unsubscription and Close.
+type SchedulerPauseDetector struct {
+	ctx      context.Context
+	cancel   context.CancelFunc
+	settings SchedulerPauseDetectorSettings
+	done     chan struct{}
+	logs     *schedulerPauseLogs
+
+	stateLock sync.Mutex
+	clients   map[*RemoteUserNatMultiClient]*schedulerPauseLogSlot
+}
+
+// Starts a detector with the default timing until ctx ends or Close is called.
+func NewSchedulerPauseDetector(ctx context.Context) *SchedulerPauseDetector {
+	return NewSchedulerPauseDetectorWithSettings(ctx, DefaultSchedulerPauseDetectorSettings())
+}
+
+// Copies the settings and starts the timer and logging workers. Nil settings
+// use the defaults. The logger worker never retains a client or detector.
+func NewSchedulerPauseDetectorWithSettings(ctx context.Context, settings *SchedulerPauseDetectorSettings) *SchedulerPauseDetector {
+	if settings == nil {
+		settings = DefaultSchedulerPauseDetectorSettings()
+	}
+	cancelCtx, cancel := context.WithCancel(ctx)
+	detector := &SchedulerPauseDetector{
+		ctx:      cancelCtx,
+		cancel:   cancel,
+		settings: *settings,
+		done:     make(chan struct{}),
+		logs:     newSchedulerPauseLogs(cancelCtx),
+		clients:  map[*RemoteUserNatMultiClient]*schedulerPauseLogSlot{},
+	}
+	go HandleError(detector.run)
+	return detector
+}
+
+// Cancels probes and releases registrations and pending logs immediately.
+// Logger calls have no cancellation contract: one already-entered log call
+// may finish later. Close does not join that external call; its worker exits
+// as soon as it returns, retaining only that scalar snapshot and logger.
+func (self *SchedulerPauseDetector) Close() {
+	self.cancel()
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		for _, slot := range self.clients {
+			self.logs.unsubscribe(slot)
+		}
+		clear(self.clients)
+	}()
+	self.logs.close()
+}
+
+// ClientCount is the number of clients the detector judges for.
+func (self *SchedulerPauseDetector) ClientCount() int {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	return len(self.clients)
+}
+
+func (self *SchedulerPauseDetector) subscribe(client *RemoteUserNatMultiClient) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.ctx.Err() != nil || (client.ctx != nil && client.ctx.Err() != nil) {
+		return
+	}
+	if _, ok := self.clients[client]; !ok {
+		self.clients[client] = &schedulerPauseLogSlot{log: loggerOrDefault(client.log), active: true}
+	}
+}
+
+func (self *SchedulerPauseDetector) unsubscribe(client *RemoteUserNatMultiClient) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if slot := self.clients[client]; slot != nil {
+		self.logs.unsubscribe(slot)
+	}
+	delete(self.clients, client)
+}
+
+// Arms a plain timer for the detector's life. WakeupAfter deliberately batches
+// wakeups, which would turn ordinary coalescing into false pause evidence.
+// Cancellation stops the timer independently of external logging.
+func (self *SchedulerPauseDetector) run() {
+	defer close(self.done)
+	defer self.Close()
+	probeInterval := self.settings.ProbeInterval
+	if probeInterval <= 0 {
+		<-self.ctx.Done()
+		return
+	}
+	probeTimer := time.NewTimer(probeInterval)
+	defer probeTimer.Stop()
+	// reused by each pass, so a pass allocates nothing
+	var observations []schedulerPauseObservation
 	for {
 		armed := time.Now()
 		select {
 		case <-self.ctx.Done():
 			return
-		case <-time.After(schedulerPauseProbeInterval):
+		case <-probeTimer.C:
 		}
-		self.observeSchedulerPause(armed, time.Now())
+		observations = self.observeSchedulerPause(observations[:0], armed, time.Now())
+		probeTimer.Reset(probeInterval)
 	}
+}
+
+// Only a detector pass holds clients. Logging receives scalar values and a
+// registration slot with no backlink to a client or detector.
+type schedulerPauseObservation struct {
+	client *RemoteUserNatMultiClient
+	slot   *schedulerPauseLogSlot
+	event  schedulerPauseLogEvent
+}
+
+// Judges one wait for every subscribed client, from the two readings of the
+// shared timer. All holds precede log publication. The pass buffer is cleared
+// before reuse so neither cancellation nor an idle timer retains old clients.
+func (self *SchedulerPauseDetector) observeSchedulerPause(observations []schedulerPauseObservation, armed time.Time, now time.Time) []schedulerPauseObservation {
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		for client, slot := range self.clients {
+			observations = append(observations, schedulerPauseObservation{client: client, slot: slot})
+		}
+	}()
+	publish := false
+	for i := range observations {
+		observations[i].event = observeSchedulerPauseIsolated(observations[i].client, armed, now, self.settings.ProbeInterval)
+		publish = publish || 0 < observations[i].event.pauseCount || observations[i].event.warning != ""
+	}
+	if publish {
+		self.logs.publish(observations)
+	}
+	clear(observations)
+	return observations
+}
+
+// One client's judgement. Even panic reporting is deferred to the log worker
+// so a logger cannot stop another client's hold publication.
+func observeSchedulerPauseIsolated(client *RemoteUserNatMultiClient, armed time.Time, now time.Time, probeInterval time.Duration) (event schedulerPauseLogEvent) {
+	defer func() {
+		if r := recover(); r != nil {
+			// The panic value may reference a client or run arbitrary formatting
+			// code. Preserve its type and stack as an immutable scalar instead.
+			event.warning = fmt.Sprintf("Unexpected scheduler pause error (%T):\n%s", r, debug.Stack())
+		}
+	}()
+	if client.ctx != nil && client.ctx.Err() != nil {
+		// a closing client leaves the detector; it is judged no more
+		return
+	}
+	return client.observeSchedulerPause(armed, now, probeInterval)
 }
 
 // Judges one wait of the pause detector, from the reading taken when it armed
 // and the one taken when it fired.
-func (self *RemoteUserNatMultiClient) observeSchedulerPause(armed time.Time, now time.Time) {
+func (self *RemoteUserNatMultiClient) observeSchedulerPause(armed time.Time, now time.Time, probeInterval time.Duration) schedulerPauseLogEvent {
 	// read the tolerance AFTER the wait so the runtime toggle takes effect
 	// without a reconnect, the same discipline the other loops here use
 	tolerance := self.reliabilitySettings().SchedulerPauseTolerance
 	elapsed := schedulerPauseElapsed(armed, now)
-	if schedulerPauseDetected(elapsed, schedulerPauseProbeInterval, tolerance) {
-		self.notifySchedulerPause(elapsed)
+	if schedulerPauseDetected(elapsed, probeInterval, tolerance) {
+		return self.notifySchedulerPause(elapsed)
 	}
+	return schedulerPauseLogEvent{}
 }
 
 // notifySchedulerPause records that the host was suspended and just resumed.
@@ -7993,7 +9014,7 @@ func (self *RemoteUserNatMultiClient) observeSchedulerPause(armed time.Time, now
 //
 // Lock discipline: only uplinkStateLock (a leaf) is taken, with nothing else
 // held. Safe on a bare client.
-func (self *RemoteUserNatMultiClient) notifySchedulerPause(elapsed time.Duration) {
+func (self *RemoteUserNatMultiClient) notifySchedulerPause(elapsed time.Duration) schedulerPauseLogEvent {
 	recoveryTimeout := self.reliabilitySettings().SchedulerPauseRecoveryTimeout
 	now := time.Now()
 	func() {
@@ -8007,13 +9028,188 @@ func (self *RemoteUserNatMultiClient) notifySchedulerPause(elapsed time.Duration
 		}
 	}()
 	self.reliabilityMetrics.schedulerPauseDetected()
-	// one line per detected pause -- a suspend is a rare, decisive event and
-	// the reconstruction of any wake-up incident starts here
-	loggerOrDefault(self.log).Infof("%s\n", relEvent(
-		"scheduler_pause",
-		"elapsed", elapsed.Round(time.Millisecond),
-		"hold", recoveryTimeout,
-	))
+	return schedulerPauseLogEvent{elapsed: elapsed, hold: recoveryTimeout, pauseCount: 1}
+}
+
+// Scalar evidence copied from a completed hold update. Repeated pauses retain
+// their count and latest timing when their logger cannot keep up.
+type schedulerPauseLogEvent struct {
+	elapsed    time.Duration
+	hold       time.Duration
+	pauseCount uint64
+	warning    string
+}
+
+// One pending record per live registration. No field points back to the
+// client or detector. All fields are guarded by schedulerPauseLogs.stateLock.
+type schedulerPauseLogSlot struct {
+	log      Logger
+	active   bool
+	pending  bool
+	previous *schedulerPauseLogSlot
+	next     *schedulerPauseLogSlot
+	event    schedulerPauseLogEvent
+}
+
+// One worker and at most one pending slot per subscription. Unsubscribe
+// removes a slot in constant time; Close releases all pending logger refs.
+// The worker takes one scalar snapshot at a time, never a batch of owners.
+type schedulerPauseLogs struct {
+	ctx       context.Context
+	notify    chan struct{}
+	done      chan struct{}
+	stateLock sync.Mutex
+	closed    bool
+	head      *schedulerPauseLogSlot
+	tail      *schedulerPauseLogSlot
+}
+
+// The worker is separate from the detector so an in-flight external logger
+// cannot retain the detector's clients after cancellation.
+func newSchedulerPauseLogs(ctx context.Context) *schedulerPauseLogs {
+	logs := &schedulerPauseLogs{
+		ctx:    ctx,
+		notify: make(chan struct{}, 1),
+		done:   make(chan struct{}),
+	}
+	go logs.run()
+	return logs
+}
+
+// Coalesces behind a slow sink without dropping a client's first pending
+// resume record. The timer never calls external logger methods here.
+func (self *schedulerPauseLogs) publish(observations []schedulerPauseObservation) {
+	notify := false
+	func() {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		if self.closed || self.ctx.Err() != nil {
+			return
+		}
+		for _, observation := range observations {
+			slot, event := observation.slot, observation.event
+			if !slot.active || (event.pauseCount == 0 && event.warning == "") {
+				continue
+			}
+			if 0 < event.pauseCount {
+				slot.event.elapsed = event.elapsed
+				slot.event.hold = event.hold
+				slot.event.pauseCount += event.pauseCount
+			}
+			if event.warning != "" {
+				slot.event.warning = event.warning
+			}
+			if !slot.pending {
+				slot.pending = true
+				slot.previous = self.tail
+				if self.tail != nil {
+					self.tail.next = slot
+				} else {
+					self.head = slot
+				}
+				self.tail = slot
+			}
+			notify = true
+		}
+	}()
+	if notify {
+		select {
+		case self.notify <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// Removes one queued record; called with the log queue lock held.
+func (self *schedulerPauseLogs) removeWithLock(slot *schedulerPauseLogSlot) {
+	if !slot.pending {
+		return
+	}
+	if slot.previous != nil {
+		slot.previous.next = slot.next
+	} else {
+		self.head = slot.next
+	}
+	if slot.next != nil {
+		slot.next.previous = slot.previous
+	} else {
+		self.tail = slot.previous
+	}
+	slot.pending = false
+	slot.previous = nil
+	slot.next = nil
+}
+
+// Retiring a client withdraws its pending logs even if another sink is held.
+func (self *schedulerPauseLogs) unsubscribe(slot *schedulerPauseLogSlot) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.removeWithLock(slot)
+	slot.active = false
+	slot.log = nil
+	slot.event = schedulerPauseLogEvent{}
+}
+
+// Stops admission and releases queued snapshots without joining an external
+// sink. Only the worker's already-entered scalar snapshot may outlive this.
+func (self *schedulerPauseLogs) close() {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.closed = true
+	for self.head != nil {
+		slot := self.head
+		self.removeWithLock(slot)
+		slot.active = false
+		slot.log = nil
+		slot.event = schedulerPauseLogEvent{}
+	}
+}
+
+// Taking a record transfers only its logger and scalar evidence to the one
+// worker. No slot/client collection survives a blocked logger call.
+func (self *schedulerPauseLogs) take() (Logger, schedulerPauseLogEvent, bool) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.closed || self.ctx.Err() != nil || self.head == nil {
+		return nil, schedulerPauseLogEvent{}, false
+	}
+	slot := self.head
+	self.removeWithLock(slot)
+	log, event := slot.log, slot.event
+	slot.event = schedulerPauseLogEvent{}
+	return log, event, true
+}
+
+// Logging is independent of timer progress and holds. A sink panic cannot
+// stop subsequent records; a sink that never returns retains this one worker,
+// because Logger has no cancellation contract.
+func (self *schedulerPauseLogs) run() {
+	defer close(self.done)
+	for {
+		select {
+		case <-self.ctx.Done():
+			return
+		case <-self.notify:
+		}
+		for {
+			log, event, ok := self.take()
+			if !ok {
+				break
+			}
+			HandleError(func() {
+				if event.warning != "" {
+					log.Warningf("%s\n", event.warning)
+				}
+				if 0 < event.pauseCount {
+					line := relEvent("scheduler_pause", "elapsed", event.elapsed.Round(time.Millisecond), "hold", event.hold)
+					if 1 < event.pauseCount {
+						line += fmt.Sprintf(" coalesced=%d", event.pauseCount-1)
+					}
+					log.Infof("%s\n", line)
+				}
+			})
+		}
+	}
 }
 
 // NotifyNetworkChanged is the parent seam for the host's network path change
@@ -8048,6 +9244,13 @@ func (self *RemoteUserNatMultiClient) NotifyNetworkChanged() {
 	// exactly how a capture tells them apart
 	loggerOrDefault(self.log).Infof("%s\n", relEvent("network_change", "rebased", true, "kick", true))
 	NetworkChanged()
+	// a window short of exits -- some lost in the outage, or a tunnel that
+	// started with no network -- re-evaluates on the new path now instead of
+	// at its next WindowResizeTimeout pass, and asks the platform again now
+	// instead of at the end of a backoff grown on the old path
+	for _, window := range self.windows {
+		window.notifyNetworkChanged()
+	}
 }
 
 // reliabilityMetricsRef hands the shared counters to the window channels via
@@ -8105,15 +9308,16 @@ func (self *RemoteUserNatMultiClient) runRemovalReceive() {
 			return
 		case packet := <-self.removalReceiveQueue:
 			if self.ctx.Err() != nil {
+				if packet.releaseAfterDelivery {
+					MessagePoolReturn(packet.Packet)
+				}
 				return
 			}
 			HandleError(func() {
-				self.deliverReceivePacket(
-					packet.Source,
-					packet.ProvideMode,
-					packet.IpPath,
-					packet.Packet,
-				)
+				if self.deliverAffinityReceivePacket(&packet) && packet.generation != nil &&
+					packet.generation.observeTcpControl(packet.tcpControl, true) {
+					self.retireCompletedTcpFlow(packet.generation)
+				}
 			})
 			if packet.releaseAfterDelivery {
 				MessagePoolReturn(packet.Packet)
@@ -8126,8 +9330,8 @@ func (self *RemoteUserNatMultiClient) runRemovalReceive() {
 // removal receive worker instead of the caller's goroutine. The caller is
 // the goroutine that drains the tun's outbound queue on the socks client and
 // the hosted proxy; delivering inline there made netstack's reply wait on a
-// queue only that goroutine drains (FLIGHTGATEFIX §13.4, M7). TCP control
-// observation stays synchronous because it is flow state, not delivery.
+// queue only that goroutine drains (FLIGHTGATEFIX §13.4, M7). Terminal TCP
+// control is observed only after actual application delivery, never at enqueue.
 //
 // Reordering bound: only this burst crosses the worker. Later packets of
 // the committed flow take the direct receive path and can reach the
@@ -8141,12 +9345,8 @@ func (self *RemoteUserNatMultiClient) deliverRaceCommitPackets(
 	client *multiClientChannel,
 	packets []*receivePacket,
 ) (completed bool) {
-	if update != nil {
-		for _, packet := range packets {
-			if update.observeTcpControl(packet.tcpControl, true) {
-				completed = true
-			}
-		}
+	for _, packet := range packets {
+		packet.generation = update
 	}
 	if self.settings != nil && self.settings.beforeRaceCommitDeliveryForTest != nil {
 		self.settings.beforeRaceCommitDeliveryForTest(client, len(packets))
@@ -8155,7 +9355,10 @@ func (self *RemoteUserNatMultiClient) deliverRaceCommitPackets(
 		// bare fixtures assemble the struct without a queue: deliver inline,
 		// the caller keeps ownership of the bytes
 		for _, packet := range packets {
-			self.deliverReceivePacket(packet.Source, packet.ProvideMode, packet.IpPath, packet.Packet)
+			if self.deliverAffinityReceivePacket(packet) && update != nil &&
+				update.observeTcpControl(packet.tcpControl, true) {
+				completed = true
+			}
 		}
 		return completed
 	}
@@ -8193,7 +9396,7 @@ func (self *RemoteUserNatMultiClient) enqueueRemovalReceive(packet *receivePacke
 	if self.removalReceiveQueue == nil {
 		// bare fixtures assemble the struct without a queue; deliver inline,
 		// which is the pre-queue behavior
-		self.deliverReceivePacket(packet.Source, packet.ProvideMode, packet.IpPath, packet.Packet)
+		self.deliverAffinityReceivePacket(packet)
 		return
 	}
 	select {
@@ -8317,6 +9520,12 @@ func (self *RemoteUserNatMultiClient) clientReceivePackets(
 	// Controls are committed only after their packets have been delivered.
 	var batchPackets [][]byte
 	var batchControls []pendingIngressTcpControl
+	var batchLeases []multiClientAffinityDeliveryLease
+	defer func() {
+		for _, lease := range batchLeases {
+			lease.release()
+		}
+	}()
 	var completedUpdates []*multiClientChannelUpdate
 	completeLater := func(update *multiClientChannelUpdate) {
 		for _, completed := range completedUpdates {
@@ -8330,6 +9539,14 @@ func (self *RemoteUserNatMultiClient) clientReceivePackets(
 		if len(batchPackets) == 0 {
 			return
 		}
+		defer func() {
+			for _, lease := range batchLeases {
+				lease.release()
+			}
+			batchLeases = batchLeases[:0]
+			batchPackets = batchPackets[:0]
+			batchControls = batchControls[:0]
+		}()
 		// The batch may span flows: the advisory per-flow ipPath is nil. This
 		// is the batched form of the documented synchronous device-TUN
 		// exception in deliverReceivePacket.
@@ -8339,8 +9556,6 @@ func (self *RemoteUserNatMultiClient) clientReceivePackets(
 				completeLater(pending.update)
 			}
 		}
-		batchPackets = batchPackets[:0]
-		batchControls = batchControls[:0]
 	}
 
 	for i := range packets {
@@ -8377,10 +9592,18 @@ func (self *RemoteUserNatMultiClient) clientReceivePackets(
 		// tail below needs a separately owned path for queued race packets.
 		reversed := ipPath.ReverseValue()
 
-		if update := self.receiveUpdate(&reversed); update != nil && update.client.Load() == sourceClient {
-			// committed-flow fast path: batch. the first-inbound mark still
-			// runs per packet -- it gates the dial-failure re-race and resets
-			// the dial-strike window, exactly as on the per-packet path.
+		if update := self.receiveUpdate(&reversed); update != nil && update.client.Load() == sourceClient && update.receivedInbound.Load() {
+			lease, admitted := self.acquireAffinityDelivery(&reversed, update)
+			if !admitted {
+				continue
+			}
+			if lease.parent != nil {
+				batchLeases = append(batchLeases, lease)
+			}
+			// Established flows batch application delivery, but every ack-bearing
+			// packet records recovery authority under the flow lock first. The
+			// first-answer resolve path below commits provider ownership under
+			// that same lock.
 			if update.markReceivedInbound(sourceClient, tcpControl) {
 				sourceClient.addConnectSuccess(update.ipPath.Version)
 				self.clearDestinationServiceFailure(sourceClient, update.ipPath)
@@ -8501,16 +9724,24 @@ func (self *RemoteUserNatMultiClient) clientReceivePacketResolve(
 	// parent stateLock, and this closure runs under the per-flow leaf lock.
 	var boundUpdate *multiClientChannelUpdate
 	var resolvedUpdate *multiClientChannelUpdate
+	// A flow with no client whose sender may adopt it, with no race or from
+	// outside its race (adoptRaced); the commit runs after receiveClientPath
+	// returns (see below).
+	var adoptUpdate *multiClientChannelUpdate
+	adoptRaced := false
 	success := self.receiveClientPath(ipPath, func(update *multiClientChannelUpdate) {
 		defer update.releaseCollapseClaims()
 		resolvedUpdate = update
-		// steady-state fast path: the flow is already committed to this client,
-		// so deliver without taking any lock (client is atomic). this is the
-		// common download path and no longer contends the parent stateLock.
-		if update.client.Load() == sourceClient {
-			// first inbound packet for this flow marks it established, which
-			// gates the dial-failure re-race (a stale signal must not unbind a
-			// flow already carrying data).
+		if !update.acceptsAffinityIngress(sourceClient, tcpControl) {
+			return
+		}
+		// Established-flow lookup avoids the parent stateLock; ack-bearing
+		// packets still take the flow lock before application delivery.
+		// A first answer takes the locked path below so concurrent unbinding
+		// cannot deliver it for a flow no longer on the answering provider.
+		if update.client.Load() == sourceClient && update.receivedInbound.Load() {
+			// Bind recovery authority to the current provider and syn cohort
+			// before the callback can trigger another send.
 			if update.markReceivedInbound(sourceClient, tcpControl) {
 				connectSucceeded = true
 				connectPath = update.ipPath
@@ -8521,19 +9752,24 @@ func (self *RemoteUserNatMultiClient) clientReceivePacketResolve(
 				IpPath:      ipPath,
 				Packet:      packet,
 				tcpControl:  tcpControl,
+				generation:  update,
 			}
 			receivePackets = []*receivePacket{p}
 			return
 		}
 
-		// race / not-yet-committed paths are guarded by the per-flow stateLock
+		// first-answer, race and not-yet-committed paths are guarded by the
+		// per-flow stateLock
 		update.stateLock.Lock()
 		defer update.stateLock.Unlock()
 
 		client := update.client.Load()
 
 		if client == sourceClient {
-			// committed between the lock-free check and acquiring the lock
+			// the flow's first answer, or committed between the lock-free
+			// check and acquiring the lock. The inference unbinds under this
+			// lock too, so the answer is marked and delivered only while the
+			// flow is still on its exit.
 			if update.markReceivedInboundWithLock(sourceClient, tcpControl) {
 				connectSucceeded = true
 				connectPath = update.ipPath
@@ -8544,16 +9780,29 @@ func (self *RemoteUserNatMultiClient) clientReceivePacketResolve(
 				IpPath:      ipPath,
 				Packet:      packet,
 				tcpControl:  tcpControl,
+				generation:  update,
 			}
 			receivePackets = []*receivePacket{p}
 		} else if client != nil {
 			// another client already chosen, drop
 		} else if race := update.race; race == nil {
-			// no race, no client, drop
-			self.log.Infof("[multi]receive no race and no client")
+			// no race, no client: adopted by its sender below when that is
+			// safe (adoptableInboundWithLock), otherwise dropped
+			if update.adoptableInboundWithLock(sourceClient, tcpControl) {
+				adoptUpdate = update
+			} else {
+				self.log.Infof("[multi]receive no race and no client")
+			}
 		} else if state, ok := race.clientStates[sourceClient]; !ok {
-			// this client is not part of the race, drop
-			self.log.Infof("[multi]receive client not part of race")
+			// this client is not part of the race: the exit that carried the
+			// attempt before the inference re-raced it joins the race below
+			// and wins it when that is safe (adoptableInboundWithLock),
+			// otherwise dropped
+			if update.adoptableInboundWithLock(sourceClient, tcpControl) {
+				adoptUpdate, adoptRaced = update, true
+			} else {
+				self.log.Infof("[multi]receive client not part of race")
+			}
 		} else if race.responseWindowElapsed {
 			// The comparison deadline does not expire the application's flow.
 			// With no earlier answer, the first live candidate still wins.
@@ -8562,7 +9811,7 @@ func (self *RemoteUserNatMultiClient) clientReceivePacketResolve(
 			}
 			state.packets = append(state.packets, &receivePacket{
 				Source: source, ProvideMode: provideMode, IpPath: ipPath,
-				Packet: packet, tcpControl: tcpControl,
+				Packet: packet, tcpControl: tcpControl, generation: update,
 			})
 			receivePackets, abandonedClients, returnPackets, connectSucceeded =
 				update.commitRaceClientWithLock(sourceClient)
@@ -8579,6 +9828,7 @@ func (self *RemoteUserNatMultiClient) clientReceivePacketResolve(
 				Packet:      packetCopy,
 				Pooled:      pooled,
 				tcpControl:  tcpControl,
+				generation:  update,
 			}
 			state.packets = append(state.packets, receivePacket)
 			if 1 == len(state.packets) {
@@ -8588,50 +9838,107 @@ func (self *RemoteUserNatMultiClient) clientReceivePacketResolve(
 			if len(state.packets) == 1 {
 				race.clientsWithPacketCount += 1
 				if int(float32(len(race.clientStates))*self.settings.MultiRaceClientEarlyCompleteFraction) <= race.clientsWithPacketCount {
-					race.completeMonitor.NotifyAll()
+					race.completeEarly()
 				}
 			}
 		} else {
 			// race buffer limits exceeded, end the race immediately
 			self.log.Infof("[multi]receive race buffer limit reached")
 
-			for abandonedClient, abandonedState := range race.clientStates {
-				if abandonedClient != sourceClient {
-					abandonedClients = append(abandonedClients, abandonedClient)
-					for _, p := range abandonedState.packets {
-						if p.Pooled {
-							p.Pooled = false
-							returnPackets = append(returnPackets, p)
-						}
-					}
-				}
-			}
-
-			update.client.Store(sourceClient)
-			update.sequenceCommittedRaceOrder = race.collapseOrder
-			update.commitCollapseClaimsWithLock(sourceClient)
-			update.clearRaceWithLock()
+			// Claim buffered owners before closing the race. The current
+			// callback packet remains borrowed and follows that buffered prefix.
+			receivePackets, abandonedClients, returnPackets, connectSucceeded =
+				update.commitRaceClientWithLock(sourceClient)
 			boundUpdate = update
+			if connectSucceeded {
+				connectPath = update.ipPath
+			}
 			receivePacket := &receivePacket{
 				Source:      source,
 				ProvideMode: provideMode,
 				IpPath:      ipPath,
 				Packet:      packet,
 				tcpControl:  tcpControl,
+				generation:  update,
 			}
-			receivePackets = append(state.packets, receivePacket)
-			for _, p := range receivePackets {
-				if update.markReceivedInboundWithLock(sourceClient, p.tcpControl) {
-					connectSucceeded = true
-					connectPath = update.ipPath
-				}
-				if p.Pooled {
-					p.Pooled = false
-					returnPackets = append(returnPackets, p)
-				}
+			receivePackets = append(receivePackets, receivePacket)
+			if update.markReceivedInboundWithLock(sourceClient, tcpControl) {
+				connectSucceeded = true
+				connectPath = update.ipPath
 			}
 		}
 	})
+	// The sender of inbound for a flow with no client adopts it, binding it as
+	// a race commit would, when it passes the placement filters a race
+	// candidate passes: not quarantined, able to carry the flow's ip version,
+	// and under the flow cap. Those take the channel and parent locks, which
+	// never nest under the flow lock, so they are read here and the commit
+	// re-validates the flow under its lock. A flow that is racing, re-raced
+	// onto other exits by the inference, takes the answer into its race as
+	// that of a candidate and commits it, which resets the candidates as any
+	// race commit does.
+	if adoptUpdate != nil {
+		adopted, joined, connected := false, false, false
+		var adoptedPackets []*receivePacket
+		placeable := !sourceClient.isQuarantined() &&
+			sourceClient.supportsIpVersion(adoptUpdate.ipPath.Version) &&
+			!func() bool {
+				self.stateLock.Lock()
+				defer self.stateLock.Unlock()
+				return self.clientAtFlowCapWithLock(sourceClient)
+			}()
+		if placeable {
+			func() {
+				adoptUpdate.stateLock.Lock()
+				defer adoptUpdate.stateLock.Unlock()
+				if !adoptUpdate.adoptableInboundWithLock(sourceClient, tcpControl) {
+					return
+				}
+				adopted = true
+				p := &receivePacket{
+					Source:      source,
+					ProvideMode: provideMode,
+					IpPath:      ipPath,
+					Packet:      packet,
+					tcpControl:  tcpControl,
+					generation:  adoptUpdate,
+				}
+				if race := adoptUpdate.race; race != nil {
+					joined = true
+					race.clientStates[sourceClient] = &multiClientChannelRaceClientState{
+						packets: []*receivePacket{p},
+					}
+					adoptedPackets, abandonedClients, returnPackets, connected =
+						adoptUpdate.commitRaceClientWithLock(sourceClient)
+					return
+				}
+				adoptUpdate.selectAffinityClient(sourceClient)
+				adoptUpdate.commitCollapseClaimsWithLock(sourceClient)
+				connected = adoptUpdate.markReceivedInboundWithLock(sourceClient, tcpControl)
+				adoptedPackets = []*receivePacket{p}
+			}()
+			// the commit can release collapse claims after the resolve's own drain
+			adoptUpdate.releaseCollapseClaims()
+		}
+		switch {
+		case joined:
+			self.log.Infof("[multi]receive adopted a flow from outside its race")
+		case adopted:
+			self.log.Infof("[multi]receive adopted a flow with no race and no client")
+		case adoptRaced:
+			self.log.Infof("[multi]receive client not part of race")
+		default:
+			self.log.Infof("[multi]receive no race and no client")
+		}
+		if adopted {
+			boundUpdate = adoptUpdate
+			if connected {
+				connectSucceeded = true
+				connectPath = adoptUpdate.ipPath
+			}
+			receivePackets = adoptedPackets
+		}
+	}
 	// a flow's first inbound packet is a proven upstream connect on this
 	// channel; it resets the dial-strike window (dialStarved requires zero
 	// successes). recorded outside every lock held above.
@@ -8648,17 +9955,14 @@ func (self *RemoteUserNatMultiClient) clientReceivePacketResolve(
 		if 0 < len(abandonedClients) {
 			if rstPacket, ok := ipOosRst(ipPath); ok {
 				for _, abandonedClient := range abandonedClients {
-					abandonedClient.Send(&parsedPacket{
-						packet: rstPacket,
-						ipPath: ipPath,
-					}, 0)
+					resolvedUpdate.sendAffinityControl(abandonedClient, rstPacket, 0)
 				}
 			}
 		}
 		completed := false
 		for _, p := range receivePackets {
-			self.deliverReceivePacket(p.Source, p.ProvideMode, p.IpPath, p.Packet)
-			if resolvedUpdate != nil && resolvedUpdate.observeTcpControl(p.tcpControl, true) {
+			if self.deliverAffinityReceivePacket(p) && resolvedUpdate != nil &&
+				resolvedUpdate.observeTcpControl(p.tcpControl, true) {
 				completed = true
 			}
 		}
@@ -8670,7 +9974,9 @@ func (self *RemoteUserNatMultiClient) clientReceivePacketResolve(
 		}
 	} else {
 		// incoming packets not in response to outgoing packets
-		self.deliverReceivePacket(source, provideMode, ipPath, packet)
+		self.deliverAffinityReceivePacket(&receivePacket{
+			Source: source, ProvideMode: provideMode, IpPath: ipPath, Packet: packet,
+		})
 	}
 }
 
@@ -8687,8 +9993,9 @@ func (self *RemoteUserNatMultiClient) clientDialFailureSignal(sourceClient *mult
 // destination-unreachable whose embed named the flow, accepted by the channel
 // only as the exact packet a provider builds for that flow
 // (providerDialFailureEgressPath). The provider could not open the upstream
-// for that flow and answered at once instead of going silent, so the source is
-// not left in syn-retransmit backoff. Only providers whose return path passes
+// for that flow and answered at once instead of going silent. An unanswered TCP
+// SYN with retained credit can retry on the existing parent worker; otherwise
+// ordinary native retries remain the fallback. Only providers whose return path passes
 // their own signal send it (IPV6.md C7), and current ones only for a dial that
 // failed at once. signaled is false for the send-path silence inference, where
 // nothing arrived: a flow retransmitting on an exit that has answered nothing.
@@ -8698,16 +10005,20 @@ func (self *RemoteUserNatMultiClient) clientDialFailureSignal(sourceClient *mult
 // a flow still waiting on its first upstream connect, not an established one a
 // late or stale signal happens to name. When those hold and DialFailureRerace
 // is on, it unbinds the flow (the removeClient per-update idiom, minus teardown
-// and minus cancelling the update) so the application's own retransmit re-races
-// it onto another exit within ~1s. A signal can also land while the flow is
+// and minus cancelling the update). A credited unanswered TCP SYN can then
+// retry on the existing parent worker; later native traffic remains the fallback.
+// A signal can also land while the flow is
 // still racing, before a race commits it (the send has not even returned when
 // a provider fails the dial at once): with the re-race on, the exit is then
 // taken out of the race, with its strike and its service failure, so the
 // commit cannot bind the flow to the exit that failed it. The one candidate
 // of a race of one taken out this way counts as a re-race, as it would had
-// the commit come first; one candidate of several does not. With the knob off it rebuilds the icmp with
-// the flow's SYN sequence and forwards it to the app (removeClient's teardown
-// convention) for a visible-but-fast failure. Each exit strikes a flow once:
+// the commit come first; one candidate of several does not. With the knob off
+// the flow keeps its exit, and the one candidate of a race of one is that exit
+// before the commit lands, so its signal stands as the bound exit's whichever
+// lands first. The icmp is then rebuilt with the connect attempt's SYN
+// sequence and forwarded to the app (removeClient's teardown convention) for
+// a visible-but-fast failure. Each exit strikes a flow once:
 // a failure the same exit already reported for the flow re-races or forwards
 // as before, but adds no strike and is not counted as a re-race again. Every
 // signal, matched or not, is counted; an unmatched one is dropped.
@@ -8750,6 +10061,7 @@ func (self *RemoteUserNatMultiClient) clientDialFailure(sourceClient *multiClien
 	rerace := self.reliabilitySettings().DialFailureRerace
 
 	standing := dialFailureStale
+	var signaledUpdate *multiClientChannelUpdate
 	// firstFromExit is whether this is the exit's first failure of the flow
 	firstFromExit := false
 	// the sequence of the flow's SYN, which the icmp forwarded with the knob
@@ -8774,12 +10086,23 @@ func (self *RemoteUserNatMultiClient) clientDialFailure(sourceClient *multiClien
 		// exit it is bound to or, with the re-race on, an exit still racing
 		// for it (dialFailureStanding). a nil update (gone), another exit's
 		// flow (already re-raced onto it), or an established flow
-		// (receivedInbound) all mean this signal is stale and must not
-		// disturb a working flow.
-		if update == nil || update.receivedInbound.Load() {
+		// (receivedInbound, checked under the flow lock together with the
+		// unbind) all mean this signal is stale and must not disturb a
+		// working flow.
+		if update == nil {
 			return
 		}
-		standing, firstFromExit = update.dialFailureStanding(sourceClient, rerace)
+		signaledUpdate = update
+		if self.beforeDialFailureStandingForTest != nil {
+			self.beforeDialFailureStandingForTest(update)
+		}
+		// with the re-race on, unbind exactly like removeClient does
+		// per-update, minus teardown and minus cancelling the update: clear
+		// its client pointer (inside dialFailureStanding) and drop it from the
+		// client's flow set. A later outbound packet sees nil and races a
+		// fresh exit. Retained unanswered TCP SYNs additionally schedule a
+		// bounded explicit-failure retry outside these owner locks.
+		standing, firstFromExit = update.dialFailureStanding(sourceClient, rerace, signaled, rerace)
 		if standing == dialFailureStale {
 			return
 		}
@@ -8790,18 +10113,12 @@ func (self *RemoteUserNatMultiClient) clientDialFailure(sourceClient *multiClien
 		}
 
 		if rerace {
-			// unbind exactly like removeClient does per-update, minus teardown
-			// and minus cancelling the update: drop it from the client's flow
-			// set and clear its client pointer. The flow's own next retransmit
-			// (SYN ~1s, QUIC PTO, DNS retry) then sees a nil client in
-			// sendPacket and races a fresh exit.
 			if updates, ok := self.clientUpdates[sourceClient]; ok {
 				delete(updates, update)
 				if len(updates) == 0 {
 					delete(self.clientUpdates, sourceClient)
 				}
 			}
-			update.client.Store(nil)
 		} else {
 			// the per-flow leaf lock under the parent lock, as removeClient
 			// takes it for sourceRstSequence
@@ -8829,7 +10146,13 @@ func (self *RemoteUserNatMultiClient) clientDialFailure(sourceClient *multiClien
 			self.noteIpFamilyDowngrade(sourceClient)
 		}
 	}
+	if rerace && firstFromExit {
+		self.requestDiscoveryForFailedAttempt(signaledUpdate, sourceClient, egressIpPath)
+	}
 
+	if rerace && signaled && firstFromExit {
+		self.enqueueSynRetry(signaledUpdate)
+	}
 	if standing == dialFailureWithdrawn {
 		// the race goes on without the exit, or, left empty, ends so the
 		// flow's next packet races afresh. one candidate of several was never
@@ -8844,8 +10167,9 @@ func (self *RemoteUserNatMultiClient) clientDialFailure(sourceClient *multiClien
 			self.reliabilityMetrics.flowReraced()
 		}
 		self.logSmtpProviderOutcome(egressIpPath, sourceClient, "reraced")
-		// swallowed: the icmp is never forwarded. the app's retransmit drives
-		// recovery. this is the whole point -- ~1s instead of 3-63s.
+		// The explicit error is swallowed. A credited unanswered TCP SYN can
+		// retry from its owned copy; other traffic and silence inference keep
+		// their ordinary outbound-retry path. No native RTO latency is promised.
 		return true
 	}
 
@@ -8861,26 +10185,31 @@ func (self *RemoteUserNatMultiClient) clientDialFailure(sourceClient *multiClien
 		forwardPath.SequenceNumber = synSequence
 	}
 	if packet, ok := ipOosUnreachable(&forwardPath); ok {
-		self.deliverReceivePacket(TransferPath{}, protocol.ProvideMode_Network, egressIpPath, packet)
+		self.deliverAffinityReceivePacket(&receivePacket{
+			Source: TransferPath{}, ProvideMode: protocol.ProvideMode_Network,
+			IpPath: egressIpPath, Packet: packet, generation: signaledUpdate,
+		})
 	}
 	return false
 }
 
-// spawns a goroutine that completes the race after a timeout. it acquires the
-// per-flow stateLock (not the parent lock) when it evaluates the race.
+// completes the race when its response window ends, or at once when enough
+// candidates answered first (completeEarly). The completion runs on the
+// window's timer, so a race waiting out its window holds a timer, not a parked
+// goroutine; the once keeps a timer an early completion re-armed from
+// completing the race twice. A race closed first is never completed. It
+// acquires the per-flow stateLock (not the parent lock) when it evaluates the
+// race.
 func (self *RemoteUserNatMultiClient) scheduleCompleteRace(
 	ipPath *IpPath,
 	race *multiClientChannelUpdateRace,
-	earlyComplete <-chan struct{},
 ) {
-	go HandleError(func() {
-		// wait for the race to finish, then choose
-
+	complete := func() {
+		// the window ended or enough candidates answered: choose
 		select {
 		case <-race.ctx.Done():
 			return
-		case <-earlyComplete:
-		case <-time.After(self.settings.MultiRaceSetOnResponseTimeout):
+		default:
 		}
 
 		var abandonedClients []*multiClientChannel
@@ -8957,17 +10286,14 @@ func (self *RemoteUserNatMultiClient) scheduleCompleteRace(
 		if 0 < len(abandonedClients) {
 			if rstPacket, ok := ipOosRst(ipPath); ok {
 				for _, abandonedClient := range abandonedClients {
-					abandonedClient.Send(&parsedPacket{
-						packet: rstPacket,
-						ipPath: ipPath,
-					}, 0)
+					boundUpdate.sendAffinityControl(abandonedClient, rstPacket, 0)
 				}
 			}
 		}
 		completed := false
 		for _, p := range receivePackets {
-			self.deliverReceivePacket(p.Source, p.ProvideMode, p.IpPath, p.Packet)
-			if boundUpdate != nil && boundUpdate.observeTcpControl(p.tcpControl, true) {
+			if self.deliverAffinityReceivePacket(p) && boundUpdate != nil &&
+				boundUpdate.observeTcpControl(p.tcpControl, true) {
 				completed = true
 			}
 		}
@@ -8977,7 +10303,18 @@ func (self *RemoteUserNatMultiClient) scheduleCompleteRace(
 		for _, p := range returnPackets {
 			MessagePoolReturn(p.Packet)
 		}
+	}
+	var completeOnce sync.Once
+	completeTimer := time.AfterFunc(self.settings.MultiRaceSetOnResponseTimeout, func() {
+		completeOnce.Do(func() {
+			HandleError(complete)
+		})
 	})
+	race.completeTimer.Store(completeTimer)
+	// an early completion asked before the timer existed
+	if race.completeRequested.Load() {
+		completeTimer.Reset(0)
+	}
 }
 
 // ExitInfo is one provider channel in the window, as reported to a developer
@@ -9324,6 +10661,7 @@ func (self *RemoteUserNatMultiClient) RemoveProvider(egressClientId Id) bool {
 }
 
 func (self *RemoteUserNatMultiClient) Close() {
+	self.blockActionCache.close()
 	self.cancel()
 	self.egressIpv4Fragments.close()
 
@@ -9373,6 +10711,10 @@ func (self *RemoteUserNatMultiClient) Close() {
 		for _, update := range self.ip6PathUpdates {
 			appendUpdate(update)
 		}
+		for _, transition := range self.affinityTransitions {
+			appendUpdate(transition.previous)
+			appendUpdate(transition.next)
+		}
 		clear(self.flowUpdates)
 		clear(self.ip4PathUpdates)
 		clear(self.ip6PathUpdates)
@@ -9398,6 +10740,11 @@ func (self *RemoteUserNatMultiClient) Close() {
 // terminal. Generated network clients remain owned by their generator.
 func (self *RemoteUserNatMultiClient) CloseAndWait(ctx context.Context) error {
 	self.Close()
+	if self.flowReaperDone != nil {
+		if err := waitForLifecycleDone(ctx, self.flowReaperDone, "multi-client flow reaper"); err != nil {
+			return err
+		}
+	}
 	if self.localUserNat == nil {
 		return nil
 	}
@@ -9407,6 +10754,14 @@ func (self *RemoteUserNatMultiClient) CloseAndWait(ctx context.Context) error {
 type multiClientChannelUpdate struct {
 	ctx    context.Context
 	cancel context.CancelFunc
+	// Delivery leases end at the app callback, not queue custody. A negative
+	// value seals an old TCP generation during/after a tuple transition.
+	affinityDelivery atomic.Int64
+	// All admitted sources, including race losers; leaf-lock-owned scalar proof.
+	affinitySources  multiClientAffinitySources
+	synRetry         *tcpSynRetry
+	synRetrySerial   uint64
+	synRetryReleased atomic.Pointer[tcpSynRetry]
 	// openTime and activityTime bound one TCP generation's active lifetime for
 	// the affinity-performance learner; no timer or goroutine is retained per
 	// flow. Construction initializes it, and a same-tuple fresh SYN resets it
@@ -9416,9 +10771,11 @@ type multiClientChannelUpdate struct {
 	// client is the channel this flow is committed to. it is read on the
 	// per-packet hot path (egress send target, ingress steady-state match) and
 	// across flows by affinity selection, so it is an atomic for lock-free
-	// reads. writes happen under the parent stateLock (which serializes them
-	// against the path maps) or a context where the writer has exclusive access.
-	client atomic.Pointer[multiClientChannel]
+	// reads. One immutable receipt publishes provider and original creation age
+	// together; inherited descendants share it without retaining update graphs.
+	// The binding's scalar origin is initialized before publication and never
+	// changes with activity, same-tuple SYN reset, setup completion or rebind.
+	client multiClientAffinityBinding
 
 	// pinned marks a flow a pin rule claimed (host pin or app pin): its
 	// affinity inheritance follows a benched donor for a multiple of the
@@ -9440,31 +10797,42 @@ type multiClientChannelUpdate struct {
 	// already carrying data. New-SYN generation commit and its first response
 	// are serialized by stateLock; established ingress remains lock-free.
 	receivedInbound atomic.Bool
+	// Set once the flow was torn down by removeClient, a send error or
+	// quarantine, each of which offers its source a reset. The connect
+	// attempt is then dead to the app, so later inbound for it is never
+	// adopted (adoptableInboundWithLock). The app's next SYN generation on the
+	// tuple clears it (resetSynGenerationWithLock).
+	sourceReset atomic.Bool
 	// Identity is independent of collapse coverage: an unwritten expiry or
 	// provider rebind must not turn a same-ISN retry into a new generation.
 	// The transient list has one inline numeric receipt per live new-SYN send,
 	// never packet storage or persistent history. All guarded by stateLock.
 	synGenerationNumber   uint32
+	synGenerationEnd      uint32
 	synGenerationSeen     bool
 	synGenerationAwaiting bool
 	synAdmissions         *tcpSynAdmission
 
-	// synWaitStart is when synWaitClient was first asked to open this flow's
-	// upstream connection -- the first dial probe (tcp syn, or quic/dns udp:
-	// see dialProbePacket) sent while receivedInbound is still false. It backs
+	// synWaitStart is when synWaitClient first accepted custody of this flow's
+	// dial probe (tcp syn, or quic/dns udp: see dialProbePacket) while
+	// receivedInbound is still false. A refused local offer has no clock. It backs
 	// the client-side dial-failure inference: a provider that silently cannot
 	// reach the destination (or a destination that silently drops the
 	// connection) produces no failure signal at all, so the wait itself is
 	// the only evidence. Keyed to synWaitClient so a re-raced flow judges
 	// each exit on its own silence; the pointer is only ever compared, never
 	// dereferenced, so a closed channel is harmless here.
-	// Both guarded by stateLock.
-	synWaitStart  time.Time
-	synWaitClient *multiClientChannel
-	// synWaitSendCount counts probes sent to synWaitClient since the clock
-	// started. Past dialProbeMaxSends the flow is a one-way stream rather
-	// than a handshake and the inference leaves it alone. Guarded by
-	// stateLock alongside the clock it qualifies.
+	// The exact selection receipt and TCP SYN number prevent an old provider
+	// attempt or generation from lending silence to a later local offer.
+	// All guarded by stateLock.
+	synWaitStart     time.Time
+	synWaitClient    *multiClientChannel
+	synWaitSelection *multiClientAffinitySelection
+	synWaitSynNumber uint32
+	// synWaitSendCount counts probe observations after accepted custody armed
+	// the clock. Past dialProbeMaxSends the existing UDP ambiguity budget
+	// treats the flow as a one-way stream. It is not a delivery counter.
+	// Guarded by stateLock alongside the clock it qualifies.
 	synWaitSendCount int
 
 	// dialFailedClients are the exits that have failed this flow's current
@@ -9473,10 +10841,23 @@ type multiClientChannelUpdate struct {
 	// record afresh (noteConnectAttempt; dialFailedSyn is that attempt's
 	// sequence), and removeClient drops a removed exit from it, so it holds
 	// at most one entry per live exit. The pointers are only compared,
-	// never dereferenced. All guarded by stateLock.
+	// never dereferenced. dialFailedSynEnd is the sequence after the
+	// attempt's SYN and any data its SYNs carry (TCP Fast Open): all an answer
+	// to the attempt can acknowledge before the app has received anything.
+	// All guarded by stateLock.
 	dialFailedClients []*multiClientChannel
 	dialFailedSyn     uint32
+	dialFailedSynEnd  uint32
 	dialFailedSynSeen bool
+	// Source-observed attempt time/version, independent of collapse replay.
+	discoveryAttemptStarted time.Time
+	discoveryAttemptStamp   atomic.Uint64
+	// Those of dialFailedClients whose failure arrived as the provider's own
+	// signal rather than the silence inference. An exit that said it cannot
+	// reach the destination is never adopted on a later answer; the app's
+	// retransmit re-races instead. Kept and cleared with dialFailedClients.
+	// Guarded by stateLock.
+	dialFailureSignaledClients []*multiClientChannel
 
 	// stateLock guards the per-flow mutable state below: the active race and the
 	// tcp collapse-prevention sequence counters. it is a leaf — its holders
@@ -9521,6 +10902,8 @@ type multiClientChannelUpdate struct {
 	sequenceCovered         bool
 	sequenceAckPositionSeen bool
 	sequenceSynSeen         bool
+	// One bounded, scalar inner-ACK authority; no packet or queue owner.
+	sequenceRecovery tcpCollapseRecovery
 	// A failed asynchronous admission invalidates conservative coverage. A
 	// captured epoch prevents callback-before-return from being recommitted.
 	sequenceAdmissionEpoch uint64
@@ -9582,6 +10965,7 @@ type multiClientChannelUpdate struct {
 }
 
 func newMultiClientChannelUpdate(ctx context.Context, ipPath *IpPath) *multiClientChannelUpdate {
+	createTime := time.Now()
 	cancelCtx, cancel := context.WithCancel(ctx)
 	// own the flow path: a caller's path may borrow (alias) packet storage
 	// (parseIpPathWithPayloadBorrowed), and the update outlives the packet
@@ -9594,7 +10978,8 @@ func newMultiClientChannelUpdate(ctx context.Context, ipPath *IpPath) *multiClie
 	return &multiClientChannelUpdate{
 		ctx:              cancelCtx,
 		cancel:           cancel,
-		openTime:         time.Now(),
+		openTime:         createTime,
+		client:           multiClientAffinityBinding{originTime: createTime},
 		ipPath:           ipPath,
 		affinityIp4Paths: map[Ip4Path]bool{},
 		affinityIp6Paths: map[Ip6Path]bool{},
@@ -9669,46 +11054,65 @@ func dialProbeAwaitsResponse(ipPath *IpPath, sendCount int) bool {
 	return ipPath.Protocol == IpProtocolTcp || sendCount <= dialProbeMaxSends
 }
 
-// startSynWait records the first unanswered dial probe carried by a committed
-// client. It is used by the one-candidate path, where there is no response race
-// to perform this transition. An inbound packet racing the send wins and keeps
-// the flow established without arming stale failure state.
-func (self *multiClientChannelUpdate) startSynWait(client *multiClientChannel) {
+// startSynWait records a successful admission by a committed client. A late
+// producer return cannot arm a replacement selection, including A->B->A.
+// An inbound packet racing the admission keeps the flow established instead.
+func (self *multiClientChannelUpdate) startSynWait(client *multiClientChannel, selection *multiClientAffinitySelection, ipPath *IpPath) {
 	if client == nil || self.receivedInbound.Load() {
 		return
 	}
 
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	if self.receivedInbound.Load() {
+	self.startSynWaitWithLock(client, selection, ipPath, time.Now())
+}
+
+// Must be called with stateLock, only after actual queue/source admission.
+// The first accepted receipt owns the clock until source-ordered SYN replay
+// starts a new generation. A refused offer never changes either boundary.
+func (self *multiClientChannelUpdate) startSynWaitWithLock(client *multiClientChannel, selection *multiClientAffinitySelection, ipPath *IpPath, admittedAt time.Time) {
+	if selection == nil || selection.client != client || self.client.loadSelection() != selection ||
+		self.IsDone() || self.receivedInbound.Load() || admittedAt.IsZero() || !dialProbePacket(ipPath) {
 		return
 	}
-	if self.synWaitClient != client || self.synWaitStart.IsZero() {
+	if self.synWaitSelection != selection || self.synWaitStart.IsZero() {
 		self.synWaitClient = client
-		self.synWaitStart = time.Now()
+		self.synWaitSelection = selection
+		self.synWaitSynNumber = ipPath.SequenceNumber
+		self.synWaitStart = admittedAt
 		self.synWaitSendCount = 1
 	}
 }
 
-// synWaitExceeded starts the connect-wait clock on the first dial probe (a
-// tcp syn or a udp handshake packet, see dialProbePacket) a given exit
-// carries for this flow, and reports whether it has run past timeout on later
-// probes through that same exit. The clock is keyed to the exit: a flow that
-// re-races restarts the wait, so each exit is judged on its own silence rather
-// than inheriting the previous one's -- otherwise the first probe through a
-// fresh exit would strike it immediately. When it trips, the clock restarts
-// for the same reason.
+// Source order alone may replace an earlier accepted SYN generation's clock.
+// The descriptor still has to own this exact provider selection.
+func (self *multiClientChannelUpdate) restartSynWaitWithLock(client *multiClientChannel, selection *multiClientAffinitySelection, ipPath *IpPath, admittedAt time.Time) {
+	if selection == nil || selection.client != client || self.client.loadSelection() != selection ||
+		self.IsDone() || self.receivedInbound.Load() || admittedAt.IsZero() || !dialProbePacket(ipPath) {
+		return
+	}
+	self.synWaitClient = client
+	self.synWaitSelection = selection
+	self.synWaitSynNumber = ipPath.SequenceNumber
+	self.synWaitStart = admittedAt
+	self.synWaitSendCount = 1
+}
+
+// synWaitExceeded observes an already accepted dial probe before collapse can
+// suppress its retransmission. Offered packets cannot initialize the clock:
+// local queue/readiness refusal is not evidence of upstream provider silence.
+// Each immutable selection and TCP generation earns its own accepted clock.
 func (self *multiClientChannelUpdate) synWaitExceeded(client *multiClientChannel, ipPath *IpPath, timeout time.Duration) bool {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
-	now := time.Now()
-	if self.synWaitClient != client || self.synWaitStart.IsZero() {
-		self.synWaitClient = client
-		self.synWaitStart = now
-		self.synWaitSendCount = 1
+	selection := self.client.loadSelection()
+	if client == nil || selection == nil || selection.client != client || self.synWaitSelection != selection ||
+		self.synWaitClient != client || self.synWaitStart.IsZero() || self.IsDone() || self.sourceReset.Load() || self.receivedInbound.Load() ||
+		ipPath.Protocol == IpProtocolTcp && self.synWaitSynNumber != ipPath.SequenceNumber {
 		return false
 	}
+	now := time.Now()
 	self.synWaitSendCount += 1
 	// Past an initial UDP window with nothing back this may be a one-way
 	// stream rather than a handshake -- see dialProbeMaxSends. A pure TCP SYN
@@ -9746,7 +11150,8 @@ func (self *multiClientChannelUpdate) resetSequenceGroup(sendPacketGroup *parsed
 func (self *multiClientChannelUpdate) resetSequenceWithLock(sendPacket *parsedPacket) {
 	ipPath := sendPacket.ipPath
 	if ipPath.Syn && (!self.synGenerationSeen || self.synGenerationNumber != ipPath.SequenceNumber) {
-		self.resetSynGenerationWithLock(ipPath.SequenceNumber)
+		self.resetSynGenerationWithLock(ipPath.SequenceNumber,
+			tcpPacketNextSequenceNumberWithPayloadByteCount(ipPath, ipPath.TcpPayloadByteCount))
 	}
 	self.sequenceAdmissionEpoch++
 	self.sequenceCloseReady.Store(false)
@@ -9755,6 +11160,14 @@ func (self *multiClientChannelUpdate) resetSequenceWithLock(sendPacket *parsedPa
 	self.sequenceSynSeen = ipPath.Syn
 	self.sequenceSynNumber = ipPath.SequenceNumber
 	self.sequenceAdmissionStateSeen = false
+	if ipPath.Syn {
+		self.sequenceRecovery.windowScale = ipPath.TcpWindowScale
+		self.sequenceRecovery.windowScaleOffered = ipPath.TcpWindowScaleEnabled
+	}
+	if ipPath.Rst {
+		self.clearSynRetryWithLock()
+		self.sequenceRecovery.clear()
+	}
 
 	self.ackSequenceNumber = ipPath.AckSequenceNumber
 	self.sequenceNumber = ipPath.SequenceNumber
@@ -9765,7 +11178,11 @@ func (self *multiClientChannelUpdate) resetSequenceWithLock(sendPacket *parsedPa
 
 // A real new source cohort clears both close directions. Candidate promotion
 // can force this transition even when an intervening unwritten SYN reused an ISN.
-func (self *multiClientChannelUpdate) resetSynGenerationWithLock(sequence uint32) {
+func (self *multiClientChannelUpdate) resetSynGenerationWithLock(sequence uint32, ends ...uint32) {
+	if self.synRetry != nil && self.synRetry.sequence != sequence {
+		self.clearSynRetryWithLock()
+	}
+	self.sequenceRecovery.clear()
 	self.egressFinSequence, self.ingressFinSequence = 0, 0
 	self.egressAckSequence, self.ingressAckSequence = 0, 0
 	self.egressFinSeen, self.ingressFinSeen = false, false
@@ -9777,9 +11194,12 @@ func (self *multiClientChannelUpdate) resetSynGenerationWithLock(sequence uint32
 		self.synGenerationAwaiting = true
 	}
 	self.synGenerationSeen, self.synGenerationNumber = true, sequence
-	self.synWaitClient = self.client.Load()
-	self.synWaitStart = time.Now()
-	self.synWaitSendCount = 1
+	self.synGenerationEnd = sequence + 1
+	if len(ends) != 0 && ends[0]-(sequence+1) < 1<<31 {
+		self.synGenerationEnd = ends[0]
+	}
+	// a new connect attempt is alive even after the last one was torn down
+	self.sourceReset.Store(false)
 }
 
 func (self *multiClientChannelUpdate) updateSequence(sendPacket *parsedPacket) {
@@ -9798,7 +11218,7 @@ func (self *multiClientChannelUpdate) commitSequenceGroup(sendPacketGroup *parse
 	self.commitSequenceGroupForClient(sendPacketGroup, self.client.Load())
 }
 
-func (self *multiClientChannelUpdate) commitSequenceGroupForClient(sendPacketGroup *parsedPacketGroup, client *multiClientChannel) {
+func (self *multiClientChannelUpdate) commitSequenceGroupForClient(sendPacketGroup *parsedPacketGroup, client *multiClientChannel, selections ...*multiClientAffinitySelection) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	if sendPacketGroup.completionFlags.Load()&groupCompletionTracked != 0 {
@@ -9812,10 +11232,15 @@ func (self *multiClientChannelUpdate) commitSequenceGroupForClient(sendPacketGro
 		// A concurrent rebind must never inherit this old provider's proof.
 		return
 	}
+	selection := sendPacketGroup.completionSelection
+	if len(selections) != 0 {
+		selection = selections[0]
+	}
 	if self.sequenceClient != client {
 		self.sequenceCovered = false
 		self.sequenceAckPositionSeen = false
 		self.sequenceSynSeen = false
+		self.sequenceRecovery.clear()
 		self.sequenceClient = client
 	}
 	for packetIndex := range sendPacketGroup.packets {
@@ -9823,11 +11248,15 @@ func (self *multiClientChannelUpdate) commitSequenceGroupForClient(sendPacketGro
 		if sendPacket.ipPath.Rst || sendPacket.ipPath.Syn &&
 			(!self.sequenceSynSeen || self.sequenceSynNumber != sendPacket.ipPath.SequenceNumber) {
 			self.resetSequenceWithLock(sendPacket)
+			if sendPacket.ipPath.Syn && sendPacketGroup.completionFlags.Load()&groupCompletionAdmitted != 0 {
+				self.restartSynWaitWithLock(client, selection, sendPacket.ipPath, time.Now())
+			}
 			if observations := sendPacketGroup.admissionObservations; observations != nil && sendPacket.ipPath.Syn {
 				proof := &observations.synAdmission
 				if proof.update == self && proof.sequence == sendPacket.ipPath.SequenceNumber && proof.responseClient == client {
 					self.receivedInbound.Store(true)
 					self.synGenerationAwaiting = false
+					self.observeTcpRecoveryAckWithLock(client, proof.responseControl)
 				}
 			}
 		}
@@ -9863,6 +11292,7 @@ func (self *multiClientChannelUpdate) updateMaterializedSequenceWithLock(sendPac
 	if len(payloadByteCounts) != 0 {
 		payloadByteCount = payloadByteCounts[0]
 	}
+	sendPacket.collapseAdmission.materializeTcpRecoveryWithLock(sendPacket, payloadByteCount)
 	update := self.sequencePacketCount == 0
 
 	nextAckSequenceNumber := ipPath.AckSequenceNumber
@@ -9948,6 +11378,9 @@ func (self *multiClientChannelUpdate) observeTcpControlWithLock(control tcpContr
 		return false
 	}
 
+	if control.rst || control.fin {
+		self.clearSynRetryWithLock()
+	}
 	if control.rst {
 		return true
 	}
@@ -9962,6 +11395,7 @@ func (self *multiClientChannelUpdate) observeTcpControlWithLock(control tcpContr
 	} else {
 		if control.ack {
 			updateLatestTcpSequence(&self.egressAckSeen, &self.egressAckSequence, control.ackSequenceNumber)
+			self.observeTcpRecoveryEgressWithLock(control)
 		}
 		if control.fin {
 			finSequence := control.sequenceNumber + control.payloadByteCount + 1
@@ -10000,7 +11434,10 @@ func (self *multiClientChannelUpdate) observeEgressTcpGroup(sendPacketGroup *par
 func (self *multiClientChannelUpdate) releaseSequenceHold(maxHold time.Duration) bool {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	return self.releaseSequenceHoldWithLock(maxHold)
+}
 
+func (self *multiClientChannelUpdate) releaseSequenceHoldWithLock(maxHold time.Duration) bool {
 	// A raw admitted group can also suppress a duplicate. The explicit hold
 	// keeps its admission clock without claiming it was already serialized.
 	if self.sequenceTime.IsZero() {
@@ -10049,9 +11486,23 @@ const (
 // candidate of its race that withdraw takes out of the race, or neither. For
 // the first two it records client among the exits that failed the flow and
 // reports whether this was client's first failure of it.
-func (self *multiClientChannelUpdate) dialFailureStanding(client *multiClientChannel, withdraw bool) (standing dialFailureStanding, first bool) {
+//
+// The flow must not have received inbound. That check, the record and, with
+// unbind, the unbind of a bound flow are one step under the lock, so a first
+// answer that commits concurrently (markReceivedInboundWithLock, under the same
+// lock) either lands first and makes the failure stale, or lands after and
+// finds the flow unbound. A failure the provider signaled is recorded as such
+// for the current attempt even when the flow is no longer bound to or racing
+// on client, so its later answer is never adopted (adoptableInboundWithLock).
+func (self *multiClientChannelUpdate) dialFailureStanding(client *multiClientChannel, withdraw bool, signaled bool, unbind bool) (standing dialFailureStanding, first bool) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	if self.receivedInbound.Load() {
+		return dialFailureStale, false
+	}
+	if signaled && !slices.Contains(self.dialFailureSignaledClients, client) {
+		self.dialFailureSignaledClients = append(self.dialFailureSignaledClients, client)
+	}
 	bound := self.client.Load()
 	switch {
 	case bound != nil && bound == client:
@@ -10061,6 +11512,12 @@ func (self *multiClientChannelUpdate) dialFailureStanding(client *multiClientCha
 		if standing == dialFailureStale {
 			return dialFailureStale, false
 		}
+	case bound == nil && self.race != nil && self.race.single &&
+		self.race.clientStates[client] != nil && len(self.race.clientStates[client].packets) == 0:
+		// with the re-race off the one candidate of a race that commits on
+		// its send is kept, so it is the flow's exit before the commit lands:
+		// its failure stands as a bound exit's, whichever lands first
+		standing = dialFailureBound
 	default:
 		return dialFailureStale, false
 	}
@@ -10068,7 +11525,50 @@ func (self *multiClientChannelUpdate) dialFailureStanding(client *multiClientCha
 		self.dialFailedClients = append(self.dialFailedClients, client)
 		first = true
 	}
+	if standing == dialFailureBound && unbind {
+		self.client.Store(nil)
+	}
 	return standing, first
+}
+
+// Reports whether inbound from client may commit a flow left with no client.
+// The silence inference unbinds a flow whose exit is in fact working; that
+// exit's late answer is the first proof of it and belongs to the app now, not
+// after the app's next retransmit. The flow can be left with no race, when
+// the re-race was refused, or racing exits that have not answered, which a
+// race never commits on for a SYN. Racing, the answer joins the race as a
+// candidate's would and wins it; a candidate of the race answers through the
+// race itself.
+//
+// Only an exit that carried the current connect attempt and was unbound from
+// it by the inference adopts it: one of dialFailedClients that did not signal
+// its own failure. The exit must be live, the flow live, its source never
+// reset, and nothing received yet. The packet must be tcp, not a reset, and
+// acknowledge only what the attempt sent: from ISN+1, which a SYN-ACK
+// acknowledges, to the end of the data its SYN carried (dialFailedSynEnd),
+// since before its first answer the app sends nothing more. The bound is the
+// app's SYN as it entered the send path (noteConnectAttempt), because the
+// collapse sequence state publishes a SYN only once it is serialized while
+// the flow is still bound, which an unbinding can overtake. A blind or stale
+// acknowledgement anywhere else in sequence space is refused. Offsets are
+// modular, so an attempt whose sequence wraps past 2^32 compares correctly.
+// The caller checks quarantine, family and flow cap outside the flow lock and
+// re-validates with this under the lock before it commits. Must be called
+// with stateLock.
+func (self *multiClientChannelUpdate) adoptableInboundWithLock(client *multiClientChannel, control tcpControlObservation) bool {
+	if client == nil || self.IsDone() || client.IsDone() || self.sourceReset.Load() ||
+		self.receivedInbound.Load() || self.client.Load() != nil ||
+		self.race != nil && self.race.clientStates[client] != nil ||
+		!slices.Contains(self.dialFailedClients, client) ||
+		slices.Contains(self.dialFailureSignaledClients, client) {
+		return false
+	}
+	if self.ipPath == nil || self.ipPath.Protocol != IpProtocolTcp || !self.dialFailedSynSeen ||
+		!control.valid || !control.ack || control.rst {
+		return false
+	}
+	base := self.dialFailedSyn + 1
+	return control.ackSequenceNumber-base <= self.dialFailedSynEnd-base
 }
 
 // withdrawRaceCandidateWithLock takes client out of the flow's race when it
@@ -10101,19 +11601,27 @@ func (self *multiClientChannelUpdate) withdrawRaceCandidateWithLock(client *mult
 // afresh when ipPath is the app's SYN with a new sequence: a new connect
 // attempt on the same 5-tuple, which the exits that failed the last one may
 // serve, and strike, again. A retransmit, with the attempt's own sequence,
-// keeps the record. It runs before the SYN is sent, so the record belongs to
-// the attempt by the time an exit can answer it.
+// keeps the record, and extends dialFailedSynEnd when it carries more data. It
+// runs before the SYN is sent, so the record belongs to the attempt by the
+// time an exit can answer it.
 func (self *multiClientChannelUpdate) noteConnectAttempt(ipPath *IpPath) {
 	if ipPath.Protocol != IpProtocolTcp || !ipPath.Syn || ipPath.Ack {
 		return
 	}
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	end := tcpPacketNextSequenceNumberWithPayloadByteCount(ipPath, ipPath.TcpPayloadByteCount)
 	if self.dialFailedSynSeen && self.dialFailedSyn == ipPath.SequenceNumber {
+		if 0 < int32(end-self.dialFailedSynEnd) {
+			self.dialFailedSynEnd = end
+		}
 		return
 	}
-	self.dialFailedSynSeen, self.dialFailedSyn = true, ipPath.SequenceNumber
+	self.discoveryAttemptStarted = time.Now()
+	self.discoveryAttemptStamp.Add(1)
+	self.dialFailedSynSeen, self.dialFailedSyn, self.dialFailedSynEnd = true, ipPath.SequenceNumber, end
 	self.dialFailedClients = nil
+	self.dialFailureSignaledClients = nil
 }
 
 // forgetDialFailedClient drops a removed exit from the exits that failed the
@@ -10121,17 +11629,29 @@ func (self *multiClientChannelUpdate) noteConnectAttempt(ipPath *IpPath) {
 func (self *multiClientChannelUpdate) forgetDialFailedClient(client *multiClientChannel) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	if slices.Contains(self.dialFailedClients, client) {
+		self.discoveryAttemptStamp.Add(1)
+	}
 	self.dialFailedClients = slices.DeleteFunc(self.dialFailedClients, func(failed *multiClientChannel) bool {
+		return failed == client
+	})
+	self.dialFailureSignaledClients = slices.DeleteFunc(self.dialFailureSignaledClients, func(failed *multiClientChannel) bool {
 		return failed == client
 	})
 }
 
 // synSequence is the sequence number of the flow's current SYN, which a
 // kernel stack checks an icmp error's embed against, and whether a SYN was
-// seen at all.
+// seen at all. It is the connect attempt's SYN, which the send path records
+// before the SYN leaves (noteConnectAttempt), so a failure that lands before
+// the send commits the SYN's generation embeds it too. The committed
+// generation stands in only where no attempt was recorded.
 func (self *multiClientChannelUpdate) synSequence() (uint32, bool) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	if self.dialFailedSynSeen {
+		return self.dialFailedSyn, true
+	}
 	return self.synGenerationNumber, self.synGenerationSeen
 }
 
@@ -10154,9 +11674,12 @@ func (self *multiClientChannelUpdate) canUpdateSequence(sendPacket *parsedPacket
 func (self *multiClientChannelUpdate) canUpdateSequenceForClient(sendPacket *parsedPacket, client *multiClientChannel) bool {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	return self.canUpdateSequenceForClientWithLock(sendPacket, client, true)
+}
 
+func (self *multiClientChannelUpdate) canUpdateSequenceForClientWithLock(sendPacket *parsedPacket, client *multiClientChannel, recovery bool) bool {
 	path := sendPacket.ipPath
-	if self.sequenceSourceOrder == 1<<48-1 {
+	if self.sequenceSourceOrder == 1<<48-1 || self.sequenceRecovery.serial == ^uint64(0) {
 		return true
 	}
 	if path.Syn && self.pendingSequenceCoversWithLock(sendPacket, client) {
@@ -10212,7 +11735,7 @@ func (self *multiClientChannelUpdate) canUpdateSequenceForClient(sendPacket *par
 		return true
 	}
 
-	return !self.sequenceCoversWithLock(sendPacket)
+	return !self.sequenceCoversWithLock(sendPacket) || recovery && self.canRecoverTcpWithLock(sendPacket, client)
 }
 
 // commitRaceClientWithLock makes client the race winner and transfers every
@@ -10256,7 +11779,7 @@ func (self *multiClientChannelUpdate) commitRaceClientWithLock(
 		}
 	}
 
-	self.client.Store(client)
+	self.selectAffinityClient(client)
 	self.sequenceCommittedRaceOrder = race.collapseOrder
 	self.commitCollapseClaimsWithLock(client)
 	self.clearRaceWithLock()
@@ -10305,6 +11828,7 @@ func (self *multiClientChannelUpdate) Close() {
 	defer self.releaseCollapseClaims()
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	self.clearSynRetryWithLock()
 	self.clearRaceWithLock()
 	self.abandonCollapseClaimsWithLock()
 }
@@ -10315,13 +11839,22 @@ type multiClientChannelUpdateRace struct {
 	clientStates map[*multiClientChannel]*multiClientChannelRaceClientState
 	// single marks a race of one candidate, which commits as soon as its send
 	// is admitted rather than on a winner decision
-	single                 bool
+	single bool
+	// Continuation fills only the original race's vacated live slots. Pending
+	// admissions remain charged even after an explicit failure withdraws them.
+	clientLimit            int
+	pendingSendCount       int
+	synRetryPending        bool
 	sentPacketCount        int
 	packetCount            int
 	clientsWithPacketCount int
-	completeMonitor        *Monitor
 	responseWindowElapsed  bool
 	collapseOrder          uint64
+	// completes the race when its response window ends; nil until the race's
+	// first send returns (scheduleCompleteRace)
+	completeTimer atomic.Pointer[time.Timer]
+	// an early completion asked before completeTimer existed
+	completeRequested atomic.Bool
 }
 
 func newMultiClientChannelUpdateRace(ctx context.Context) *multiClientChannelUpdateRace {
@@ -10333,12 +11866,26 @@ func newMultiClientChannelUpdateRace(ctx context.Context) *multiClientChannelUpd
 		// sentPacketCount:        0,
 		// packetCount:            0,
 		// clientsWithPacketCount: 0,
-		completeMonitor: NewMonitor(),
+	}
+}
+
+// completeEarly completes the race now instead of at the end of its response
+// window: enough candidates answered. Safe under the flow lock, since it only
+// re-arms the completion timer; the request is kept for a timer not yet
+// scheduled.
+func (self *multiClientChannelUpdateRace) completeEarly() {
+	self.completeRequested.Store(true)
+	if completeTimer := self.completeTimer.Load(); completeTimer != nil {
+		completeTimer.Reset(0)
 	}
 }
 
 func (self *multiClientChannelUpdateRace) Close() {
 	self.cancel()
+	// a closed race is never completed: release its window's timer now
+	if completeTimer := self.completeTimer.Load(); completeTimer != nil {
+		completeTimer.Stop()
+	}
 	// return any still-pooled packets that no other path has claimed.
 	// the Pooled flag is the single-owner marker: paths that consume a
 	// receivePacket (race-buffer-exceeded in clientReceivePacket, the
@@ -10389,19 +11936,27 @@ type parsedPacket struct {
 // One exact directional flow carried through policy, provider selection, and
 // Transfer admission without decomposing back into independently routed sends.
 type parsedPacketGroup struct {
-	packets               []parsedPacket
-	ipPath                *IpPath
-	pin                   flowPin
-	byteCount             ByteCount
-	transportAttribution  *transportPacketAttribution
-	admissionObservations *sendPackAdmissionObservations
-	collapseAdmission     tcpCollapseAdmission
-	collapseOwner         *tcpCollapseGroup
-	completionClient      *multiClientChannel
-	collapseNext          *parsedPacketGroup
-	collapseSource        *SendSequence
-	admissionTime         time.Time
-	completionFlags       atomic.Uint64
+	packets                    []parsedPacket
+	ipPath                     *IpPath
+	pin                        flowPin
+	byteCount                  ByteCount
+	transportAttribution       *transportPacketAttribution
+	admissionObservations      *sendPackAdmissionObservations
+	collapseAdmission          tcpCollapseAdmission
+	collapseOwner              *tcpCollapseGroup
+	completionClient           *multiClientChannel
+	completionSelection        *multiClientAffinitySelection
+	collapseNext               *parsedPacketGroup
+	collapseSource             *SendSequence
+	admissionTime              time.Time
+	completionFlags            atomic.Uint64
+	affinityTransition         atomic.Pointer[multiClientAffinityTransition]
+	affinitySourceRegistration uint64
+	affinitySourceState        uint8
+	affinitySynReuse           bool
+	// Compacted race copies retain the original owned path allocation.
+	retainedIpPathCount uint32
+	synRetry            *tcpSynRetryRequest
 }
 
 // flowPin is what a pin rule resolved to for one flow: the owning pinned
@@ -10532,6 +12087,71 @@ func (self *multiClientWindow) backendDegraded() bool {
 	return isBackendDegraded()
 }
 
+// Whether the platform is rate limiting the contract requests of any of these
+// channels' clients (ContractManager.createContractRateLimitHeld). A window
+// reads it as a degraded backend scoped to itself: while one of its own
+// clients is held it does not grow (resize), and a race that would send to a
+// held client dials at most MultiRaceDegradedClientCount exits
+// (contractRateLimitHeldRaced). A client minted meanwhile would be minted into
+// the same refusal, and a race copy sent to a held client waits for a contract
+// it cannot get yet, then asks for one after the hold, while the platform is
+// shedding load. A hold lasts 12.5 s at most and leaves the process-wide gate
+// alone, so a sibling window, and the window itself once the hold ends, grows
+// as usual. Lock-free; a bare fixture channel has no client and is never held.
+func contractRateLimitHeldChannels(channels []*multiClientChannel, now time.Time) bool {
+	for _, channel := range channels {
+		if contractRateLimitHeldChannel(channel, now) {
+			return true
+		}
+	}
+	return false
+}
+
+func contractRateLimitHeldChannel(channel *multiClientChannel, now time.Time) bool {
+	return channel != nil && channel.client != nil && channel.client.ContractManager().createContractRateLimitHeld(now)
+}
+
+// contractRateLimitHeldLast is a race's candidates with the held ones
+// (contractRateLimitHeldChannel) after the rest, each part in its own order,
+// so a bounded race spends its slots on exits that can take a new contract.
+// It returns the candidates as they are when none is held, and a reordered
+// copy otherwise, so the caller's list keeps its order.
+func contractRateLimitHeldLast(orderedClients []*multiClientChannel, now time.Time) []*multiClientChannel {
+	if !contractRateLimitHeldChannels(orderedClients, now) {
+		return orderedClients
+	}
+	sorted := make([]*multiClientChannel, 0, len(orderedClients))
+	var held []*multiClientChannel
+	for _, client := range orderedClients {
+		if contractRateLimitHeldChannel(client, now) {
+			held = append(held, client)
+		} else {
+			sorted = append(sorted, client)
+		}
+	}
+	return append(sorted, held...)
+}
+
+// contractRateLimitHeldRaced is whether a race over orderedClients, ordered by
+// contractRateLimitHeldLast, would send to a held client at its configured
+// width, so the race is bounded to MultiRaceDegradedClientCount. A race the
+// held clients fall outside of is not cut. Neither is a field of benched
+// exits only, which is what a window offers once its ordinary offer is empty
+// (lastResortClients): that race is how the window finds the exit still
+// moving bytes, and it keeps its full width.
+func contractRateLimitHeldRaced(orderedClients []*multiClientChannel, configured int, now time.Time) bool {
+	width := multiRaceClientCount(len(orderedClients), configured, 0, false)
+	if !contractRateLimitHeldChannels(orderedClients[:width], now) {
+		return false
+	}
+	for _, client := range orderedClients {
+		if !client.isWarning() {
+			return true
+		}
+	}
+	return false
+}
+
 // degradedWindowTarget caps a window's resize target at its current size
 // while the control API is degraded (see isBackendDegraded), so an outage
 // never grows the window. Every client the window adds during an outage is
@@ -10561,10 +12181,11 @@ func degradedWindowTarget(targetWindowSize int, clientCount int, degraded bool) 
 }
 
 type multiClientWindow struct {
-	ctx                context.Context
-	cancel             context.CancelFunc
-	log                Logger
-	providerEvaluation providerEvaluationState
+	ctx                   context.Context
+	cancel                context.CancelFunc
+	log                   Logger
+	providerEvaluation    providerEvaluationState
+	ackRouteWriteFailures ackRouteWriteFailureOwner
 
 	// Consecutive platform rate limits across ALL expanders in this window.
 	// Shared deliberately: the herd is the problem, so the backoff has to be a
@@ -10587,7 +12208,14 @@ type multiClientWindow struct {
 	networkPeerDestination bool
 	ingressSecurityPolicy  SecurityPolicy
 	clientRemoveCallback   func(client *multiClientChannel)
-	windowType             WindowType
+	// Cache-only retirement, after cancellation with no window/channel lock.
+	// It neither emits provider events nor migrates flows.
+	clientRetireCallback func(client *multiClientChannel)
+	windowType           WindowType
+	// called after the window admits a client, outside the window and
+	// channel state locks and under expand's admission mutex, so it must not
+	// block; nil in bare fixtures
+	clientAddCallback func(client *multiClientChannel)
 
 	settings *MultiClientSettings
 	// reliabilitySettingsFunc reads the parent's effective reliability config,
@@ -10601,6 +12229,12 @@ type multiClientWindow struct {
 	// callback convention as reliabilitySettingsFunc; nil (bare fixtures)
 	// reads as gate off.
 	uplinkGateFunc func(now time.Time) (stale bool, freshSince time.Time)
+	// uplinkLastIngressFunc reads when the tunnel last received a packet from
+	// any provider (zero when never); see RemoteUserNatMultiClient.uplinkLastIngress.
+	// The recent-exit memory reads it with the gate to tell a verdict collected
+	// in the dark from one against the provider (classifyRecentExit). nil
+	// (bare fixtures) remembers no verdict.
+	uplinkLastIngressFunc func() time.Time
 	// reliabilityMetricsFunc hands the parent's shared counters to the
 	// channels. nil (bare fixtures) loses the counts, never the traffic --
 	// every counter method tolerates a nil receiver.
@@ -10645,6 +12279,10 @@ type multiClientWindow struct {
 	// parent stateLock inside, so the same contract as flowCountFunc applies:
 	// call it with no window or channel lock held.
 	clientMigrateFunc func(client *multiClientChannel, cause string) (rebound int, replacements int, remaining int)
+	// transportDelayStats is the parent's pass-through; every client this
+	// window creates subscribes it (DELAY.md §9). Set at construction and
+	// never changed. Nil in bare fixtures.
+	transportDelayStats TransportDelayStatsFunction
 
 	clientChannelArgs chan *multiClientChannelArgs
 
@@ -10660,10 +12298,12 @@ type multiClientWindow struct {
 	performanceProfile *PerformanceProfile
 	windowSizeLimit    int
 	// Nil test seams expose one initial-evaluation callback across the exact
-	// expand-pass phase and terminal boundaries. Production leaves all five
-	// unset.
+	// expand-pass phase and terminal boundaries, and hold the ping's
+	// evaluation-cancellation branch before it takes the pass mutex.
+	// Production leaves all six unset.
 	beforeExpandPingResultForTest func()
 	afterExpandPingResultForTest  func()
+	beforeExpandPingCancelForTest func()
 	finishExpandRequestsForTest   <-chan struct{}
 	expireExpandPingForTest       <-chan struct{}
 	expireExpandPassForTest       <-chan struct{}
@@ -10679,9 +12319,41 @@ type multiClientWindow struct {
 	// Re-dial pacing of a fixed window's failed destinations. Guarded by
 	// stateLock. See ip_remote_multi_client_fixed_retry.go.
 	fixedRetries map[MultiHopId]*fixedDestinationRetry
+	// Expansion pacing of a discovery window after passes that admitted
+	// nothing. Guarded by stateLock. See
+	// ip_remote_multi_client_discovery_retry.go.
+	discoveryRetry discoveryExpandRetry
+	// Whether the payer's balance holds the refill. Guarded by stateLock. See
+	// ip_remote_multi_client_balance_hold.go.
+	balanceHold            windowBalanceHold
+	discoveryDemand        discoveryAcquisitionDemand
+	discoveryDemandChanged *Monitor
+	// A strict window's current expansion pass: the candidates the
+	// enumerator may still hand it, and its reservation of a warned client's
+	// slot at the hard max. Guarded by stateLock. See
+	// ip_remote_multi_client_strict_handover.go.
+	strictPass *strictWindowPass
+	// Nil outside focused tests. Runs before a handover's swap section, with
+	// no lock held. Guarded by stateLock.
+	beforeStrictHandoverSwapForTest func()
 
 	generatorMonitor *Monitor
 	resizeMonitor    *Monitor
+	// the send-stall pass reads the clients into this list, so a pass that
+	// finds nothing stalled allocates nothing. Owned by whichever pass holds
+	// sendStallClientsBusy; a concurrent pass collects its own.
+	sendStallClients     []*multiClientChannel
+	sendStallClientsBusy atomic.Bool
+	// parks the send-stall watchdog while nothing is outstanding; every
+	// client the window constructs holds it. nil (bare fixtures) never parks
+	sendStallWake *outstandingSendWake
+	// Nil outside focused tests. Runs at the start of each send-stall pass
+	// (watchSendStalls). Set before the loop starts.
+	sendStallPassForTest func()
+	// networkChangeMonitor ends a platform-error retry wait when the host's
+	// network path changes (see notifyNetworkChanged). nil (bare fixtures)
+	// never wakes a wait.
+	networkChangeMonitor *Monitor
 
 	// --- window honesty (see ip_remote_multi_client_outcome.go) ---
 
@@ -10743,6 +12415,12 @@ type multiClientWindow struct {
 	// The exit a sticky window lost to transport loss, for the next discovery
 	// round to ask for first. Its own lock inside.
 	stickyRedial stickyRedial
+
+	// --- recent exits (see ip_remote_multi_client_recent_exits.go) ---
+
+	// The exits any other window lost to an outage of ours, for the rounds
+	// that re-form it to ask for first. Its own lock inside.
+	recentExits recentExitMemory
 }
 
 func newMultiClientWindow(
@@ -10755,20 +12433,32 @@ func newMultiClientWindow(
 	dialFailureCallback dialFailureFunction,
 	ingressSecurityPolicy SecurityPolicy,
 	clientRemoveCallback func(client *multiClientChannel),
+	clientRetireCallback func(client *multiClientChannel),
 	windowType WindowType,
 	initialPerformanceProfile *PerformanceProfile,
 	settings *MultiClientSettings,
 	reliabilitySettingsFunc func() *ReliabilitySettings,
 	uplinkGateFunc func(now time.Time) (stale bool, freshSince time.Time),
+	uplinkLastIngressFunc func() time.Time,
 	reliabilityMetricsFunc func() *reliabilityMetrics,
 	flowCountFunc func(*multiClientChannel) int,
 	providerQualifiedFunc func(MultiHopId) bool,
 	receivingSiblingsFunc func(exclude *multiClientChannel) int,
 	qualificationRefreshFunc func(MultiHopId),
 	providerPolicyPreference *providerPolicyPreference,
+	// the parent's delay stats pass-through, set before the window's
+	// goroutines start so every client it creates subscribes it (DELAY.md
+	// §9); nil in bare fixtures
+	transportDelayStats TransportDelayStatsFunction,
+	// called after the window admits a client, outside the window and
+	// channel state locks and under expand's admission mutex, so it must not
+	// block; nil in bare fixtures
+	clientAddCallback func(client *multiClientChannel),
 ) *multiClientWindow {
 	window := &multiClientWindow{
 		ctx:                          ctx,
+		transportDelayStats:          transportDelayStats,
+		clientAddCallback:            clientAddCallback,
 		cancel:                       cancel,
 		log:                          loggerOrDefault(settings.Log),
 		generator:                    generator,
@@ -10778,12 +12468,14 @@ func newMultiClientWindow(
 		dialFailureCallback:          dialFailureCallback,
 		ingressSecurityPolicy:        ingressSecurityPolicy,
 		clientRemoveCallback:         clientRemoveCallback,
+		clientRetireCallback:         clientRetireCallback,
 		windowType:                   windowType,
 		performanceProfile:           initialPerformanceProfile,
 		windowSizeLimit:              settings.WindowSizeLimit,
 		settings:                     settings,
 		reliabilitySettingsFunc:      reliabilitySettingsFunc,
 		uplinkGateFunc:               uplinkGateFunc,
+		uplinkLastIngressFunc:        uplinkLastIngressFunc,
 		reliabilityMetricsFunc:       reliabilityMetricsFunc,
 		flowCountFunc:                flowCountFunc,
 		providerQualifiedFunc:        providerQualifiedFunc,
@@ -10798,11 +12490,13 @@ func newMultiClientWindow(
 		clients:                      map[Id]*multiClientChannel{},
 		generatorMonitor:             NewMonitor(),
 		resizeMonitor:                NewMonitor(),
+		sendStallWake:                newOutstandingSendWake(),
+		networkChangeMonitor:         NewMonitor(),
 		failures:                     &windowFailureRecorder{},
-		createFailThrottle:           newLogThrottle(evaluationFailureLogInterval),
-		pingFailThrottle:             newLogThrottle(evaluationFailureLogInterval),
-		budgetFailThrottle:           newLogThrottle(evaluationFailureLogInterval),
-		enumerateZeroThrottle:        newLogThrottle(evaluationFailureLogInterval),
+		createFailThrottle:           newLogThrottle(settings.EvaluationFailureLogInterval),
+		pingFailThrottle:             newLogThrottle(settings.EvaluationFailureLogInterval),
+		budgetFailThrottle:           newLogThrottle(settings.EvaluationFailureLogInterval),
+		enumerateZeroThrottle:        newLogThrottle(settings.EvaluationFailureLogInterval),
 	}
 	window.evalEpochCtx, window.evalEpochCancel = context.WithCancel(ctx)
 
@@ -10831,6 +12525,36 @@ func sendStallPollTimeout(stallTimeout time.Duration, resizeTimeout time.Duratio
 	return max(stallTimeout/3, 250*time.Millisecond)
 }
 
+// outstandingSendWake parks a window's send-stall watchdog while no client of
+// the window has a send outstanding, and wakes it at the first send of a run:
+// a stall needs an outstanding send (sendStalled). The watchdog marks itself
+// parked before its last look at the clients, and the first send of a run
+// reads the mark under the client lock that look takes, so one of the two
+// always sees the other. While the watchdog runs, that send pays one atomic
+// load.
+type outstandingSendWake struct {
+	parked atomic.Bool
+	wake   chan struct{}
+}
+
+func newOutstandingSendWake() *outstandingSendWake {
+	return &outstandingSendWake{
+		wake: make(chan struct{}, 1),
+	}
+}
+
+// signal wakes the watchdog if it is parked. Nil-safe: a channel built
+// outside a window has none.
+func (self *outstandingSendWake) signal() {
+	if self == nil || !self.parked.Load() || !self.parked.CompareAndSwap(true, false) {
+		return
+	}
+	select {
+	case self.wake <- struct{}{}:
+	default:
+	}
+}
+
 // watchSendStalls evaluates a client once its acknowledged-send progress stops.
 //
 // The watchdog polls on a fraction of the stall timeout (resize otherwise runs
@@ -10849,16 +12573,37 @@ func sendStallPollTimeout(stallTimeout time.Duration, resizeTimeout time.Duratio
 // admissible. An admitted verdict errors and cancels the channel immediately;
 // resize is woken only to reap it and backfill the window. Soft classifications
 // (stats-unhealthy, rank, drain) remain exclusively in resize.
+//
+// With nothing outstanding in the window no stall can start, so the watchdog
+// parks until the first send of a run or a newly admitted client wakes it
+// (outstandingSendWake), and polls again from there.
 func (self *multiClientWindow) watchSendStalls() {
+	// one timer for the loop's life
+	var pollTimer *time.Timer
+	defer func() {
+		if pollTimer != nil {
+			pollTimer.Stop()
+		}
+	}()
+	// reused by each look before parking, so an idle look allocates nothing
+	var parkClients []*multiClientChannel
 	for {
 		stallTimeout := self.reliabilitySettings().SendStallTimeout
 
 		pollTimeout := sendStallPollTimeout(stallTimeout, self.settings.WindowResizeTimeout)
+		if pollTimer == nil {
+			pollTimer = time.NewTimer(pollTimeout)
+		} else {
+			pollTimer.Reset(pollTimeout)
+		}
 
 		select {
 		case <-self.ctx.Done():
 			return
-		case <-time.After(pollTimeout):
+		case <-pollTimer.C:
+		}
+		if self.sendStallPassForTest != nil {
+			self.sendStallPassForTest()
 		}
 
 		if stallTimeout <= 0 {
@@ -10868,6 +12613,29 @@ func (self *multiClientWindow) watchSendStalls() {
 			// wake resize for the reap and the backfill only; the verdict has
 			// already been executed above
 			self.resizeMonitor.NotifyAll()
+		}
+
+		if wake := self.sendStallWake; wake != nil {
+			wake.parked.Store(true)
+			parkClients = self.appendUnorderedClients(parkClients[:0])
+			outstanding := false
+			for _, client := range parkClients {
+				// judged as convictSendStalls judges them
+				if !client.dataOnlyProviderProbe && client.hasOutstandingSends() {
+					outstanding = true
+					break
+				}
+			}
+			clear(parkClients)
+			if outstanding {
+				wake.parked.Store(false)
+			} else {
+				select {
+				case <-self.ctx.Done():
+					return
+				case <-wake.wake:
+				}
+			}
 		}
 	}
 }
@@ -10903,8 +12671,19 @@ func (self *multiClientWindow) watchSendStalls() {
 // state; the verdicts are applied serially afterwards so the addError-before-
 // Cancel ordering above is preserved per channel.
 func (self *multiClientWindow) convictSendStalls(stallTimeout time.Duration) bool {
+	var clients []*multiClientChannel
+	if self.sendStallClientsBusy.CompareAndSwap(false, true) {
+		clients = self.appendUnorderedClients(self.sendStallClients[:0])
+		defer func() {
+			clear(clients)
+			self.sendStallClients = clients[:0]
+			self.sendStallClientsBusy.Store(false)
+		}()
+	} else {
+		clients = self.unorderedClients()
+	}
 	var stalled []*multiClientChannel
-	for _, client := range self.unorderedClients() {
+	for _, client := range clients {
 		// A finite application probe owns its data deadline and outcome. Skip
 		// this active question and its conviction together, not just the ping.
 		if client.dataOnlyProviderProbe {
@@ -10993,6 +12772,24 @@ func (self *multiClientWindow) convictSendStalls(stallTimeout time.Duration) boo
 	for i, client := range stalled {
 		verdict := verdicts[i]
 		if !verdict.convict {
+			if client.ctx != nil && client.ctx.Err() != nil {
+				// Closing a channel is not a successful peer-health observation.
+				continue
+			}
+			if verdict.localUnwritten || verdict.unanswered {
+				// Refusal, expiry or an unresolved callback carries no peer-health evidence. Report it once
+				// in this stale episode without refreshing its pending clock.
+				if client.markStallHoldOnce() {
+					loggerOrDefault(self.log).Infof("%s\n", relEvent(
+						"busy_probe",
+						"exit", client.ClientId(),
+						"outcome", "held",
+						"detail", verdict.detail,
+						"bar", stallTimeout,
+					))
+				}
+				continue
+			}
 			// acquitted by the probe, or deferred to the next pass (a single
 			// unsendable probe). Nothing is written here: the acquittal already
 			// refreshed the stall bar through addBusyProbeAck, and there is no
@@ -11094,7 +12891,20 @@ func (self *multiClientWindow) convictSendStalls(stallTimeout time.Duration) boo
 		if verdict.detail != "" {
 			reason = fmt.Sprintf("%s, %s", reason, verdict.detail)
 		}
-		client.addError(fmt.Errorf("send stalled: %s", reason))
+		committed := func() bool {
+			client.stateLock.Lock()
+			defer client.stateLock.Unlock()
+			// Other probes may have kept the window waiting after this result.
+			// Commit the error only to the pending episode that was actually judged.
+			if verdict.pendingEpisode && (client.pendingSendGeneration != verdict.pendingGeneration || (client.ctx != nil && client.ctx.Err() != nil)) {
+				return false
+			}
+			client.addErrorWithLock(fmt.Errorf("send stalled: %s", reason))
+			return true
+		}()
+		if !committed {
+			continue
+		}
 		client.Cancel()
 		loggerOrDefault(self.log).Infof("%s\n", relEvent(
 			"busy_probe",
@@ -11192,6 +13002,7 @@ func (self *multiClientWindow) contractStatusFromClient(client *multiClientChann
 			}
 		})
 	}
+	self.noteContractStatusForBalanceHold(status)
 
 	self.contractStatus(status)
 }
@@ -11230,18 +13041,24 @@ func (self *multiClientWindow) peerIdentityChanged() {
 
 // the performance profile will take effect at the next `resize` iteration
 func (self *multiClientWindow) SetPerformanceProfile(performanceProfile *PerformanceProfile) {
-	self.stateLock.Lock()
-	defer self.stateLock.Unlock()
+	forgottenCount := func() int {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
 
-	if performanceProfilesEqual(self.performanceProfile, performanceProfile) {
-		return
-	}
-	self.performanceProfile = performanceProfile
-	// a lost exit is only wanted back under the profile it was lost in
-	self.stickyRedial.Forget()
-	if self.resizeMonitor != nil {
-		self.resizeMonitor.NotifyAll()
-	}
+		if performanceProfilesEqual(self.performanceProfile, performanceProfile) {
+			return 0
+		}
+		self.performanceProfile = performanceProfile
+		// a lost exit is only wanted back under the profile it was lost in
+		self.stickyRedial.Forget()
+		forgottenCount := self.recentExits.Forget()
+		if self.resizeMonitor != nil {
+			self.resizeMonitor.NotifyAll()
+		}
+		return forgottenCount
+	}()
+	// logged with no lock held
+	self.logRecentExitsForgotten(forgottenCount, "profile_change")
 }
 
 // generatorCallResult carries one generator call's result across the deadline
@@ -11355,8 +13172,25 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 		}()
 	}()
 
+	var demandRead *discoveryDemandRead
 	for {
 		generatorNotify := self.generatorMonitor.NotifyChannel()
+		if demandRead != nil && !self.discoveryDemandReadLive(demandRead) {
+			notify := demandRead.generatorNotify
+			demandRead = nil
+			demandRead = self.waitDiscoveryDemand(notify, true)
+			continue
+		}
+		// before the platform call, so a change during it ends the retry wait
+		networkChanged := self.networkChangeNotify()
+
+		// A discovery window waiting out its expansion backoff lists and
+		// mints nothing: an identity minted now would expire unused before
+		// the next expansion and be replaced, a registration and a retirement
+		// per window every WindowExpandArgsTimeout.
+		if !self.waitDiscoveryExpandDeferral() {
+			return
+		}
 
 		// exclude healthy destinations that are already in the window
 		windowDestinations := func() map[MultiHopId]bool {
@@ -11378,12 +13212,42 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 		// family-aware discovery order: v6-capable first while a shortfall
 		// is open, then the main fill -- or, for a resize-pass probe, the
 		// v6-capable request alone; see enumerateDestinations
-		probeOnly := self.takeIpv6ProbeRequest()
-		destinations, err := self.enumerateDestinations(
-			slices.Collect(maps.Keys(windowDestinations())),
-			probeOnly,
-		)
+		probeOnly := false
+		var destinations []enumeratedDestination
+		var err error
+		if demandRead == nil {
+			probeOnly = self.takeIpv6ProbeRequest()
+			// a strict window at its hard max with no handover to fill lists
+			// and mints nothing until an expansion asks again; a family-swap
+			// probe still asks before the window gives anything up
+			// a window the payer's balance holds lists and mints nothing
+			// either; the probe in its expansion step releases it
+			if !probeOnly && (!self.strictDiscoveryAdmissible() || self.balanceListingHeld()) {
+				demandRead = self.waitDiscoveryDemand(generatorNotify, true)
+				if self.ctx.Err() != nil {
+					return
+				}
+				continue
+			}
+			destinations, err = self.enumerateDestinations(slices.Collect(maps.Keys(windowDestinations())), probeOnly)
+		} else {
+			destinations, err = self.listDiscoveryDemand(demandRead, slices.Collect(maps.Keys(windowDestinations())))
+			if !self.discoveryDemandReadLive(demandRead) {
+				notify := demandRead.generatorNotify
+				demandRead = nil
+				demandRead = self.waitDiscoveryDemand(notify, true)
+				continue
+			}
+		}
 		if err != nil {
+			if demandRead != nil {
+				// The demand call retains backend refusal authority even if
+				// its current slot ends while that response arrives.
+				notify := demandRead.generatorNotify
+				demandRead = nil
+				demandRead = self.waitDiscoveryDemand(notify, true)
+				continue
+			}
 			select {
 			case <-self.ctx.Done():
 				return
@@ -11393,19 +13257,18 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 			// a hung/erroring platform api is the platform-unreachable class
 			// unless the message names auth or rate limiting
 			class := self.recordEvaluationFailure(windowFailurePlatform, err)
-			select {
-			case <-self.ctx.Done():
+			if !self.waitWindowRetry(self.ctx, class, networkChanged) {
 				return
-			case <-time.After(self.windowRetryDelay(class)):
 			}
 			continue
 		}
-		// The platform answered. Any success clears the backoff so the window
-		// returns to its normal cadence once the platform recovers. A fixed
+		// The platform answered, which clears the error backoff so the window
+		// returns to its normal cadence once the platform recovers. A refused
+		// mint keeps its rate-limit backoff until a mint succeeds. A fixed
 		// destination set is listed locally without asking the platform, so
-		// it proves nothing about the mint that is backing off.
+		// it proves nothing about the platform either.
 		if _, fixed := self.generator.FixedDestinationSize(); !fixed {
-			self.windowRetryReset()
+			self.windowListingRetryReset()
 		}
 
 		// unconditional (V0): the platform answered with ZERO candidates. Only
@@ -11458,11 +13321,18 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 					continue
 				}
 
+				if demandRead == nil && !probeOnly && (!self.strictDiscoveryAdmissible() || self.balanceListingHeld()) {
+					return
+				}
+				if demandRead != nil && !self.claimDiscoveryDemandMint(demandRead) {
+					return
+				}
 				for {
 					timeout := expirationTime.Sub(time.Now())
 					if timeout <= 0 {
 						return
 					}
+					networkChanged := self.networkChangeNotify()
 
 					// a destination-aware generator can reuse a persisted
 					// identity for this destination (PROXYDRAIN1.md §3.5).
@@ -11472,7 +13342,9 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 					// removeLateClientArgs rather than discarded.
 					var clientArgs *MultiClientGeneratorClientArgs
 					var err error
-					if destinationGenerator, ok := self.generator.(MultiClientGeneratorWithDestination); ok {
+					if demandRead != nil {
+						clientArgs, err = self.mintDiscoveryDemand(demandRead, destination)
+					} else if destinationGenerator, ok := self.generator.(MultiClientGeneratorWithDestination); ok {
 						clientArgs, err = windowGeneratorCall(
 							self.ctx,
 							self.settings.WindowGeneratorTimeout,
@@ -11489,7 +13361,19 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 							self.removeLateClientArgs,
 						)
 					}
+					if demandRead != nil && !self.discoveryDemandReadLive(demandRead) {
+						if clientArgs != nil {
+							self.generator.RemoveClientArgs(clientArgs)
+						}
+						return
+					}
 					if err != nil {
+						if demandRead != nil {
+							if clientArgs != nil {
+								self.generator.RemoveClientArgs(clientArgs)
+							}
+							return
+						}
 						select {
 						case <-self.ctx.Done():
 							return
@@ -11500,10 +13384,8 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 						// round trip, so its timeout is platform-unreachable
 						// (auth/rate refine via the message)
 						class := self.recordEvaluationFailure(windowFailurePlatform, err)
-						select {
-						case <-self.ctx.Done():
+						if !self.waitWindowRetry(self.ctx, class, networkChanged) {
 							return
-						case <-time.After(self.windowRetryDelay(class)):
 						}
 						continue
 					}
@@ -11516,15 +13398,16 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 						MultiClientGeneratorClientArgs: *clientArgs,
 						FixedDestination:               fixedDestination,
 						stickyRedial:                   enumerated.stickyRedial,
+						recentExit:                     enumerated.recentExit,
 					}
-					select {
-					case <-self.ctx.Done():
-						self.generator.RemoveClientArgs(clientArgs)
-						return
-					case self.clientChannelArgs <- args:
-					case <-time.After(timeout):
-						// destination expired
-						self.log.Infof("[multi]create client args expired\n")
+					offered := self.offerPassCandidate(demandRead, args, time.Now().Add(timeout))
+					if !offered {
+						select {
+						case <-self.ctx.Done():
+						default:
+							// destination expired
+							self.log.Infof("[multi]create client args expired\n")
+						}
 						self.generator.RemoveClientArgs(clientArgs)
 						return
 					}
@@ -11536,16 +13419,115 @@ func (self *multiClientWindow) randomEnumerateClientArgs() {
 			self.setIpv6CandidateReady(false)
 		}
 
-		select {
-		case <-self.ctx.Done():
+		demandRead = nil
+		demandRead = self.waitDiscoveryDemand(generatorNotify, len(destinations) == 0)
+		if self.ctx.Err() != nil {
 			return
-		case <-generatorNotify:
 		}
 	}
 }
 
+// The removal of a window client that ended with an error, which the resize
+// pass and a handover whose victim ended before its swap share: THE verdict
+// line, the Fixed IP's re-dial, and the recent-exit memory, classified while
+// the client is still in the window and held only after it left.
+type windowErrorRemoval struct {
+	window     *multiClientWindow
+	client     *multiClientChannel
+	err        error
+	stickyExit bool
+	// what classifyRecentExit found, held by finish
+	lostExit         recentExit
+	lostExitMaxCount int
+	rememberLostExit bool
+}
+
+// Classifies the removal of a client that ended with err. Every other window
+// remembers an exit lost to an outage of ours for the rounds that re-form it
+// (see recentExitMemory), so this runs before the removal, while the uplink
+// gate still counts the exit's outstanding sends. Nothing is recorded yet.
+// Called with no lock held.
+func (self *multiClientWindow) classifyErrorRemoval(
+	client *multiClientChannel,
+	err error,
+	stats *clientWindowStats,
+	windowSize WindowSizeSettings,
+	stickyExit bool,
+) *windowErrorRemoval {
+	removal := &windowErrorRemoval{
+		window:     self,
+		client:     client,
+		err:        err,
+		stickyExit: stickyExit,
+	}
+	removal.lostExit, removal.lostExitMaxCount, removal.rememberLostExit =
+		self.classifyRecentExit(client, err, stats, windowSize, stickyExit)
+	return removal
+}
+
+// Records the removal before the client leaves the window. Called with no
+// lock held.
+func (self *windowErrorRemoval) begin() {
+	window := self.window
+	// the historical format is preserved EXACTLY up to the separator -- this
+	// is THE verdict line, the one the owner greps and the one every removal
+	// postmortem starts from. The twin adds the compact reason token and the
+	// blast radius on the same line, so `grep 'event=removal'` yields the
+	// removal census without a regex over the free-text error.
+	window.log.Infof(
+		"[multi]remove error client [%s] = %s | %s\n",
+		self.client.ClientId(), self.err,
+		relEvent(
+			"removal",
+			"exit", self.client.ClientId(),
+			"reason", relRemovalReason(self.err),
+			"flows", window.flowCount(self.client),
+		),
+	)
+	// the user's Fixed IP lost its exit to transport loss, not to a verdict
+	// against the provider: ask for the same provider first (see
+	// stickyRedial)
+	window.rememberStickyRedial(self.client, self.err, self.stickyExit)
+}
+
+// The cause the removal counts under.
+func (self *windowErrorRemoval) cause() windowRemovalCause {
+	return windowRemovalCauseOf(self.err)
+}
+
+// Holds the lost exit once the client left the window, so a round in flight
+// never finds the exit still in the window.
+func (self *windowErrorRemoval) finish() {
+	if self.rememberLostExit {
+		self.window.rememberRecentExit(self.client, self.lostExit, self.lostExitMaxCount)
+	}
+}
+
 func (self *multiClientWindow) resize() {
+	// one timer for the loop's life, re-armed for each wait between passes
+	var waitTimer *time.Timer
+	defer func() {
+		if waitTimer != nil {
+			waitTimer.Stop()
+		}
+	}()
+	// the process counters (nil counts nothing): the state this loop last
+	// published for the window, retracted when the loop ends, and the warned
+	// clients' causes as the last pass classified them
+	windowClientStats := self.windowClientStats()
+	publishedWindowState := windowStateNone
+	defer func() {
+		windowClientStats.moveWindowState(self.windowType, publishedWindowState, windowStateNone)
+	}()
+	warningTransitions := windowWarningTransitions{}
 	for {
+		// Cancellation can race a ready resize edge after an expansion ends.
+		// Leave owned channels to Close instead of starting a teardown pass.
+		select {
+		case <-self.ctx.Done():
+			return
+		default:
+		}
 		update := self.resizeMonitor.NotifyChannel()
 
 		var windowSize WindowSizeSettings
@@ -11573,7 +13555,7 @@ func (self *multiClientWindow) resize() {
 		weights := map[*multiClientChannel]float32{}
 		durations := map[*multiClientChannel]time.Duration{}
 
-		removeClient := func(client *multiClientChannel) {
+		removeClient := func(client *multiClientChannel, cause windowRemovalCause) {
 			client.Close()
 			removed := false
 			func() {
@@ -11593,6 +13575,7 @@ func (self *multiClientWindow) resize() {
 				}
 			}()
 			if removed {
+				windowClientStats.addRemoval(self.windowType, cause)
 				self.removeClients(client)
 			}
 		}
@@ -11639,27 +13622,13 @@ func (self *multiClientWindow) resize() {
 					"detail", err,
 				))
 			} else {
-				// the historical format is preserved EXACTLY up to the
-				// separator -- this is THE verdict line, the one the owner
-				// greps and the one every removal postmortem starts from. The
-				// twin adds the compact reason token and the blast radius on
-				// the same line, so `grep 'event=removal'` yields the removal
-				// census without a regex over the free-text error.
-				self.log.Infof(
-					"[multi]remove error client [%s] = %s | %s\n",
-					client.ClientId(), err,
-					relEvent(
-						"removal",
-						"exit", client.ClientId(),
-						"reason", relRemovalReason(err),
-						"flows", self.flowCount(client),
-					),
-				)
-				// the user's Fixed IP lost its exit to transport loss, not to
-				// a verdict against the provider: ask for the same provider
-				// first (see stickyRedial)
-				self.rememberStickyRedial(client, err, stickyExit)
-				removeClient(client)
+				// THE verdict line, the Fixed IP's re-dial and the recent-exit
+				// memory, which a handover victim that ended before its swap
+				// shares (see windowErrorRemoval)
+				removal := self.classifyErrorRemoval(client, err, stats, windowSize, stickyExit)
+				removal.begin()
+				removeClient(client, removal.cause())
+				removal.finish()
 			}
 		}
 
@@ -11936,7 +13905,7 @@ func (self *multiClientWindow) resize() {
 					} else {
 						previousCause, causeChanged := client.setWarning(true, warnUnhealthy)
 						self.logWarnTransition(client, previousCause, causeChanged, stats)
-						removeClient(client)
+						removeClient(client, windowRemovalUnhealthy)
 					}
 				} else {
 					previousCause, causeChanged := client.setWarning(false, warnNone)
@@ -11946,6 +13915,8 @@ func (self *multiClientWindow) resize() {
 			}
 		}
 
+		warningTransitions.observe(windowClientStats, self.windowType, warnedClients)
+
 		collapseLowestWeighted := func(targetWindowSize int) {
 
 			n := (len(warnedClients) + len(clients)) - targetWindowSize
@@ -11954,28 +13925,9 @@ func (self *multiClientWindow) resize() {
 				if 0 < n && 0 < len(cs) {
 					m := min(len(cs), n)
 					if 0 < m {
+						// the tail is what is shed
 						slices.SortFunc(cs, func(a *multiClientChannel, b *multiClientChannel) int {
-							// dualstack exits are kept ahead of single-family
-							// ones (IPV6.md B2); the tail is what is shed
-							if c := collapseFamilyOrder(a, b); c != 0 {
-								return c
-							}
-							// descending weight
-							aWeight := weights[a]
-							bWeight := weights[b]
-							if aWeight < bWeight {
-								return 1
-							} else if bWeight < aWeight {
-								return -1
-							}
-							aDuration := durations[a]
-							bDuration := durations[b]
-							if aDuration < bDuration {
-								return 1
-							} else if bDuration < aDuration {
-								return -1
-							}
-							return 0
+							return collapseKeepOrder(a, b, weights, durations)
 						})
 
 						for _, client := range cs[len(cs)-m : len(cs)] {
@@ -11995,7 +13947,7 @@ func (self *multiClientWindow) resize() {
 								// own idiom: the flow count read takes the
 								// parent stateLock inside.
 								if self.collapseRemovalAllowed(client, durations[client]) {
-									removeClient(client)
+									removeClient(client, windowRemovalCollapse)
 								} else {
 									// collapse deferred: the capacity collapse
 									// would have destroyed live flows
@@ -12114,8 +14066,10 @@ func (self *multiClientWindow) resize() {
 		)
 
 		// while the control API is unreachable, hold the window at its
-		// current size. See degradedWindowTarget.
-		degraded := self.backendDegraded()
+		// current size. See degradedWindowTarget. So too while the platform
+		// is rate limiting one of the window's own clients, scoped to this
+		// window (contractRateLimitHeldChannels).
+		degraded := self.backendDegraded() || contractRateLimitHeldChannels(self.unorderedClients(), time.Now())
 		targetWindowSize = degradedWindowTarget(targetWindowSize, len(clients), degraded)
 
 		// publish the shortfall for the enumerator (it asks for v6-capable
@@ -12151,7 +14105,7 @@ func (self *multiClientWindow) resize() {
 						"action", "remove_idle",
 						"family", string(victim.IpFamily()),
 					))
-					removeClient(victim)
+					removeClient(victim, windowRemovalFamilySwap)
 					clients = slices.DeleteFunc(clients, func(c *multiClientChannel) bool { return c == victim })
 				} else {
 					// admit one over target and let the capacity collapse
@@ -12210,17 +14164,69 @@ func (self *multiClientWindow) resize() {
 
 		addedCount := 0
 		// A fixed window whose every missing destination is waiting out its
-		// re-dial backoff mints nothing this pass. Health, rotation and
+		// re-dial backoff mints nothing this pass, and neither does a
+		// discovery window whose last expansions admitted nothing (see
+		// ip_remote_multi_client_discovery_retry.go). Health, rotation and
 		// collapse above keep their cadence; the wait below ends with the
 		// first deferral.
 		var redialTime time.Time
 		redialDeferred := false
-		if fixedDestination && len(clients) < targetWindowSize {
-			redialTime, redialDeferred = self.fixedRetryDeferral(targetWindowSize-len(clients), time.Now())
+		// A strict discovery window builds only what admission would accept
+		// now: at its hard max, one candidate for the slot a warned client
+		// hands over, or nothing (see
+		// ip_remote_multi_client_strict_handover.go). A pass that builds
+		// nothing attempted nothing, so the expansion backoff neither advances
+		// nor resets. Fixed destinations and non-strict windows are unbounded.
+		strictCapacity := math.MaxInt
+		var strictHandover *strictWindowHandover
+		if !fixedDestination {
+			self.noteDiscoveryClientCount(len(clients))
+			if len(clients) < targetWindowSize && self.strictWindowHandoverEnabled() {
+				strictCapacity = self.strictAdmissionCapacity(windowSize.WindowSizeHardMax)
+				// exactly at the hard max; above it, the capacity collapse
+				// below sheds clients and nothing is built
+				if strictCapacity == 0 {
+					strictHandover = self.selectStrictHandoverVictim(warnedClients, weights, durations)
+					if strictHandover != nil {
+						strictCapacity = 1
+					}
+				}
+			}
 		}
-		if len(clients) < targetWindowSize && !redialDeferred {
+		if len(clients) < targetWindowSize && strictCapacity <= 0 {
+			windowClientStats.addExpandPass(self.windowType, windowExpandPassSkippedStrictFull)
+		} else if len(clients) < targetWindowSize {
+			if fixedDestination {
+				redialTime, redialDeferred = self.fixedRetryDeferral(targetWindowSize-len(clients), time.Now())
+			} else {
+				redialTime, redialDeferred = self.discoveryExpandDeferral(time.Now())
+			}
+		}
+		if len(clients) < targetWindowSize && redialDeferred {
+			windowClientStats.addExpandPass(self.windowType, windowExpandPassDeferred)
+		}
+		// While the payer's balance refuses the window's contracts, the step
+		// sends one probe instead of building candidates; a restored balance
+		// expands in this same pass (see
+		// ip_remote_multi_client_balance_hold.go)
+		balanceHeld := false
+		if len(clients) < targetWindowSize && 0 < strictCapacity && !redialDeferred && !fixedDestination {
+			balanceHeld = self.probeBalanceHold(windowClientStats)
+		}
+		if len(clients) < targetWindowSize && 0 < strictCapacity && !redialDeferred && !balanceHeld {
 			// expand
-			neededCount := targetWindowSize - len(clients)
+			expandPass := windowExpandPassPlan{
+				state: windowExpandPassStateOf(
+					len(clients),
+					len(clients)+len(warnedClients),
+					windowSizeMin,
+					self.settings.StrictWindowSizeHardMax,
+					windowSize.WindowSizeHardMax,
+				),
+				handover: strictHandover,
+			}
+			windowClientStats.addExpandPass(self.windowType, expandPass.state)
+			neededCount := min(targetWindowSize-len(clients), strictCapacity)
 			plannedAdmitCount, _ := multiClientExpandPlan(
 				neededCount,
 				self.reliabilitySettings().EvaluationPoolMultiple,
@@ -12240,7 +14246,22 @@ func (self *multiClientWindow) resize() {
 				windowSizeMin,
 				neededCount,
 				ipv6Shortfall,
+				expandPass,
 			)
+			if strictHandover != nil && strictHandover.completed.Load() {
+				// the victim left the window in the swap; the rest of this
+				// pass sees it gone
+				warnedClients = slices.DeleteFunc(warnedClients, func(client *multiClientChannel) bool {
+					return client == strictHandover.victim
+				})
+			}
+			if !fixedDestination {
+				if 0 < addedCount {
+					self.noteDiscoveryExpandAdmitted()
+				} else {
+					self.noteDiscoveryExpandUnproductive(time.Now())
+				}
+			}
 			if self.log.V(1).Enabled() {
 				self.log.Infof(
 					"[multi]window expand +%d needed=%d %d->%d (+%d)\n",
@@ -12264,12 +14285,34 @@ func (self *multiClientWindow) resize() {
 				self.log.Infof("[multi]window collapse -%d ->%d\n", (len(clients)+len(warnedClients)+addedCount)-windowSize.WindowSizeHardMax, windowSize.WindowSizeHardMax)
 			}
 		} else {
+			publishedTargetSize := len(clients) + len(warnedClients) + addedCount
+			if !fixedDestination {
+				// Deferring discovery delays acquisition, not the active goal.
+				// Readiness and provider ownership remain the actual counts.
+				if _, deferred := self.discoveryExpandDeferral(time.Now()); deferred {
+					publishedTargetSize = max(publishedTargetSize, targetWindowSize+len(warnedClients))
+				}
+			}
 			self.monitor.addWindowExpandEvent(
 				minSatisfied(self.hardMinimumClientCount(fixedDestination)),
-				len(clients)+len(warnedClients)+addedCount,
+				publishedTargetSize,
 				self.ipv6Available(),
 				inactive,
 			)
+		}
+		if windowClientStats != nil {
+			selectableCount, installedCount := self.windowStateCounts(fixedDestination)
+			windowState := windowStateOf(
+				selectableCount,
+				installedCount,
+				targetWindowSize,
+				windowSizeMin,
+				fixedDestination,
+				self.settings.StrictWindowSizeHardMax,
+				windowSize.WindowSizeHardMax,
+			)
+			windowClientStats.moveWindowState(self.windowType, publishedWindowState, windowState)
+			publishedWindowState = windowState
 		}
 
 		timeout := self.settings.WindowResizeTimeout - time.Now().Sub(startTime)
@@ -12287,7 +14330,7 @@ func (self *multiClientWindow) resize() {
 			case <-self.ctx.Done():
 				return
 			case <-update:
-			case <-time.After(timeout):
+			case <-resetOrCreateTimer(&waitTimer, timeout):
 			}
 		}
 	}
@@ -12300,6 +14343,15 @@ func (self *multiClientWindow) resize() {
 type expandEvaluatedCandidate struct {
 	client *multiClientChannel
 	args   *multiClientChannelArgs
+}
+
+// What resize hands one expansion pass beyond its sizes: the window state the pass was started in, which labels the pass's
+// candidates in the process counters, and a strict window's handover.
+type windowExpandPassPlan struct {
+	state windowExpandPassState
+	// the warned client whose slot a strict window at its hard max hands to
+	// the candidate this pass admits; nil for every other pass
+	handover *strictWindowHandover
 }
 
 // multiClientExpandStepMax bounds every object-producing expansion pass, not
@@ -12361,7 +14413,9 @@ func (self *multiClientWindow) expand(
 	// while positive and unfilled, an evaluated candidate that can carry v6
 	// is admitted ahead of every other, as p2p-only candidates are preferred
 	ipv6Shortfall int,
+	pass windowExpandPassPlan,
 ) (returnPingSuccess int) {
+	windowClientStats := self.windowClientStats()
 	mutex := sync.Mutex{}
 	evaluationOwner := &multiClientEvaluationOwner{}
 	defer self.releaseOutcomeEvaluation(evaluationOwner)
@@ -12400,6 +14454,14 @@ func (self *multiClientWindow) expand(
 		self.reliabilitySettings().EvaluationPoolMultiple,
 		fixedDestination,
 	)
+	// a strict window's pass: the enumerator hands it only the candidates it
+	// requests, and its handover lasts as long as the pass, its final
+	// admissions included (registered before the terminal cleanup, so it ends
+	// after it)
+	if pass.handover != nil || (!fixedDestination && self.strictWindowHandoverEnabled()) {
+		strictPass := self.beginStrictPass(evaluationOwner, requestCount, pass.handover)
+		defer self.endStrictPass(strictPass)
+	}
 
 	admitted := 0
 	pending := []*expandEvaluatedCandidate{}
@@ -12464,19 +14526,76 @@ func (self *multiClientWindow) expand(
 			// Calling RemoveClientArgs here would revoke the derived JWT first
 			// and turn the channel's final contract closes into 401s.
 			client.Cancel()
-			self.monitor.AddProviderEventWithExtenderIps(
+			self.monitor.AddProviderEventWithLocationMatch(
 				args.ClientId,
 				ProviderStateAdded,
 				args.Destination.Tail(),
 				args.Location,
+				args.LocationMatch,
 				args.IpFamily,
 				// the dot belongs to the live old client, so its extenders are
 				// what the re-emitted event must carry
 				self.clientExtenderIps(existingClient),
 			)
+			self.noteRecentExitDropped(args, "declined")
+			windowClientStats.addCandidate(self.windowType, pass.state, windowCandidateDeclinedReplacement)
 			return false
 		}
-		if !self.strictWindowAdmissionAllowed(clientId, windowSize) {
+		// at its hard max a strict window admits only into the slot this
+		// pass's handover reserved (see strictWindowHandover)
+		admissible := self.strictWindowAdmissionAllowed(clientId, windowSize)
+		var strictHandover *strictWindowHandover
+		if !admissible {
+			strictHandover = self.takeStrictHandover(evaluationOwner)
+		}
+		if strictHandover != nil {
+			var beforeSwap func()
+			func() {
+				self.stateLock.Lock()
+				defer self.stateLock.Unlock()
+				beforeSwap = self.beforeStrictHandoverSwapForTest
+			}()
+			if beforeSwap != nil {
+				beforeSwap()
+			}
+		}
+		// a victim that ended with an error before its swap is removed by its
+		// error, as the resize pass removes one: classified here, while it is
+		// still in the window
+		var victimRemoval *windowErrorRemoval
+		if strictHandover != nil {
+			victimRemoval = self.classifyHandoverVictimRemoval(strictHandover.victim, windowSize)
+		}
+		var replacedClient *multiClientChannel
+		installed := false
+		if admissible || strictHandover != nil {
+			func() {
+				self.stateLock.Lock()
+				defer self.stateLock.Unlock()
+				if strictHandover != nil {
+					// the swap: the victim leaves and the candidate takes its
+					// slot in one section, so the installed count never
+					// leaves the hard max
+					if !self.strictHandoverSwappableWithLock(strictHandover) {
+						return
+					}
+					delete(self.clients, strictHandover.victim.ClientId())
+					strictHandover.completed.Store(true)
+				}
+				// re-read under the lock: the slot is installed against whatever
+				// is there NOW, so a concurrent remove/replace between the gate
+				// above and here can never leak an uncancelled channel
+				replacedClient = self.clients[clientId]
+				self.clients[clientId] = client
+				if self.resizeMonitor != nil {
+					self.resizeMonitor.NotifyAll()
+				}
+				// the client may already have sends outstanding
+				self.sendStallWake.signal()
+				installed = true
+			}()
+		}
+		if !installed {
 			self.log.Infof("%s\n", relEvent(
 				"expand_decline",
 				"exit", clientId,
@@ -12487,25 +14606,44 @@ func (self *multiClientWindow) expand(
 			// ownership without disturbing an existing flow. The channel owns
 			// its generator args at this point; do not return them separately.
 			client.Cancel()
-			self.monitor.AddProviderEvent(args.ClientId, ProviderStateNotAdded, args.Destination.Tail(), args.Location, args.IpFamily)
+			self.monitor.AddProviderEventWithLocationMatch(args.ClientId, ProviderStateNotAdded, args.Destination.Tail(), args.Location, args.LocationMatch, args.IpFamily, nil)
+			self.noteRecentExitDropped(args, "declined")
+			windowClientStats.addCandidate(self.windowType, pass.state, windowCandidateDeclinedStrictCap)
 			return false
 		}
 
 		self.log.V(1).Infof("[multi]expand new client\n")
 
-		var replacedClient *multiClientChannel
-		func() {
-			self.stateLock.Lock()
-			defer self.stateLock.Unlock()
-			// re-read under the lock: the slot is installed against whatever
-			// is there NOW, so a concurrent remove/replace between the gate
-			// above and here can never leak an uncancelled channel
-			replacedClient = self.clients[clientId]
-			self.clients[clientId] = client
-			if self.resizeMonitor != nil {
-				self.resizeMonitor.NotifyAll()
+		if strictHandover != nil {
+			victim := strictHandover.victim
+			if victimRemoval != nil {
+				// the storm breaker counts the removal as resize's would count,
+				// even past its budget: an evaluated replacement already holds
+				// the victim's slot, and it carries no flow the breaker protects
+				if blackholeVerdictErr(victimRemoval.err) {
+					self.noteVerdictRemoval(time.Now())
+				}
+				victimRemoval.begin()
 			}
-		}()
+			// the victim's ordinary removal, after the swap: its remaining
+			// flows move or end with it, and its channel cleanup retires it
+			victim.Close()
+			self.removeClients(victim)
+			if victimRemoval != nil {
+				windowClientStats.addRemoval(self.windowType, victimRemoval.cause())
+				victimRemoval.finish()
+			} else {
+				windowClientStats.addRemoval(self.windowType, windowRemovalHandover)
+				// verbose: a hosted window hands a slot over at every rotation
+				if self.log.V(1).Enabled() {
+					self.log.Infof("%s\n", relEvent(
+						"handover",
+						"exit", victim.ClientId(),
+						"replacement", clientId,
+					))
+				}
+			}
+		}
 		if client.IpFamily().SupportsIpv6() {
 			admittedIpv6Capable += 1
 			self.noteIpv6CandidateAdmitted()
@@ -12517,18 +14655,31 @@ func (self *multiClientWindow) expand(
 			// the NEW live client (Added below), and the ui would reap it
 			// while the client is still routing.
 			replacedClient.Cancel()
+			if self.clientRetireCallback != nil {
+				self.clientRetireCallback(replacedClient)
+			}
 		}
-		self.monitor.AddProviderEventWithExtenderIps(
+		self.monitor.AddProviderEventWithLocationMatch(
 			args.ClientId,
 			ProviderStateAdded,
 			args.Destination.Tail(),
 			args.Location,
+			args.LocationMatch,
 			args.IpFamily,
 			self.clientExtenderIps(client),
 		)
 		// the outcome watchdog stands down: this window has proven it can
 		// install a provider (and a latched failed state is cleared)
 		self.noteClientAdded(client)
+		if self.clientAddCallback != nil {
+			self.clientAddCallback(client)
+		}
+		self.noteRecentExitAdmitted(args)
+		if strictHandover == nil {
+			windowClientStats.addCandidate(self.windowType, pass.state, windowCandidateAdmitted)
+		} else {
+			windowClientStats.addCandidate(self.windowType, pass.state, windowCandidateAdmittedHandover)
+		}
 		if _, attempted := fixedAttempts[args.Destination]; attempted {
 			fixedAttempts[args.Destination] = true
 			self.noteFixedDestinationAdmitted(args.Destination)
@@ -12559,12 +14710,14 @@ func (self *multiClientWindow) expand(
 	// chosen), distinct from EvaluationFailed.
 	//
 	// must be called with mutex
-	cancelCandidate := func(candidate *expandEvaluatedCandidate) {
+	cancelCandidate := func(candidate *expandEvaluatedCandidate, outcome windowCandidateOutcome) {
 		// A successfully constructed channel owns its generator args. Its
 		// cancellation cleanup returns them through RemoveClientWithArgs after
 		// the Client/OOB join; do not also revoke them directly here.
 		candidate.client.Cancel()
-		self.monitor.AddProviderEvent(candidate.args.ClientId, ProviderStateNotAdded, candidate.args.Destination.Tail(), candidate.args.Location, candidate.args.IpFamily)
+		self.monitor.AddProviderEventWithLocationMatch(candidate.args.ClientId, ProviderStateNotAdded, candidate.args.Destination.Tail(), candidate.args.Location, candidate.args.LocationMatch, candidate.args.IpFamily, nil)
+		self.noteRecentExitDropped(candidate.args, "not_admitted")
+		windowClientStats.addCandidate(self.windowType, pass.state, outcome)
 	}
 
 	// admitPending admits from the evaluated pool while budget remains. Every
@@ -12619,7 +14772,7 @@ func (self *multiClientWindow) expand(
 		expandEnded = true
 		admitPending()
 		for _, candidate := range pending {
-			cancelCandidate(candidate)
+			cancelCandidate(candidate, windowCandidateNotAdmittedSurplus)
 		}
 		pending = nil
 		// The pass deadline is an ownership boundary, not merely a return to
@@ -12689,6 +14842,10 @@ func (self *multiClientWindow) expand(
 		self.settings.PingTimeout,
 	)
 	evaluationOwner.deadline = passEndTime
+	if !fixedDestination && currentWindowSize < targetWindowSize && 0 < requestCount {
+		self.beginDiscoveryAcquisition(evaluationOwner, self.evalEpochContext(), requestEndTime, targetWindowSize, windowSize.WindowSizeHardMax)
+		defer self.endDiscoveryAcquisition(evaluationOwner)
+	}
 
 requestCandidates:
 	for i := 0; i < requestCount; i += 1 {
@@ -12698,7 +14855,10 @@ requestCandidates:
 			break
 		}
 
+		self.beginDiscoveryDemandSlot(evaluationOwner)
 		self.generatorMonitor.NotifyAll()
+		requestExpired := time.After(timeout)
+	awaitCandidate:
 		select {
 		case <-self.ctx.Done():
 			return
@@ -12712,6 +14872,10 @@ requestCandidates:
 		case args, ok := <-self.clientChannelArgs:
 			if !ok {
 				return
+			}
+			if !self.acceptDiscoveryDemandArgs(evaluationOwner, args) {
+				self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
+				goto awaitCandidate
 			}
 			// A ready args channel and the acquisition timer can race in select.
 			// Recheck the wall clock after receipt so a candidate observed after
@@ -12782,9 +14946,11 @@ requestCandidates:
 			// the batch delivery seam rides the args so the channel
 			// constructor signature stays put (nil falls back per-packet)
 			args.ReceivePackets = self.clientReceivePacketsCallback
+			args.ackRouteWriteFailureOwner = &self.ackRouteWriteFailures
 			args.NetworkPeerDestination = self.networkPeerDestination
 			args.contractStatus = self.contractStatusFromClient
 			args.providerPolicyPreference = self.providerPolicyPreference
+			args.sendStallWake = self.sendStallWake
 			args.providerEvaluation = &providerEvaluationAttempt{
 				owner:             &self.providerEvaluation,
 				destinationId:     args.Destination.Tail(),
@@ -12823,6 +14989,11 @@ requestCandidates:
 				self.receivingSiblingsFunc,
 				self.qualificationRefreshFunc,
 			)
+			if err == nil && self.transportDelayStats != nil {
+				// every new client adds the multi client as a subscriber; the
+				// subscription ends with the client
+				client.client.AddTransportDelayStatsCallback(self.transportDelayStats)
+			}
 			if err != nil {
 				providerFailure := self.recordChannelCreationFailure(evaluationCtx, args, err)
 				var setupErr *multiClientSetupError
@@ -12831,10 +15002,16 @@ requestCandidates:
 					self.generator.RemoveClientArgs(&args.MultiClientGeneratorClientArgs)
 				}
 				if providerFailure {
-					self.monitor.AddProviderEvent(args.ClientId, ProviderStateEvaluationFailed, args.Destination.Tail(), args.Location, args.IpFamily)
+					self.monitor.AddProviderEventWithLocationMatch(args.ClientId, ProviderStateEvaluationFailed, args.Destination.Tail(), args.Location, args.LocationMatch, args.IpFamily, nil)
 				} else if setupFailed && evaluationCtx.Err() == nil {
-					self.monitor.AddProviderEvent(args.ClientId, ProviderStateNotAdded, args.Destination.Tail(), args.Location, args.IpFamily)
+					self.monitor.AddProviderEventWithLocationMatch(args.ClientId, ProviderStateNotAdded, args.Destination.Tail(), args.Location, args.LocationMatch, args.IpFamily, nil)
 				}
+				self.noteRecentExitDropped(args, recentExitEvaluationReason(providerFailure))
+				setupOutcome := windowCandidateFailedSetup
+				if evaluationCtx.Err() != nil {
+					setupOutcome = windowCandidateCanceled
+				}
+				windowClientStats.addCandidate(self.windowType, pass.state, setupOutcome)
 			} else if client.dataOnlyProviderProbe {
 				// Registered construction is sufficient to select this explicit
 				// provider. The application's DNS/URL exchange owns qualification;
@@ -12842,7 +15019,7 @@ requestCandidates:
 				mutex.Lock()
 				candidate := &expandEvaluatedCandidate{client: client, args: args}
 				if self.ctx.Err() != nil || evaluationCtx.Err() != nil || client.IsDone() {
-					cancelCandidate(candidate)
+					cancelCandidate(candidate, windowCandidateCanceled)
 				} else {
 					added += 1
 					if client.IsP2pOnly() {
@@ -12892,6 +15069,11 @@ requestCandidates:
 					}
 
 					providerFailure = providerFailure && evaluationCtx.Err() == nil
+					// read before our own cancellation releases a contract wait
+					failureOutcome := windowCandidateFailureOutcome(
+						outcome == initialPingCanceled || evaluationCtx.Err() != nil || self.ctx.Err() != nil,
+						args.providerEvaluation.localContractUnavailable(),
+					)
 					pingCancel()
 					// The channel cleanup owns the generator args and preserves the
 					// derived identity through its final contract-close controls.
@@ -12900,10 +15082,12 @@ requestCandidates:
 					if providerFailure {
 						state = ProviderStateEvaluationFailed
 					}
-					self.monitor.AddProviderEvent(args.ClientId, state, args.Destination.Tail(), args.Location, args.IpFamily)
+					self.monitor.AddProviderEventWithLocationMatch(args.ClientId, state, args.Destination.Tail(), args.Location, args.LocationMatch, args.IpFamily, nil)
 					if providerFailure && 0 < ipv6Shortfall && args.IpFamily.SupportsIpv6() {
 						self.noteIpv6CandidateFailed()
 					}
+					self.noteRecentExitDropped(args, recentExitEvaluationReason(providerFailure))
+					windowClientStats.addCandidate(self.windowType, pass.state, failureOutcome)
 					return true
 				}
 				pendingPingFailures = append(pendingPingFailures, pendingPingFailure{
@@ -12913,6 +15097,25 @@ requestCandidates:
 					startedAt:       pingStartedAt,
 					effectiveBudget: self.settings.PingTimeout,
 				})
+
+				// The candidate's client lives under the evaluation context, so
+				// ending the context tears the client down and fails a ping still
+				// in flight with the teardown's own error ("Done", "Send sequence
+				// closed.") rather than the context's. Read as the client hands
+				// the error over, before it waits for the pass mutex: an error
+				// delivered after the client ended carries the end's context
+				// outcome, so the cancellation it caused is not provider evidence,
+				// while a provider error delivered before and observed after it
+				// still is.
+				deliveredPingError := func(err error) error {
+					if err == nil {
+						return nil
+					}
+					if endErr := client.ctx.Err(); endErr != nil && !errors.Is(err, endErr) {
+						return fmt.Errorf("%w (%w)", err, endErr)
+					}
+					return err
+				}
 
 				// PingTimeout starts after processed control registration, but
 				// includes transport/contract work during SendDetailedMessage.
@@ -12930,6 +15133,9 @@ requestCandidates:
 					case <-pingDone.Done():
 						return
 					case <-evaluationCtx.Done():
+						if self.beforeExpandPingCancelForTest != nil {
+							self.beforeExpandPingCancelForTest()
+						}
 						func() {
 							mutex.Lock()
 							defer mutex.Unlock()
@@ -13011,11 +15217,12 @@ requestCandidates:
 						addedP2pOnly += 1
 					}
 
-					self.monitor.AddProviderEventWithExtenderIps(
+					self.monitor.AddProviderEventWithLocationMatch(
 						args.ClientId,
 						ProviderStateInEvaluation,
 						args.Destination.Tail(),
 						args.Location,
+						args.LocationMatch,
 						args.IpFamily,
 						self.clientExtenderIps(client),
 					)
@@ -13029,6 +15236,7 @@ requestCandidates:
 						self.settings.PingWriteTimeout,
 						func(err error) {
 							pingPath.observeAckCallback(err)
+							err = deliveredPingError(err)
 							if self.beforeExpandPingResultForTest != nil {
 								self.beforeExpandPingResultForTest()
 							}
@@ -13063,7 +15271,7 @@ requestCandidates:
 									// branch is reachable only when its callback crossed
 									// the terminal mutex boundary before cleanup canceled
 									// the unresolved ping.
-									cancelCandidate(candidate)
+									cancelCandidate(candidate, windowCandidateNotAdmittedSurplus)
 								} else {
 									pending = append(pending, candidate)
 									admitPending()
@@ -13076,6 +15284,7 @@ requestCandidates:
 						},
 						pingOptions...,
 					)
+					err = deliveredPingError(err)
 					if err != nil {
 						if pingDone.Err() == nil {
 							providerFailure := self.recordEvaluationPingFailure(evaluationCtx, args, err)
@@ -13094,11 +15303,13 @@ requestCandidates:
 				// as usual (the enumerator took the re-dial).
 				break requestCandidates
 			}
-		case <-time.After(timeout):
+		case <-requestExpired:
 			self.log.V(2).Infof("[multi]expand window timeout waiting for args\n")
 			break requestCandidates
 		}
 	}
+
+	self.endDiscoveryAcquisition(evaluationOwner)
 
 	// Candidate acquisition is over. Retain pass ownership until every ping
 	// resolves, capped at acquisition + setup + one full initial-ping budget.
@@ -13446,6 +15657,35 @@ func (self *multiClientWindow) verdictRemovalAllowed(now time.Time) bool {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
+	self.pruneVerdictRemovalTimesWithLock(now, budgetWindow)
+
+	if budgetCount <= len(self.verdictRemovalTimes) {
+		return false
+	}
+	self.verdictRemovalTimes = append(self.verdictRemovalTimes, now)
+	return true
+}
+
+// Records a verdict-driven removal the budget does not decide, so the storm
+// breaker counts it with the rest: a handover's victim leaves even past the
+// budget, since its evaluated replacement already holds the slot. Takes the
+// window stateLock.
+func (self *multiClientWindow) noteVerdictRemoval(now time.Time) {
+	reliabilitySettings := self.reliabilitySettings()
+	budgetWindow := reliabilitySettings.RemovalBudgetWindow
+	if reliabilitySettings.RemovalBudgetCount <= 0 || budgetWindow <= 0 {
+		return
+	}
+
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+
+	self.pruneVerdictRemovalTimesWithLock(now, budgetWindow)
+	self.verdictRemovalTimes = append(self.verdictRemovalTimes, now)
+}
+
+// Drops the verdict removals older than the budget window.
+func (self *multiClientWindow) pruneVerdictRemovalTimesWithLock(now time.Time, budgetWindow time.Duration) {
 	horizon := now.Add(-budgetWindow)
 	// timestamps are appended in order, so pruning is a prefix scan
 	i := 0
@@ -13455,17 +15695,12 @@ func (self *multiClientWindow) verdictRemovalAllowed(now time.Time) bool {
 	if 0 < i {
 		self.verdictRemovalTimes = self.verdictRemovalTimes[i:]
 	}
-
-	if budgetCount <= len(self.verdictRemovalTimes) {
-		return false
-	}
-	self.verdictRemovalTimes = append(self.verdictRemovalTimes, now)
-	return true
 }
 
 func (self *multiClientWindow) shuffle() {
 	// a shuffle asks for new exits, so a lost exit is not dialed again
 	self.stickyRedial.Forget()
+	self.logRecentExitsForgotten(self.recentExits.Forget(), "shuffle")
 	for _, client := range self.unorderedClients() {
 		client.Cancel()
 	}
@@ -13476,6 +15711,15 @@ func (self *multiClientWindow) shuffle() {
 // tail) client id. Cancellation wakes the resize loop, which reaps the client
 // (emitting ProviderStateRemoved) and refills the window.
 func (self *multiClientWindow) removeProvider(egressClientId Id) bool {
+	// the user removed this provider, so a loss of it is not asked for again
+	if self.recentExits.ForgetProvider(egressClientId) {
+		loggerOrDefault(self.log).Infof("%s\n", relEvent(
+			"recent_exit",
+			"provider", egressClientId,
+			"action", "drop",
+			"reason", "removed",
+		))
+	}
 	removed := false
 	for _, client := range self.unorderedClients() {
 		if client.Destination().Tail() == egressClientId {
@@ -13490,9 +15734,23 @@ func (self *multiClientWindow) removeProvider(egressClientId Id) bool {
 }
 
 func (self *multiClientWindow) unorderedClients() []*multiClientChannel {
+	return self.appendUnorderedClients(nil)
+}
+
+// appendUnorderedClients appends the window's clients to clients, in no
+// order, growing it at most once. A loop that passes its last list back with
+// length 0 collects without allocating.
+func (self *multiClientWindow) appendUnorderedClients(clients []*multiClientChannel) []*multiClientChannel {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	return slices.Collect(maps.Values(self.clients))
+	if len(self.clients) == 0 {
+		return clients
+	}
+	clients = slices.Grow(clients, len(self.clients))
+	for _, client := range self.clients {
+		clients = append(clients, client)
+	}
+	return clients
 }
 
 // lastResortClients is the window's offer when its ordinary offer is empty:
@@ -13510,6 +15768,12 @@ func (self *multiClientWindow) lastResortClients() []*multiClientChannel {
 // lastResortClientsForIpVersion is lastResortClients narrowed to the exits
 // that can carry the version -- a benched exit that cannot carry v6 is no
 // exit at all for a v6 flow. 0 is any.
+//
+// A sticky window (the user's Fixed IP) can hold two live exits at once, the
+// warned exit and its replacement. Racing both would let each new flow leave
+// on whichever answers first, so the egress ip changes between page loads.
+// Its offer keeps one exit: the most recently used, then the busiest, then
+// the lowest client id, so every call picks the same one.
 func (self *multiClientWindow) lastResortClientsForIpVersion(ipVersion int) []*multiClientChannel {
 	clients := []*multiClientChannel{}
 	for _, client := range self.unorderedClients() {
@@ -13518,7 +15782,48 @@ func (self *multiClientWindow) lastResortClientsForIpVersion(ipVersion int) []*m
 		}
 		clients = append(clients, client)
 	}
+	if 1 < len(clients) && self.stickyExit() {
+		lruTimes := map[*multiClientChannel]time.Time{}
+		weights := map[*multiClientChannel]float32{}
+		for _, client := range clients {
+			if stats, err := client.WindowStats(); err == nil {
+				lruTimes[client] = stats.lastEventTime
+				weights[client] = float32(1 + stats.ExpectedByteCountPerSecond())
+			}
+		}
+		sortClientsByRecentUse(clients, lruTimes, weights)
+		clients = clients[:1]
+	}
 	return clients
+}
+
+// sortClientsByRecentUse orders clients most recently used first, then by
+// expected throughput descending, then by client id, so equal clients do not
+// reorder between calls.
+func sortClientsByRecentUse(
+	clients []*multiClientChannel,
+	lruTimes map[*multiClientChannel]time.Time,
+	weights map[*multiClientChannel]float32,
+) {
+	slices.SortFunc(clients, func(a *multiClientChannel, b *multiClientChannel) int {
+		lruTimeA := lruTimes[a]
+		lruTimeB := lruTimes[b]
+		// descending
+		if lruTimeA.Before(lruTimeB) {
+			return 1
+		} else if lruTimeB.Before(lruTimeA) {
+			return -1
+		}
+		weightA := weights[a]
+		weightB := weights[b]
+		// descending
+		if weightA < weightB {
+			return 1
+		} else if weightB < weightA {
+			return -1
+		}
+		return a.ClientId().Cmp(b.ClientId())
+	})
 }
 
 // OrderedClients is the window's offer to the race: its healthy clients,
@@ -13662,25 +15967,7 @@ func (self *multiClientWindow) orderedClients(crossTier bool, ipVersion int, cha
 	}
 
 	if 0 < windowSize.FixedWindowSize && windowSize.FixedWindowSize < len(clients) {
-		slices.SortFunc(clients, func(a *multiClientChannel, b *multiClientChannel) int {
-			lruTimeA := lruTimes[a]
-			lruTimeB := lruTimes[b]
-			// descending
-			if lruTimeA.Before(lruTimeB) {
-				return 1
-			} else if lruTimeB.Before(lruTimeA) {
-				return -1
-			}
-			weightA := weights[a]
-			weightB := weights[b]
-			// descending
-			if weightA < weightB {
-				return 1
-			} else if weightB < weightA {
-				return -1
-			}
-			return 0
-		})
+		sortClientsByRecentUse(clients, lruTimes, weights)
 		clients = clients[:windowSize.FixedWindowSize]
 	}
 
@@ -13794,9 +16081,16 @@ func (self *multiClientWindow) Close() {
 			}
 		}
 	}()
+	windowClientStats := self.windowClientStats()
 	for _, client := range removedClients {
 		client.Close()
+		if self.clientRetireCallback != nil {
+			self.clientRetireCallback(client)
+		}
+		windowClientStats.addRemoval(self.windowType, windowRemovalClosed)
 	}
+	// a closed window re-forms nothing; a new destination builds new windows
+	self.logRecentExitsForgotten(self.recentExits.Forget(), "close")
 	// DELIBERATELY NOT self.removeClients(removedClients) -- but the reason is
 	// worth stating, because the bare commented-out call above invited exactly
 	// the wrong fix.
@@ -13818,7 +16112,7 @@ func (self *multiClientWindow) Close() {
 
 func (self *multiClientWindow) removeClients(removedClients ...*multiClientChannel) {
 	for _, client := range removedClients {
-		self.monitor.AddProviderEvent(client.ClientId(), ProviderStateRemoved, client.args.Destination.Tail(), client.args.Location, client.IpFamily())
+		self.monitor.AddProviderEventWithLocationMatch(client.ClientId(), ProviderStateRemoved, client.args.Destination.Tail(), client.args.Location, client.args.LocationMatch, client.IpFamily(), nil)
 	}
 	for _, client := range removedClients {
 		self.clientRemoveCallback(client)
@@ -13827,6 +16121,10 @@ func (self *multiClientWindow) removeClients(removedClients ...*multiClientChann
 
 type multiClientChannelArgs struct {
 	MultiClientGeneratorClientArgs
+	ackRouteWriteFailureOwner *ackRouteWriteFailureOwner
+	// Only demand-minted args carry an exact ordinary request-slot receipt.
+	discoveryDemandOwner *multiClientEvaluationOwner
+	discoveryDemandSlot  uint64
 	// A fixed destination offer owns no identity until expand accepts it.
 	// Only the receiving expansion mutates this after the unbuffered handoff.
 	deferredClientArgs bool
@@ -13860,12 +16158,20 @@ type multiClientChannelArgs struct {
 	// exists to keep.
 	stickyRedial bool
 
+	// Marks an exit the window lost to an outage of ours, asked for again by
+	// name (enumerateRecentExits). It is evaluated and admitted like any other
+	// candidate; the mark only names its outcome in the log.
+	recentExit bool
+
 	// contractStatus preserves the identity of the channel whose contract
 	// manager emitted a result. The public constructor callback does not carry
 	// that identity; the owning window needs it to retire only the failed route.
 	// nil keeps directly constructed test channels on the legacy relay path.
 	contractStatus     func(client *multiClientChannel, status *ContractStatus)
 	providerEvaluation *providerEvaluationAttempt
+	// The window's send-stall watchdog wake, signaled at the first send of a
+	// run. nil (directly constructed channels) signals nothing.
+	sendStallWake *outstandingSendWake
 	// The parent's, shared by every channel: armed from this channel's provider
 	// diagnostics, read by effectiveTier. nil (bare fixtures, or disabled)
 	// leaves the channel at its rank.
@@ -14097,7 +16403,7 @@ type multiClientChannel struct {
 	// never be called with this channel's stateLock (or any leaf lock) held.
 	receivingSiblingsFunc func(exclude *multiClientChannel) int
 	// busyProbeSendFunc, when non-nil, overrides how the busy-flow liveness
-	// probe puts its control ping on the wire. Test seam only: the real path
+	// probe offers its control ping for admission. Test seam only: the real path
 	// needs a live Client under the channel and a provider to answer, and what
 	// needs testing is the probe's DECISION (acquit, defer, convict) against
 	// each outcome. Production leaves it nil, which routes through the same
@@ -14113,6 +16419,12 @@ type multiClientChannel struct {
 	sendGroupForTest func(*parsedPacketGroup, time.Duration, bool) (bool, error)
 	// Holds a registered producer before its typed completion is prepared.
 	beforeGroupCompletionForTest func()
+	// Nil outside focused tests. Runs in markReceivedInbound for a packet
+	// from this channel that passed the established-flow early return, before
+	// the flow lock is taken: the window a lock-free receive path leaves
+	// between its client check and its mark. Only a flow's first answers and
+	// SYN packets reach it.
+	beforeFirstAnswerMarkForTest func(*multiClientChannelUpdate)
 	// Nil outside focused tests. Replaces only concrete Client admission after
 	// the real packet/group callback is built, since Client is not an interface.
 	sendTransferForTest func(AckFunction) (bool, error)
@@ -14123,6 +16435,9 @@ type multiClientChannel struct {
 	// timeout lifecycle can be tested without constructing a full Transfer
 	// route. Production uses SendDetailedMessage with the same signature.
 	pingSendForTest func(time.Duration, func(error)) (bool, error)
+	// Nil outside focused tests. Runs at the start of each health pass
+	// (detectBlackhole). Set before the loop starts.
+	blackholePassForTest func()
 	// qualificationRefreshFunc re-stamps the parent's qualification for this
 	// channel's destination (RemoteUserNatMultiClient.recordProbePass), called
 	// from the receive-ack path at most once per
@@ -14157,6 +16472,7 @@ type multiClientChannel struct {
 	// destination -> source -> count
 	ip4DestinationSourceCount          map[Ip4Path]map[Ip4Path]int
 	ip6DestinationSourceCount          map[Ip6Path]map[Ip6Path]int
+	windowStatsSourceCounts            []int // reused by each window stats read
 	packetStats                        *clientWindowStats
 	endErr                             error
 	maxEffectiveByteCountPerSecond     ByteCount
@@ -14259,8 +16575,18 @@ type multiClientChannel struct {
 	// route write, resend, or busy-probe ACK is not packet delivery.
 	// Guarded by stateLock.
 	pendingSendTime time.Time
+	// Orders pending-episode changes even when their clock readings tie.
+	pendingSendGeneration uint64
+	// The health loop's wake while it is parked on an idle channel
+	// (parkIdleBlackhole), nil otherwise. The first send of a run and the
+	// channel's first error signal it and clear it, so the loop judges the
+	// new evidence at once. Guarded by stateLock.
+	blackholeWake chan struct{}
+	// The window's send-stall watchdog wake, signaled at the first send of a
+	// run. Immutable from construction; nil outside a window.
+	sendStallWake *outstandingSendWake
 
-	// the busy-flow liveness probe's state (see busyLivenessProbe). All three
+	// the busy-flow liveness probe's state (see busyLivenessProbe). All fields
 	// are guarded by stateLock.
 	//
 	// busyProbeAckTime is the last time a probe was answered: proof the exit is
@@ -14274,18 +16600,15 @@ type multiClientChannel struct {
 	// further: the exit gets another full SendStallTimeout to either deliver or
 	// be asked again, and the record of what actually happened stays honest.
 	//
-	// busyProbeOutstanding is set while a probe is in flight and unanswered,
-	// which is the effectiveTier suspect demerit's whole input. Cleared on the
-	// ack and on the conviction.
-	//
-	// busyProbeSendFailures counts probes that could not even be queued within
-	// ONE stale episode -- the send path being wedged full of the same unacked
-	// data the probe is investigating is itself weak evidence, so it takes two
-	// in a row to convict. Reset whenever the channel reads not-stalled, which
-	// is what ends an episode.
+	// busyProbeOutstanding is only the bounded evaluator's suspect demerit.
+	// busyProbe owns at most one admitted callback, including after that wait
+	// ends. A completed result remains for the next window verdict or shutdown.
+	// busyProbeSendFailures retains the separate nonnil-error compatibility
+	// policy within one stale episode; local admission refusals do not count.
 	busyProbeAckTime      time.Time
 	busyProbeOutstanding  bool
 	busyProbeSendFailures int
+	busyProbe             *busyProbeAttempt
 	// stallHoldCounted latches the sibling-corroboration hold to one counter
 	// increment and one log line per stall episode. Cleared on every
 	// sendStalled reset path and on the probe ack, the same places the
@@ -14427,6 +16750,9 @@ func newMultiClientChannel(
 	cancelCtx, cancel := context.WithCancel(ctx)
 
 	clientSettings := generator.NewClientSettings()
+	if clientSettings.EnableAckRouteWriteDiagnostics {
+		clientSettings.ackRouteWriteFailureOwner = args.ackRouteWriteFailureOwner.load(true)
+	}
 	clientSettings.SendBufferSettings.AckTimeout = settings.AckTimeout
 	clientSettings.SendBufferSettings.providerEvaluation = args.providerEvaluation
 	// This client is dedicated to the selected destination. Stamp every send
@@ -14511,6 +16837,7 @@ func newMultiClientChannel(
 		providerQualifiedFunc:     providerQualifiedFunc,
 		receivingSiblingsFunc:     receivingSiblingsFunc,
 		qualificationRefreshFunc:  qualificationRefreshFunc,
+		sendStallWake:             args.sendStallWake,
 		// affinityCount:             0,
 		// affinityTime:              time.Time{},
 	}
@@ -14531,36 +16858,44 @@ func newMultiClientChannel(
 	contractStatusSub := client.ContractManager().addContractStatusDispatchCallback(effectiveContractStatusCallback)
 	contractStatsSub := client.ContractManager().AddContractStatsCallback(contractStatsCallback)
 	peerIdentitySub := client.EncryptionSessionManager().AddPeerIdentityChangeCallback(peerIdentityChangeCallback)
-	go HandleError(func() {
-		select {
-		case <-cancelCtx.Done():
-		case <-client.Done():
+	// The cleanup runs once, when the channel or its client ends. It is
+	// registered on both contexts rather than parked in a goroutine of its
+	// own, so a live channel holds no goroutine for it.
+	cleanupStarted := atomic.Bool{}
+	cleanup := func() {
+		if !cleanupStarted.CompareAndSwap(false, true) {
+			return
 		}
-		// Essential cleanup first, observer-facing events after. A stats
-		// observer can remain parked (an app suspended mid-callback), and
-		// CloseContractStats dispatches to it SYNCHRONOUSLY — ordering it
-		// first let a parked observer block RemoveClientWithArgs, retaining
-		// the platform identity and another client/transport record on every
-		// peer churn. See TestMultiClientCleanupPrecedesBlockedObservers.
-		contractStatusSub()
-		peerIdentitySub()
-		// Detach the platform transport before the synchronous local teardown.
-		// The API generator retires the derived identity asynchronously after
-		// Client and OOB cleanup have joined, so a slow Pion close never blocks
-		// this path and the final contract-close controls retain valid auth.
-		generator.RemoveClientWithArgs(client, &args.MultiClientGeneratorClientArgs)
-		client.Cancel()
-		// Fire the contract-close events for this client's still-open
-		// contracts while the stats listener is still attached, or a removed
-		// peer's contracts linger open forever in the contract-details UI.
-		// The client is already cancelled — that is what woke this cleanup —
-		// and CloseAllContractStats is the deterministic synchronous backstop
-		// that emits regardless of the stopped epoch worker.
-		client.CloseContractStats()
-		contractStatsSub()
-		// the removed client's established peers leave the aggregate set
-		peerIdentityChangeCallback()
-	}, cancel)
+		HandleError(func() {
+			clientChannel.clearBusyProbe()
+			// Essential cleanup first, observer-facing events after. A stats
+			// observer can remain parked (an app suspended mid-callback), and
+			// CloseContractStats dispatches to it SYNCHRONOUSLY — ordering it
+			// first let a parked observer block RemoveClientWithArgs, retaining
+			// the platform identity and another client/transport record on every
+			// peer churn. See TestMultiClientCleanupPrecedesBlockedObservers.
+			contractStatusSub()
+			peerIdentitySub()
+			// Detach the platform transport before the synchronous local teardown.
+			// The API generator retires the derived identity asynchronously after
+			// Client and OOB cleanup have joined, so a slow Pion close never blocks
+			// this path and the final contract-close controls retain valid auth.
+			generator.RemoveClientWithArgs(client, &args.MultiClientGeneratorClientArgs)
+			client.Cancel()
+			// Fire the contract-close events for this client's still-open
+			// contracts while the stats listener is still attached, or a removed
+			// peer's contracts linger open forever in the contract-details UI.
+			// The client is already cancelled — that is what woke this cleanup —
+			// and CloseAllContractStats is the deterministic synchronous backstop
+			// that emits regardless of the stopped epoch worker.
+			client.CloseContractStats()
+			contractStatsSub()
+			// the removed client's established peers leave the aggregate set
+			peerIdentityChangeCallback()
+		}, cancel)
+	}
+	context.AfterFunc(cancelCtx, cleanup)
+	context.AfterFunc(client.Ctx(), cleanup)
 
 	go HandleError(clientChannel.detectBlackhole, cancel)
 	if clientChannel.dataOnlyProviderProbe {
@@ -14778,9 +17113,8 @@ func (self *multiClientChannel) effectiveTier() int {
 	// that means anything. One step is enough to steer a new flow to a clean
 	// peer of the same tier for the ~1.5s the probe runs, without exiling the
 	// channel behind the next full tier for a suspicion that acquits more often
-	// than it convicts. Self-clearing by construction: the flag is cleared on
-	// the probe ack and on the conviction (which removes the channel anyway), so
-	// nothing here can outlive the probe.
+	// than it convicts. The bounded evaluator clears this flag even when the
+	// unanswered callback retains custody; custody alone is not a tier penalty.
 	if self.busyProbeOutstanding {
 		tier += 1
 	}
@@ -15128,7 +17462,7 @@ func (self *multiClientChannel) noSendAckTimeout() time.Duration {
 	if self.settings != nil {
 		return self.settings.BlackholeTimeout
 	}
-	return defaultPlatformTransportReadTimeout
+	return DefaultMultiClientSettings().BlackholeTimeout
 }
 
 // setStalled makes the channel swallow packets without acknowledging or
@@ -15197,6 +17531,7 @@ func (self *multiClientChannel) sendStalled(stallTimeout time.Duration) bool {
 		// "no probe, no conviction while the transport is down" needs no
 		// separate guard downstream.
 		self.pendingSendTime = time.Now()
+		self.pendingSendGeneration++
 		self.busyProbeSendFailures = 0
 		self.stallHoldCounted = false
 		return false
@@ -15256,14 +17591,6 @@ func (self *multiClientChannel) markDrainMigrateOnce() bool {
 	return true
 }
 
-// busyProbeUnsendableConvictions is how many consecutive probes must fail to
-// even reach the wire, inside one stale episode, before the stall verdict
-// stands on that evidence alone. One is not enough: the send path being wedged
-// full of the same unacked data the probe is investigating is what a congested
-// exit looks like too, and a live one drains enough between polls for the next
-// probe to queue.
-const busyProbeUnsendableConvictions = 2
-
 // errBusyProbeUnavailable marks a channel with no probe plumbing under it (a
 // bare fixture, a channel whose client is gone). Distinct from a send failure
 // on purpose: absence of the mechanism must fall back to the pre-probe verdict,
@@ -15298,10 +17625,36 @@ func busyProbeWriteTimeout(budget time.Duration, cpingWriteTimeout time.Duration
 type busyProbeVerdict struct {
 	// convict: the send-stall verdict stands this pass.
 	convict bool
+	// localUnwritten distinguishes local refusal or queue expiry from a peer
+	// answer and bounds its diagnostic with the existing stale-episode latch.
+	localUnwritten bool
+	// An admitted callback is still unresolved; no physical-write claim follows
+	// from admission or the expiration of this evaluator's local timer.
+	unanswered bool
+	// A destructive window result must still refer to this pending data episode
+	// when it is committed after the other concurrent probe evaluations finish.
+	pendingEpisode    bool
+	pendingGeneration uint64
 	// detail extends the conviction reason so a field capture can tell WHICH
 	// probe outcome convicted. "" convicts with today's exact reason string,
 	// which is what a channel with no probe plumbing gets.
 	detail string
+}
+
+// One callback owner, guarded by its channel's stateLock. The buffered result
+// never blocks a Transfer callback. waiting excludes concurrent evaluators;
+// completed rejects duplicates. The generation binds errors to one data episode.
+type busyProbeAttempt struct {
+	done              chan busyProbeCompletion
+	pendingGeneration uint64
+	waiting           bool
+	completed         bool
+}
+
+// The callback's actual observation time survives a later window evaluation.
+type busyProbeCompletion struct {
+	err error
+	at  time.Time
 }
 
 // addBusyProbeAck records positive liveness: the exit answered a control ping
@@ -15318,7 +17671,14 @@ type busyProbeVerdict struct {
 func (self *multiClientChannel) addBusyProbeAck() {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
-	self.busyProbeAckTime = time.Now()
+	self.addBusyProbeAckAtWithLock(time.Now())
+}
+
+// Records only an actual callback's timestamp, never the later consumption time.
+func (self *multiClientChannel) addBusyProbeAckAtWithLock(at time.Time) {
+	if self.busyProbeAckTime.Before(at) {
+		self.busyProbeAckTime = at
+	}
 	self.busyProbeOutstanding = false
 	self.busyProbeSendFailures = 0
 	self.stallHoldCounted = false
@@ -15336,6 +17696,15 @@ func (self *multiClientChannel) busyProbeOutstandingNow() bool {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 	return self.busyProbeOutstanding
+}
+
+// Shutdown drops callback custody without judging the peer or waiting on I/O.
+// The existing channel teardown worker also calls this on parent cancellation.
+func (self *multiClientChannel) clearBusyProbe() {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.busyProbe = nil
+	self.busyProbeOutstanding = false
 }
 
 // probeReceiveAge reports how many whole seconds since return traffic last
@@ -15421,8 +17790,8 @@ func (self *multiClientChannel) hasRecentBusyProbeAck(window time.Duration) bool
 	return !self.busyProbeAckTime.IsZero() && time.Since(self.busyProbeAckTime) < window
 }
 
-// addBusyProbeSendFailure counts one probe that could not be queued and reports
-// whether the run inside this stale episode is now long enough to convict on.
+// Count a nonnil send error under the existing compatibility policy. Exact
+// local false/nil refusal and cancellation never contribute to this run.
 func (self *multiClientChannel) addBusyProbeSendFailure() int {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
@@ -15430,10 +17799,9 @@ func (self *multiClientChannel) addBusyProbeSendFailure() int {
 	return self.busyProbeSendFailures
 }
 
-// sendBusyProbe puts the probe's control ping on the wire through the same
-// plumbing the idle cping loop uses. The seam (busyProbeSendFunc) exists only
-// so the probe's decisions can be driven from a test; production is always the
-// SendDetailedMessage path below.
+// Offer the control ping through the idle cping plumbing. Success reports
+// admission, not first-route-write; the callback separately reports completion.
+// The test seam drives decisions; production uses SendDetailedMessage below.
 func (self *multiClientChannel) sendBusyProbe(timeout time.Duration, ackCallback func(error)) (bool, error) {
 	if self.busyProbeSendFunc != nil {
 		return self.busyProbeSendFunc(timeout, ackCallback)
@@ -15454,9 +17822,8 @@ func (self *multiClientChannel) sendBusyProbe(timeout time.Duration, ackCallback
 // borrowed. What it buys: "bytes committed, nothing acknowledged" is the same
 // observation for an exit that died and for an exit whose upstream is saturated
 // or whose send window is full of the very data the stall is about. The control
-// ping rides the transport rather than the blocked flow, so a live exit answers
-// it in a couple of rtts. Asking costs one packet; the answer separates the two
-// cases the passive signal cannot.
+// ping can share local admission and serialization with the stalled flow. A
+// positive answer is useful evidence; a locally refused question is not.
 //
 // WHERE THIS MAY INTERPOSE, and nowhere else:
 //   - the sendStalled path only. The no-send-ack blackhole verdict has its own
@@ -15476,63 +17843,132 @@ func (self *multiClientChannel) sendBusyProbe(timeout time.Duration, ackCallback
 //   - ack inside the budget: the exit is alive despite the stalled flow acks.
 //     Record the liveness (addBusyProbeAck, which refreshes the stall bar
 //     without forging a send ack) and do not convict.
-//   - budget expires: convict, with the reason naming the probe. One fresh
-//     budget is granted first if the wait itself was suspended (see
-//     schedulerPauseDetected) -- a probe armed before a doze must not convict on
-//     wake, when neither the exit's answer nor this waiter had a cpu. A host
-//     sleep counts too (schedulerPauseElapsed).
-//   - the probe cannot be queued twice in one stale episode: convict. Once is
-//     not evidence (a congested exit drains between polls); twice, while the
-//     same data sits unacked, is.
+//   - budget expires: hold without refreshing any progress clock. Admission
+//     and route-channel acceptance can both precede a physical write. Retain
+//     this exact callback owner, so later passes cannot accumulate pings.
+//     The existing one-time scheduler-pause refresh still bounds evaluation.
+//   - exact false/nil admission refusal or unwritten queue expiry: hold without
+//     refreshing the stall clock or inventing a peer answer. Repetition does not
+//     turn local admission pressure into remote evidence.
+//   - nonnil send errors: retain the owner-configured compatibility policy.
+//     These errors are not all remote evidence; this narrow refusal correction
+//     does not broaden their classification.
 //   - no probe plumbing at all: convict exactly as before the probe existed.
 //
 // Locking: takes only this channel's stateLock, in short sections, never across
 // the send or the wait.
-func (self *multiClientChannel) busyLivenessProbe(budget time.Duration) busyProbeVerdict {
+func (self *multiClientChannel) busyLivenessProbe(budget time.Duration) (verdict busyProbeVerdict) {
 	if budget <= 0 {
 		return busyProbeVerdict{convict: true}
 	}
 
-	probeDone := make(chan error, 1)
-	cpingWriteTimeout := time.Duration(0)
-	if self.settings != nil {
-		cpingWriteTimeout = self.settings.CPingWriteTimeout
+	if self.ctx != nil && self.ctx.Err() != nil {
+		return busyProbeVerdict{detail: "liveness probe abandoned: channel closing"}
 	}
-	writeTimeout := busyProbeWriteTimeout(budget, cpingWriteTimeout)
-	success, err := self.sendBusyProbe(writeTimeout, func(err error) {
-		// buffered by one and non-blocking: the waiter below may already have
-		// given up, and the transport's ack callback must never block on us
-		select {
-		case probeDone <- err:
-		default:
-		}
-	})
-	if errors.Is(err, errBusyProbeUnavailable) {
-		return busyProbeVerdict{convict: true}
-	}
-	if err != nil || !success {
-		// could not even be queued. see busyProbeUnsendableConvictions
-		if failures := self.addBusyProbeSendFailure(); busyProbeUnsendableConvictions <= failures {
-			return busyProbeVerdict{
-				convict: true,
-				detail: fmt.Sprintf(
-					"liveness probe unsendable %dx",
-					busyProbeUnsendableConvictions,
-				),
+	probe, admitted := func() (*busyProbeAttempt, bool) {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		if self.busyProbe != nil {
+			if self.busyProbe.waiting || !self.busyProbe.completed {
+				return nil, false
 			}
-		} else {
+			probe := self.busyProbe
+			probe.waiting = true
+			return probe, true
+		}
+		probe := &busyProbeAttempt{
+			done:              make(chan busyProbeCompletion, 1),
+			pendingGeneration: self.pendingSendGeneration,
+			waiting:           true,
+		}
+		self.busyProbe = probe
+		return probe, false
+	}()
+	if probe == nil {
+		return busyProbeVerdict{unanswered: true, detail: "liveness probe retained: callback pending"}
+	}
+	consumed := false
+	defer func() {
+		if verdict.convict {
+			verdict.pendingEpisode = true
+			verdict.pendingGeneration = probe.pendingGeneration
+		}
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
+		if self.busyProbe != probe {
+			return
+		}
+		probe.waiting = false
+		self.busyProbeOutstanding = false
+		if !admitted || consumed || (self.ctx != nil && self.ctx.Err() != nil) {
+			self.busyProbe = nil
+		}
+	}()
+	if !admitted {
+		cpingWriteTimeout := time.Duration(0)
+		if self.settings != nil {
+			cpingWriteTimeout = self.settings.CPingWriteTimeout
+		}
+		writeTimeout := busyProbeWriteTimeout(budget, cpingWriteTimeout)
+		success, err := self.sendBusyProbe(writeTimeout, func(err error) {
+			self.stateLock.Lock()
+			defer self.stateLock.Unlock()
+			if self.busyProbe != probe || probe.completed {
+				return
+			}
+			if self.ctx != nil && self.ctx.Err() != nil {
+				self.busyProbe = nil
+				self.busyProbeOutstanding = false
+				return
+			}
+			probe.completed = true
+			probe.done <- busyProbeCompletion{err: err, at: time.Now()}
+		})
+		if self.ctx != nil && self.ctx.Err() != nil {
+			return busyProbeVerdict{detail: "liveness probe abandoned: channel closing"}
+		}
+		if errors.Is(err, errBusyProbeUnavailable) {
+			return busyProbeVerdict{convict: true}
+		}
+		if !success && err == nil {
+			// The caller's bounded local admission refused this ping before taking
+			// ownership. No question reached the peer, regardless of prior refusals.
 			return busyProbeVerdict{
-				detail: fmt.Sprintf("liveness probe unsendable %dx, deferred", failures),
+				localUnwritten: true,
+				detail:         "liveness probe locally refused before admission",
 			}
 		}
-	}
+		if err != nil || !success {
+			// Preserve the separate nonnil-error compatibility policy.
+			threshold := 0
+			if self.settings != nil {
+				threshold = self.settings.BusyProbeSendErrorThreshold
+			}
+			if failures := self.addBusyProbeSendFailure(); 0 < threshold && threshold <= failures {
+				return busyProbeVerdict{
+					convict: true,
+					detail: fmt.Sprintf(
+						"liveness probe unsendable %dx",
+						threshold,
+					),
+				}
+			} else {
+				return busyProbeVerdict{
+					detail: fmt.Sprintf("liveness probe unsendable %dx, deferred", failures),
+				}
+			}
+		}
 
-	self.setBusyProbeOutstanding(true)
-	// every return below either acks (addBusyProbeAck clears it) or convicts;
-	// the disarm covers both plus the ctx-done escape, so the suspect demerit
-	// can never outlive the probe that armed it
-	defer self.setBusyProbeOutstanding(false)
-	self.metrics().busyProbeSent()
+		admitted = true
+		func() {
+			self.stateLock.Lock()
+			defer self.stateLock.Unlock()
+			if self.busyProbe == probe {
+				self.busyProbeOutstanding = true
+			}
+		}()
+		self.metrics().busyProbeSent()
+	}
 
 	tolerance := self.reliabilitySettings().SchedulerPauseTolerance
 	now := time.Now
@@ -15556,8 +17992,36 @@ func (self *multiClientChannel) busyLivenessProbe(budget time.Duration) busyProb
 		case <-done:
 			// the channel is going away for its own reasons; no verdict to add
 			return busyProbeVerdict{detail: "liveness probe abandoned: channel closing"}
-		case err := <-probeDone:
+		case completion := <-probe.done:
+			consumed = true
+			current := func() bool {
+				self.stateLock.Lock()
+				defer self.stateLock.Unlock()
+				if self.busyProbe != probe || self.pendingSendGeneration != probe.pendingGeneration || (self.ctx != nil && self.ctx.Err() != nil) {
+					return false
+				}
+				if completion.err == nil {
+					self.addBusyProbeAckAtWithLock(completion.at)
+				}
+				return true
+			}()
+			if !current {
+				return busyProbeVerdict{unanswered: true, detail: "liveness probe completed for an earlier pending episode"}
+			}
+			err := completion.err
 			if err != nil {
+				if self.ctx != nil && self.ctx.Err() != nil {
+					return busyProbeVerdict{detail: "liveness probe abandoned: channel closing"}
+				}
+				if packetTransferExpiredUnwritten(err) {
+					// This ping never reached serialization. Local queue pressure
+					// is not a failed remote answer and cannot retire other flows.
+					// Keep their pending clock and accounting: no ACK was observed.
+					return busyProbeVerdict{
+						localUnwritten: true,
+						detail:         "liveness probe locally expired before write",
+					}
+				}
 				// the send sequence gave up on the ping itself. that is a
 				// failed question, not an answer, so it convicts -- but it is
 				// named distinctly from a plain timeout so a capture can tell
@@ -15567,7 +18031,6 @@ func (self *multiClientChannel) busyLivenessProbe(budget time.Duration) busyProb
 					detail:  fmt.Sprintf("liveness probe failed: %s", err),
 				}
 			}
-			self.addBusyProbeAck()
 			self.metrics().busyProbeAcquitted()
 			return busyProbeVerdict{detail: "liveness probe answered"}
 		case <-timer.C:
@@ -15575,10 +18038,8 @@ func (self *multiClientChannel) busyLivenessProbe(budget time.Duration) busyProb
 				// the host was suspended while this probe was in flight: the
 				// exit's answer and this waiter were both off the cpu, so the
 				// expiry says nothing about the exit. Grant the SAME probe one
-				// fresh budget. Once only -- a second expiry past a full budget
-				// of real running time is a real timeout, and an unbounded
-				// refresh would let a flapping scheduler suspend the verdict
-				// forever.
+				// fresh evaluation budget, once only. Its expiry still cannot
+				// turn local admission into physical-write evidence.
 				budgetRefreshed = true
 				waitStart = now()
 				timer.Reset(budget)
@@ -15592,8 +18053,8 @@ func (self *multiClientChannel) busyLivenessProbe(budget time.Duration) busyProb
 				continue
 			}
 			return busyProbeVerdict{
-				convict: true,
-				detail:  fmt.Sprintf("liveness probe timed out after %s", budget),
+				unanswered: true,
+				detail:     fmt.Sprintf("liveness probe unanswered after %s; callback retained", budget),
 			}
 		}
 	}
@@ -16146,13 +18607,18 @@ func sendMultiClientGroupRaceAttempt(
 ) bool {
 	sharedGroup := &parsedPacketGroup{
 		packets:               make([]parsedPacket, len(sendPacketGroup.packets)),
+		retainedIpPathCount:   sendPacketGroup.retainedIpPathCount,
 		ipPath:                sendPacketGroup.ipPath,
 		pin:                   sendPacketGroup.pin,
 		byteCount:             sendPacketGroup.byteCount,
 		transportAttribution:  sendPacketGroup.transportAttribution,
 		admissionObservations: sendPacketGroup.admissionObservations,
 		collapseAdmission:     sendPacketGroup.collapseAdmission,
+		synRetry:              sendPacketGroup.synRetry,
 	}
+	sharedGroup.affinityTransition.Store(sendPacketGroup.affinityTransition.Load())
+	sharedGroup.affinitySynReuse = sendPacketGroup.affinitySynReuse
+	sharedGroup.completionFlags.Or(sendPacketGroup.completionFlags.Load() & groupCompletionCompactedMetadata)
 	for packetIndex := range sendPacketGroup.packets {
 		sharedGroup.packets[packetIndex] = sendPacketGroup.packets[packetIndex]
 		sharedGroup.packets[packetIndex].packet = MessagePoolShareReadOnly(
@@ -16216,7 +18682,17 @@ func (self *multiClientChannel) SendGroupDetailedWithAck(
 	// demote it to NoAck or weaken an affirmative reliable commit.
 	ack = ipPacketTransferAckForRequest(sendPacketGroup.ipPath, ack)
 	if self.sendGroupForTest != nil {
-		return self.sendGroupForTest(sendPacketGroup, timeout, ack)
+		success, err := self.sendGroupForTest(sendPacketGroup, timeout, ack)
+		if success && err == nil {
+			sendPacketGroup.completionFlags.Or(groupCompletionAdmitted)
+		} else {
+			sendPacketGroup.completionSelection = nil
+		}
+		return success, err
+	}
+	if sendPacketGroup.affinityTransition.Load() != nil && self.stalled.Load() {
+		sendPacketGroup.completionSelection = nil
+		return false, nil
 	}
 	frames := make([]*protocol.Frame, len(sendPacketGroup.packets))
 	for packetIndex := range sendPacketGroup.packets {
@@ -16231,6 +18707,7 @@ func (self *multiClientChannel) SendGroupDetailedWithAck(
 				}
 			}
 			self.addError(err)
+			sendPacketGroup.completionSelection = nil
 			return false, err
 		}
 		frames[packetIndex] = frame
@@ -16238,23 +18715,58 @@ func (self *multiClientChannel) SendGroupDetailedWithAck(
 
 	self.addSendGroup(sendPacketGroup)
 	if self.stalled.Load() {
+		if sendPacketGroup.affinityTransition.Load() != nil {
+			// Stalling can change after the entry check. Synthetic success
+			// without a source owner cannot commit a reserved new generation.
+			self.addSendAbandonedGroup(sendPacketGroup)
+			sendPacketGroup.completionSelection = nil
+			for _, frame := range frames {
+				if !frame.Raw {
+					MessagePoolReturn(frame.MessageBytes)
+				}
+			}
+			return false, nil
+		}
 		for packetIndex, frame := range frames {
 			if !frame.Raw {
 				MessagePoolReturn(frame.MessageBytes)
 			}
 			MessagePoolReturn(sendPacketGroup.packets[packetIndex].packet)
 		}
+		sendPacketGroup.completionSelection = nil
 		return true, nil
 	}
 
 	if self.beforeGroupCompletionForTest != nil {
 		self.beforeGroupCompletionForTest()
 	}
+	if sendPacketGroup.affinitySynReuse && sendPacketGroup.collapseAdmission.update != nil {
+		update := sendPacketGroup.collapseAdmission.update
+		if parent := update.sequenceParent; parent == nil ||
+			!parent.reuseAffinitySyn(update, self, sendPacketGroup.packets[0].ipPath) {
+			self.addSendAbandonedGroup(sendPacketGroup)
+			sendPacketGroup.completionSelection = nil
+			for _, frame := range frames {
+				if !frame.Raw {
+					MessagePoolReturn(frame.MessageBytes)
+				}
+			}
+			return false, nil
+		}
+	}
 	var raceOrder uint64
 	if len(raceOrders) != 0 {
 		raceOrder = raceOrders[0]
 	}
-	self.prepareGroupCompletion(sendPacketGroup, ack, raceOrder)
+	if !self.prepareGroupCompletion(sendPacketGroup, ack, raceOrder) {
+		self.addSendAbandonedGroup(sendPacketGroup)
+		for _, frame := range frames {
+			if !frame.Raw {
+				MessagePoolReturn(frame.MessageBytes)
+			}
+		}
+		return false, nil
+	}
 	defer sendPacketGroup.finishGroupOffer()
 	opts := []any{scheduleIpFlow(sendPacketGroup.ipPath)}
 	if sendPacketGroup.admissionObservations != nil && self.client != nil {
@@ -16302,6 +18814,9 @@ func (self *multiClientChannel) SendGroupDetailedWithAck(
 			}
 		}
 		return success, err
+	}
+	if self.sendTransferForTest != nil {
+		sendPacketGroup.completionFlags.Or(groupCompletionAdmitted)
 	}
 	for packetIndex, frame := range frames {
 		if !frame.Raw {
@@ -16531,6 +19046,8 @@ func (self *multiClientChannel) observePacketGroupTransferCompletion(
 	self.addSendAbandonedGroup(sendPacketGroup)
 }
 
+// Owns marshaled frame bytes until admission. Raw IP PacketBytes transfer only
+// on success; refusal leaves those caller-owned input bytes untouched.
 func (self *multiClientChannel) SendDetailedMessage(message proto.Message, timeout time.Duration, ackCallback func(error), opts ...any) (bool, error) {
 	if frame, err := ToFrame(message, self.settings.ProtocolVersion); err != nil {
 		return false, err
@@ -16538,13 +19055,17 @@ func (self *multiClientChannel) SendDetailedMessage(message proto.Message, timeo
 		if self.performanceProfile != nil && self.performanceProfile.AllowDirect {
 			opts = append(opts, ForceStream())
 		}
-		return self.client.SendMultiHopWithTimeoutDetailed(
+		success, err := self.client.SendMultiHopWithTimeoutDetailed(
 			frame,
 			self.args.Destination,
 			ackCallback,
 			timeout,
 			opts...,
 		)
+		if !frame.Raw && !success {
+			MessagePoolReturn(frame.MessageBytes)
+		}
+		return success, err
 	}
 }
 
@@ -17165,8 +19686,20 @@ func (self *multiClientChannel) detectBlackhole() {
 	heldCounted := false
 	sharedFateCounted := false
 
+	// each pass reads the window stats into one value and waits on one timer,
+	// both kept for the loop's life; nothing below keeps the stats past its
+	// pass
+	windowStats := &clientWindowStats{}
+	pollTimer := time.NewTimer(self.settings.BlackholePollInterval)
+	pollTimer.Stop()
+	defer pollTimer.Stop()
+	// handed to the channel while the loop is parked; see parkIdleBlackhole
+	idleWake := make(chan struct{}, 1)
 	for {
-		if windowStats, err := self.WindowStats(); err != nil {
+		if self.blackholePassForTest != nil {
+			self.blackholePassForTest()
+		}
+		if err := self.windowStatsInto(true, windowStats); err != nil {
 			return
 		} else {
 			now := time.Now()
@@ -17500,20 +20033,110 @@ func (self *multiClientChannel) detectBlackhole() {
 				}
 			}
 
+			// With no evidence left to judge, the carrier is all there is to
+			// watch, and its change wakes the loop: park. The carrier is read
+			// with its change subscribed in one step and before the evidence
+			// check, so a loss after either still wakes the parked loop.
+			pollInterval := self.settings.BlackholePollInterval
+			parked := false
+			var carrierChanged <-chan struct{}
+			if idlePollInterval := self.settings.BlackholeIdlePollInterval; 0 < idlePollInterval && !transportDown {
+				carrierUp, changed := self.carrierNotify()
+				if carrierUp {
+					parked = self.parkIdleBlackhole(idleWake)
+				}
+				if parked {
+					pollInterval = idlePollInterval
+					carrierChanged = changed
+				}
+			}
+			pollTimer.Reset(pollInterval)
 			select {
 			case <-self.ctx.Done():
 				return
 			case <-self.client.Done():
 				return
-			case <-time.After(blackholePollInterval):
+			case <-idleWake:
+			case <-carrierChanged:
+			case <-pollTimer.C:
+			}
+			if parked {
+				self.unparkIdleBlackhole(idleWake)
 			}
 		}
 	}
 }
 
+// carrierNotify reads whether this channel's carrier is up, with a channel
+// that closes at its next change, in one step. A bare fixture channel has no
+// client, which reads as up (see hasActiveTransport) and never changes.
+func (self *multiClientChannel) carrierNotify() (bool, <-chan struct{}) {
+	if self.client == nil {
+		return true, nil
+	}
+	return self.client.RouteManager().ActiveTransportNotify()
+}
+
+// parkIdleBlackhole hands the health loop's wake to the channel when the
+// channel holds no evidence a verdict could mature on, and reports whether it
+// did. The caller has found the carrier up and watches it for the loop
+// (carrierNotify). Every verdict needs a send: one outstanding (no-send-ack),
+// one in the stats window (no-receive-ack), or an unanswered connect, whose
+// clock outlives the window (no-receive-syn). A quarantine is judged every
+// pass, and an error ends the loop. The check and the handoff share the lock
+// under which the first send of a run and the first error signal the wake, so
+// neither can land between them unseen.
+func (self *multiClientChannel) parkIdleBlackhole(wake chan struct{}) bool {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	if self.endErr != nil || self.quarantined || 0 < self.packetStats.sendNackCount ||
+		!self.packetStats.firstUnansweredSendSynTime.IsZero() {
+		return false
+	}
+	for _, eventBucket := range self.eventBuckets {
+		if 0 < eventBucket.sendNackCount || 0 < eventBucket.sendSynCount {
+			return false
+		}
+	}
+	self.blackholeWake = wake
+	return true
+}
+
+// unparkIdleBlackhole takes the wake back from the channel when the parked
+// loop resumes, and drops a signal that raced the resume, so the next park
+// starts clean.
+func (self *multiClientChannel) unparkIdleBlackhole(wake chan struct{}) {
+	self.stateLock.Lock()
+	defer self.stateLock.Unlock()
+	self.blackholeWake = nil
+	select {
+	case <-wake:
+	default:
+	}
+}
+
+// Wakes a parked health loop to judge new evidence.
+// must be called with `stateLock`
+func (self *multiClientChannel) wakeBlackholeWithLock() {
+	if self.blackholeWake == nil {
+		return
+	}
+	select {
+	case self.blackholeWake <- struct{}{}:
+	default:
+	}
+	self.blackholeWake = nil
+}
+
 func (self *multiClientChannel) ping() {
+	// one stats value and one timer for the loop's life: the ack wait and the
+	// rest between pings take turns on the timer
+	windowStats := &clientWindowStats{}
+	pingTimer := time.NewTimer(self.settings.CPingTimeout)
+	pingTimer.Stop()
+	defer pingTimer.Stop()
 	for {
-		if windowStats, err := self.WindowStats(); err != nil {
+		if err := self.windowStatsInto(true, windowStats); err != nil {
 			return
 		} else if self.settings.CPingMaxByteCountPerSecond == 0 || windowStats.EffectiveByteCountPerSecond() <= self.settings.CPingMaxByteCountPerSecond {
 			// One callback, one buffered result. The ping loop deliberately may
@@ -17557,6 +20180,7 @@ func (self *multiClientChannel) ping() {
 				// ping has no deferred cancel: that stale defer contradicted this
 				// branch and reset a lossy H3 flow at CPingTimeout with reason
 				// "Done.".
+				pingTimer.Reset(self.settings.CPingTimeout)
 				select {
 				case <-self.ctx.Done():
 					return
@@ -17574,7 +20198,7 @@ func (self *multiClientChannel) ping() {
 						self.cancel()
 						return
 					}
-				case <-time.After(self.settings.CPingTimeout):
+				case <-pingTimer.C:
 					self.log.Infof("[multi]cping %s unanswered: ping loop ended, channel remains\n", self.args.Destination)
 					return
 				}
@@ -17595,12 +20219,13 @@ func (self *multiClientChannel) ping() {
 				restTimeout = time.Duration(float64(restTimeout) * scale)
 			}
 		}
+		resetWakeupTimer(pingTimer, restTimeout, restTimeout)
 		select {
 		case <-self.ctx.Done():
 			return
 		case <-self.clientDone():
 			return
-		case <-WakeupAfter(restTimeout, restTimeout):
+		case <-pingTimer.C:
 		}
 	}
 }
@@ -17614,9 +20239,15 @@ func (self *multiClientChannel) addSend(packetByteCount ByteCount, ipPath *IpPat
 
 	eventBucket := self.eventBucket()
 
+	if self.packetStats.sendNackCount <= 0 {
+		// the first send of a run is evidence for the parked watchers
+		self.wakeBlackholeWithLock()
+		self.sendStallWake.signal()
+	}
 	if self.packetStats.sendNackCount == 0 {
 		// first outstanding send, so start the stall clock. see sendStalled
 		self.pendingSendTime = time.Now()
+		self.pendingSendGeneration++
 	}
 	self.packetStats.sendNackCount += 1
 	self.packetStats.sendNackByteCount += packetByteCount
@@ -17648,8 +20279,14 @@ func (self *multiClientChannel) addSendGroup(sendPacketGroup *parsedPacketGroup)
 
 	eventBucket := self.eventBucket()
 	packetCount := len(sendPacketGroup.packets)
+	if self.packetStats.sendNackCount <= 0 {
+		// the first send of a run is evidence for the parked watchers
+		self.wakeBlackholeWithLock()
+		self.sendStallWake.signal()
+	}
 	if self.packetStats.sendNackCount == 0 {
 		self.pendingSendTime = time.Now()
+		self.pendingSendGeneration++
 	}
 	self.packetStats.sendNackCount += packetCount
 	self.packetStats.sendNackByteCount += sendPacketGroup.byteCount
@@ -17719,6 +20356,7 @@ func (self *multiClientChannel) addSendAbandoned(packetByteCount ByteCount) {
 	self.packetStats.sendNackByteCount -= packetByteCount
 	if self.packetStats.sendNackCount <= 0 {
 		self.pendingSendTime = time.Time{}
+		self.pendingSendGeneration++
 	}
 
 	if n := len(self.eventBuckets); 0 < n {
@@ -17740,6 +20378,7 @@ func (self *multiClientChannel) addSendAbandonedGroup(sendPacketGroup *parsedPac
 	self.packetStats.sendNackByteCount -= sendPacketGroup.byteCount
 	if self.packetStats.sendNackCount <= 0 {
 		self.pendingSendTime = time.Time{}
+		self.pendingSendGeneration++
 	}
 	if eventBucketCount := len(self.eventBuckets); 0 < eventBucketCount {
 		eventBucket := self.eventBuckets[eventBucketCount-1]
@@ -17755,8 +20394,14 @@ func (self *multiClientChannel) addSendNack(ackByteCount ByteCount) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
+	if self.packetStats.sendNackCount <= 0 {
+		// the first send of a run is evidence for the parked watchers
+		self.wakeBlackholeWithLock()
+		self.sendStallWake.signal()
+	}
 	if self.packetStats.sendNackCount == 0 {
 		self.pendingSendTime = time.Now()
+		self.pendingSendGeneration++
 	}
 	self.packetStats.sendNackCount += 1
 	self.packetStats.sendNackByteCount += ackByteCount
@@ -17787,8 +20432,10 @@ func (self *multiClientChannel) addSendCompletion(ackByteCount ByteCount, peerAc
 	if peerAck {
 		self.lastSendAckTime = time.Now()
 		self.pendingSendTime = self.lastSendAckTime
+		self.pendingSendGeneration++
 	} else if self.packetStats.sendNackCount <= 0 {
 		self.pendingSendTime = time.Time{}
+		self.pendingSendGeneration++
 	}
 
 	eventBucket := self.eventBucket()
@@ -17816,8 +20463,10 @@ func (self *multiClientChannel) addSendGroupCompletion(sendPacketGroup *parsedPa
 	if peerAck {
 		self.lastSendAckTime = time.Now()
 		self.pendingSendTime = self.lastSendAckTime
+		self.pendingSendGeneration++
 	} else if self.packetStats.sendNackCount <= 0 {
 		self.pendingSendTime = time.Time{}
+		self.pendingSendGeneration++
 	}
 
 	eventBucket := self.eventBucket()
@@ -17834,6 +20483,8 @@ func (self *multiClientChannel) addSendSyn(synCount int) {
 
 	if 0 < synCount && self.packetStats.firstUnansweredSendSynTime.IsZero() {
 		self.packetStats.firstUnansweredSendSynTime = time.Now()
+		// an unanswered connect is evidence for a parked health loop
+		self.wakeBlackholeWithLock()
 	}
 	self.packetStats.sendSynCount += synCount
 
@@ -17980,9 +20631,15 @@ func (self *multiClientChannel) addSourceToEventBucketWithLock(eventBucket *mult
 func (self *multiClientChannel) addError(err error) {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
+	self.addErrorWithLock(err)
+}
 
+// Commits the existing error and event accounting under the channel lock.
+func (self *multiClientChannel) addErrorWithLock(err error) {
 	if self.endErr == nil {
 		self.endErr = err
+		// the health loop ends on the error
+		self.wakeBlackholeWithLock()
 	}
 
 	eventBucket := self.eventBucket()
@@ -18084,6 +20741,16 @@ func (self *multiClientChannel) WindowStats() (*clientWindowStats, error) {
 }
 
 func (self *multiClientChannel) windowStatsWithCoalesce(coalesce bool) (*clientWindowStats, error) {
+	stats := &clientWindowStats{}
+	err := self.windowStatsInto(coalesce, stats)
+	return stats, err
+}
+
+// windowStatsInto is windowStatsWithCoalesce writing into stats, which it
+// overwrites whole. A loop that judges one pass at a time (detectBlackhole,
+// ping) reuses one value instead of allocating one per pass; the caller must
+// not keep the value past its pass.
+func (self *multiClientChannel) windowStatsInto(coalesce bool, stats *clientWindowStats) error {
 	self.stateLock.Lock()
 	defer self.stateLock.Unlock()
 
@@ -18134,7 +20801,7 @@ func (self *multiClientChannel) windowStatsWithCoalesce(coalesce bool) (*clientW
 		}
 	}
 
-	netSourceCounts := []int{}
+	netSourceCounts := self.windowStatsSourceCounts[:0]
 	for ip4Path, sourceCounts := range self.ip4DestinationSourceCount {
 		if isPublicPort(ip4Path.DestinationPort) {
 			netSourceCounts = append(netSourceCounts, len(sourceCounts))
@@ -18144,6 +20811,12 @@ func (self *multiClientChannel) windowStatsWithCoalesce(coalesce bool) (*clientW
 		if isPublicPort(ip6Path.DestinationPort) {
 			netSourceCounts = append(netSourceCounts, len(sourceCounts))
 		}
+	}
+	// keep the list for the next read unless a burst grew it past a small bound
+	if cap(netSourceCounts) <= windowStatsSourceCountsRetainMax {
+		self.windowStatsSourceCounts = netSourceCounts[:0]
+	} else {
+		self.windowStatsSourceCounts = nil
 	}
 	slices.Sort(netSourceCounts)
 	maxSourceCount := 0
@@ -18183,7 +20856,7 @@ func (self *multiClientChannel) windowStatsWithCoalesce(coalesce bool) (*clientW
 		}
 	}
 
-	stats := &clientWindowStats{
+	*stats = clientWindowStats{
 		log:            log,
 		sourceCount:    maxSourceCount,
 		netSourceCount: netSourceCount,
@@ -18305,8 +20978,12 @@ func (self *multiClientChannel) windowStatsWithCoalesce(coalesce bool) (*clientW
 		}
 	}
 
-	return stats, err
+	return err
 }
+
+// windowStatsSourceCountsRetainMax bounds the per-destination list a channel
+// keeps between window stats reads.
+const windowStatsSourceCountsRetainMax = 1024
 
 // clientDone is the underlying transport client's done channel, nil-safe for
 // the bare fixture channels built literally by tests (the same convention
@@ -18398,11 +21075,19 @@ func (self *multiClientChannel) clientReceive(source TransferPath, frames []*pro
 			if !ok {
 				continue
 			}
-			self.transportMigrator.MigrateClientTransport(
-				self.client,
-				&self.args.MultiClientGeneratorClientArgs,
-				time.UnixMilli(int64(residentMigrate.MigrateTime)),
-			)
+			if mover, ok := self.transportMigrator.(MultiClientGeneratorTransportMover); ok {
+				mover.MoveClientTransport(
+					self.client,
+					&self.args.MultiClientGeneratorClientArgs,
+					NewResidentMove(residentMigrate),
+				)
+			} else {
+				self.transportMigrator.MigrateClientTransport(
+					self.client,
+					&self.args.MultiClientGeneratorClientArgs,
+					time.UnixMilli(int64(residentMigrate.MigrateTime)),
+				)
+			}
 		case protocol.MessageType_IpIpPacketFromProvider:
 			if packet, err := ipPacketFromProviderBytes(frame); err == nil {
 				if isIpFragmentPacket(packet) {
@@ -18504,6 +21189,7 @@ func (self *multiClientChannel) clientReceive(source TransferPath, frames []*pro
 
 func (self *multiClientChannel) Cancel() {
 	self.addError(errors.New("Done."))
+	self.clearBusyProbe()
 	self.ingressIpv4Fragments.close()
 	// nil-guard each teardown hook: bare fixture channels (built literally by
 	// tests, per the ClientId/Tier convention above) have none of them, and
@@ -18526,6 +21212,7 @@ func (self *multiClientChannel) Cancel() {
 
 func (self *multiClientChannel) Close() {
 	self.addError(errors.New("Done."))
+	self.clearBusyProbe()
 	self.ingressIpv4Fragments.close()
 	self.cancel()
 	// the local client teardown (which can wait on a slow Pion close) is

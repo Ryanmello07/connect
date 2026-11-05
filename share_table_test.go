@@ -211,7 +211,7 @@ func shareTableRows() []shareTableRow {
 			// the resolved quic.Config, not the setting: §42.1's second finding
 			// was that every term can be right while the number the mechanism
 			// clamps to never moves
-			settings := DefaultPlatformTransportSettingsWithMemoryTarget(targetByteCount)
+			settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(targetByteCount)
 			return read(settings)
 		}
 	}
@@ -227,7 +227,7 @@ func shareTableRows() []shareTableRow {
 			loopRoundTrip:  shareTableTransferLoopRtt,
 			framed:         true,
 			resolve: atProcessBudget(func() ByteCount {
-				settings := DefaultSendBufferSettingsWithBufferSize(defaultTransferBufferSize)
+				settings := DefaultSendBufferSettings()
 				settings.WindowSizing = WindowSizingFromDelivery
 				settings.ApplyWindowSizing()
 				if settings.ResendQueueBudget == nil {
@@ -246,7 +246,7 @@ func shareTableRows() []shareTableRow {
 			loopRoundTrip:  shareTableTransferLoopRtt,
 			framed:         true,
 			resolve: atProcessBudget(func() ByteCount {
-				settings := DefaultReceiveBufferSettingsWithBufferSize(defaultTransferBufferSize)
+				settings := DefaultReceiveBufferSettingsWithBufferSize(32)
 				settings.WindowSizing = WindowSizingFromDelivery
 				settings.ApplyWindowSizing()
 				if settings.ReceiveQueueBudget == nil {
@@ -681,7 +681,7 @@ func TestTheShareTableFloorsFitEverySurfaceMinimum(t *testing.T) {
 	// windows keep their own floors rather than inheriting the reservation's,
 	// which is what keeps a small host from advertising credit it cannot back
 	for _, target := range []ByteCount{mib(8), mib(20), mib(24)} {
-		settings := DefaultPlatformTransportSettingsWithMemoryTarget(target)
+		settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(target)
 		config := newPlatformQuicConfig(settings, 1)
 		stream := ByteCount(config.MaxStreamReceiveWindow)
 		connection := ByteCount(config.MaxConnectionReceiveWindow)

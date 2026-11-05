@@ -35,7 +35,7 @@ func newIosMemoryLiveSettings(t *testing.T) *PlatformTransportSettings {
 		SetMemoryBudget(previousTarget)
 		debug.SetMemoryLimit(previousSoftLimit)
 	})
-	settings := DefaultPlatformTransportSettingsWithMemoryTarget(mib(32))
+	settings := testingDefaultPlatformTransportSettingsWithMemoryTarget(mib(32))
 	ApplyMobilePlatformTransportMemoryPolicy(settings, mib(32))
 	assertIosMemoryLiveSettings(t, settings)
 	return settings
@@ -237,6 +237,7 @@ func testIosMemoryLiveH3(t *testing.T, mode TransportMode) {
 			}
 			matched := bytes.Equal(response, expected)
 			MessagePoolReturn(response)
+			disposition.h1Credit.release()
 			if !matched {
 				t.Fatalf("%s exchange=%d changed payload", mode, i)
 			}

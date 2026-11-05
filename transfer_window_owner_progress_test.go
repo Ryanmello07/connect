@@ -140,6 +140,7 @@ func runWindowOwnerProgressFixture(t *testing.T, prefix, writer bool, serviceWai
 		settings.EncryptionSettings.Mode = EncryptionModeOff
 		settings.beforeClientKeyPublishForTest = func() { <-ctx.Done() }
 		settings.SendBufferSettings.WindowSizing = WindowSizingFromDelivery
+		settings.SendBufferSettings.ApplicationPacing = true
 		settings.SendBufferSettings.ApplyWindowSizing()
 		observer, lifecycle := sendPackLifecycleTestObserver(destination)
 		fixture.lifecycle = lifecycle
@@ -297,7 +298,9 @@ func runWindowOwnerProgressFixture(t *testing.T, prefix, writer bool, serviceWai
 				t.Fatal("younger write did not reach the real full selector")
 			}
 		} else if len(fixture.route) != 0 || reservations != 1 || reserved != fixture.younger.pacingByteCount ||
-			!queued || !fixture.youngerDeadline.After(fixture.due) {
+			!queued || !fixture.youngerDeadline.After(time.Now()) ||
+			serviceWait >= 0 && !fixture.youngerDeadline.After(fixture.due) ||
+			serviceWait < 0 && !fixture.youngerDeadline.Before(fixture.due) {
 			t.Fatal("younger write did not retain exactly one charged FIFO entry across recovery")
 		}
 		check(t, fixture)

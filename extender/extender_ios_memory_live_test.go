@@ -136,6 +136,9 @@ func testExtenderIosMemoryLive(t *testing.T, inner connect.TransportMode, outer 
 	})
 	run := func(cancelParent bool) {
 		settings := connect.DefaultPlatformTransportSettingsWithMemoryTarget(32 * 1024 * 1024)
+		// no re-dial spread after a lost connection: these tests do not
+		// exercise it
+		settings.ReconnectJitter = 0
 		connect.ApplyMobilePlatformTransportMemoryPolicy(settings, 32*1024*1024)
 		budget := settings.PlatformTransportBudget
 		assertProfile := func() {
@@ -151,7 +154,7 @@ func testExtenderIosMemoryLive(t *testing.T, inner connect.TransportMode, outer 
 			}
 		}
 		assertProfile()
-		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(t.Context(), testMemoryExchangeTimeout)
 		defer cancel()
 		fixture, port, packetDestination, beginPeerShutdown, closePeer := newExtenderIosMemoryFixture(t, inner)
 		defer closePeer()
@@ -174,7 +177,7 @@ func testExtenderIosMemoryLive(t *testing.T, inner connect.TransportMode, outer 
 		if unrelated == budget || unrelatedBase.Root.TotalByteCount != 8*1024*1024 {
 			t.Fatal("current profile did not construct independent admission owners")
 		}
-		want := settings.H1BudgetByteCount
+		want := settings.H1MemoryReservationByteCount()
 		if inner != connect.TransportModeH1 {
 			want = settings.H3BudgetByteCount
 			if inner != connect.TransportModeH3 {
@@ -248,6 +251,8 @@ func testExtenderIosMemoryLive(t *testing.T, inner connect.TransportMode, outer 
 		routeManager := connect.NewRouteManager(ctx, "extender-ios-memory")
 		reader := routeManager.OpenMultiRouteReader(connect.DestinationId(connect.NewId()))
 		defer routeManager.CloseMultiRouteReader(reader)
+		writer := routeManager.OpenMultiRouteWriter(connect.DestinationId(connect.NewId()))
+		defer routeManager.CloseMultiRouteWriter(writer)
 		transport := connect.NewPlatformTransportWithTargetMode(ctx, strategy, routeManager, "wss://127.0.0.1/ws",
 			&connect.ClientAuth{ByJwt: "synthetic-ios-memory", InstanceId: connect.NewId(), AppVersion: "test"}, inner, settings)
 		defer func() {
@@ -288,13 +293,11 @@ func testExtenderIosMemoryLive(t *testing.T, inner connect.TransportMode, outer 
 				t.Fatal(err)
 			}
 			expected := bytes.Clone(message)
-			select {
-			case route <- message:
-			case <-ctx.Done():
+			if accepted, err := writer.WriteDetailed(ctx, message, -1); !accepted || err != nil {
 				connect.MessagePoolReturn(message)
-				t.Fatal(ctx.Err())
+				t.Fatalf("live composed selector: accepted=%t err=%v", accepted, err)
 			}
-			response, err := reader.Read(ctx, 5*time.Second)
+			response, err := reader.Read(ctx, -1)
 			if err != nil {
 				t.Fatalf("%s/%s cancel=%t exchange=%d: %v", inner, outer, cancelParent, i, err)
 			}

@@ -25,6 +25,7 @@ type windowRoundFrame struct {
 type windowRoundFixture struct {
 	t              *testing.T
 	ctx            context.Context
+	cancel         context.CancelFunc
 	sender         *Client
 	receiver       *Client
 	senderOut      Route
@@ -44,6 +45,7 @@ func newWindowRoundFixture(
 	t *testing.T,
 	configureSend func(*SendBufferSettings),
 	configureReceive func(*ReceiveBufferSettings),
+	sendCarrier ...TransportType,
 ) *windowRoundFixture {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -72,6 +74,7 @@ func newWindowRoundFixture(
 	fixture := &windowRoundFixture{
 		t:           t,
 		ctx:         ctx,
+		cancel:      cancel,
 		sender:      NewClient(ctx, NewId(), NewNoContractClientOob(), senderSettings),
 		receiver:    NewClient(ctx, NewId(), NewNoContractClientOob(), receiverSettings),
 		senderOut:   make(Route, 128),
@@ -81,7 +84,11 @@ func newWindowRoundFixture(
 	}
 	fixture.sender.ContractManager().AddNoContractPeer(fixture.receiver.ClientId())
 	fixture.receiver.ContractManager().AddNoContractPeer(fixture.sender.ClientId())
-	fixture.sender.RouteManager().UpdateTransport(NewSendGatewayTransport(), []Route{fixture.senderOut})
+	sendTransport := NewSendGatewayTransport()
+	if len(sendCarrier) != 0 {
+		sendTransport = NewSendGatewayTransportWithType(sendCarrier[0])
+	}
+	fixture.sender.RouteManager().UpdateTransport(sendTransport, []Route{fixture.senderOut})
 	fixture.sender.RouteManager().UpdateTransport(NewReceiveGatewayTransport(), []Route{fixture.senderIn})
 	fixture.receiver.RouteManager().UpdateTransport(NewSendGatewayTransport(), []Route{fixture.receiverOut})
 	fixture.receiver.RouteManager().UpdateTransport(NewReceiveGatewayTransport(), []Route{fixture.receiverIn})
@@ -285,19 +292,29 @@ func (self *windowRoundFixture) offer(messageCount int, payloadByteCount int) {
 	}()
 }
 
-// Delivers one Pack and captures the latest cumulative or selective Ack. A
-// head release can drain several held items and coalesce their acknowledgements.
+// Captures every owned ACK wire share in publication order. Feedback such
+// as eviction withdrawals is not implied by a later cumulative or selective ACK.
+func (self *windowRoundFixture) takeAcknowledgements() []*windowRoundFrame {
+	self.t.Helper()
+	acks := []*windowRoundFrame{self.take(self.receiverOut)}
+	for len(self.receiverOut) != 0 {
+		acks = append(acks, self.take(self.receiverOut))
+	}
+	for _, ack := range acks {
+		if ack.ack == nil {
+			self.t.Fatal("receiver published a Pack in place of its acknowledgement")
+		}
+	}
+	return acks
+}
+
+// Delivers one Pack and captures the latest cumulative or selective Ack. This
+// projection is only suitable when earlier feedback has no independent meaning.
 func (self *windowRoundFixture) receive(frame *windowRoundFrame) *windowRoundFrame {
 	self.t.Helper()
 	self.forward(frame, self.receiverIn)
-	ack := self.take(self.receiverOut)
-	for len(self.receiverOut) != 0 {
-		ack = self.take(self.receiverOut)
-	}
-	if ack.ack == nil {
-		self.t.Fatal("receiver published a Pack in place of its acknowledgement")
-	}
-	return ack
+	acks := self.takeAcknowledgements()
+	return acks[len(acks)-1]
 }
 
 // Looks up the only application sender after its initial wire write. Mutable

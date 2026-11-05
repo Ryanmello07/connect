@@ -1,5 +1,7 @@
 package connect
 
+import "time"
+
 // A value copied into the existing send completion closure, not a separately
 // allocated recovery owner. It records only a flow and its admission epoch;
 // it retains no IP bytes or frame. An explicit unwritten failure invalidates
@@ -7,6 +9,8 @@ package connect
 type tcpCollapseAdmission struct {
 	update *multiClientChannelUpdate
 	epoch  uint64
+	// A scalar lease for one real inner-TCP ACK frontier, not Transfer ACK.
+	recovery uint64
 }
 
 // One numeric receipt per in-flight group offering a new SYN generation. It
@@ -14,10 +18,12 @@ type tcpCollapseAdmission struct {
 // asynchronous completion token. The native send's unconditional completion
 // unlinks and clears it, including on refusal or panic. No packet is retained.
 type tcpSynAdmission struct {
-	next           *tcpSynAdmission
-	update         *multiClientChannelUpdate
-	responseClient *multiClientChannel
-	sequence       uint32
+	next            *tcpSynAdmission
+	update          *multiClientChannelUpdate
+	responseClient  *multiClientChannel
+	responseControl tcpControlObservation
+	sequence        uint32
+	sequenceEnd     uint32
 }
 
 func (admission *tcpSynAdmission) clear() {
@@ -38,60 +44,79 @@ func (admission *tcpSynAdmission) clear() {
 	*admission = tcpSynAdmission{}
 }
 
-func (group *parsedPacketGroup) prepareCollapseAdmission(update *multiClientChannelUpdate, parents ...*RemoteUserNatMultiClient) bool {
+// Compatibility callers retain the same complete-group collapse contract.
+func (self *parsedPacketGroup) prepareCollapseAdmission(update *multiClientChannelUpdate, parents ...*RemoteUserNatMultiClient) bool {
+	return self.prepareCollapseAdmissionWithRefusal(update, nil, parents...)
+}
+
+// Carries the synchronous native refusal receipt through the final lease gate.
+func (self *parsedPacketGroup) prepareCollapseAdmissionWithRefusal(update *multiClientChannelUpdate, batchAdmission *ipPacketGroupAdmission, parents ...*RemoteUserNatMultiClient) bool {
 	update.stateLock.Lock()
 	if len(parents) != 0 {
 		update.sequenceParent = parents[0]
 	}
 	admission := tcpCollapseAdmission{update: update, epoch: update.sequenceAdmissionEpoch}
+	if len(parents) != 0 && parents[0].settings.TcpCollapsePrevention &&
+		!self.reserveTcpRecoveryWithLock(update, parents[0], &admission) {
+		parents[0].recordCollapsedPacketGroup(self, batchAdmission)
+		update.stateLock.Unlock()
+		return false
+	}
 	// Only an actually different generation needs pre-commit response proof.
 	// Generation identity survives coverage revocation and provider rebinding.
 	seen, sequence := update.synGenerationSeen, update.synGenerationNumber
 	hasPriorState := seen || update.sequencePacketCount != 0
 	newGeneration := false
 	hasSyn := false
-	for i := range group.packets {
-		path := group.packets[i].ipPath
+	sequenceEnd := sequence + 1
+	for i := range self.packets {
+		path := self.packets[i].ipPath
 		if path.Syn {
 			hasSyn = true
 			newGeneration = newGeneration || hasPriorState && (!seen || sequence != path.SequenceNumber)
 			seen, sequence, hasPriorState = true, path.SequenceNumber, true
+			sequenceEnd = tcpPacketNextSequenceNumberWithPayloadByteCount(path, path.TcpPayloadByteCount)
 		}
 	}
 	if hasSyn && len(parents) != 0 {
 		if update.IsDone() {
+			admission.releaseTcpRecoveryWithLock()
 			update.stateLock.Unlock()
 			return false
 		}
 		// The existing send defer releases this scalar; no descriptor is
 		// linked and no bytes are reserved before successful admission.
-		if group.completionFlags.Or(groupCompletionSynOffer)&groupCompletionSynOffer == 0 {
+		if self.completionFlags.Or(groupCompletionSynOffer)&groupCompletionSynOffer == 0 {
 			update.sequenceSynOffers++
 		}
 	}
 	if newGeneration {
-		if group.admissionObservations == nil {
-			group.admissionObservations = &sendPackAdmissionObservations{}
+		if self.admissionObservations == nil {
+			self.admissionObservations = &sendPackAdmissionObservations{}
 		}
-		observation := &group.admissionObservations.synAdmission
-		*observation = tcpSynAdmission{next: update.synAdmissions, update: update, sequence: sequence}
+		observation := &self.admissionObservations.synAdmission
+		*observation = tcpSynAdmission{next: update.synAdmissions, update: update, sequence: sequence, sequenceEnd: sequenceEnd}
 		update.synAdmissions = observation
 	}
 	update.stateLock.Unlock()
-	group.collapseAdmission = admission
-	for i := range group.packets {
-		group.packets[i].collapseAdmission = admission
+	self.collapseAdmission = admission
+	for i := range self.packets {
+		self.packets[i].collapseAdmission = admission
 	}
 	return true
 }
 
-// Established non-SYN ingress keeps its lock-free fast path. First response
-// and SYN-ACK observations serialize with admission commit so an old response
-// cannot establish a newly accepted generation after the reset.
+// Controls without SYN/ACK keep their established lock-free fast path. Inner
+// ACK authority and first/SYN responses serialize with admission and reset.
 func (update *multiClientChannelUpdate) markReceivedInbound(client *multiClientChannel, control tcpControlObservation) bool {
-	if !control.syn && update.receivedInbound.Load() {
+	established := update.receivedInbound.Load()
+	if !control.syn && !control.ack && established {
 		return false
 	}
+	if (!established || control.syn) && client != nil && client.beforeFirstAnswerMarkForTest != nil {
+		client.beforeFirstAnswerMarkForTest(update)
+	}
+	defer update.releaseSynRetryMemory()
 	update.stateLock.Lock()
 	defer update.stateLock.Unlock()
 	return update.markReceivedInboundWithLock(client, control)
@@ -104,19 +129,20 @@ func (update *multiClientChannelUpdate) markReceivedInboundWithLock(client *mult
 	}
 	if control.syn && control.ack {
 		for admission := update.synAdmissions; admission != nil; admission = admission.next {
-			// The provider acknowledges the SYN at ISN+1, including a
-			// payload-bearing SYN. uint32 addition preserves wraparound.
-			if control.ackSequenceNumber == admission.sequence+1 {
+			if tcpSynAckInRange(admission.sequence, admission.sequenceEnd, control.ackSequenceNumber) {
 				admission.responseClient = client
+				admission.responseControl = control
 			}
 		}
 	}
 	if update.synGenerationAwaiting {
-		if !control.syn || !control.ack || control.ackSequenceNumber != update.synGenerationNumber+1 {
+		if !control.syn || !control.ack || !tcpSynAckInRange(update.synGenerationNumber, update.synGenerationEnd, control.ackSequenceNumber) {
 			return false
 		}
 		update.synGenerationAwaiting = false
 	}
+	update.observeTcpRecoveryAckWithLock(client, control)
+	update.clearSynRetryWithLock()
 	return update.receivedInbound.CompareAndSwap(false, true)
 }
 
@@ -136,6 +162,7 @@ func (admission tcpCollapseAdmission) complete(err error) {
 	update.sequenceCovered = false
 	update.sequenceAckPositionSeen = false
 	update.sequenceSynSeen = false
+	admission.revokeTcpRecoveryWithLock(err)
 }
 
 // sequenceCoversWithLock proves the entire requested interval, never only its
@@ -192,4 +219,59 @@ func (update *multiClientChannelUpdate) updateSequenceCoverageWithLock(packet *p
 		update.sequenceCoveredFrom, update.sequenceCoveredTo = start, end
 	}
 	return changed
+}
+
+// Each unanswered candidate owns its accepted SYN independently of the eventual
+// winner. A native retransmission can still explore an untried candidate. Mixed
+// groups retain their complete ordered admission, including any fresh data.
+func (self *RemoteUserNatMultiClient) filterOwnedRaceSynCandidatesWithLock(group *parsedPacketGroup, update *multiClientChannelUpdate, candidates []*multiClientChannel) ([]*multiClientChannel, bool) {
+	if !self.settings.TcpCollapsePrevention || group.ipPath.Protocol != IpProtocolTcp ||
+		update.client.Load() != nil || update.race == nil || len(group.packets) == 0 {
+		return candidates, false
+	}
+	for index := range group.packets {
+		path := group.packets[index].ipPath
+		if !path.Syn || path.Ack || path.Rst || path.Fin {
+			return candidates, false
+		}
+	}
+	var fresh []*multiClientChannel
+	maxHold := self.reliabilitySettings().TcpCollapseMaxHold
+	for index, client := range candidates {
+		state := update.race.clientStates[client]
+		covered := state != nil
+		if covered {
+			control := &state.collapseControl
+			for packetIndex := range group.packets {
+				packet := &group.packets[packetIndex]
+				// A dequeued different SYN/RST and unresolved raw controls keep
+				// the existing fail-open cohort ordering, including ISN ABA.
+				if control.closed || !update.pendingCandidateSequenceCoversWithLock(packet, client, control) {
+					covered = false
+					break
+				}
+			}
+			if covered && 0 < maxHold {
+				admittedAt := control.admittedAt
+				for claim := update.sequenceClaims; claim != nil; claim = claim.collapseNext {
+					if claim.completionClient == client && claim.collapseAdmission.epoch == update.sequenceAdmissionEpoch && admittedAt.Before(claim.admissionTime) {
+						admittedAt = claim.admissionTime
+					}
+				}
+				covered = admittedAt.IsZero() || time.Since(admittedAt) < maxHold
+			}
+		}
+		if covered {
+			if fresh == nil {
+				fresh = make([]*multiClientChannel, 0, len(candidates)-1)
+				fresh = append(fresh, candidates[:index]...)
+			}
+		} else if fresh != nil {
+			fresh = append(fresh, client)
+		}
+	}
+	if fresh == nil {
+		return candidates, false
+	}
+	return fresh, true
 }

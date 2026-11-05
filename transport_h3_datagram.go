@@ -38,37 +38,15 @@ const (
 	// overhead are reserved from the initial packet.
 	H3InitialDatagramByteCount = H3InitialPacketByteCount - 40
 
-	// This optimistic target allows DPLPMTUD to grow a validated path to the
-	// previous Ethernet-sized ceiling. quic-go synchronously reports the
-	// smaller initial or migrated-path ceiling through DatagramTooLargeError;
-	// the hybrid sender records that live limit before choosing the lane.
-	defaultH3DatagramTargetByteCount = 1360
-
 	// Wire bytes preceding each fragment payload.
-	H3DatagramHeaderByteCount               = 28
-	defaultH3HybridDatagramMessageByteCount = defaultH3DatagramTargetByteCount -
-		H3DatagramHeaderByteCount
-	// A complete routed message either fits one QUIC DATAGRAM or uses the
-	// reliable stream. Splitting one Transfer message across multiple lossy
-	// DATAGRAMs multiplies its loss probability and made full-MTU TCP 19% slower
-	// in the corrected one-bar full-TUN benchmark.
-	defaultH3DatagramMaxFragments  = 1
-	defaultH3DatagramMaxMessages   = 32
-	defaultH3DatagramReplayIds     = 256
-	defaultH3DatagramMessageBytes  = 8 * 1024
-	defaultH3DatagramPeerBytes     = 64 * 1024
-	defaultH3DatagramProcessBytes  = 8 * 1024 * 1024
-	defaultH3DatagramReassemblyTtl = 5 * time.Second
+	H3DatagramHeaderByteCount = 28
 
-	// The hybrid dispatcher must not turn lane separation into another large
-	// per-connection buffer. The byte limit counts the actual retained slice
-	// capacity (including message-pool metadata), and reservations stay live
-	// until the stream writer returns the message. Reserve metadata for every
-	// count slot so 32 packet-pool buffers fit the intended 64 KiB payload-
-	// capacity budget; one maximum uint16-framed message also fits.
-	H3HybridStreamQueueMessageCount = 32
-	H3HybridStreamQueueByteCount    = 64*1024 +
-		H3HybridStreamQueueMessageCount*MessagePoolMetaByteCount
+	// The largest fixed per-message header an envelope carries ahead of its
+	// message: the delay header (DELAY.md §7). The reassembler keeps it apart
+	// from the pooled message.
+	h3DatagramMaxMessageHeaderByteCount = transportDelayHeaderByteCount
+
+	defaultH3DatagramReplayIds = 256
 )
 
 var (
@@ -115,6 +93,21 @@ type H3DatagramSettings struct {
 	// require more than one envelope fragment. Larger frames use the reliable
 	// stream.
 	HybridDatagramMessageByteCount int
+	// HybridStreamQueueMessageCount and HybridStreamQueuePayloadByteCount
+	// bound the queue that hands a hybrid connection's reliable-lane messages
+	// to its stream writer, so lane separation cannot become another large
+	// per-connection buffer. Reservations stay live until the stream writer
+	// returns the message. Both must be positive.
+	HybridStreamQueueMessageCount     int
+	HybridStreamQueuePayloadByteCount int
+}
+
+// HybridStreamQueueByteCount is the hybrid stream queue's retained-byte limit.
+// It counts the actual retained slice capacity, so it reserves message-pool
+// metadata for every message slot on top of the payload bytes.
+func (self *H3DatagramSettings) HybridStreamQueueByteCount() int {
+	return self.HybridStreamQueuePayloadByteCount +
+		self.HybridStreamQueueMessageCount*MessagePoolMetaByteCount
 }
 
 // Returns bounded limits for a hybrid carrier and a path that may grow from
@@ -123,15 +116,28 @@ type H3DatagramSettings struct {
 // budget is shared by all connections owned by one PlatformTransport or
 // ConnectHandler.
 func DefaultH3DatagramSettings() *H3DatagramSettings {
+	// This optimistic target allows DPLPMTUD to grow a validated path to the
+	// previous Ethernet-sized ceiling. quic-go synchronously reports the
+	// smaller initial or migrated-path ceiling through DatagramTooLargeError;
+	// the hybrid sender records that live limit before choosing the lane.
+	targetDatagramByteCount := 1360
 	return &H3DatagramSettings{
-		TargetDatagramByteCount:        defaultH3DatagramTargetByteCount,
-		MaxFragmentCount:               defaultH3DatagramMaxFragments,
-		MaxMessageByteCount:            defaultH3DatagramMessageBytes,
-		MaxReassemblyMessageCount:      defaultH3DatagramMaxMessages,
-		MaxReassemblyByteCount:         defaultH3DatagramPeerBytes,
-		ProcessReassemblyByteCount:     defaultH3DatagramProcessBytes,
-		ReassemblyTimeout:              defaultH3DatagramReassemblyTtl,
-		HybridDatagramMessageByteCount: defaultH3HybridDatagramMessageByteCount,
+		TargetDatagramByteCount: targetDatagramByteCount,
+		// A complete routed message either fits one QUIC DATAGRAM or uses the
+		// reliable stream. Splitting one Transfer message across multiple lossy
+		// DATAGRAMs multiplies its loss probability and made full-MTU TCP 19%
+		// slower in the corrected one-bar full-TUN benchmark.
+		MaxFragmentCount:               1,
+		MaxMessageByteCount:            8 * 1024,
+		MaxReassemblyMessageCount:      32,
+		MaxReassemblyByteCount:         64 * 1024,
+		ProcessReassemblyByteCount:     8 * 1024 * 1024,
+		ReassemblyTimeout:              5 * time.Second,
+		HybridDatagramMessageByteCount: targetDatagramByteCount - H3DatagramHeaderByteCount,
+		// 32 packet-pool buffers fit the intended 64 KiB payload-capacity
+		// budget; one maximum uint16-framed message also fits
+		HybridStreamQueueMessageCount:     32,
+		HybridStreamQueuePayloadByteCount: 64 * 1024,
 	}
 }
 
@@ -270,6 +276,26 @@ func (self *H3DatagramSettings) UseDatagramForPath(
 	return fragmentCount <= self.MaxFragmentCount
 }
 
+// UseDatagramForPathWithHeader is UseDatagramForPath for a connection whose
+// every DATAGRAM message carries a fixed header of headerByteCount bytes inside
+// its envelope (the delay header, DELAY.md §5.1). The header counts against the
+// hybrid threshold and the path, so a message within headerByteCount bytes of
+// either limit moves to the stream. A zero headerByteCount is the legacy
+// predicate.
+func (self *H3DatagramSettings) UseDatagramForPathWithHeader(
+	messageByteCount int,
+	maxDatagramByteCount int,
+	headerByteCount int,
+) bool {
+	if messageByteCount <= 0 {
+		return false
+	}
+	return self.UseDatagramForPath(
+		messageByteCount+max(0, headerByteCount),
+		maxDatagramByteCount,
+	)
+}
+
 // H3DatagramTransferFrameByteLimit returns the largest complete Transfer frame
 // selected for DATAGRAM on one observed QUIC path. UseDatagramForPath is a
 // contiguous size predicate, so this limit can be serialized across the server
@@ -298,6 +324,23 @@ func H3DatagramTransferFrameByteLimit(
 		return int(^uint(0) >> 1)
 	}
 	return int(limit)
+}
+
+// H3DatagramTransferFrameByteLimitWithHeader is the serialized form of
+// UseDatagramForPathWithHeader: the envelope limit less the header every
+// DATAGRAM message carries on the connection (DELAY.md §5.1). Both ends of a
+// negotiated connection must subtract the same header.
+func H3DatagramTransferFrameByteLimitWithHeader(
+	settings *H3DatagramSettings,
+	maxDatagramByteCount int,
+	headerByteCount int,
+) int {
+	limit := H3DatagramTransferFrameByteLimit(settings, maxDatagramByteCount)
+	headerByteCount = max(0, headerByteCount)
+	if limit <= headerByteCount {
+		return 0
+	}
+	return limit - headerByteCount
 }
 
 // H3DatagramStatsSnapshot is one lock-free lifetime view of the candidate data
@@ -650,9 +693,12 @@ func NewH3DatagramFragmenter(settings *H3DatagramSettings, stats *H3DatagramStat
 // Send emits every fragment through the provided blocking sender. quic-go
 // copies each slice before returning, so one bounded scratch buffer is reused.
 // A failure may follow earlier fragments; Transfer will retry the whole frame
-// with a new message id.
+// with a new message id. A non-empty header leads the message inside the
+// envelope: the total length, the checksum and the fragment offsets cover
+// header and message together, and the one copy into each datagram writes both.
 func (self *H3DatagramFragmenter) send(
 	message []byte,
+	header []byte,
 	maxDatagramByteCount int,
 	send func(datagram []byte) error,
 ) (fragmentCount int, err error) {
@@ -663,7 +709,8 @@ func (self *H3DatagramFragmenter) send(
 	if fragmentPayloadByteCount < 1 {
 		return 0, ErrH3DatagramMessageTooLarge
 	}
-	fragmentCount = (len(message) + fragmentPayloadByteCount - 1) / fragmentPayloadByteCount
+	totalByteCount := len(header) + len(message)
+	fragmentCount = (totalByteCount + fragmentPayloadByteCount - 1) / fragmentPayloadByteCount
 	if self.settings.MaxFragmentCount < fragmentCount || int(^uint16(0)) < fragmentCount {
 		return 0, ErrH3DatagramMessageTooLarge
 	}
@@ -673,24 +720,33 @@ func (self *H3DatagramFragmenter) send(
 		self.nextMessageId += 1
 	}
 	messageId := self.nextMessageId
-	checksum := crc32.ChecksumIEEE(message)
+	checksum := h3DatagramChecksum(header, message)
 	if cap(self.scratch) < maxDatagramByteCount {
 		self.scratch = make([]byte, maxDatagramByteCount)
 	}
 
 	for fragmentIndex := range fragmentCount {
 		offset := fragmentIndex * fragmentPayloadByteCount
-		end := min(len(message), offset+fragmentPayloadByteCount)
+		end := min(totalByteCount, offset+fragmentPayloadByteCount)
 		datagram := self.scratch[:H3DatagramHeaderByteCount+end-offset]
 		copy(datagram[0:3], h3DatagramMagic[:])
 		datagram[3] = byte(H3DatagramProtocolVersion)
 		binary.BigEndian.PutUint64(datagram[4:12], messageId)
-		binary.BigEndian.PutUint32(datagram[12:16], uint32(len(message)))
+		binary.BigEndian.PutUint32(datagram[12:16], uint32(totalByteCount))
 		binary.BigEndian.PutUint32(datagram[16:20], checksum)
 		binary.BigEndian.PutUint32(datagram[20:24], uint32(offset))
 		binary.BigEndian.PutUint16(datagram[24:26], uint16(fragmentIndex))
 		binary.BigEndian.PutUint16(datagram[26:28], uint16(fragmentCount))
-		copy(datagram[H3DatagramHeaderByteCount:], message[offset:end])
+		// the header bytes this fragment covers, then its message bytes; each
+		// copy stops at the end of the fragment
+		headerPayloadByteCount := copy(
+			datagram[H3DatagramHeaderByteCount:],
+			header[min(offset, len(header)):],
+		)
+		copy(
+			datagram[H3DatagramHeaderByteCount+headerPayloadByteCount:],
+			message[max(0, offset-len(header)):],
+		)
 		if err := send(datagram); err != nil {
 			return fragmentIndex, err
 		}
@@ -702,6 +758,14 @@ func (self *H3DatagramFragmenter) send(
 	return fragmentCount, nil
 }
 
+// Covers an envelope's complete payload: the header, if any, then the message.
+func h3DatagramChecksum(header []byte, message []byte) uint32 {
+	if len(header) == 0 {
+		return crc32.ChecksumIEEE(message)
+	}
+	return crc32.Update(crc32.ChecksumIEEE(header), crc32.IEEETable, message)
+}
+
 // Send emits one complete Transfer frame through the bounded DATAGRAM carrier.
 // Public callers observe any failed carrier attempt in SendErrorCount.
 func (self *H3DatagramFragmenter) Send(
@@ -709,7 +773,7 @@ func (self *H3DatagramFragmenter) Send(
 	maxDatagramByteCount int,
 	send func(datagram []byte) error,
 ) (fragmentCount int, err error) {
-	fragmentCount, err = self.send(message, maxDatagramByteCount, send)
+	fragmentCount, err = self.send(message, nil, maxDatagramByteCount, send)
 	if err != nil {
 		self.stats.sendErrorCount.Add(1)
 	}
@@ -727,21 +791,58 @@ func (self *H3DatagramFragmenter) SendHybrid(
 	maxDatagramByteCount int,
 	send func(datagram []byte) error,
 ) (useStream bool, nextMaxDatagramByteCount int, err error) {
+	useStream, nextMaxDatagramByteCount, _, err = self.sendHybrid(
+		message,
+		nil,
+		maxDatagramByteCount,
+		send,
+	)
+	return useStream, nextMaxDatagramByteCount, err
+}
+
+// SendHybridWithHeader is SendHybrid for a connection whose every DATAGRAM
+// message carries header inside its envelope (DELAY.md §7). The header counts
+// against the hybrid threshold and the path (UseDatagramForPathWithHeader), so
+// a message within len(header) bytes of either moves to the stream.
+func (self *H3DatagramFragmenter) SendHybridWithHeader(
+	message []byte,
+	header []byte,
+	maxDatagramByteCount int,
+	send func(datagram []byte) error,
+) (useStream bool, nextMaxDatagramByteCount int, err error) {
+	useStream, nextMaxDatagramByteCount, _, err = self.sendHybrid(
+		message,
+		header,
+		maxDatagramByteCount,
+		send,
+	)
+	return useStream, nextMaxDatagramByteCount, err
+}
+
+// The fragment count is that of the DATAGRAMs sent, 0 when the message moved
+// to the stream or the send failed.
+func (self *H3DatagramFragmenter) sendHybrid(
+	message []byte,
+	header []byte,
+	maxDatagramByteCount int,
+	send func(datagram []byte) error,
+) (useStream bool, nextMaxDatagramByteCount int, fragmentCount int, err error) {
 	nextMaxDatagramByteCount = maxDatagramByteCount
-	if !self.settings.UseDatagramForPath(
+	if !self.settings.UseDatagramForPathWithHeader(
 		len(message),
 		maxDatagramByteCount,
+		len(header),
 	) {
-		return true, nextMaxDatagramByteCount, nil
+		return true, nextMaxDatagramByteCount, 0, nil
 	}
-	if _, err = self.send(message, maxDatagramByteCount, send); err == nil {
-		return false, nextMaxDatagramByteCount, nil
+	if fragmentCount, err = self.send(message, header, maxDatagramByteCount, send); err == nil {
+		return false, nextMaxDatagramByteCount, fragmentCount, nil
 	}
 	if errors.Is(err, errQuicDatagramFlightFull) {
 		// This complete message has not entered quic-go. A full shared
 		// queued/sent-root allowance is local pressure, not a connection error;
 		// use the already bounded reliable lane without waiting on ACKs here.
-		return true, nextMaxDatagramByteCount, nil
+		return true, nextMaxDatagramByteCount, 0, nil
 	}
 
 	var tooLargeErr *quic.DatagramTooLargeError
@@ -749,23 +850,25 @@ func (self *H3DatagramFragmenter) SendHybrid(
 		int(tooLargeErr.MaxDatagramPayloadSize) <= H3DatagramHeaderByteCount ||
 		maxDatagramByteCount <= int(tooLargeErr.MaxDatagramPayloadSize) {
 		self.stats.sendErrorCount.Add(1)
-		return false, nextMaxDatagramByteCount, err
+		return false, nextMaxDatagramByteCount, 0, err
 	}
 	nextMaxDatagramByteCount = int(tooLargeErr.MaxDatagramPayloadSize)
-	if !self.settings.UseDatagramForPath(
+	if !self.settings.UseDatagramForPathWithHeader(
 		len(message),
 		nextMaxDatagramByteCount,
+		len(header),
 	) {
-		return true, nextMaxDatagramByteCount, nil
+		return true, nextMaxDatagramByteCount, 0, nil
 	}
-	_, err = self.send(message, nextMaxDatagramByteCount, send)
+	fragmentCount, err = self.send(message, header, nextMaxDatagramByteCount, send)
 	if errors.Is(err, errQuicDatagramFlightFull) {
-		return true, nextMaxDatagramByteCount, nil
+		return true, nextMaxDatagramByteCount, 0, nil
 	}
 	if err != nil {
 		self.stats.sendErrorCount.Add(1)
+		return false, nextMaxDatagramByteCount, 0, err
 	}
-	return false, nextMaxDatagramByteCount, err
+	return false, nextMaxDatagramByteCount, fragmentCount, nil
 }
 
 type h3DatagramFragmentSlot struct {
@@ -775,14 +878,20 @@ type h3DatagramFragmentSlot struct {
 }
 
 type h3DatagramPendingMessage struct {
-	messageId      uint64
+	messageId uint64
+	// the envelope's length, which covers the header and the message
 	totalByteCount int
-	checksum       uint32
-	fragmentCount  int
-	receivedCount  int
-	expiresAt      time.Time
-	message        []byte
-	fragments      []h3DatagramFragmentSlot
+	// the pooled message alone, which the local and shared budgets reserve
+	messageByteCount int
+	checksum         uint32
+	fragmentCount    int
+	receivedCount    int
+	expiresAt        time.Time
+	// the leading header bytes, kept out of the pooled message
+	headerByteCount int
+	header          [h3DatagramMaxMessageHeaderByteCount]byte
+	message         []byte
+	fragments       []h3DatagramFragmentSlot
 }
 
 // H3DatagramReassembler accepts reordered and duplicated fragments while
@@ -837,7 +946,7 @@ func (self *H3DatagramReassembler) removePendingWithLock(messageId uint64) *h3Da
 		return nil
 	}
 	delete(self.pendingMessageIdMessages, messageId)
-	self.reassemblyByteCount -= pending.totalByteCount
+	self.reassemblyByteCount -= pending.messageByteCount
 	return pending
 }
 
@@ -846,7 +955,7 @@ func (self *H3DatagramReassembler) releasePending(pending *h3DatagramPendingMess
 	if pending == nil {
 		return
 	}
-	self.globalBudget.release(pending.totalByteCount)
+	self.globalBudget.release(pending.messageByteCount)
 	if pending.message != nil {
 		MessagePoolReturn(pending.message)
 	}
@@ -906,6 +1015,33 @@ func (self *H3DatagramReassembler) Expire(now time.Time) {
 // Transfer frame only after exact non-overlapping coverage and checksum pass.
 // Malformed or incomplete input is dropped without terminating the carrier.
 func (self *H3DatagramReassembler) Accept(datagram []byte, now time.Time) []byte {
+	return self.accept(datagram, now, nil)
+}
+
+// AcceptWithHeader is Accept for a connection whose every DATAGRAM message
+// carries a fixed header of len(header) bytes inside its envelope (DELAY.md
+// §7). The header bytes are copied into header while the fragments are copied
+// in, never into the returned message, so the pooled message keeps its own
+// capacity class. header is written only when a complete message is returned.
+// A header longer than h3DatagramMaxMessageHeaderByteCount is a programming
+// error.
+func (self *H3DatagramReassembler) AcceptWithHeader(
+	datagram []byte,
+	now time.Time,
+	header []byte,
+) []byte {
+	if h3DatagramMaxMessageHeaderByteCount < len(header) {
+		panic(fmt.Errorf(
+			"H3 DATAGRAM message header length %d > %d",
+			len(header),
+			h3DatagramMaxMessageHeaderByteCount,
+		))
+	}
+	return self.accept(datagram, now, header)
+}
+
+// An empty header is the legacy envelope, whose total length is the message's.
+func (self *H3DatagramReassembler) accept(datagram []byte, now time.Time, header []byte) []byte {
 	self.stats.receivedFragmentCount.Add(1)
 	self.stats.receivedByteCount.Add(uint64(len(datagram)))
 	if len(datagram) <= H3DatagramHeaderByteCount ||
@@ -915,6 +1051,7 @@ func (self *H3DatagramReassembler) Accept(datagram []byte, now time.Time) []byte
 		return nil
 	}
 
+	headerByteCount := len(header)
 	messageId := binary.BigEndian.Uint64(datagram[4:12])
 	totalByteCount := int(binary.BigEndian.Uint32(datagram[12:16]))
 	checksum := binary.BigEndian.Uint32(datagram[16:20])
@@ -922,13 +1059,20 @@ func (self *H3DatagramReassembler) Accept(datagram []byte, now time.Time) []byte
 	fragmentIndex := int(binary.BigEndian.Uint16(datagram[24:26]))
 	fragmentCount := int(binary.BigEndian.Uint16(datagram[26:28]))
 	payload := datagram[H3DatagramHeaderByteCount:]
-	if messageId == 0 || totalByteCount < 1 || self.settings.MaxMessageByteCount < totalByteCount ||
+	messageByteCount := totalByteCount - headerByteCount
+	if messageId == 0 || messageByteCount < 1 || self.settings.MaxMessageByteCount < messageByteCount ||
 		fragmentCount < 1 || self.settings.MaxFragmentCount < fragmentCount ||
 		fragmentCount <= fragmentIndex || offset < 0 || totalByteCount <= offset ||
 		totalByteCount-offset < len(payload) {
 		self.stats.malformedFragmentCount.Add(1)
 		return nil
 	}
+	// Offsets cover the header, then the message. A fragment's leading bytes
+	// may fall in the header, which is kept apart from the pooled message.
+	headerOffset := min(offset, headerByteCount)
+	headerPayload := payload[:min(len(payload), headerByteCount-headerOffset)]
+	messagePayload := payload[len(headerPayload):]
+	messageOffset := max(0, offset-headerByteCount)
 
 	for {
 		var expiredPendingMessages []*h3DatagramPendingMessage
@@ -957,14 +1101,15 @@ func (self *H3DatagramReassembler) Accept(datagram []byte, now time.Time) []byte
 			pending := self.pendingMessageIdMessages[messageId]
 			if pending == nil {
 				if self.settings.MaxReassemblyMessageCount <= len(self.pendingMessageIdMessages) ||
-					self.settings.MaxReassemblyByteCount-self.reassemblyByteCount < totalByteCount {
+					self.settings.MaxReassemblyByteCount-self.reassemblyByteCount < messageByteCount {
 					limitRefusal = true
 					return
 				}
 				needsPendingMessage = true
 				return
 			}
-			if pending.totalByteCount != totalByteCount || pending.checksum != checksum || pending.fragmentCount != fragmentCount {
+			if pending.totalByteCount != totalByteCount || pending.checksum != checksum ||
+				pending.fragmentCount != fragmentCount || pending.headerByteCount != headerByteCount {
 				removedPendingMessage = self.removePendingWithLock(messageId)
 				self.rememberRetiredWithLock(messageId)
 				malformed = true
@@ -974,7 +1119,8 @@ func (self *H3DatagramReassembler) Accept(datagram []byte, now time.Time) []byte
 			slot := &pending.fragments[fragmentIndex]
 			if slot.received {
 				if slot.offset == offset && slot.byteCount == len(payload) &&
-					bytes.Equal(pending.message[offset:offset+len(payload)], payload) {
+					bytes.Equal(pending.header[headerOffset:headerOffset+len(headerPayload)], headerPayload) &&
+					bytes.Equal(pending.message[messageOffset:messageOffset+len(messagePayload)], messagePayload) {
 					duplicate = true
 					return
 				}
@@ -983,7 +1129,8 @@ func (self *H3DatagramReassembler) Accept(datagram []byte, now time.Time) []byte
 				malformed = true
 				return
 			}
-			copy(pending.message[offset:offset+len(payload)], payload)
+			copy(pending.header[headerOffset:headerOffset+len(headerPayload)], headerPayload)
+			copy(pending.message[messageOffset:messageOffset+len(messagePayload)], messagePayload)
 			slot.offset = offset
 			slot.byteCount = len(payload)
 			slot.received = true
@@ -1008,7 +1155,7 @@ func (self *H3DatagramReassembler) Accept(datagram []byte, now time.Time) []byte
 				malformed = true
 				return
 			}
-			if crc32.ChecksumIEEE(pending.message) != pending.checksum {
+			if h3DatagramChecksum(pending.header[:pending.headerByteCount], pending.message) != pending.checksum {
 				removedPendingMessage = self.removePendingWithLock(messageId)
 				self.rememberRetiredWithLock(messageId)
 				checksumFailure = true
@@ -1018,6 +1165,7 @@ func (self *H3DatagramReassembler) Accept(datagram []byte, now time.Time) []byte
 			removedPendingMessage = self.removePendingWithLock(messageId)
 			message = removedPendingMessage.message
 			removedPendingMessage.message = nil
+			copy(header, removedPendingMessage.header[:removedPendingMessage.headerByteCount])
 			self.rememberRetiredWithLock(messageId)
 		}()
 
@@ -1056,18 +1204,20 @@ func (self *H3DatagramReassembler) Accept(datagram []byte, now time.Time) []byte
 			return nil
 		}
 
-		if !self.globalBudget.tryReserve(totalByteCount) {
+		if !self.globalBudget.tryReserve(messageByteCount) {
 			self.stats.reassemblyLimitCount.Add(1)
 			return nil
 		}
 		candidate := &h3DatagramPendingMessage{
-			messageId:      messageId,
-			totalByteCount: totalByteCount,
-			checksum:       checksum,
-			fragmentCount:  fragmentCount,
-			expiresAt:      now.Add(self.settings.ReassemblyTimeout),
-			message:        MessagePoolGet(totalByteCount),
-			fragments:      make([]h3DatagramFragmentSlot, fragmentCount),
+			messageId:        messageId,
+			totalByteCount:   totalByteCount,
+			messageByteCount: messageByteCount,
+			checksum:         checksum,
+			fragmentCount:    fragmentCount,
+			expiresAt:        now.Add(self.settings.ReassemblyTimeout),
+			headerByteCount:  headerByteCount,
+			message:          MessagePoolGet(messageByteCount),
+			fragments:        make([]h3DatagramFragmentSlot, fragmentCount),
 		}
 		installed := false
 		candidateClosed := false
@@ -1088,12 +1238,12 @@ func (self *H3DatagramReassembler) Accept(datagram []byte, now time.Time) []byte
 				return
 			}
 			if self.settings.MaxReassemblyMessageCount <= len(self.pendingMessageIdMessages) ||
-				self.settings.MaxReassemblyByteCount-self.reassemblyByteCount < totalByteCount {
+				self.settings.MaxReassemblyByteCount-self.reassemblyByteCount < messageByteCount {
 				candidateLimitRefusal = true
 				return
 			}
 			self.pendingMessageIdMessages[messageId] = candidate
-			self.reassemblyByteCount += totalByteCount
+			self.reassemblyByteCount += messageByteCount
 			installed = true
 		}()
 		if !installed {

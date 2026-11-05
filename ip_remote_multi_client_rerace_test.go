@@ -19,6 +19,7 @@ import (
 	"net"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -74,6 +75,8 @@ type reraceExitSpec struct {
 	tier   int
 	// answer decides each SYN (and each udp datagram); nil accepts all
 	answer func(path *IpPath) reraceAnswer
+	// Optional source settings are applied before real Client construction.
+	clientSettings func(*ClientSettings)
 }
 
 // reraceExitPacket is one packet a test provider received.
@@ -344,6 +347,9 @@ func (self *reraceGenerator) NewClient(ctx context.Context, args *MultiClientGen
 		return nil, errors.New("client args were not minted for a destination")
 	}
 
+	if exit.clientSettings != nil {
+		exit.clientSettings(clientSettings)
+	}
 	client := NewClient(ctx, args.ClientId, NewNoContractClientOob(), clientSettings)
 	routeSend := make(chan []byte)
 	routeReceive := make(chan []byte)
@@ -852,8 +858,8 @@ func TestReraceHarnessIgnoresEarlierBackendFailures(t *testing.T) {
 // --- RR-1: the re-race ---
 
 // RR-1. A new flow whose exit answers with the dial-failure signal is unbound
-// and its next retransmit completes on another exit within one retransmit
-// interval -- not at the 3s inference, not on the app's backoff. The signal
+// and its next source retransmit completes on another exit within one retry
+// interval while automatic continuation is held. The signal
 // never reaches the app. The first SYN goes to A alone because A is the only
 // exit of the best tier, as a pinned or single-candidate flow does; the
 // retransmit crosses tiers because A has failed this destination service.
@@ -869,8 +875,12 @@ func TestDialFailureReraceRetransmitCompletesOnAnotherExit(t *testing.T) {
 				}, nil)
 				a, b := harness.exit("a"), harness.exit("b")
 				path := reraceFlow(version, 0, 40001)
+				retry := reraceHoldSynRetryOnSource(t, harness, path)
 
 				synCount, elapsed, ok := harness.connect(path)
+				retry.assertEntered(t)
+				retry.release()
+				harness.settle()
 				if !ok {
 					t.Fatalf("the connect never completed: A saw %d SYNs, B saw %d", len(a.syns(path)), len(b.syns(path)))
 				}
@@ -955,32 +965,52 @@ func TestDialFailureReraceRetransmitCompletesOnAnotherExit(t *testing.T) {
 // strike, so the one-candidate race cannot commit the flow to the exit that
 // failed it, and the app's next SYN goes to another exit and completes. It
 // counts as the re-race it would have been had the commit come first. The
-// send hook delivers the signal before the send returns, deterministically.
+// send hook delivers the signal before the send returns, deterministically;
+// hold retained continuation so the next source SYN owns the replacement.
 func TestDialFailureSignalBeforeTheCommitWithdrawsTheExit(t *testing.T) {
 	GetMessagePoolAggregateStats()
+	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
+		path := reraceFlow(4, 0, 47000)
+		observed := make(chan struct{})
+		var observedOnce sync.Once
 		harness := newReraceHarness(t, []reraceExitSpec{
-			{name: "a", tier: 0, answer: reraceAlways(reraceSignal)},
+			{name: "a", tier: 0, answer: func(candidate *IpPath) reraceAnswer {
+				if reraceSameFlow(candidate, path) {
+					observedOnce.Do(func() { close(observed) })
+				}
+				return reraceSilent
+			}},
 			{name: "b", tier: 1},
 		}, nil)
 		a := harness.channel("a")
-		path := reraceFlow(4, 0, 47000)
-		a.sendGroupForTest = reraceSignalDuringSend(t, harness, a, path)
+		retry := reraceHoldSynRetryOnSource(t, harness, path)
+		restore := reraceAnswerDuringSend(t, harness, a, path, reraceProviderSignal(t, path), observed, nil)
 		harness.syn(path)
-		a.sendGroupForTest = nil
+		restore()
+		retry.assertEntered(t)
 		if got := harness.metrics().DialFailuresIntercepted; got != 1 {
 			t.Fatalf("setup: DialFailuresIntercepted = %d, want the signal", got)
 		}
 		if harness.boundTo(path) == a {
 			t.Fatal("the signal that landed before the commit was dropped: the flow is bound to the exit that failed it")
 		}
+		if harness.boundTo(path) != nil || len(harness.exit("b").syns(path)) != 0 || len(harness.sentSyns(path)) != 1 {
+			t.Fatal("automatic continuation escaped before the next source SYN")
+		}
 		if got := a.dialFailureCount(); got != 1 {
 			t.Errorf("A carries %d strikes, want the signal's 1", got)
 		}
 		harness.sleep(time.Second)
 		harness.syn(path)
+		retry.assertEntered(t)
+		retry.release()
+		harness.settle()
 		if _, ok := harness.synAck(path); !ok || harness.boundTo(path) != harness.channel("b") {
 			t.Error("the next SYN did not complete on B")
+		}
+		if len(harness.sentSyns(path)) != 2 || len(harness.exit("b").syns(path)) != 1 {
+			t.Error("the replacement did not follow exactly one source retransmit")
 		}
 		// whether the signal beats the commit or follows it, the flow leaves
 		// the exit that failed it once, and counts once
@@ -995,24 +1025,21 @@ func TestDialFailureSignalBeforeTheCommitWithdrawsTheExit(t *testing.T) {
 // answers and wins.
 func TestDialFailureRaceCandidateSignalLeavesTheRaceToTheOthers(t *testing.T) {
 	GetMessagePoolAggregateStats()
+	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
 		harness := newReraceHarness(t, []reraceExitSpec{
-			{name: "a", tier: 0, answer: reraceAlways(reraceSignal)},
-			{name: "b", tier: 0},
+			{name: "a", tier: 0, answer: reraceAlways(reraceSilent)},
+			{name: "b", tier: 0, answer: reraceAlways(reraceSilent)},
 		}, nil)
 		a, b := harness.channel("a"), harness.channel("b")
 		path := reraceFlow(4, 0, 47001)
 		// A's signal lands during its send; B answers once it has
 		signaled := make(chan struct{})
-		var signaledOnce sync.Once
-		signal := reraceSignalDuringSend(t, harness, a, path)
-		a.sendGroupForTest = func(group *parsedPacketGroup, timeout time.Duration, ack bool) (bool, error) {
-			defer signaledOnce.Do(func() { close(signaled) })
-			return signal(group, timeout, ack)
-		}
-		b.sendGroupForTest = reraceAnswerDuringSend(t, harness, b, reraceSynAck(path), signaled)
+		restoreA := reraceAnswerDuringSend(t, harness, a, path, reraceProviderSignal(t, path), nil, func() { close(signaled) })
+		restoreB := reraceAnswerDuringSend(t, harness, b, path, reraceSynAck(path), signaled, nil)
 		synCount, _, ok := harness.connect(path)
-		a.sendGroupForTest, b.sendGroupForTest = nil, nil
+		restoreA()
+		restoreB()
 		if !ok || synCount != 1 {
 			t.Fatalf("the connect completed on SYN %d (%t), want on the first", synCount, ok)
 		}
@@ -1028,23 +1055,41 @@ func TestDialFailureRaceCandidateSignalLeavesTheRaceToTheOthers(t *testing.T) {
 	})
 }
 
-// RR-1. A race whose every candidate signals is left empty and ends, so the
-// flow's next SYN starts a race of its own, which completes on another exit.
+// RR-1. A race whose every candidate signals is left empty and ends. Holding
+// automatic continuation lets the next source SYN start its own fresh race.
 func TestDialFailureWithdrawnRaceStartsAfresh(t *testing.T) {
 	GetMessagePoolAggregateStats()
+	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
+		path := reraceFlow(4, 0, 47002)
+		observedA, observedB := make(chan struct{}), make(chan struct{})
+		// Real provider observation follows source serialization and cache
+		// retention; the producer stays held before its admission hook returns.
+		observeSyn := func(observed chan struct{}) func(*IpPath) reraceAnswer {
+			var once sync.Once
+			return func(candidate *IpPath) reraceAnswer {
+				if reraceSameFlow(candidate, path) {
+					once.Do(func() { close(observed) })
+				}
+				return reraceSilent
+			}
+		}
 		harness := newReraceHarness(t, []reraceExitSpec{
-			{name: "a", tier: 0, answer: reraceAlways(reraceSignal)},
-			{name: "b", tier: 0, answer: reraceAlways(reraceSignal)},
+			{name: "a", tier: 0, answer: observeSyn(observedA)},
+			{name: "b", tier: 0, answer: observeSyn(observedB)},
 			{name: "c", tier: 1},
 			{name: "d", tier: 1},
 		}, nil)
 		a, b := harness.channel("a"), harness.channel("b")
-		path := reraceFlow(4, 0, 47002)
-		a.sendGroupForTest = reraceSignalDuringSend(t, harness, a, path)
-		b.sendGroupForTest = reraceSignalDuringSend(t, harness, b, path)
+		retry := reraceHoldSynRetryOnSource(t, harness, path)
+		restoreA := reraceAnswerDuringSend(t, harness, a, path, reraceProviderSignal(t, path), observedA, nil)
+		restoreB := reraceAnswerDuringSend(t, harness, b, path, reraceProviderSignal(t, path), observedB, nil)
 		synCount, _, ok := harness.connect(path)
-		a.sendGroupForTest, b.sendGroupForTest = nil, nil
+		restoreA()
+		restoreB()
+		retry.assertEntered(t)
+		retry.release()
+		harness.settle()
 		if !ok || synCount != 2 {
 			t.Fatalf("the connect completed on SYN %d (%t), want on the second", synCount, ok)
 		}
@@ -1062,56 +1107,137 @@ func TestDialFailureWithdrawnRaceStartsAfresh(t *testing.T) {
 // RR-1. An emptied race ends rather than lingering for the next SYN: when that
 // SYN finds a single exit, it gets a race of one of its own, which commits on
 // the send, so that exit's signal before the commit counts as the re-race it
-// is, as for a race of one from the start.
+// is, as for a race of one from the start. Force both source-retransmit and
+// retained-SYN continuation orderings around the same empty-race checkpoint.
 func TestDialFailureEmptiedRaceGivesTheNextSynARaceOfItsOwn(t *testing.T) {
 	GetMessagePoolAggregateStats()
-	synctest.Test(t, func(t *testing.T) {
-		harness := newReraceHarness(t, []reraceExitSpec{
-			{name: "a", tier: 0, answer: reraceAlways(reraceSignal)},
-			{name: "b", tier: 0, answer: reraceAlways(reraceSignal)},
-			{name: "c", tier: 1, answer: reraceAlways(reraceSignal)},
-		}, nil)
-		a, b, c := harness.channel("a"), harness.channel("b"), harness.channel("c")
-		path := reraceFlow(4, 0, 47003)
-		for _, channel := range []*multiClientChannel{a, b, c} {
-			channel.sendGroupForTest = reraceSignalDuringSend(t, harness, channel, path)
-		}
-		// the first SYN races A and B, which both fail it
-		harness.syn(path)
-		if got := harness.metrics().FlowsReraced; got != 0 {
-			t.Fatalf("FlowsReraced = %d after the race of two, want 0", got)
-		}
-		// the retransmit finds only C, which fails it before the commit
-		harness.sleep(time.Second)
-		harness.syn(path)
-		for _, channel := range []*multiClientChannel{a, b, c} {
-			channel.sendGroupForTest = nil
-		}
-		if got := harness.metrics().DialFailuresIntercepted; got != 3 {
-			t.Fatalf("setup: DialFailuresIntercepted = %d, want the three signals", got)
-		}
-		if got := harness.metrics().FlowsReraced; got != 1 {
-			t.Errorf("FlowsReraced = %d, want C's 1: its race of one was its own", got)
-		}
-		if harness.boundTo(path) != nil {
-			t.Error("the flow is bound to an exit that failed it")
-		}
-	})
+	assertMessagePoolOwnership(t)
+	for _, sourceFirst := range []bool{true, false} {
+		synctest.Test(t, func(t *testing.T) {
+			path := reraceFlow(4, 0, 47003)
+			observedA, observedB, observedC := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			// Real provider observation follows source serialization and cache
+			// retention while the admission producer still holds the commit.
+			observeSyn := func(observed chan struct{}) func(*IpPath) reraceAnswer {
+				var once sync.Once
+				return func(candidate *IpPath) reraceAnswer {
+					if reraceSameFlow(candidate, path) {
+						once.Do(func() { close(observed) })
+					}
+					return reraceSilent
+				}
+			}
+			harness := newReraceHarness(t, []reraceExitSpec{
+				{name: "a", tier: 0, answer: observeSyn(observedA)},
+				{name: "b", tier: 0, answer: observeSyn(observedB)},
+				{name: "c", tier: 1, answer: observeSyn(observedC)},
+			}, nil)
+			a, b, c := harness.channel("a"), harness.channel("b"), harness.channel("c")
+			retry := reraceHoldSynRetryOnSource(t, harness, path)
+			var cSourceGroups, cRetryGroups atomic.Int32
+			settings := c.client.sendBuffer.sendBufferSettings
+			previous := settings.afterGroupAdmissionForTest
+			settings.afterGroupAdmissionForTest = func(target sendGroupAdmissionTarget) {
+				if previous != nil {
+					previous(target)
+				}
+				if group, ok := target.(*parsedPacketGroup); ok && group.completionClient == c &&
+					reraceSameFlow(group.ipPath, path) {
+					if group.isSynRetry() {
+						cRetryGroups.Add(1)
+					} else {
+						cSourceGroups.Add(1)
+					}
+				}
+			}
+			restoreA := reraceAnswerDuringSend(t, harness, a, path, reraceProviderSignal(t, path), observedA, nil)
+			restoreB := reraceAnswerDuringSend(t, harness, b, path, reraceProviderSignal(t, path), observedB, nil)
+			restoreC := reraceAnswerDuringSend(t, harness, c, path, reraceProviderSignal(t, path), observedC, nil)
+
+			if !harness.syn(path) {
+				t.Fatal("the original source SYN was refused")
+			}
+			retry.assertEntered(t)
+			if got := harness.metrics().FlowsReraced; got != 0 {
+				t.Fatalf("FlowsReraced = %d after the race of two, want 0", got)
+			}
+			if harness.metrics().DialFailuresIntercepted != 2 || len(harness.sentSyns(path)) != 1 ||
+				len(harness.exit("a").syns(path)) != 1 || len(harness.exit("b").syns(path)) != 1 ||
+				len(harness.exit("c").syns(path)) != 0 || cSourceGroups.Load() != 0 || cRetryGroups.Load() != 0 {
+				t.Fatal("the empty-race checkpoint did not isolate the two original candidate failures")
+			}
+			update := harness.update(path)
+			func() {
+				update.stateLock.Lock()
+				defer update.stateLock.Unlock()
+				if update.client.Load() != nil || update.race != nil || update.receivedInbound.Load() {
+					t.Fatal("the withdrawn race did not end on the original source update")
+				}
+			}()
+
+			wantSourceSyns := 1
+			if sourceFirst {
+				// Keep the retained dispatcher held while the source retransmit
+				// reaches C and fails before its one-candidate commit.
+				harness.sleep(time.Second)
+				if !harness.syn(path) {
+					t.Fatal("the source retransmit was refused")
+				}
+				wantSourceSyns = 2
+			} else {
+				// The same C failure must count once when the retained original
+				// reaches C before the source offers a second SYN.
+				retry.release()
+				harness.settle()
+			}
+			restoreA()
+			restoreB()
+			restoreC()
+			retry.assertEntered(t)
+			retry.release()
+			harness.settle()
+			if got := harness.metrics().DialFailuresIntercepted; got != 3 {
+				t.Fatalf("sourceFirst=%t: DialFailuresIntercepted = %d, want the three signals", sourceFirst, got)
+			}
+			if got := harness.metrics().FlowsReraced; got != 1 {
+				t.Errorf("sourceFirst=%t: FlowsReraced = %d, want C's 1: its race of one was its own", sourceFirst, got)
+			}
+			wantSourceGroups, wantRetryGroups := int32(0), int32(1)
+			if sourceFirst {
+				wantSourceGroups, wantRetryGroups = 1, 0
+			}
+			if len(harness.sentSyns(path)) != wantSourceSyns || len(harness.exit("c").syns(path)) != 1 ||
+				cSourceGroups.Load() != wantSourceGroups || cRetryGroups.Load() != wantRetryGroups {
+				t.Fatalf("sourceFirst=%t: C's admitted source groups=%d retry groups=%d source SYNs=%d C SYNs=%d",
+					sourceFirst, cSourceGroups.Load(), cRetryGroups.Load(), len(harness.sentSyns(path)), len(harness.exit("c").syns(path)))
+			}
+			for _, channel := range []*multiClientChannel{a, b, c} {
+				if got := channel.dialFailureCount(); got != 1 {
+					t.Errorf("sourceFirst=%t: failed candidate carries %d strikes, want 1", sourceFirst, got)
+				}
+			}
+			if harness.update(path) != update || harness.boundTo(path) != nil {
+				t.Error("the original flow was replaced or bound to an exit that failed it")
+			}
+			reraceAssertNoErrorDelivered(t, harness, path)
+		})
+	}
 }
 
-// reraceSignalDuringSend is a send hook for an exit's channel: the exit's
-// provider fails the flow's dial at once, and its signal lands before the
-// send returns.
-func reraceSignalDuringSend(t *testing.T, harness *reraceHarness, channel *multiClientChannel, path *IpPath) func(*parsedPacketGroup, time.Duration, bool) (bool, error) {
+// The provider's inbound answer is controlled, but outbound admission is real.
+// Installing at quiescence and restoring after the public send joins preserves
+// prepareGroupCompletion, source custody and canonical renewal publication.
+func reraceSignalDuringSend(t *testing.T, harness *reraceHarness, channel *multiClientChannel, path *IpPath) func() {
 	t.Helper()
-	return reraceAnswerDuringSend(t, harness, channel, reraceProviderSignal(t, path), nil)
+	return reraceAnswerDuringSend(t, harness, channel, path, reraceProviderSignal(t, path), nil, nil)
 }
 
-// reraceAnswerDuringSend is a send hook for an exit's channel: the exit's
-// provider answers the sent packet with answer before the send returns,
-// once after is closed when it is not nil.
-func reraceAnswerDuringSend(t *testing.T, harness *reraceHarness, channel *multiClientChannel, answer []byte, after <-chan struct{}) func(*parsedPacketGroup, time.Duration, bool) (bool, error) {
+// This observation seam does not claim physical return or dequeue ordering.
+// The held-producer RR-5 controls below separately use real provider responses.
+func reraceAnswerDuringSend(t *testing.T, harness *reraceHarness, channel *multiClientChannel, path *IpPath,
+	answer []byte, after <-chan struct{}, answered func()) func() {
 	t.Helper()
+	harness.settle()
 	var provider Id
 	for _, exit := range harness.generator.exitList() {
 		if exit.destination == channel.Destination() {
@@ -1121,21 +1247,55 @@ func reraceAnswerDuringSend(t *testing.T, harness *reraceHarness, channel *multi
 	if provider == (Id{}) {
 		t.Fatal("no provider behind the channel")
 	}
-	return func(group *parsedPacketGroup, timeout time.Duration, ack bool) (bool, error) {
-		if after != nil {
-			<-after
+	settings := channel.client.sendBuffer.sendBufferSettings
+	previous := settings.afterGroupAdmissionForTest
+	stop := make(chan struct{})
+	var answerOnce, restoreOnce sync.Once
+	settings.afterGroupAdmissionForTest = func(target sendGroupAdmissionTarget) {
+		if previous != nil {
+			previous(target)
 		}
-		frame, err := ipPacketFromProviderFrame(answer, DefaultProtocolVersion)
-		if err != nil {
-			t.Errorf("answer frame: %s", err)
-		} else {
+		group, ok := target.(*parsedPacketGroup)
+		if !ok || group.completionClient != channel || !reraceSameFlow(group.ipPath, path) ||
+			!group.ipPath.Syn || group.ipPath.Ack || group.ipPath.SequenceNumber != path.SequenceNumber {
+			return
+		}
+		answerOnce.Do(func() {
+			if answered != nil {
+				defer answered()
+			}
+			if after != nil {
+				select {
+				case <-after:
+				case <-stop:
+					return
+				case <-harness.ctx.Done():
+					return
+				}
+			}
+			update := group.collapseAdmission.update
+			if update == nil || harness.update(path) != update ||
+				group.completionFlags.Load()&(groupCompletionTracked|groupCompletionAdmitted) !=
+					groupCompletionTracked|groupCompletionAdmitted {
+				t.Error("early response did not follow real current-generation source admission")
+				return
+			}
+			frame, err := ipPacketFromProviderFrame(answer, DefaultProtocolVersion)
+			if err != nil {
+				t.Errorf("answer frame: %s", err)
+				return
+			}
 			channel.clientReceive(SourceId(provider), []*protocol.Frame{frame}, Peer{})
-		}
-		for packetIndex := range group.packets {
-			MessagePoolReturn(group.packets[packetIndex].packet)
-		}
-		return true, nil
+		})
 	}
+	restore := func() {
+		restoreOnce.Do(func() {
+			close(stop)
+			settings.afterGroupAdmissionForTest = previous
+		})
+	}
+	t.Cleanup(restore)
+	return restore
 }
 
 // --- RR-2: established flows ---
@@ -1215,9 +1375,16 @@ func TestDialFailureStaleSignalIsIgnored(t *testing.T) {
 				{name: "b", tier: 1, answer: reraceAlways(reraceSilent)},
 			}, nil)
 			path := reraceFlow(4, 0, 40003)
+			retry := reraceHoldSynRetryOnSource(t, harness, path)
 			harness.syn(path)
+			retry.assertEntered(t)
+			if harness.boundTo(path) != nil || len(harness.exit("b").syns(path)) != 0 {
+				t.Fatal("setup: automatic continuation escaped the exact flow's barrier")
+			}
 			harness.sleep(time.Second)
 			harness.syn(path)
+			retry.release()
+			harness.settle()
 			b := harness.channel("b")
 			if harness.boundTo(path) != b {
 				t.Fatal("setup: the retransmit did not move the flow to B")
@@ -1292,8 +1459,10 @@ func TestDialFailureStaleSignalIsIgnored(t *testing.T) {
 			if harness.boundTo(path) != a {
 				t.Fatal("setup: the SYN did not bind the flow to A")
 			}
+			retry := reraceHoldSynRetry(t, harness, harness.update(path))
 
 			harness.inject("b", reraceProviderSignal(t, path))
+			retry.assertNotEntered(t)
 
 			if harness.boundTo(path) != a {
 				t.Error("B's signal unbound A's flow")
@@ -1314,8 +1483,15 @@ func TestDialFailureStaleSignalIsIgnored(t *testing.T) {
 
 			// positive control: the owner's signal does unbind
 			harness.inject("a", reraceProviderSignal(t, path))
+			retry.assertEntered(t)
 			if harness.boundTo(path) != nil {
 				t.Error("A's own signal did not unbind the flow")
+			}
+			retry.release()
+			harness.settle()
+			if harness.boundTo(path) != harness.channel("b") || len(harness.sentSyns(path)) != 1 ||
+				len(harness.exit("b").syns(path)) != 1 {
+				t.Error("the owner's signal did not resume the retained SYN on B")
 			}
 		})
 	})
@@ -1327,12 +1503,15 @@ func TestDialFailureStaleSignalIsIgnored(t *testing.T) {
 				{name: "b", tier: 1},
 			}, nil)
 			path := reraceFlow(4, 0, 40006)
+			retry := reraceHoldSynRetryOnSource(t, harness, path)
 			harness.syn(path)
+			retry.assertEntered(t)
 			if harness.boundTo(path) != nil {
 				t.Fatal("setup: the signal did not unbind the flow")
 			}
 
 			harness.inject("a", reraceProviderSignal(t, path))
+			retry.assertEntered(t)
 
 			if got := harness.channel("a").dialFailureCount(); got != 1 {
 				t.Errorf("A dialFailureCount = %d, want 1: one failed SYN is one strike", got)
@@ -1343,6 +1522,12 @@ func TestDialFailureStaleSignalIsIgnored(t *testing.T) {
 			}
 			if got := len(harness.delivered(path)); got != 0 {
 				t.Errorf("the app received %d packets, want none", got)
+			}
+			retry.release()
+			harness.settle()
+			if harness.boundTo(path) != harness.channel("b") || len(harness.sentSyns(path)) != 1 ||
+				len(harness.exit("b").syns(path)) != 1 {
+				t.Error("repeated signals did not leave one retained SYN continuation on B")
 			}
 		})
 	})
@@ -1412,28 +1597,55 @@ func TestProbeDialFailureThroughChannelFeedsNothing(t *testing.T) {
 
 // RR-5. With DialFailureRerace off the signal is handed to the app at once,
 // once per failed dial, rebuilt over the SYN's sequence so a kernel stack
-// accepts it, and nothing re-races: through the retransmits at 1s,
-// 3s and 7s -- the 3s and 7s ones past the silence inference, which the knob
-// turns off too -- the flow stays on its exit and the other exit never sees
-// it. (Blackhole detection benches an exit that never answers later; that is
-// not a re-race.)
+// accepts it. A young positively healthy owner stays bound through 1s, 3s
+// and 7s. Its identical SYN retries remain collapsed: the signal is not a
+// new generation or authority to reopen already-owned Transfer recovery.
+// The separate no-success cases below require ordinary renewal; disabling
+// dial-failure unbinding does not grant unhealthy affinity reuse.
 func TestDialFailureReraceOffForwardsSignalAndKeepsExit(t *testing.T) {
 	GetMessagePoolAggregateStats()
+	assertMessagePoolOwnership(t)
 	for _, version := range []int{4, 6} {
 		t.Run(fmt.Sprintf("ipv%d", version), func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
+				path := reraceFlow(version, 0, 40007)
 				harness := newReraceHarness(t, []reraceExitSpec{
-					{name: "a", tier: 0, answer: reraceAlways(reraceSignal)},
+					{name: "a", tier: 0, answer: func(candidate *IpPath) reraceAnswer {
+						if reraceSameFlow(candidate, path) {
+							return reraceSignal
+						}
+						return reraceAccept
+					}},
 					{name: "b", tier: 1},
 				}, func(settings *MultiClientSettings) {
 					settings.DialFailureRerace = false
 				})
 				a := harness.channel("a")
-				path := reraceFlow(version, 0, 40007)
+				sibling := reraceHealthySibling(t, harness, version)
+				siblingOwner := harness.update(sibling)
+				var owner *multiClientChannelUpdate
 				start := time.Now()
-				for _, offset := range reraceSynSchedule[:4] {
+				for index, offset := range reraceSynSchedule[:4] {
 					time.Sleep(start.Add(offset).Sub(time.Now()))
-					harness.syn(path)
+					stats, err := a.WindowStats()
+					if err != nil || !stats.healthy || owner != nil && !harness.multiClient.reuseAffinitySyn(owner, a, path) {
+						t.Fatal("independent real traffic did not preserve positive affinity eligibility")
+					}
+					drops := harness.multiClient.TcpCollapseDropCount()
+					wantAdmitted, wantDrops := index == 0, uint64(0)
+					if !wantAdmitted {
+						wantDrops = 1
+					}
+					admitted := harness.syn(path)
+					if gotDrops := harness.multiClient.TcpCollapseDropCount() - drops; admitted != wantAdmitted || gotDrops != wantDrops {
+						t.Fatalf("SYN offer %d at +%s admitted=%t collapseDrops=%d, want %t/%d",
+							index, offset, admitted, gotDrops, wantAdmitted, wantDrops)
+					}
+					if owner == nil {
+						owner = harness.update(path)
+					} else if harness.update(path) != owner {
+						t.Fatal("young healthy retry replaced its canonical update")
+					}
 					if harness.boundTo(path) != a {
 						t.Fatalf("the flow left A at +%s with the knob off", offset)
 					}
@@ -1441,8 +1653,8 @@ func TestDialFailureReraceOffForwardsSignalAndKeepsExit(t *testing.T) {
 
 				errorsDelivered := harness.errorsDelivered(path)
 				failedDials := harness.exit("a").syns(path)
-				if len(errorsDelivered) == 0 || len(errorsDelivered) != len(failedDials) {
-					t.Fatalf("the app received %d icmp errors for %d failed dials, want one each", len(errorsDelivered), len(failedDials))
+				if len(errorsDelivered) != 1 || len(failedDials) != 1 {
+					t.Fatalf("the app received %d icmp errors for %d provider SYNs, want exactly one each", len(errorsDelivered), len(failedDials))
 				}
 				for i, packet := range errorsDelivered {
 					if packet.at.Sub(failedDials[i].at) != 0 {
@@ -1473,8 +1685,112 @@ func TestDialFailureReraceOffForwardsSignalAndKeepsExit(t *testing.T) {
 				if metrics.FlowsReraced != 0 || metrics.DialFailuresIntercepted != uint64(len(failedDials)) {
 					t.Errorf("FlowsReraced=%d DialFailuresIntercepted=%d, want 0 and %d", metrics.FlowsReraced, metrics.DialFailuresIntercepted, len(failedDials))
 				}
+				if got := a.dialFailureCount(); got != 1 {
+					t.Errorf("A carries %d strikes, want the one actual failed dial", got)
+				}
+				if harness.update(sibling) != siblingOwner || siblingOwner.IsDone() ||
+					!harness.send(reraceSegment(sibling, 24, []byte("still live"))) || len(harness.delivered(sibling)) != 6 {
+					t.Fatal("failed dial disturbed the actual healthy sibling")
+				}
 			})
 		})
+	}
+	for _, version := range []int{4, 6} {
+		for _, knownFailure := range []bool{false, true} {
+			testReraceOffAdmittedAttempt(t, version, false, false, knownFailure)
+		}
+	}
+}
+
+// RR-5. With the knob off the signal is the same failure whether it lands
+// before the race of one commits the flow -- a provider that fails the dial
+// at once can answer before the send returns -- or after: the app gets one
+// icmp error at once, rebuilt over the SYN's sequence, the exit its strike,
+// and the flow stays on its exit. Dropped as stale, the early signal left the
+// app nothing at all: the commit bound the flow to the exit that failed it,
+// and collapse prevention keeps the app's same-sequence retransmits from that
+// exit, so no second signal could follow. The send hook lands the signal
+// before the send returns; a silent exit given the signal after the send is
+// the order in which the commit comes first.
+func TestDialFailureReraceOffSignalBeforeTheCommitForwards(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	assertMessagePoolOwnership(t)
+	for _, version := range []int{4, 6} {
+		for _, beforeCommit := range []bool{true, false} {
+			label := fmt.Sprintf("ipv%d, signal before the commit %t", version, beforeCommit)
+			synctest.Test(t, func(t *testing.T) {
+				harness := newReraceHarness(t, []reraceExitSpec{
+					{name: "a", tier: 0, answer: reraceAlways(reraceSilent)},
+					{name: "b", tier: 1},
+				}, func(settings *MultiClientSettings) {
+					settings.DialFailureRerace = false
+				})
+				a := harness.channel("a")
+				path := reraceFlow(version, 0, 47100)
+				var restore func()
+				if beforeCommit {
+					restore = reraceSignalDuringSend(t, harness, a, path)
+				}
+				harness.syn(path)
+				if restore != nil {
+					restore()
+				}
+				if !beforeCommit {
+					harness.inject("a", reraceProviderSignal(t, path))
+				}
+				if got := harness.metrics().DialFailuresIntercepted; got != 1 {
+					t.Fatalf("%s: setup: DialFailuresIntercepted = %d, want the signal", label, got)
+				}
+
+				if harness.boundTo(path) != a {
+					t.Errorf("%s: the flow left A with the knob off", label)
+				}
+				errorsDelivered := harness.errorsDelivered(path)
+				if len(errorsDelivered) != 1 {
+					t.Fatalf("%s: the app received %d icmp errors for the failed dial, want 1", label, len(errorsDelivered))
+				}
+				if sent := harness.sentSyns(path); !errorsDelivered[0].at.Equal(sent[0]) {
+					t.Errorf("%s: the icmp error reached the app %s after the SYN, want at once", label, errorsDelivered[0].at.Sub(sent[0]))
+				}
+				if embedded, ok := ipParseIcmpUnreachable(errorsDelivered[0].packet); !ok || embedded.SequenceNumber != path.SequenceNumber {
+					t.Errorf("%s: the icmp error embeds %+v, want the SYN's sequence %d", label, embedded, path.SequenceNumber)
+				}
+				want := reraceProviderFlowPath(path)
+				want.SequenceNumber = path.SequenceNumber
+				if wantPacket, _ := ipOosUnreachable(want); !bytes.Equal(errorsDelivered[0].packet, wantPacket) {
+					t.Errorf("%s: the icmp error is %x, want %x", label, errorsDelivered[0].packet, wantPacket)
+				}
+				if got := len(harness.delivered(path)); got != 1 {
+					t.Errorf("%s: the app received %d packets, want only the icmp error", label, got)
+				}
+				if got := a.dialFailureCount(); got != 1 {
+					t.Errorf("%s: A carries %d strikes, want the signal's 1", label, got)
+				}
+				if got := harness.metrics().FlowsReraced; got != 0 {
+					t.Errorf("%s: FlowsReraced = %d, want 0 with the knob off", label, got)
+				}
+				if got := len(harness.exit("b").received(path)); got != 0 {
+					t.Errorf("%s: B received %d packets of the flow, want 0", label, got)
+				}
+			})
+		}
+	}
+}
+
+// RR-5. The icmp error the knob forwards embeds the SYN of the connect attempt
+// the signal fails, which the send path records before that SYN leaves. A new
+// attempt on a flow already bound to its exit -- the app's SYN with a new
+// sequence on the same 5-tuple -- can fail at once, before its send commits
+// the new sequence: the error must embed the new SYN's sequence, not the
+// last committed one, which the app's stack no longer accepts.
+func TestDialFailureReraceOffForwardsTheNewAttemptsSequence(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	assertMessagePoolOwnership(t)
+	for _, version := range []int{4, 6} {
+		testReraceOffAdmittedAttempt(t, version, true, true, false)
+		for _, knownFailure := range []bool{false, true} {
+			testReraceOffAdmittedAttempt(t, version, true, false, knownFailure)
+		}
 	}
 }
 
@@ -2153,7 +2469,8 @@ type reraceIcmpCase struct {
 // must stay bound, A must take no strike, the packet must not count as
 // received data and the app must receive nothing for the flow; then A's
 // genuine signal for the same flow must unbind it, so the fixture can tell
-// the difference.
+// the difference. Hold only that flow's independent syn dispatcher to observe
+// the unbind, then release it and prove default automatic continuation on B.
 func reraceAssertIcmpIgnored(t *testing.T, version int, cases []reraceIcmpCase) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -2173,11 +2490,27 @@ func reraceAssertIcmpIgnored(t *testing.T, version int, cases []reraceIcmpCase) 
 				if harness.boundTo(path) != a {
 					t.Fatal("setup: the flow is not bound to A")
 				}
+				update := harness.update(path)
+				var retry *reraceSynRetryBarrier
+				var owner *tcpSynRetry
+				if !c.udp {
+					owner = synRetryControlOwner(t, update)
+					retry = reraceHoldSynRetry(t, harness, update)
+				}
 
 				harness.inject("a", c.packet(t, path))
 
 				if harness.boundTo(path) != a {
 					t.Error("the flow was unbound")
+				}
+				if harness.update(path) != update || update.receivedInbound.Load() || update.sourceReset.Load() {
+					t.Error("the ignored packet changed the flow's authority")
+				}
+				if retry != nil {
+					retry.assertNotEntered(t)
+					if synRetryControlOwner(t, update) != owner || len(harness.exit("b").syns(path)) != 0 {
+						t.Error("the ignored packet changed the retained SYN owner or admitted a retry")
+					}
 				}
 				if got := len(harness.delivered(path)); got != 0 {
 					t.Errorf("the app received %d packets for the flow", got)
@@ -2197,8 +2530,28 @@ func reraceAssertIcmpIgnored(t *testing.T, version int, cases []reraceIcmpCase) 
 				}
 
 				harness.inject("a", reraceProviderSignal(t, path))
+				if retry != nil {
+					retry.assertEntered(t)
+				}
 				if harness.boundTo(path) != nil {
 					t.Error("positive control: A's genuine signal did not unbind the flow")
+				}
+				if harness.update(path) != update || a.dialFailureCount() != 1 || harness.metrics().FlowsReraced != 1 {
+					t.Error("positive control: the genuine signal did not rerace the existing flow exactly once")
+				}
+				if retry != nil {
+					if len(harness.exit("b").syns(path)) != 0 {
+						t.Error("positive control: B received the retained SYN before its dispatcher was released")
+					}
+					retry.release()
+					harness.settle()
+					if harness.update(path) != update || harness.boundTo(path) != harness.channel("b") {
+						t.Error("positive control: the released retained SYN did not continue the existing flow on B")
+					}
+					if _, ok := harness.synAck(path); !ok || len(harness.sentSyns(path)) != 1 || len(harness.exit("b").syns(path)) != 1 {
+						t.Error("positive control: continuation did not complete with one app SYN and one SYN on B")
+					}
+					synRetryControlReleased(t, owner)
 				}
 			})
 		})
@@ -2664,12 +3017,21 @@ func TestDialFailureSilentProviderLeavesFlowToTheAppTimeout(t *testing.T) {
 // signal existed; the signal is what moves it at 1s (RR-1).
 func TestDialFailureSilentProviderRecoversAtTheInference(t *testing.T) {
 	GetMessagePoolAggregateStats()
+	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
+		path := reraceFlow(4, 1, 50002)
 		harness := newReraceHarness(t, []reraceExitSpec{
-			{name: "a", tier: 0, answer: reraceAlways(reraceSilent)},
+			{name: "a", tier: 0, answer: func(candidate *IpPath) reraceAnswer {
+				if reraceSameFlow(candidate, path) {
+					return reraceSilent
+				}
+				return reraceAccept
+			}},
 			{name: "b", tier: 1},
 		}, nil)
-		path := reraceFlow(4, 1, 50002)
+		// Inference judges one retained healthy owner. Without actual closed
+		// traffic buckets, each SYN instead renews the unhealthy binding.
+		reraceHealthySibling(t, harness, 4)
 		synCount, elapsed, ok := harness.connect(path)
 		if !ok {
 			t.Fatal("the connect never completed")
@@ -2680,8 +3042,204 @@ func TestDialFailureSilentProviderRecoversAtTheInference(t *testing.T) {
 		if harness.boundTo(path) != harness.channel("b") {
 			t.Error("the flow is not on B")
 		}
-		if metrics := harness.metrics(); metrics.FlowsReraced != 1 {
-			t.Errorf("FlowsReraced = %d, want the one inferred re-race", metrics.FlowsReraced)
+		if metrics := harness.metrics(); metrics.FlowsReraced != 1 || metrics.DialFailuresIntercepted != 0 {
+			t.Errorf("FlowsReraced = %d DialFailuresIntercepted = %d, want one inference and no signal", metrics.FlowsReraced, metrics.DialFailuresIntercepted)
+		}
+	})
+}
+
+// The third public SYN must reach B's real source admission at three seconds,
+// not fail an incumbent-reuse check and wait for the app's seven-second retry.
+// Hold its producer after admission while real serialization, provider return
+// and peer ACK establish source ownership independently of the public result.
+func TestDialFailureInferredRetryUsesFreshSourceAdmission(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		path := reraceFlow(4, 1, 50004)
+		var started, writes, terminals atomic.Uint64
+		var token atomic.Uint64
+		var invalidLifecycle atomic.Bool
+		t.Cleanup(func() {
+			if started.Load() != terminals.Load() || invalidLifecycle.Load() {
+				t.Errorf("replacement source did not join exact ACK-required callback custody: started=%d written=%d terminal=%d", started.Load(), writes.Load(), terminals.Load())
+			}
+		})
+		harness := newReraceHarness(t, []reraceExitSpec{
+			{name: "a", tier: 0, answer: func(candidate *IpPath) reraceAnswer {
+				if reraceSameFlow(candidate, path) {
+					return reraceSilent
+				}
+				return reraceAccept
+			}},
+			{name: "b", tier: 1},
+		}, nil)
+		reraceHealthySibling(t, harness, 4)
+		a, b := harness.channel("a"), harness.channel("b")
+		written, terminal := make(chan struct{}), make(chan struct{})
+		var writeOnce, terminalOnce sync.Once
+		b.client.settings.SendBufferSettings.SendPackLifecycleObserver = func(event SendPackLifecycleObservation) {
+			if event.MessageType != protocol.MessageType_IpIpPacketToProvider {
+				return
+			}
+			if event.ClientId != b.client.ClientId() || !event.AckRequired || event.Err != nil {
+				invalidLifecycle.Store(true)
+			}
+			switch event.Phase {
+			case SendPackLifecyclePhaseStarted:
+				started.Add(1)
+				if !token.CompareAndSwap(0, event.Token) {
+					invalidLifecycle.Store(true)
+				}
+			case SendPackLifecyclePhaseFirstRouteWrite:
+				writes.Add(1)
+				writeOnce.Do(func() { close(written) })
+			case SendPackLifecyclePhaseTerminal:
+				terminals.Add(1)
+				terminalOnce.Do(func() { close(terminal) })
+			}
+			if event.Token != token.Load() {
+				invalidLifecycle.Store(true)
+			}
+		}
+		start := time.Now()
+		if !harness.syn(path) || harness.boundTo(path) != a {
+			t.Fatal("initial real SYN did not select the healthy incumbent")
+		}
+		owner := harness.update(path)
+		harness.sleep(time.Second)
+		if harness.syn(path) || harness.update(path) != owner || harness.boundTo(path) != a || harness.metrics().FlowsReraced != 0 {
+			t.Fatal("one-second duplicate lost retained incumbent ownership")
+		}
+		harness.sleep(2 * time.Second)
+		entered, release := make(chan struct{}), make(chan struct{})
+		var releaseOnce sync.Once
+		resume := func() { releaseOnce.Do(func() { close(release) }) }
+		var admitted atomic.Pointer[parsedPacketGroup]
+		var admissionAt atomic.Int64
+		b.client.settings.SendBufferSettings.afterGroupAdmissionForTest = func(target sendGroupAdmissionTarget) {
+			group, ok := target.(*parsedPacketGroup)
+			if !ok || !reraceSameFlow(group.ipPath, path) || !admitted.CompareAndSwap(nil, group) {
+				return
+			}
+			admissionAt.Store(time.Now().Sub(start).Nanoseconds())
+			close(entered)
+			select {
+			case <-release:
+			case <-harness.ctx.Done():
+			}
+		}
+		results := make(chan bool, 1)
+		joined, accepted := false, false
+		join := func() {
+			resume()
+			if !joined {
+				accepted = <-results
+				joined = true
+			}
+			harness.concurrent = false
+		}
+		t.Cleanup(join)
+		harness.concurrent = true
+		go func() { results <- harness.syn(path) }()
+		synctest.Wait()
+		select {
+		case <-entered:
+		default:
+			t.Fatalf("three-second inferred retry never reached fresh B source admission: reraced=%d started=%d", harness.metrics().FlowsReraced, started.Load())
+		}
+		group := admitted.Load()
+		if group == nil || group.affinitySynReuse || group.completionClient != b || group.collapseAdmission.update != owner ||
+			time.Duration(admissionAt.Load()) < reraceSynSchedule[2] || reraceSynSchedule[2]+reraceSettle < time.Duration(admissionAt.Load()) {
+			t.Fatal("replacement source inherited incumbent-reuse authority or missed the original three-second bound")
+		}
+		select {
+		case <-written:
+		case <-time.After(reraceSettle):
+			t.Fatal("admitted replacement SYN never reached a real route writer")
+		}
+		synctest.Wait()
+		bufferedReply := func() bool {
+			owner.stateLock.Lock()
+			defer owner.stateLock.Unlock()
+			if owner.race == nil || owner.client.Load() != nil {
+				return false
+			}
+			state := owner.race.clientStates[b]
+			return state != nil && len(state.packets) == 1 && state.packets[0].tcpControl.valid &&
+				state.packets[0].tcpControl.syn && state.packets[0].tcpControl.ack &&
+				state.packets[0].tcpControl.ackSequenceNumber == path.SequenceNumber+1
+		}()
+		if !bufferedReply || harness.update(path) != owner ||
+			len(harness.exit("a").syns(path)) != 1 || len(harness.exit("b").syns(path)) != 1 ||
+			len(harness.delivered(path)) != 0 {
+			t.Fatal("fresh B source did not retain its actual provider reply behind the producer's admission barrier")
+		}
+		select {
+		case accepted = <-results:
+			joined = true
+			t.Fatal("producer returned before its actual admission barrier was released")
+		default:
+		}
+		join()
+		if !accepted {
+			t.Fatal("the source-owned replacement SYN was not accepted by the public send")
+		}
+		harness.settle()
+		if _, ok := harness.synAck(path); !ok || harness.update(path) != owner || harness.boundTo(path) != b {
+			t.Fatal("releasing the producer did not commit and deliver the actual B reply on the same flow owner")
+		}
+		select {
+		case <-terminal:
+		case <-time.After(reraceSettle):
+			t.Fatal("replacement SYN did not release its real peer-ACK retry owner")
+		}
+		metrics := harness.metrics()
+		if started.Load() != 1 || writes.Load() != 1 || terminals.Load() != 1 || invalidLifecycle.Load() ||
+			metrics.FlowsReraced != 1 || metrics.DialFailuresIntercepted != 0 || len(harness.sentSyns(path)) != 3 {
+			t.Fatal("replacement source changed original attempts, signal accounting or exact callback ownership")
+		}
+		t.Logf("fresh provider source at %s; SYNs=3 started=%d written=%d terminal=%d", time.Duration(admissionAt.Load()), started.Load(), writes.Load(), terminals.Load())
+	})
+}
+
+// An unproven exit cannot donate its current binding to another SYN. These
+// actual admissions renew the owner rather than accumulating a false inference
+// across three different connect generations; no health flag is synthesized.
+func TestDialFailureUnhealthySynRenewsBeforeSilenceInference(t *testing.T) {
+	GetMessagePoolAggregateStats()
+	assertMessagePoolOwnership(t)
+	synctest.Test(t, func(t *testing.T) {
+		harness := newReraceHarness(t, []reraceExitSpec{
+			{name: "a", tier: 0, answer: reraceAlways(reraceSilent)},
+			{name: "b", tier: 1, answer: reraceAlways(reraceSilent)},
+		}, nil)
+		path := reraceFlow(4, 1, 50003)
+		a := harness.channel("a")
+		start := time.Now()
+		var previous *multiClientChannelUpdate
+		for _, offset := range reraceSynSchedule[:3] {
+			harness.sleep(start.Add(offset).Sub(time.Now()))
+			a.stateLock.Lock()
+			healthy := a.healthy
+			a.stateLock.Unlock()
+			if healthy || !harness.syn(path) {
+				t.Fatalf("unproven provider's real SYN was not admitted at %s", offset)
+			}
+			current := harness.update(path)
+			if current == nil || current == previous || current.receivedInbound.Load() || harness.boundTo(path) != a ||
+				previous != nil && !previous.IsDone() {
+				t.Fatalf("unhealthy SYN did not publish its independently owned generation at %s", offset)
+			}
+			previous = current
+		}
+		if got := len(harness.exit("a").syns(path)); got != 3 {
+			t.Fatalf("provider received %d SYNs, want the three actual fresh admissions", got)
+		}
+		metrics := harness.metrics()
+		if metrics.FlowsReraced != 0 || metrics.DialFailuresIntercepted != 0 ||
+			harness.multiClient.uplinkLastIngressNanos.Load() != 0 || len(harness.delivered(path)) != 0 {
+			t.Fatal("fresh unhealthy SYN ownership fabricated a silence inference or uplink ingress")
 		}
 	})
 }
@@ -2694,20 +3252,20 @@ func TestDialFailureSilentProviderRecoversAtTheInference(t *testing.T) {
 // gate exists for.
 func TestDialFailureInferenceIsNotUplinkIngress(t *testing.T) {
 	GetMessagePoolAggregateStats()
+	assertMessagePoolOwnership(t)
 	synctest.Test(t, func(t *testing.T) {
+		path := reraceFlow(4, 1, 45001)
 		harness := newReraceHarness(t, []reraceExitSpec{
-			{name: "a", tier: 0, answer: func(path *IpPath) reraceAnswer {
-				if path.DestinationIp[len(path.DestinationIp)-1] == 11 {
+			{name: "a", tier: 0, answer: func(candidate *IpPath) reraceAnswer {
+				if reraceSameFlow(candidate, path) {
 					return reraceSilent
 				}
 				return reraceAccept
 			}},
 			{name: "b", tier: 1, answer: reraceAlways(reraceSilent)},
 		}, nil)
-		live := reraceFlow(4, 0, 45000)
-		if _, _, ok := harness.connect(live); !ok {
-			t.Fatal("setup: the live flow did not connect")
-		}
+		// A single SYN-ACK does not prove the positive WindowStats premise.
+		reraceHealthySibling(t, harness, 4)
 		lastIngress := harness.multiClient.uplinkLastIngressNanos.Load()
 		if lastIngress == 0 {
 			t.Fatal("setup: no ingress was stamped")
@@ -2715,10 +3273,13 @@ func TestDialFailureInferenceIsNotUplinkIngress(t *testing.T) {
 
 		// from here on nothing arrives from any exit
 		harness.sleep(10 * time.Second)
-		path := reraceFlow(4, 1, 45001)
 		harness.syn(path)
+		owner := harness.update(path)
 		harness.sleep(time.Second)
 		harness.syn(path)
+		if owner == nil || harness.update(path) != owner || owner.IsDone() {
+			t.Fatal("positive provider health did not retain one owner for the inference clock")
+		}
 		harness.sleep(2 * time.Second)
 		// the 3s retransmit trips the silence inference
 		harness.syn(path)

@@ -535,7 +535,7 @@ func (self *RemoteUserNatMultiClient) registerProbeFlow(
 		update := newMultiClientChannelUpdate(self.probeCtx(), ipPath)
 		update.probe = probe
 		update.activityTime = time.Now()
-		update.client.Store(client)
+		update.selectAffinityClient(client)
 
 		switch version {
 		case 4:
@@ -861,16 +861,13 @@ func (self *RemoteUserNatMultiClient) clientReceiveProbePacket(
 				found = u
 			}
 		}
-		if found == nil {
+		if found == nil || found.client.Load() != sourceClient {
 			return
 		}
 		if questions := found.probe.dnsQueries; questions != nil {
 			// The path identifies this resolver and pass; the transaction id
 			// identifies a question. Wrong/late/duplicate ids cannot complete
 			// a sibling, and another channel cannot answer for this one.
-			if found.client.Load() != sourceClient {
-				return
-			}
 			_, payload, err := ParseIpPathWithPayload(packet)
 			if err == nil && len(payload) >= 2 {
 				probe = questions[binary.BigEndian.Uint16(payload[:2])]
@@ -960,10 +957,14 @@ func (self *RemoteUserNatMultiClient) clientReceiveProbePacket(
 	// connection for its own timeout and the provider can release the socket
 	if sourceClient != nil && probe.target.Class == probeClassHealth {
 		if rstPacket, ok := probeCourtesyRstPacket(probe.ipPath, probe.synSequence); ok {
-			sourceClient.sendProbe(&parsedPacket{
+			// Optional cleanup cannot wait on the shared receive callback.
+			// Refusal leaves the provider's existing dial/idle timeout in charge.
+			if !sourceClient.sendProbe(&parsedPacket{
 				packet: rstPacket,
 				ipPath: probe.ipPath,
-			}, probeSendTimeout)
+			}, 0) {
+				MessagePoolReturn(rstPacket)
+			}
 		}
 	}
 
@@ -1106,7 +1107,7 @@ func (self *multiClientChannel) probeDestination() MultiHopId {
 func (self *RemoteUserNatMultiClient) recordProbePass(destination MultiHopId) {
 	now := time.Now()
 
-	newlyQualified := func() bool {
+	newlyQualified, evicted := func() (bool, bool) {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
 
@@ -1115,8 +1116,8 @@ func (self *RemoteUserNatMultiClient) recordProbePass(destination MultiHopId) {
 		entry.qualifiedAt = now
 		entry.lastProbeAt = now
 		entry.passed += 1
-		self.evictQualificationWithLock()
-		return !was
+		evicted := self.evictQualificationWithLock()
+		return !was, evicted
 	}()
 
 	// counted on the transition only: the number that matters is how many
@@ -1124,6 +1125,9 @@ func (self *RemoteUserNatMultiClient) recordProbePass(destination MultiHopId) {
 	// the same one
 	if newlyQualified {
 		self.reliabilityMetrics.providerQualified()
+	}
+	if evicted {
+		self.wakeProber()
 	}
 }
 
@@ -1137,13 +1141,18 @@ func (self *RemoteUserNatMultiClient) recordProbePass(destination MultiHopId) {
 //
 // called without stateLock
 func (self *RemoteUserNatMultiClient) recordProbeFail(destination MultiHopId) {
-	self.stateLock.Lock()
-	defer self.stateLock.Unlock()
+	evicted := func() bool {
+		self.stateLock.Lock()
+		defer self.stateLock.Unlock()
 
-	entry := self.qualificationEntryWithLock(destination)
-	entry.lastProbeAt = time.Now()
-	entry.failed += 1
-	self.evictQualificationWithLock()
+		entry := self.qualificationEntryWithLock(destination)
+		entry.lastProbeAt = time.Now()
+		entry.failed += 1
+		return self.evictQualificationWithLock()
+	}()
+	if evicted {
+		self.wakeProber()
+	}
 }
 
 // providerQualified reports whether a provider has a probe pass inside
@@ -1179,8 +1188,14 @@ func (self *RemoteUserNatMultiClient) qualificationEntryWithLock(destination Mul
 // means "the most recently probed providers survive" is a property a test can
 // assert rather than a tendency.
 //
+// Reports whether it evicted a record. A provider a window still holds is
+// unprobed again once its record is gone, so due at once, and nothing but
+// the caller can tell a sleeping prober: the caller wakes it (wakeProber)
+// once it has released the lock.
+//
 // must be called with stateLock
-func (self *RemoteUserNatMultiClient) evictQualificationWithLock() {
+func (self *RemoteUserNatMultiClient) evictQualificationWithLock() bool {
+	evicted := false
 	for qualificationMaxEntries < len(self.qualification) {
 		var oldestKey MultiHopId
 		var oldestTime time.Time
@@ -1191,10 +1206,12 @@ func (self *RemoteUserNatMultiClient) evictQualificationWithLock() {
 			}
 		}
 		if !found {
-			return
+			return evicted
 		}
 		delete(self.qualification, oldestKey)
+		evicted = true
 	}
+	return evicted
 }
 
 // --- the send seam ---

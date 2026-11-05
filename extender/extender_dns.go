@@ -3,7 +3,6 @@ package extender
 import (
 	"context"
 	"encoding/binary"
-	"fmt"
 	"net"
 	"strings"
 	"sync"
@@ -58,6 +57,12 @@ type extenderDnsForwarder struct {
 	packetConn net.PacketConn
 	queries    chan *extenderDnsQuery
 
+	// the life of this forwarder, which is its carrier's: a carrier that is
+	// rebuilt builds a new forwarder, so these end with close, not the server
+	ctx     context.Context
+	cancel  context.CancelFunc
+	workers sync.WaitGroup
+
 	stateLock    sync.Mutex
 	totalBucket  tokenBucket
 	sourceStates map[string]*extenderDnsSource
@@ -70,17 +75,22 @@ type extenderDnsForwarder struct {
 // is owned by the carrier; the forwarder only answers on it.
 func newExtenderDnsForwarder(server *ExtenderServer, packetConn net.PacketConn) *extenderDnsForwarder {
 	workerCount := max(1, server.settings.DnsForwardWorkerCount)
+	cancelCtx, cancel := context.WithCancel(server.ctx)
 	self := &extenderDnsForwarder{
 		server:       server,
 		packetConn:   packetConn,
 		queries:      make(chan *extenderDnsQuery, workerCount),
+		ctx:          cancelCtx,
+		cancel:       cancel,
 		sourceStates: map[string]*extenderDnsSource{},
 	}
 	for range workerCount {
 		if !server.beginWorker() {
 			break
 		}
+		self.workers.Add(1)
 		go func() {
+			defer self.workers.Done()
 			defer server.endWorker()
 			connect.HandleError(func() {
 				self.run()
@@ -94,7 +104,7 @@ func newExtenderDnsForwarder(server *ExtenderServer, packetConn net.PacketConn) 
 func (self *extenderDnsForwarder) run() {
 	for {
 		select {
-		case <-self.server.ctx.Done():
+		case <-self.ctx.Done():
 			return
 		case query := <-self.queries:
 			self.resolveQuery(query)
@@ -120,7 +130,7 @@ func (self *extenderDnsForwarder) handleQuery(queryBytes []byte, addr net.Addr) 
 	default:
 		// every worker is busy; a dropped query is what a loaded resolver does
 		self.release(source)
-		self.server.reportError("dns query", fmt.Errorf("the dns forward workers are busy"))
+		self.server.reportError("dns query", extenderFixedError("the dns forward workers are busy"))
 	}
 }
 
@@ -137,7 +147,7 @@ func (self *extenderDnsForwarder) admit(source string, now time.Time) error {
 		self.sourceStates[source] = sourceState
 	}
 	if sourceState.inFlight {
-		return fmt.Errorf("%s already has a query in flight", source)
+		return extenderFixedError("the source already has a query in flight")
 	}
 	// both buckets are refilled before either is taken, so a query refused by
 	// one does not spend the other's token
@@ -153,11 +163,11 @@ func (self *extenderDnsForwarder) admit(source string, now time.Time) error {
 	)
 	if !sourceAvailable {
 		self.pruneSourceStatesWithLock(now)
-		return fmt.Errorf("%s is over its query rate", source)
+		return extenderFixedError("the source is over its query rate")
 	}
 	if !totalAvailable {
 		self.pruneSourceStatesWithLock(now)
-		return fmt.Errorf("the extender is over its query rate")
+		return extenderFixedError("the extender is over its query rate")
 	}
 	sourceState.bucket.take()
 	self.totalBucket.take()
@@ -221,11 +231,11 @@ func (self *extenderDnsForwarder) resolveQuery(query *extenderDnsQuery) {
 	// answer echoes its own query exactly
 	name := strings.TrimSuffix(question.Name.String(), ".")
 	if name == "" {
-		self.server.reportError("dns query", fmt.Errorf("the query has no name"))
+		self.server.reportError("dns query", extenderFixedError("the query has no name"))
 		return
 	}
 
-	forwardCtx := self.server.ctx
+	forwardCtx := self.ctx
 	var forwardCancel context.CancelFunc
 	if 0 < self.server.settings.DnsForwardTimeout {
 		forwardCtx, forwardCancel = context.WithTimeout(forwardCtx, self.server.settings.DnsForwardTimeout)
@@ -238,7 +248,7 @@ func (self *extenderDnsForwarder) resolveQuery(query *extenderDnsQuery) {
 	if !ok || len(responseBytes) < 2 {
 		// a resolver that did not answer is silence here too; the client
 		// retries or moves to another resolver
-		self.server.reportError("dns query", fmt.Errorf("%s %s did not resolve", question.Type, name))
+		self.server.reportError("dns query", extenderFixedError("the query did not resolve"))
 		return
 	}
 
@@ -323,9 +333,12 @@ func (self *extenderDnsForwarder) forward(
 	return self.dohCache.Forward(ctx, qType, name)
 }
 
-// Releases the forwarder's own resolver. The workers exit with the server
-// context, which CloseAndWait joins.
+// Ends the workers and releases the forwarder's own resolver. Joined, because a
+// carrier that is rebuilt must not leave its workers behind, and a worker may be
+// using the resolver until it has returned.
 func (self *extenderDnsForwarder) close() {
+	self.cancel()
+	self.workers.Wait()
 	self.dohOnce.Do(func() {})
 	if self.dohCache != nil {
 		self.dohCache.Close()

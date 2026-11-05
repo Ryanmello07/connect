@@ -48,11 +48,11 @@ func acquireExtenderTcpMemory(ctx context.Context) (*platformTransportBudgetRese
 	if nested, _ := ctx.Value(platformTransportNestedBudgetContextKey{}).(*PlatformTransportBudget); nested != nil {
 		budget = nested
 	}
-	byteCount := transport.h1BudgetByteCount()
+	byteCount := transport.h1BaseBudgetByteCount()
 	if !owned {
 		// A standalone HTTPS API call also owns the inner TLS graph. Device
 		// callers already acquired that graph against their child budget.
-		byteCount += transport.h1BudgetByteCount()
+		byteCount += transport.h1BaseBudgetByteCount()
 	}
 	return (extenderQuicMemoryPolicy{budget: budget, byteCount: byteCount, usesSlot: !owned}).acquire(ctx)
 }
@@ -120,6 +120,15 @@ func newExtenderQuicMemoryPolicy(ctx context.Context, connectSettings *ConnectSe
 	transport := &PlatformTransport{settings: settings}
 	config := newPlatformQuicConfig(settings, 1)
 	config.HandshakeIdleTimeout = connectSettings.ConnectTimeout + connectSettings.TlsTimeout + connectSettings.HandshakeTimeout
+	// QUIC notices a dead extender MaxIdleTimeout after the first
+	// ack-eliciting packet that follows the extender's last packet. A QUIC
+	// PING one ping timeout after that last packet bounds the wait at one ping
+	// timeout and the idle timeout, 25 s by default. A platform transport's
+	// own ping over this carrier does not bound it as tightly: it is due at
+	// the first wakeup instant a ping timeout after the transport's last
+	// write, up to two ping timeouts after it. So every carrier keeps this
+	// keepalive, owned or standalone, whatever the platform config's.
+	config.KeepAlivePeriod = settings.PingTimeout
 	// the offer is the dial's, not the platform transport's that sized the
 	// windows: an extender carrier crosses the filter in the clear (A13)
 	config.Versions = connectSettings.QuicVersionPolicy.Versions()
@@ -148,7 +157,7 @@ func newExtenderQuicMemoryPolicy(ctx context.Context, connectSettings *ConnectSe
 	byteCount := ByteCount(config.MaxConnectionReceiveWindow) + kib(512) + extenderQuicSendMemoryByteCount +
 		readBufferByteCount + writeBufferByteCount
 	if !owned {
-		byteCount += transport.h1BudgetByteCount()
+		byteCount += transport.h1BaseBudgetByteCount()
 	}
 	return extenderQuicMemoryPolicy{
 		budget:    budget,

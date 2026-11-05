@@ -3,6 +3,7 @@
 package connect
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -123,8 +124,9 @@ func NewClientSignalSender(client *Client) *ClientSignalSender {
 // contract (CODESTYLE: receive callbacks must not block), such sends use
 // timeout 0 — enqueue if there is room, drop otherwise — instead of the
 // sender-context default of blocking for backpressure. Recovery depends on
-// kind: an offer may replay on WaitingForSdpOffer, while a refused answer or
-// flushed candidate may need the outer transport's generation reconnect.
+// kind: an offer may replay on WaitingForSdpOffer, and a cached answer may
+// replay on an identical offer from the accepted generation. Without another
+// offer, a refused answer or flushed candidate may still need generation reconnect.
 // A refusal alone does not establish recovery or usable exchange fallback.
 // Blocking here can wedge signal delivery for every peer.
 type signalSendNonBlocking struct{}
@@ -300,15 +302,19 @@ func receiveSignalsFromClient(
 	receiver SignalReceiver,
 ) (*clientSignalDispatcher, func()) {
 	cancelCtx, cancel := context.WithCancel(client.Ctx())
-	bufferSize := defaultTransferBufferSize
+	var bufferSize int
 	if client.settings != nil && client.settings.ReceiveBufferSettings != nil {
 		bufferSize = client.settings.ReceiveBufferSettings.SequenceBufferSize
+	} else {
+		bufferSize = DefaultReceiveBufferSettings().SequenceBufferSize
 	}
 	bufferSize = max(1, bufferSize)
-	workerCount := 4
+	var workerCount int
 	if client.settings != nil && client.settings.WebRtcSettings != nil &&
 		0 < client.settings.WebRtcSettings.SignalReceiveWorkerCount {
 		workerCount = client.settings.WebRtcSettings.SignalReceiveWorkerCount
+	} else {
+		workerCount = DefaultWebRtcSettings().SignalReceiveWorkerCount
 	}
 	workerCount = min(bufferSize, max(1, workerCount))
 	dispatcher := &clientSignalDispatcher{
@@ -865,7 +871,9 @@ func DefaultWebRtcSettings() *WebRtcSettings {
 		FailedTimeout:          30 * time.Second,
 		// Pion's two-second default halves idle STUN/radio wakeups versus the
 		// former one-second override without changing the 30-second
-		// disconnect/failure thresholds.
+		// disconnect/failure thresholds. The agent judges those thresholds
+		// only when it wakes for a keepalive, so a longer keepalive notices a
+		// lost path later too.
 		KeepAliveTimeout: 2 * time.Second,
 		// Host candidates are available immediately. Bound the lifetime of
 		// dead STUN socket/gather goroutines instead of accepting Pion's
@@ -990,7 +998,7 @@ type WebRtcSettings struct {
 	// SignalReceiveWorkerCount hashes each peer/stream onto one ordered
 	// worker. Separate peers negotiate concurrently, while each stream's SDP
 	// and ICE ordering and the bounded receive callback backpressure remain
-	// intact.
+	// intact. Non-positive uses the default (DefaultWebRtcSettings).
 	SignalReceiveWorkerCount int
 	EnableSctpSnap           bool
 	EnableSctpZeroChecksum   bool
@@ -2496,10 +2504,11 @@ func (self *WebRtcManager) ReceiveExchangeSignals(
 		if self.log.V(2).Enabled() {
 			self.log.Infof("[signal]%s\n", signal.SignalType)
 		}
-		if err := conn.receiveSignalFromPeerWithTransferKey(
+		if err := conn.receiveBatchSignalFromPeer(
 			signal,
 			senderGenerationId,
 			senderGenerationSet,
+			v.TransportDelayVersion,
 			transferKey,
 			true,
 		); err != nil {
@@ -2518,10 +2527,20 @@ func (self *WebRtcManager) ReceiveExchangeSignals(
 }
 
 func (self *WebRtcManager) NewP2pConnActive(ctx context.Context, path TransferPath) (WebRtcConn, error) {
+	return self.newP2pConnActiveWithTransportDelay(ctx, path, nil)
+}
+
+// Starts an active generation that offers the delay header when
+// transportDelay offers it (DELAY.md §6.1).
+func (self *WebRtcManager) newP2pConnActiveWithTransportDelay(
+	ctx context.Context,
+	path TransferPath,
+	transportDelay *TransportDelaySettings,
+) (WebRtcConn, error) {
 	if self.newP2pConnForTest != nil {
 		return self.newP2pConnForTest(ctx, path, true)
 	}
-	conn, err := self.newP2pConn(ctx, path, true)
+	conn, err := self.newP2pConn(ctx, path, true, transportDelay.offered())
 	if err == nil && self.testingAfterPeerConnRegistered != nil {
 		self.testingAfterPeerConnRegistered(path, true)
 	}
@@ -2532,14 +2551,19 @@ func (self *WebRtcManager) NewP2pConnPassive(ctx context.Context, path TransferP
 	if self.newP2pConnForTest != nil {
 		return self.newP2pConnForTest(ctx, path, false)
 	}
-	conn, err := self.newP2pConn(ctx, path, false)
+	conn, err := self.newP2pConn(ctx, path, false, false)
 	if err == nil && self.testingAfterPeerConnRegistered != nil {
 		self.testingAfterPeerConnRegistered(path, false)
 	}
 	return conn, err
 }
 
-func (self *WebRtcManager) newP2pConn(ctx context.Context, path TransferPath, active bool) (conn *peerConn, err error) {
+func (self *WebRtcManager) newP2pConn(
+	ctx context.Context,
+	path TransferPath,
+	active bool,
+	offerTransportDelay bool,
+) (conn *peerConn, err error) {
 	if err = ctx.Err(); err != nil {
 		return
 	}
@@ -2752,6 +2776,8 @@ func (self *WebRtcManager) newP2pConn(ctx context.Context, path TransferPath, ac
 	conn.admissionBudget = reserveBudget
 	conn.admissionByteCount = reserveByteCount
 	conn.admissionOwner = admissionOwner
+	// set before Run sends the first signal batch; only an active side offers
+	conn.transportDelayOffered = active && offerTransportDelay
 	if !self.peerConnLifecycle.start() {
 		panic("open WebRTC manager rejected peer lifecycle admission")
 	}
@@ -3069,6 +3095,14 @@ type peerConn struct {
 	signalGeneration          Id
 	remoteSignalGeneration    Id
 	remoteSignalGenerationSet bool
+	// Immutable after manager admission: an active generation of a client
+	// that offers the delay header puts its version on every outbound signal
+	// batch (DELAY.md §6.1).
+	transportDelayOffered bool
+	// The delay header version on the batch of the remote offer or answer
+	// this generation applies, stored before the description so the data
+	// channel cannot open ahead of it.
+	remoteTransportDelayVersion atomic.Uint32
 	// Inbound signaling supplies the local lane/session used by replies. Active
 	// setup has no key until the peer answers, so the presence bit is separate.
 	signalReplyTransferKey    TransferKey
@@ -3095,6 +3129,15 @@ type peerConn struct {
 
 	readDeadline  time.Time
 	writeDeadline time.Time
+	// The deadlines Read and Write last installed on conn, so an unchanged
+	// deadline is not installed again for every message: on the SCTP stream
+	// each install takes the stream lock, and a write deadline also re-arms
+	// the stream's deadline timer. A new conn has none, so installing one
+	// resets both. Guarded by stateLock. Writes are serialized by the route's
+	// one writer and reads by its one reader; another concurrent caller at
+	// worst installs an unchanged deadline again.
+	connReadDeadline  time.Time
+	connWriteDeadline time.Time
 }
 
 const (
@@ -3590,6 +3633,26 @@ func (self *peerConn) receiveSignalFromPeerWithTransferKey(
 	transferKey TransferKey,
 	transferKeySet bool,
 ) error {
+	return self.receiveBatchSignalFromPeer(
+		signal,
+		senderGenerationId,
+		senderGenerationSet,
+		0,
+		transferKey,
+		transferKeySet,
+	)
+}
+
+// Applies one signal of a batch with the batch's sender generation and delay
+// header version.
+func (self *peerConn) receiveBatchSignalFromPeer(
+	signal *protocol.ExchangeSignal,
+	senderGenerationId Id,
+	senderGenerationSet bool,
+	transportDelayVersion uint32,
+	transferKey TransferKey,
+	transferKeySet bool,
+) error {
 	if signal == nil {
 		return nil
 	}
@@ -3633,6 +3696,7 @@ func (self *peerConn) receiveSignalFromPeerWithTransferKey(
 				signal,
 				senderGenerationId,
 				senderGenerationSet,
+				transportDelayVersion,
 				transferKey,
 				transferKeySet,
 			)
@@ -3712,6 +3776,7 @@ func (self *peerConn) receiveSignalFromPeerLocked(
 	signal *protocol.ExchangeSignal,
 	senderGenerationId Id,
 	senderGenerationSet bool,
+	transportDelayVersion uint32,
 	transferKey TransferKey,
 	transferKeySet bool,
 ) (
@@ -3726,8 +3791,17 @@ func (self *peerConn) receiveSignalFromPeerLocked(
 		if self.active {
 			return
 		}
-		if self.offerSignal() != nil {
-			// already accepted an offer; ignore the duplicate
+		if offerSignal := self.offerSignal(); offerSignal != nil {
+			// The first answer can be refused by zero-wait Client admission.
+			// Replay only for the exact accepted offer/generation; applying SDP
+			// again would advance Pion's already-stable state machine.
+			if senderGenerationSet == self.remoteSignalGenerationSet &&
+				(!senderGenerationSet || senderGenerationId == self.remoteSignalGeneration) &&
+				bytes.Equal(signal.Sdp, offerSignal.Sdp) {
+				if answerSignal := self.answerSignal(); answerSignal != nil {
+					toSend = []*protocol.ExchangeSignal{answerSignal}
+				}
+			}
 			return
 		}
 		// Decode and apply before committing our cached offer. A malformed or
@@ -3736,6 +3810,8 @@ func (self *peerConn) receiveSignalFromPeerLocked(
 		if err = json.Unmarshal(signal.Sdp, &offer); err != nil {
 			return
 		}
+		// the answer built below accepts the delay header this batch offers
+		self.remoteTransportDelayVersion.Store(transportDelayVersion)
 		if err = self.pc.SetRemoteDescription(offer); err != nil {
 			return
 		}
@@ -3783,6 +3859,7 @@ func (self *peerConn) receiveSignalFromPeerLocked(
 		if err = json.Unmarshal(signal.Sdp, &answer); err != nil {
 			return
 		}
+		self.remoteTransportDelayVersion.Store(transportDelayVersion)
 		if err = self.pc.SetRemoteDescription(answer); err != nil {
 			return
 		}
@@ -4284,10 +4361,11 @@ func (self *peerConn) sendSignalsWithTransferKey(
 		return
 	}
 	signals := &protocol.ExchangeSignals{
-		StreamId:           self.key.StreamId.Bytes(),
-		ResetSignals:       resetSignals,
-		Signals:            signalValues,
-		SenderGenerationId: self.signalGeneration.Bytes(),
+		StreamId:              self.key.StreamId.Bytes(),
+		ResetSignals:          resetSignals,
+		Signals:               signalValues,
+		SenderGenerationId:    self.signalGeneration.Bytes(),
+		TransportDelayVersion: self.localTransportDelayVersion(),
 	}
 	// passive peers send signals in the return direction of the stream,
 	// so they ask for a companion contract (verified as
@@ -4372,6 +4450,8 @@ func (self *peerConn) installOpenDataChannel(conn datachannel.ReadWriteCloserDea
 		defer self.stateLock.Unlock()
 		if (self.ctx == nil || self.ctx.Err() == nil) && self.conn == nil {
 			self.conn = conn
+			self.connReadDeadline = time.Time{}
+			self.connWriteDeadline = time.Time{}
 			accepted = true
 			self.connMonitor.NotifyAll()
 		}
@@ -4384,28 +4464,30 @@ func (self *peerConn) installOpenDataChannel(conn datachannel.ReadWriteCloserDea
 	return accepted
 }
 
+// The open data channel, waiting until it opens or the deadline passes. A
+// deadline that has already passed fails at once, as a stream deadline does.
+// Once the connection is up the channel is open for every message, so the
+// deadline's timer is created only when the first look misses.
 func (self *peerConn) dataChannelConn(deadline time.Time) (datachannel.ReadWriteCloserDeadliner, error) {
 	conn := func() (datachannel.ReadWriteCloserDeadliner, chan struct{}) {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
 		return self.conn, self.connMonitor.NotifyChannel()
 	}
-	var deadlineTimer *time.Timer
+	if !deadline.IsZero() && !time.Now().Before(deadline) {
+		return nil, os.ErrDeadlineExceeded
+	}
+	c, update := conn()
+	if c != nil {
+		return c, nil
+	}
 	var deadlineC <-chan time.Time
 	if !deadline.IsZero() {
-		timeout := time.Until(deadline)
-		if timeout <= 0 {
-			return nil, os.ErrDeadlineExceeded
-		}
-		deadlineTimer = time.NewTimer(timeout)
-		deadlineC = deadlineTimer.C
+		deadlineTimer := time.NewTimer(time.Until(deadline))
 		defer deadlineTimer.Stop()
+		deadlineC = deadlineTimer.C
 	}
 	for {
-		c, update := conn()
-		if c != nil {
-			return c, nil
-		}
 		select {
 		case <-self.ctx.Done():
 			return nil, os.ErrClosed
@@ -4413,22 +4495,37 @@ func (self *peerConn) dataChannelConn(deadline time.Time) (datachannel.ReadWrite
 		case <-deadlineC:
 			return nil, os.ErrDeadlineExceeded
 		}
+		c, update = conn()
+		if c != nil {
+			return c, nil
+		}
 	}
 }
 
 func (self *peerConn) Read(b []byte) (n int, err error) {
 	var deadline time.Time
+	var connDeadline time.Time
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
 		deadline = self.readDeadline
+		connDeadline = self.connReadDeadline
 	}()
 	var c datachannel.ReadWriteCloserDeadliner
 	c, err = self.dataChannelConn(deadline)
 	if err != nil {
 		return
 	}
-	c.SetReadDeadline(deadline)
+	// the steady-state reader clears its deadline once, so this is nearly
+	// always unchanged
+	if !deadline.Equal(connDeadline) {
+		c.SetReadDeadline(deadline)
+		func() {
+			self.stateLock.Lock()
+			defer self.stateLock.Unlock()
+			self.connReadDeadline = deadline
+		}()
+	}
 	n, err = c.Read(b)
 	return
 }
@@ -4608,17 +4705,28 @@ func (self *peerConn) runSctpProgressWatchdog() {
 
 func (self *peerConn) Write(b []byte) (n int, err error) {
 	var deadline time.Time
+	var connDeadline time.Time
 	func() {
 		self.stateLock.Lock()
 		defer self.stateLock.Unlock()
 		deadline = self.writeDeadline
+		connDeadline = self.connWriteDeadline
 	}()
 	var c datachannel.ReadWriteCloserDeadliner
 	c, err = self.dataChannelConn(deadline)
 	if err != nil {
 		return
 	}
-	c.SetWriteDeadline(deadline)
+	// the legacy writer re-arms its deadline lazily, so this is unchanged for
+	// most messages
+	if !deadline.Equal(connDeadline) {
+		c.SetWriteDeadline(deadline)
+		func() {
+			self.stateLock.Lock()
+			defer self.stateLock.Unlock()
+			self.connWriteDeadline = deadline
+		}()
+	}
 	n, err = c.Write(b)
 	if 0 < n {
 		self.outboundByteCount.Add(uint64(n))

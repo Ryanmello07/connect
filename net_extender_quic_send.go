@@ -24,7 +24,12 @@ const extenderQuicSendMemoryByteCount ByteCount = 256 * 1024
 
 const (
 	quicSendFlightFrameLimit = 96
-	quicSendFlightWriteLimit = 64
+	// Writers block with a root free for every admitted root. Retransmission
+	// splits a lost root once whenever its packet carries more ACK or control
+	// bytes than the original did (sentFrameLocked), and the table fails
+	// closed when the roots reach quicSendFlightFrameLimit. Even a whole lost
+	// window retransmitted entirely as splits stays below that.
+	quicSendFlightWriteLimit = (quicSendFlightFrameLimit - 1) / 2
 	quicSendFlightPackets    = 256
 	quicSendFlightChunk      = 4096
 	quicSendFlightStreams    = 8
@@ -229,7 +234,17 @@ func (self *quicSendFlight) retireWriter(writer *quicSendFlightWriter) {
 	}
 }
 
+// Waits for credit, or for an empty flight when idle. While the flight stays
+// full every freed root wakes another pass, so one timer serves the whole
+// wait and is reset only when the writer's deadline moves.
 func (self *quicSendFlight) wait(ctx context.Context, idle bool, deadline func() time.Time) error {
+	var timer *time.Timer
+	var timerUntil time.Time
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
 	for {
 		self.mutex.Lock()
 		err := self.err
@@ -257,20 +272,22 @@ func (self *quicSendFlight) wait(ctx context.Context, idle bool, deadline func()
 		if ready {
 			return nil
 		}
-		var timer *time.Timer
 		var timeout <-chan time.Time
 		if !until.IsZero() {
-			timer = time.NewTimer(time.Until(until))
-			timeout = timer.C
+			if timer != nil && until.Equal(timerUntil) {
+				// still armed for this deadline, even if it was cleared and
+				// set back since
+				timeout = timer.C
+			} else {
+				timeout = resetOrCreateTimer(&timer, time.Until(until))
+				timerUntil = until
+			}
 		}
 		select {
 		case <-ctx.Done():
 		case <-self.notify:
 		case <-self.failed:
 		case <-timeout:
-		}
-		if timer != nil {
-			timer.Stop()
 		}
 	}
 }
@@ -517,8 +534,9 @@ func (self *quicSendFlight) sentFrameLocked(packet int64, frame *qlog.StreamFram
 			continue
 		}
 		// Retransmissions are an entire frame or its prefix. A prefix split
-		// allocates a second pooled root. PTO moves an entire old packet,
-		// even though v0.61 does not emit PacketLost for that move.
+		// allocates a second pooled root, which admission left free. PTO
+		// moves an entire old packet, even though v0.61 does not emit
+		// PacketLost for that move.
 		if old.abandoned || start != old.start || old.end < end {
 			self.failLocked()
 			return

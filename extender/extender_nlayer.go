@@ -117,6 +117,7 @@ func newExtenderNLayerHops(extenderConfigs []*connect.ExtenderConfig) []*extende
 		if extenderConfig != nil {
 			hopConfig := *extenderConfig
 			hopConfig.PublicKey = slices.Clone(extenderConfig.PublicKey)
+			hopConfig.RealityPublicKey = slices.Clone(extenderConfig.RealityPublicKey)
 			hop.extenderConfig = &hopConfig
 			hop.ipVersion = 6
 			if hopConfig.Ip.Unmap().Is4() {
@@ -159,10 +160,10 @@ func (self *ExtenderServer) newNLayerConnectSettings() *connect.ConnectSettings 
 func (self *ExtenderServer) checkNLayerDepth(header *protocol.ExtenderHeader) error {
 	depth := int64(header.HopCount) + 1
 	if maxDepth := self.settings.NLayerMaxDepth; 0 < maxDepth && int64(maxDepth) < depth {
-		return fmt.Errorf("the request would be %d extenders deep, at most %d", depth, maxDepth)
+		return extenderFixedError("the request would be past the depth bound")
 	}
 	if header.HopCount == ^uint32(0) {
-		return fmt.Errorf("the request has crossed %d extenders", header.HopCount)
+		return extenderFixedError("the request has crossed as many extenders as its count can hold")
 	}
 	return nil
 }
@@ -182,9 +183,7 @@ func (self *ExtenderServer) serveNLayer(
 		prefixBytes, clientRandom, ok := self.peekNLayerClientRandom(clientConn)
 		if ok {
 			if !self.beginNLayerClientRandom(clientRandom) {
-				self.reportError("nlayer loop", fmt.Errorf(
-					"the inner client random is already relayed by this extender",
-				))
+				self.reportError("nlayer loop", extenderFixedError("the inner client random is already relayed by this extender"))
 				return
 			}
 			defer self.endNLayerClientRandom(clientRandom)
@@ -233,8 +232,8 @@ func (self *ExtenderServer) peekNLayerClientRandom(clientConn net.Conn) ([]byte,
 		m, err := clientConn.Read(prefixBytes[n:])
 		n += m
 		if err != nil {
-			// a timeout leaves the stream usable, since the relay sets its own
-			// deadlines; any other error the relay meets on its first read
+			// a timeout leaves the stream usable once the deadline is cleared
+			// below; any other error the relay meets on its first read
 			break
 		}
 	}
@@ -354,7 +353,7 @@ func (self *ExtenderServer) dialNLayerHop(
 			return hopConn, hopResponse, nil
 		}
 		lastErr = fmt.Errorf("NLayer hop %d: %w", index, err)
-		self.reportError("nlayer hop dial", lastErr)
+		self.reportError(ExtenderErrorStageNLayerHopDial, lastErr)
 
 		var refusedErr *connect.ExtenderRefusedError
 		var limitedErr *connect.ExtenderLimitedError
@@ -386,12 +385,12 @@ func (self *ExtenderServer) dialNLayerHop(
 		// every hop left is limited, which the client is told as a limit,
 		// with the shortest backoff, and not as a refusal (A12)
 		limitedErr := &connect.ExtenderLimitedError{RetryAfter: retryAfter}
-		self.reportError("nlayer hop dial", limitedErr)
+		self.reportError(ExtenderErrorStageNLayerHopDial, limitedErr)
 		return nil, nil, limitedErr
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("no NLayer hop is available")
-		self.reportError("nlayer hop dial", lastErr)
+		self.reportError(ExtenderErrorStageNLayerHopDial, lastErr)
 	}
 	return nil, nil, lastErr
 }
