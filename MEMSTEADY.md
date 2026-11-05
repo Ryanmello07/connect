@@ -6498,3 +6498,116 @@ Evidence: [Pixel 32 MiB final cell](/Volumes/data/c49-native-relocated-execution
 [retained invalid Fast observation](/Volumes/data/c49-native-relocated-execution.PREP.dupk0plj/device-memory8-native-contextfix.0i9bb1_t/SECOND-CELL-FAILURE-PACKET.json),
 [Galaxy pre-traffic failure](/Volumes/data/c49-native-relocated-execution.PREP.dupk0plj/device-memory8-galaxy-first.a_ft2ikx/FIRST-CELL-FAILURE-PACKET.json),
 and [Fast aggregate receipts](/Volumes/data/c49-native-relocated-execution.PREP.dupk0plj/fast-bulk-limit-readonly.baWtD1/fast-results.json).
+
+## 2026-11-05 checkpoint: guarded H1 batching and safe 9 KiB pooling
+
+This checkpoint preserves the selected ten-file H1/adaptive-TCP candidate, the
+two-file safe 9,216-byte pool change, and their 23 associated test files. The H1
+change admits up to eight frames only through the carrier/envelope guards;
+decoded metadata and reusable TCP batching workspaces retain explicit budget
+ownership. The pool change adds a payload class and accounts for its H1 scratch
+storage. It does not adopt the rejected 9,460-byte capacity-collision experiment.
+The test sources include the later route-isolation, retry-ordering, workspace-join
+and mobile-profile fixture corrections.
+
+These are research results from qualified private overlays on the frozen
+`04cac7be` baseline. Integration also retains upstream's newer balance-refill
+jitter changes. Formatting and source/preimage checks were performed for this
+checkpoint; Go tests and performance were **not rerun after integration**.
+
+### Synthetic H1 bulk comparisons
+
+The [three-pair readback](/Volumes/data/urnetwork/c49-native-relocated-execution.PREP.dupk0plj/h1-bulk-three-pairs.READBACK.20261105/THREE-PAIRS.json)
+retains all 30 ten-second windows, including cold starts. The comparison changes
+the known-H1 chunk limit from three to guarded eight; adaptive batching,
+metadata charges, explicit SDK64 budgets and fixture contracts remain common.
+Five windows in one process are not independent trials.
+
+| Pair and order | Three-frame median, Mbps | Guarded-eight median, Mbps | Change |
+| --- | ---: | ---: | ---: |
+| 1: control, candidate | 98.486 | 131.806 | +33.831% |
+| 2: candidate, control | 98.800 | 130.808 | +32.397% |
+| 3: control, candidate | 98.644 | 131.072 | +32.873% |
+
+All six recorded workloads passed and joined, with tracked budgets released.
+Native compilation overlapped only the candidate in pair 2; shared-host load
+was not independently controlled. Allocation per useful byte was 7.308–7.346
+for controls and 13.285–13.315 for candidates over the request-quiescence
+interval, including drain; GC cycles were 29 versus 68. Thus the bulk throughput
+gain alone did not establish allocation efficiency or a phone-memory result.
+
+The separate [safe-pool pair](/Volumes/data/urnetwork/c49-native-relocated-execution.PREP.dupk0plj/h1-pool9216-pair.READBACK.20261105/PAIR.json)
+kept guarded-eight behavior and fixture budgets common and changed only the
+pool/scratch production files. Both arms retained all five windows.
+
+| Whole-harness measurement | Old pool | Safe 9 KiB pool |
+| --- | ---: | ---: |
+| Median throughput, Mbps | 131.724294 | 132.224986 |
+| Allocated bytes per useful byte | 13.2808 | 6.61704 |
+| TotalAlloc delta, bytes | 10,882,242,320 | 5,442,364,560 |
+| GC cycles | 68 | 34 |
+| Malloc count | 33,868,928 | 34,199,127 |
+| Peak sampled HeapInuse, bytes | 354,336,768 | 357,892,096 |
+
+Throughput increased 0.380%; allocation per useful byte decreased 50.18% and GC
+cycles halved. Sampled HeapInuse **increased 1.003%**: neither live heap nor RSS
+halved. The allocation interval is BeforeDetails through request quiescence,
+including drain, normalized by 819,396,608 and 822,476,800 useful bytes. These
+include clients, providers, origins and fixtures, not isolated SDK costs. Loaded
+probes completed 85/85 and 84/84 with no failed, canceled or unaccounted outcomes.
+The 40 normal and 40 race pool controls passed; both negative controls retained
+their exact expected failures without positive-test credit. All six owners
+joined, released their leases and retained equal source hashes. This one process
+pair does not establish statistical throughput non-regression or matched host
+load; exact unrelated-compilation overlap was not established.
+
+### Browsing regression signal and remaining qualification
+
+The first [pool-only 100-page pair](/Volumes/data/urnetwork/c49-native-relocated-execution.PREP.dupk0plj/same-site100-pool9216-pair.READBACK.20261105/PAIR.json)
+completed 100 HTML requests, 400 asset outcomes and 99 overlapping handoffs per
+arm. Asset counts include intentional cancellations. Both owners joined and
+released their leases, with no reported five-second stall.
+
+| HTML TTFB | Old pool | Safe 9 KiB pool | Change |
+| --- | ---: | ---: | ---: |
+| Median | 508.672 ms | 563.937 ms | +10.86% |
+| p95 | 1,197.776 ms | 1,662.947 ms | +38.84% |
+| Maximum | 2,982.698 ms | 2,841.827 ms | −4.72% |
+
+The baseline realized one provider/channel and the candidate three. This is a
+comparison limitation, not grounds to dismiss the median/p95 increase or a
+possible end-to-end regression. The lower maximum and absence of a five-second
+stall do not establish a pause cure. Later repeats stopped on fixture contract
+failures, not a proven network stall. The corrected purpose/readiness fixtures
+passed 30 normal and 30 race roots; fresh corrected-fixture 100-page performance
+comparisons remain pending.
+
+Historical corrected H1 controls passed 100 roots in normal and race modes,
+with exact negative controls verified. They do not replace complete six-suite
+correctness on this integrated source. The existing 512 KiB mobile large-pool
+allowance is already consumed by the 4 KiB and 8 KiB floors, leaving no free
+9 KiB retention under that policy. The separate 1:1:2 redistribution candidate
+and its 47 controls remain preserved privately and unrun. Native/APK/device
+workloads and the complete 32/64 MiB MEMSTEADY/performance matrix remain
+unqualified. No production-baseline promotion or release qualification is
+claimed by this checkpoint.
+
+
+### 2026-11-05: Corrected ordinary 100-page workload — current-source qualification
+
+The committed production candidate (Connect `b8a746af`, Server `29f80efdd`, SDK `cf90cf6f`) passed one fresh ordinary same-site H1 run using natural provider selection, verified TLS and the complete public SDK/TUN path. It completed 100 HTML requests, 400 asset outcomes, 500 requests total and 99 unfinished-navigation overlaps, with 99 HTML connection reuses.
+
+| HTML TTFB | Current run |
+| --- | ---: |
+| Median | 457.841 ms |
+| p95 | 1,517.564 ms |
+| Maximum | 2,176.993 ms |
+| At least 5 seconds / at least 10 seconds / stalls | 0 / 0 / 0 |
+
+Ready setup took 5,201.424 ms; the first HTML byte arrived at 6,124.368 ms from setup start. Acquire time median/p95 was 0.010/867.569 ms; written-to-first-byte median/p95 was 406.456/1,099.170 ms. Actual traffic used providers 0 and 2, two local channels, with 230/270 requests attributed to their respective masks. All 400 asset tasks and 382 opened bodies joined; HTTP request/connection counts returned to zero, SDK owners joined, and retained-byte reservations balanced releases. The process exited 0 and the resource owner completed its joined final census without a capacity error.
+
+This is one current-source qualification, not an old/new comparison or baseline promotion. It does not erase the earlier pool-pair latency regression signal, prove every browsing pause fixed, or qualify device memory. The ordinary workload reports mechanism qualification separately; a strict fault-injection result is not inferred from it. Inner HTTP/2 has separate coverage and is not exercised by this H1 inner-HTTP workload.
+
+The full correctness attempt first stopped at a stale cold-cancellation test expectation. The corrected test pins the existing two-group cleanup iteration, latest accepted ACK, cancellation fences, balanced budgets and healthy sibling traffic. Twelve focused/adjacent tests passed in each of three fresh normal processes and one race process; both isolated negative controls failed at their expected boundaries. The test-only correction is committed as Connect `f51df986`; production code is unchanged from the performance run. Full six-suite correctness remains pending.
+
+Evidence: `/Volumes/data/urnetwork/runtime-20261105/cold-fixed-and-current100.brka8s7m/ordinary100/COMPACT-READBACK.json`, the associated `TERMINAL.json`, and the four focused positive/two negative phase receipts in the same parent. Real-device 32 MiB iOS-profile and 64 MiB Android-profile MEMSTEADY/PERFVAR qualification remains outstanding.
