@@ -3,6 +3,7 @@ package connect
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"math"
@@ -1383,33 +1384,35 @@ type ReceivePack struct {
 	// with sequenceQueueBudgetByteCount. It is cleared at the same dequeue
 	// boundary.
 	sequenceQueueBudget *TransferMemoryBudget
-	// retainedQueueByteCount memoizes the allocation scan shared by handoff and
-	// reorder accounting. Zero means not computed; every live Pack has a
-	// positive charge.
-	retainedQueueByteCount ByteCount
-	TransportType          TransportType
-	Ctx                    context.Context
-	// Unwrapped is true when the inbound TransferFrame arrived as plaintext (no
-	// outer wrap). The ack for this pack (and any aggregated ack including it) is
-	// sent plaintext to mirror, so a peer whose cipher isn't up yet isn't handed
-	// a wrapped ack it can't open.
-	Unwrapped bool
+	// Live original binding; all links and loans use the root admission lock.
+	ingressSequence      *ReceiveSequence
+	ingressNext          *ReceivePack
+	ingressLoanByteCount ByteCount
+	TransportType        TransportType
+	Ctx                  context.Context
 	// EncryptionRole is the local per-peer session role that owns this inbound
 	// stream — the complement of the sender's role, keying the ReceiveSequence
 	// and the session it holds. Normal peer data (peer is the TLS client) maps
 	// to our server session (the default); EncryptedControl carriers and
 	// server-session replies map to our client session.
 	EncryptionRole sequenceTlsRole
+	// Unwrapped is true when the inbound TransferFrame arrived as plaintext (no
+	// outer wrap). The ack for this pack (and any aggregated ack including it) is
+	// sent plaintext to mirror, so a peer whose cipher isn't up yet isn't handed
+	// a wrapped ack it can't open.
+	Unwrapped bool
 	// EncryptionCompanion is the local session identity companion that owns this
 	// inbound stream (shared by both peers, not complemented). Derived from the
 	// wire companion hint, the decrypting session, or the EncryptedControl;
 	// defaults false. Keys the ReceiveSequence and its session.
 	EncryptionCompanion bool
+	receiveMemoryOwned  bool
+	sequenceQueueQuota  bool
 }
 
-// A decoded owner is 1000 bytes on the measured arm64 target. Charge a
-// rounded KiB so the aggregate receive budget covers the pipeline envelope as
-// well as both pooled byte roots and remains conservative on other targets.
+// The owned-decoder envelope includes its pointer-bearing allocator header.
+// A size-class regression control keeps that envelope within one KiB; copied
+// payload roots and overflow frame objects are charged independently.
 const decodedPackOwnerQueueByteCount = ByteCount(1024)
 
 func addReceiveQueueByteCount(total ByteCount, value ByteCount) ByteCount {
@@ -1428,8 +1431,8 @@ func (self *ReceivePack) receiveQueueByteCount() ByteCount {
 	if self == nil {
 		return 0
 	}
-	if 0 < self.retainedQueueByteCount {
-		return self.retainedQueueByteCount
+	if self.receiveMemoryOwned && self.decodedOwner != nil {
+		return self.decodedOwner.receiveItem.QueueByteCount()
 	}
 	byteCount := MessagePoolRootByteCount(self.TransferFrameBytes)
 	if self.Pack != nil {
@@ -1451,8 +1454,7 @@ func (self *ReceivePack) receiveQueueByteCount() ByteCount {
 	if self.decodedOwner != nil {
 		byteCount = addReceiveQueueByteCount(byteCount, self.decodedOwner.metadataQueueByteCount())
 	}
-	self.retainedQueueByteCount = max(1, max(byteCount, self.MessageByteCount))
-	return self.retainedQueueByteCount
+	return max(1, max(byteCount, self.MessageByteCount))
 }
 
 func (self *ReceivePack) messagePoolReturn() {
@@ -1466,7 +1468,10 @@ func (self *ReceivePack) messagePoolReturn() {
 	self.TransferFrameBytes = nil
 	if self.decodedOwner != nil {
 		owner := self.decodedOwner
-		self.decodedOwner = nil
+		// Keep the intrusive identity readable until real return unlinks it.
+		if !self.receiveMemoryOwned {
+			self.decodedOwner = nil
+		}
 		MessagePoolReturn(transferFrameBytes)
 		owner.release()
 		return
@@ -1731,6 +1736,8 @@ func (self *ClientSettings) MinimumMessageLenLimit() ByteCount {
 // application message bytes, not encoded carrier bytes. Counters are monotonic
 // for the lifetime of one Client.
 type ClientReceiveStatsSnapshot struct {
+	ReceiveDecodeReservedByteCount  ByteCount
+	ReceiveDecodePressureDropCount  uint64
 	// Frames a direct peer (P2P) route delivered that named the platform or
 	// this client as their source, dropped as forged.
 	ForgedSourceDropCount           uint64
@@ -2109,9 +2116,13 @@ type Client struct {
 
 	log Logger
 
-	settings           *ClientSettings
-	memoryOwnerLedger  *TransferMemoryOwnerLedger
-	payloadOwnerLedger *TransferPayloadOwnerLedger
+	settings *ClientSettings
+	// Paid transient decode capacity; no buffer or owner is retained here.
+	receiveDecodeReservedByteCount atomic.Int64
+	receiveDecodeMemoryBudget      *TransferMemoryBudget
+	receiveDecodePressureDropCount atomic.Uint64
+	memoryOwnerLedger              *TransferMemoryOwnerLedger
+	payloadOwnerLedger             *TransferPayloadOwnerLedger
 	// from settings at construction; nil records nothing
 	peerCapabilityRecorder *PeerCapabilityRecorder
 
@@ -2418,6 +2429,8 @@ func NewClientWithTag(
 
 	client.initBuffers(routeManager, contractManager, webRtcManager, streamManager, clientKeyManager, encryptionSessionManager)
 	client.networkQuality = newClientNetworkQualityState(client)
+	// Reserve before ready lets any sender/receiver consume the shared tree.
+	client.prepareReceiveDecodeMemory(nil, int(settings.MinimumMessageLenLimit()))
 
 	go func() {
 		defer close(client.runDone)
@@ -2558,6 +2571,8 @@ func (self *Client) ClientTag() string {
 // message counts are consistent-enough telemetry rather than a transaction.
 func (self *Client) ReceiveStats() ClientReceiveStatsSnapshot {
 	snapshot := ClientReceiveStatsSnapshot{
+		ReceiveDecodeReservedByteCount:         self.receiveDecodeReservedByteCount.Load(),
+		ReceiveDecodePressureDropCount:         self.receiveDecodePressureDropCount.Load(),
 		ForgedSourceDropCount:                  self.receiveForgedSourceDropCount.Load(),
 		PackHandoffDropCount:                   self.receivePackHandoffDropCount.Load(),
 		PackHandoffDropByteCount:               self.receivePackHandoffDropByteCount.Load(),
@@ -4484,6 +4499,7 @@ func (self *Client) AddForwardCallback(forwardCallback ForwardFunction) func() {
 }
 
 func (self *Client) run() {
+	defer self.releaseReceiveDecodeMemory()
 	var workerWaitGroup sync.WaitGroup
 	defer func() {
 		self.cancel()
@@ -4613,6 +4629,7 @@ func (self *Client) run() {
 		var transferFrameBytes []byte
 		var transportType TransportType
 		var carrierReliability CarrierReliability
+		var receiveWireLimit int
 		var err error
 		c := func() error {
 			if carrierReader, ok := multiRouteReader.(transferCarrierMultiRouteReader); ok {
@@ -4623,6 +4640,7 @@ func (self *Client) run() {
 				)
 				transportType = disposition.transportType
 				carrierReliability = disposition.reliability
+				receiveWireLimit = disposition.maxMessageByteCount
 				h1ReceiveCredit = disposition.h1Credit
 			} else if transportReader, ok := multiRouteReader.(TransportMultiRouteReader); ok {
 				transferFrameBytes, transportType, err = transportReader.ReadWithTransport(
@@ -4698,6 +4716,13 @@ func (self *Client) run() {
 		}
 
 		if path.DestinationId == self.clientId {
+			// The exact selected carrier bound is paid before any decrypt or
+			// copied decode. Unknown carriers acquire only observed capacity.
+			if !self.prepareReceiveDecodeMemory(transferFrameBytes, receiveWireLimit) {
+				self.receiveDecodePressureDropCount.Add(1)
+				MessagePoolReturn(transferFrameBytes)
+				continue
+			}
 			// the transports have typically not parsed the full `TransferFrame`
 			// on error, discard the message and report the peer
 			decodedFrame := inboundDecodedTransferFrames.take()
@@ -4705,13 +4730,14 @@ func (self *Client) run() {
 			// hand-rolled copy-safe decode (no reflection); skips the outer
 			// transfer_path (routing already parsed it via FilteredTransferPath)
 			// and the deprecated message_type. See frame_protobuf.go.
-			if !unmarshalOwnedTransferFrame(transferFrameBytes, decodedFrame, false) {
-				// bad protobuf
-				updatePeerAudit(source, func(a *PeerAudit) {
-					a.badMessage(ByteCount(len(transferFrameBytes)))
-				})
-				inboundDecodedTransferFrames.put(decodedFrame)
+			if decoded, pressure := self.unmarshalReceiveMemoryFrame(transferFrameBytes, decodedFrame, false, path, false, sequenceTlsRoleServer, false); !decoded {
+				if !pressure {
+					updatePeerAudit(source, func(a *PeerAudit) {
+						a.badMessage(ByteCount(len(transferFrameBytes)))
+					})
+				}
 				MessagePoolReturn(transferFrameBytes)
+				inboundDecodedTransferFrames.put(decodedFrame)
 				continue
 			}
 
@@ -4769,8 +4795,8 @@ func (self *Client) run() {
 						self.encryptionSessionManager.NotifyUndecryptableWrap(
 							path.SourceId, senderRole, nackCompanion)
 					}
-					inboundDecodedTransferFrames.put(decodedFrame)
 					MessagePoolReturn(transferFrameBytes)
+					inboundDecodedTransferFrames.put(decodedFrame)
 					continue
 				}
 				receiveRole = decryptRole
@@ -4778,14 +4804,16 @@ func (self *Client) run() {
 				// inner frame: decode the path too — it is tamper-checked against
 				// the routing path below.
 				innerDecodedFrame := inboundDecodedTransferFrames.take()
-				if !unmarshalOwnedTransferFrame(unwrappedTransferFrameBytes, innerDecodedFrame, true) {
-					updatePeerAudit(source, func(a *PeerAudit) {
-						a.badMessage(ByteCount(len(transferFrameBytes)))
-					})
-					inboundDecodedTransferFrames.put(decodedFrame)
-					inboundDecodedTransferFrames.put(innerDecodedFrame)
+				if decoded, pressure := self.unmarshalReceiveMemoryFrame(unwrappedTransferFrameBytes, innerDecodedFrame, true, path, true, decryptRole, decryptCompanion); !decoded {
+					if !pressure {
+						updatePeerAudit(source, func(a *PeerAudit) {
+							a.badMessage(ByteCount(len(transferFrameBytes)))
+						})
+					}
 					MessagePoolReturn(transferFrameBytes)
 					MessagePoolReturn(unwrappedTransferFrameBytes)
+					inboundDecodedTransferFrames.put(decodedFrame)
+					inboundDecodedTransferFrames.put(innerDecodedFrame)
 					continue
 				}
 				unwrappedTransferFrame := &innerDecodedFrame.frame
@@ -4800,14 +4828,14 @@ func (self *Client) run() {
 					updatePeerAudit(source, func(a *PeerAudit) {
 						a.badMessage(ByteCount(len(transferFrameBytes)))
 					})
-					inboundDecodedTransferFrames.put(decodedFrame)
-					inboundDecodedTransferFrames.put(innerDecodedFrame)
 					MessagePoolReturn(transferFrameBytes)
 					MessagePoolReturn(unwrappedTransferFrameBytes)
+					inboundDecodedTransferFrames.put(decodedFrame)
+					inboundDecodedTransferFrames.put(innerDecodedFrame)
 					continue
 				}
-				inboundDecodedTransferFrames.put(decodedFrame)
 				MessagePoolReturn(transferFrameBytes)
+				inboundDecodedTransferFrames.put(decodedFrame)
 				transferFrameBytes = unwrappedTransferFrameBytes
 				decodedFrame = innerDecodedFrame
 				transferFrame = unwrappedTransferFrame
@@ -4844,8 +4872,8 @@ func (self *Client) run() {
 						updatePeerAudit(source, func(a *PeerAudit) {
 							a.badMessage(ByteCount(len(transferFrameBytes)))
 						})
-						inboundDecodedTransferFrames.put(decodedFrame)
 						MessagePoolReturn(transferFrameBytes)
+						inboundDecodedTransferFrames.put(decodedFrame)
 						continue
 					}
 
@@ -4856,8 +4884,8 @@ func (self *Client) run() {
 						updatePeerAudit(source, func(a *PeerAudit) {
 							a.badMessage(ByteCount(len(transferFrameBytes)))
 						})
-						inboundDecodedTransferFrames.put(decodedFrame)
 						MessagePoolReturn(transferFrameBytes)
+						inboundDecodedTransferFrames.put(decodedFrame)
 						continue
 					}
 
@@ -4865,8 +4893,8 @@ func (self *Client) run() {
 					updatePeerAudit(source, func(a *PeerAudit) {
 						a.badMessage(ByteCount(len(transferFrameBytes)))
 					})
-					inboundDecodedTransferFrames.put(decodedFrame)
 					MessagePoolReturn(transferFrameBytes)
+					inboundDecodedTransferFrames.put(decodedFrame)
 					continue
 				}
 				// The v1 carrier bytes were pooled by the outer decoder only
@@ -4886,8 +4914,8 @@ func (self *Client) run() {
 				if decodedFrame.packOwner == nil {
 					returnDecodedPackMessageBytes(pack)
 				}
-				inboundDecodedTransferFrames.put(decodedFrame)
 				MessagePoolReturn(transferFrameBytes)
+				inboundDecodedTransferFrames.put(decodedFrame)
 				continue
 			}
 
@@ -4942,8 +4970,8 @@ func (self *Client) run() {
 					if decodedFrame.packOwner == nil {
 						returnDecodedPackMessageBytes(pack)
 					}
-					inboundDecodedTransferFrames.put(decodedFrame)
 					MessagePoolReturn(transferFrameBytes)
+					inboundDecodedTransferFrames.put(decodedFrame)
 					continue
 				}
 				// Optimistic EC apply: deliver EncryptedControl frames straight to
@@ -5032,7 +5060,16 @@ func (self *Client) run() {
 					} else {
 						receivePack = &ReceivePack{}
 					}
+					paid := receivePack.receiveMemoryOwned
+					var paidRoot *TransferMemoryBudget
+					if paid {
+						paidRoot = decodedOwner.receiveItem.memoryBudget.admissionRoot()
+						paidRoot.admissionLock.Lock()
+					}
+					ingress, next, loan := receivePack.ingressSequence, receivePack.ingressNext, receivePack.ingressLoanByteCount
 					*receivePack = ReceivePack{
+						receiveMemoryOwned: paid,
+						ingressSequence:    ingress, ingressNext: next, ingressLoanByteCount: loan,
 						carrierDone:         h1ReceiveCredit.done,
 						receivedAtNanos:     receivedAtNanos,
 						Source:              source,
@@ -5046,6 +5083,9 @@ func (self *Client) run() {
 						Unwrapped:           unwrapped,
 						EncryptionRole:      receiveRole,
 						EncryptionCompanion: receiveCompanion,
+					}
+					if paidRoot != nil {
+						paidRoot.admissionLock.Unlock()
 					}
 					handoffTimeout := self.settings.ReceiveBufferSettings.
 						packHandoffTimeout(transportType, carrierReliability)
@@ -5064,6 +5104,9 @@ func (self *Client) run() {
 					if !success {
 						if err == nil {
 							self.recordReceivePackHandoffDrop(messageByteCount)
+						}
+						if hook := self.settings.ReceiveBufferSettings.receiveOwnerStageForTest; hook != nil {
+							hook(nil, receivePack.decodedOwner, "handoff_refused")
 						}
 						receivePack.messagePoolReturn()
 					}
@@ -13092,25 +13135,21 @@ func (self *ReceiveSequence) takeEvictions() []uint64 {
 	return evicted
 }
 
-// What the receiver may hold out of order, measured from the delivered point:
-// its capacity, not its free space.
+// Advertise a numerical encoded-byte ceiling measured from the delivered
+// point. Capacity stays independent of free space: SACKed originals remain in
+// the sender's encoded debt until cumulative retirement.
 //
-// THROUGHPUTFIX §37.16 corrects §37.3 here. Capacity less what is held double
-// counts, because a selective acknowledgement does not release the item — the
-// sender keeps it in its resend queue on a lease — so held bytes are already
-// inside the sender's outstanding count. Subtracting them would shrink the
-// window by the held amount for nothing and, as the hold fills after a route
-// death, pull the right edge of the window inward, which is the one thing a
-// window must never do. The figure is monotone except when the budget moves.
-//
-// The rule this pairs with on the sender: outstanding-from-delivered at most
-// this. A sender that keeps to it can never force an eviction whatever the gap
-// structure, because the hold would have to contain more than the sender has
-// outstanding.
+// This legacy field does not promise retained-cost or shared-sequence credit.
+// Physical-root admission and conservative predecessor reservations may refuse
+// before that encoded ceiling is reached. An optional cap keeps an experiment
+// or owner policy independent of its logical hold and physical RX capacities.
 func (self *ReceiveSequence) receiveWindowAdvertisement() uint64 {
 	share := self.receiveBufferSettings.ReceiveQueueMaxByteCount
 	if budget := self.receiveQueue.Budget(); budget != nil {
 		share = min(share, budget.TotalByteCount())
+	}
+	if maximum := self.receiveBufferSettings.AdvertisedReceiveWindowMaxByteCount; maximum > 0 {
+		share = min(share, maximum)
 	}
 	return uint64(max(0, share))
 }
@@ -15289,6 +15328,15 @@ type ReceiveBufferSettings struct {
 	// payload window. Constrained mobile profiles enable this; server/default
 	// paths retain their historical accounting and avoid the extra scan.
 	ReceiveQueueRetainedByteAccounting bool
+	// Optional shared consumer-head partition. It must be a sibling of RX
+	// under the same immutable parent; its capacity cannot exceed RX. Only a
+	// promised exact-next FromProvider original may use it after ordinary
+	// admission fails. Every physical byte remains charged to the shared root.
+	ReceiveHeadRecoveryBudget *TransferMemoryBudget
+	// Positive caps the legacy encoded-byte permission advertised on ACKs,
+	// independently of logical hold and physical RX capacity. Nonpositive
+	// preserves the existing advertisement; it does not reserve shared rights.
+	AdvertisedReceiveWindowMaxByteCount ByteCount
 
 	// whether to allow nacks without a contract_id
 	AllowLegacyNack bool
@@ -15321,6 +15369,9 @@ type ReceiveBufferSettings struct {
 	// Update or UpdateDeliveredPrefix, the edges where the ACK worker may
 	// drain the window.
 	afterAckWindowUpdateForTest func(receiveSequenceId)
+
+	// Borrows the decoded owner at stable lifetime boundaries outside locks/callbacks.
+	receiveOwnerStageForTest func(*ReceiveSequence, *decodedPackOwner, string)
 }
 
 func (self *ReceiveBufferSettings) packHandoffTimeout(
@@ -16026,6 +16077,8 @@ type ReceiveSequence struct {
 	// what the committed prefix promised its missing predecessors (see
 	// transfer_receive_hold_promise.go)
 	holdPromise receiveHoldPromise
+	// Bounded scalar pressure handoff; the RX root lock guards reservations.
+	memoryPressure receiveMemoryPressure
 	// reused by commitHeldPrefix so walking the hold in order allocates
 	// nothing per arrival
 	heldScratch []*receiveItem
@@ -16363,6 +16416,7 @@ func (self *ReceiveSequence) tryDeepenH1PackQueue(
 	byteCount ByteCount,
 	budgetByteCount ByteCount,
 	saturationRecorded *bool,
+	quotaStops ...*TransferMemoryBudget,
 ) bool {
 	if *saturationRecorded {
 		return false
@@ -16419,9 +16473,14 @@ func (self *ReceiveSequence) tryDeepenH1PackQueue(
 		(currentByteCount > nextByteLimit || nextByteLimit-currentByteCount < byteCount) {
 		return false
 	}
-	if budget := self.receiveBufferSettings.PackQueueBudget; budget != nil &&
-		budget.Available() < budgetByteCount {
-		return false
+	if budget := self.receiveBufferSettings.PackQueueBudget; budget != nil {
+		available := budget.Available()
+		if len(quotaStops) != 0 && quotaStops[0] != nil {
+			available = budget.receiveQuotaAvailable(quotaStops[0])
+		}
+		if available < budgetByteCount {
+			return false
+		}
 	}
 	self.packQueueH1Limit = nextLimit
 	self.packQueueH1ByteLimit = nextByteLimit
@@ -16463,6 +16522,9 @@ func (self *ReceiveSequence) Pack(receivePack *ReceivePack, timeout time.Duratio
 	}
 	defer self.idleCondition.UpdateClose()
 
+	if !self.bindReceiveMemoryOwner(receivePack) {
+		return false, nil
+	}
 	h1SaturationRecorded := false
 	packQueueBudget := self.receiveBufferSettings.PackQueueBudget
 	byteCount := ByteCount(len(receivePack.TransferFrameBytes))
@@ -16470,6 +16532,14 @@ func (self *ReceiveSequence) Pack(receivePack *ReceivePack, timeout time.Duratio
 		byteCount = max(1, receivePack.MessageByteCount)
 	}
 	budgetByteCount := byteCount
+	var quotaStop *TransferMemoryBudget
+	if receivePack.receiveMemoryOwned {
+		owner := &receivePack.decodedOwner.receiveItem
+		if owner.memoryBudget == nil || owner.QueueByteCount() < byteCount {
+			panic("handoff lacks its physical backing")
+		}
+		quotaStop = receiveMemoryQuotaStop(packQueueBudget, owner.memoryBudget)
+	}
 	if packQueueBudget != nil &&
 		self.receiveBufferSettings.PackQueueRetainedByteAccounting {
 		budgetByteCount = receivePack.receiveQueueByteCount()
@@ -16490,6 +16560,7 @@ func (self *ReceiveSequence) Pack(receivePack *ReceivePack, timeout time.Duratio
 		if packQueueBudget != nil {
 			receivePack.sequenceQueueBudgetByteCount = budgetByteCount
 			receivePack.sequenceQueueBudget = packQueueBudget
+			receivePack.sequenceQueueQuota = quotaStop != nil
 		}
 		updateAtomicMaximum(&self.client.receivePackHandoffMaxCount, uint64(count))
 		updateAtomicMaximum(
@@ -16523,6 +16594,7 @@ func (self *ReceiveSequence) Pack(receivePack *ReceivePack, timeout time.Duratio
 						byteCount,
 						budgetByteCount,
 						&h1SaturationRecorded,
+						quotaStop,
 					) {
 					countLimit = self.packQueueH1Limit
 					continue
@@ -16550,6 +16622,7 @@ func (self *ReceiveSequence) Pack(receivePack *ReceivePack, timeout time.Duratio
 						byteCount,
 						budgetByteCount,
 						&h1SaturationRecorded,
+						quotaStop,
 					) {
 					byteLimit = self.packQueueH1ByteLimit
 					continue
@@ -16560,7 +16633,9 @@ func (self *ReceiveSequence) Pack(receivePack *ReceivePack, timeout time.Duratio
 			if self.packQueueByteCount.CompareAndSwap(current, current+byteCount) {
 				if packQueueBudget != nil {
 					reserved := false
-					if wait {
+					if quotaStop != nil {
+						reserved, budgetWaiter = packQueueBudget.reserveReceiveQuota(budgetByteCount, quotaStop, wait)
+					} else if wait {
 						reserved, budgetWaiter = packQueueBudget.tryReserveOrQueue(budgetByteCount)
 					} else {
 						reserved = packQueueBudget.TryReserve(budgetByteCount)
@@ -16683,7 +16758,16 @@ func (self *ReceiveSequence) releasePackQueue(receivePack *ReceivePack) {
 	if budget != nil {
 		budgetByteCount := receivePack.sequenceQueueBudgetByteCount
 		receivePack.sequenceQueueBudgetByteCount = 0
-		budget.Release(budgetByteCount)
+		if receivePack.sequenceQueueQuota {
+			receivePack.sequenceQueueQuota = false
+			stop := receiveMemoryQuotaStop(budget, receivePack.decodedOwner.receiveItem.memoryBudget)
+			if stop == nil {
+				panic("physical backing vanished before handoff release")
+			}
+			budget.releaseReceiveQuota(budgetByteCount, stop)
+		} else {
+			budget.Release(budgetByteCount)
+		}
 	}
 	if remaining := self.packQueueByteCount.Add(-byteCount); remaining < 0 {
 		panic("negative receive sequence handoff byte count")
@@ -17322,6 +17406,7 @@ func (self *ReceiveSequence) Run() {
 			}
 		default:
 		}
+		self.applyReceiveMemoryPressure()
 		var timeout time.Duration
 		// the earliest hole's absolute deadline; zero when none
 		var gapDeadline time.Time
@@ -17403,6 +17488,7 @@ func (self *ReceiveSequence) Run() {
 							self.log.Infof("[r]seq+ %d->%d (queue) %s<-%s s(%s)\n", self.nextSequenceNumber, self.nextSequenceNumber+1, self.client.ClientTag(), self.source.SourceId, self.source.StreamId)
 						}
 						self.nextSequenceNumber = self.nextSequenceNumber + 1
+						self.publishReceiveMemoryFloor()
 						self.receiveHead(item)
 					} else {
 						// no valid contract. it should have been attached to the head
@@ -17436,6 +17522,9 @@ func (self *ReceiveSequence) Run() {
 		processPack := func(receivePack *ReceivePack, ok bool) bool {
 			if !ok {
 				return false
+			}
+			if hook := self.receiveBufferSettings.receiveOwnerStageForTest; hook != nil {
+				hook(self, receivePack.decodedOwner, "pack_released")
 			}
 
 			if receivePack.Pack.Nack {
@@ -17568,6 +17657,7 @@ func (self *ReceiveSequence) Run() {
 			if self.applyCloseRequests() {
 				return
 			}
+			timerWake = self.receiveMemoryPressurePending()
 		case <-deadlineTimer.wake:
 			deadlineTimer.woke()
 			timerWake = true
@@ -17686,8 +17776,14 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 	if self.receiveBufferSettings.ReceiveQueueRetainedByteAccounting {
 		queueByteCount = receivePack.receiveQueueByteCount()
 	}
+	paidBudget, paidBytes := item.memoryBudget, item.queueByteCount
+	if paidBudget != nil {
+		queueByteCount = paidBytes
+		paidBudget.admissionRoot().admissionLock.Lock()
+	}
 	*item = receiveItem{
 		transferItem: transferItem{
+			memoryBudget:     paidBudget,
 			messageId:        messageId,
 			sequenceNumber:   sequenceNumber,
 			messageByteCount: receivePack.MessageByteCount,
@@ -17709,7 +17805,14 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 		transportType:      receivePack.TransportType,
 		unwrapped:          receivePack.Unwrapped,
 	}
-	self.prepareReceiveDeliveryCredit(item)
+	if paidBudget != nil {
+		paidBudget.admissionRoot().admissionLock.Unlock()
+	}
+	if !self.prepareReceiveDeliveryCredit(item) {
+		self.client.receiveQueueDropCount.Add(1)
+		self.client.receiveQueueDropByteCount.Add(uint64(max(item.MessageByteCount(), 0)))
+		return false, nil
+	}
 
 	// A compact head is meaningful only against a contract verified earlier in
 	// this sequence. Keep the sequence number pending and request the proof;
@@ -17802,6 +17905,7 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 			self.log.Infof("[r]seq= %d->%d %s<-%s s(%s)\n", self.nextSequenceNumber, item.sequenceNumber, self.client.ClientTag(), self.source.SourceId, self.source.StreamId)
 		}
 		self.nextSequenceNumber = item.sequenceNumber
+		self.publishReceiveMemoryFloor()
 		// the head must have a contract frame to reset the contract
 	}
 
@@ -17852,6 +17956,8 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 			}
 			if self.updateContract(item) {
 				self.nextSequenceNumber = self.nextSequenceNumber + 1
+				self.publishReceiveMemoryFloor()
+				self.adoptReceiveMemoryOwner(item)
 				self.receiveHead(item)
 				return true, nil
 			} else {
@@ -17889,11 +17995,15 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 		// that item committed, and draws on the reservation made for it then.
 		promised := self.holdPromised(sequenceNumber)
 		canQueue := func(item *receiveItem) bool {
+			credit := self.holdPromiseCredit(promised)
+			if item.memoryBudget == self.receiveQueue.budget && item.memoryBudget != nil {
+				credit = addReceiveQueueByteCount(credit, item.QueueByteCount())
+			}
 			return self.receiveQueue.CanAddWithQueueByteCountAndCredit(
 				item.MessageByteCount(),
 				item.QueueByteCount(),
 				self.receiveBufferSettings.ReceiveQueueMaxByteCount,
-				self.holdPromiseCredit(promised),
+				credit,
 			)
 		}
 
@@ -17982,6 +18092,7 @@ func (self *ReceiveSequence) receive(receivePack *ReceivePack) (bool, error) {
 			self.maxHeldByteCount = max(self.maxHeldByteCount, item.MessageByteCount())
 			self.maxHeldQueueByteCount = max(self.maxHeldQueueByteCount, item.QueueByteCount())
 			self.receiveQueue.Add(item)
+			self.adoptReceiveMemoryOwner(item)
 			if self.receiveBufferSettings.ReceiveHoldPolicy == ReceiveHoldCommittedPrefix {
 				self.commitHeldPrefix()
 			} else {
@@ -18142,8 +18253,14 @@ func (self *ReceiveSequence) receiveNack(receivePack *ReceivePack) (bool, error)
 	if self.receiveBufferSettings.ReceiveQueueRetainedByteAccounting {
 		queueByteCount = receivePack.receiveQueueByteCount()
 	}
+	paidBudget, paidBytes := item.memoryBudget, item.queueByteCount
+	if paidBudget != nil {
+		queueByteCount = paidBytes
+		paidBudget.admissionRoot().admissionLock.Lock()
+	}
 	*item = receiveItem{
 		transferItem: transferItem{
+			memoryBudget:     paidBudget,
 			messageId:        messageId,
 			sequenceNumber:   sequenceNumber,
 			messageByteCount: receivePack.MessageByteCount,
@@ -18166,6 +18283,10 @@ func (self *ReceiveSequence) receiveNack(receivePack *ReceivePack) (bool, error)
 		// the EncryptionModeRequired receive gate in `receiveHead` now reads it
 		// to refuse plaintext application frames on this path too
 		unwrapped: receivePack.Unwrapped,
+	}
+
+	if paidBudget != nil {
+		paidBudget.admissionRoot().admissionLock.Unlock()
 	}
 
 	if err := self.registerContracts(item); err != nil {
@@ -18197,6 +18318,7 @@ func (self *ReceiveSequence) receiveNack(receivePack *ReceivePack) (bool, error)
 	}
 
 	if self.updateContract(item) {
+		self.adoptReceiveMemoryOwner(item)
 		self.receiveHead(item)
 		return true, nil
 	} else {
@@ -18311,6 +18433,9 @@ func (self *ReceiveSequence) receiveHead(item *receiveItem) {
 	item.deliverFrameCountSet = true
 	self.deliverItems = append(self.deliverItems, item)
 	self.deliverFrames = append(self.deliverFrames, appFrames...)
+	if hook := self.receiveBufferSettings.receiveOwnerStageForTest; hook != nil {
+		hook(self, item.decodedOwner, "head_buffered")
+	}
 	if receiveDeliverBatchMaxFrames <= len(self.deliverFrames) {
 		self.flushDeliver()
 	}
@@ -18544,6 +18669,9 @@ func (self *ReceiveSequence) registerContracts(item *receiveItem) error {
 		}
 		return errContractExpired
 	}
+
+	nextReceiveContract.verifiedReceiveProof = sha256.Sum256(item.contractFrame.MessageBytes)
+	nextReceiveContract.verifiedReceiveProofSet = true
 
 	// THROUGHPUTFIX §39.1. An announced successor is verified exactly as an
 	// opening contract is — the same hmac, the same path check above — and
@@ -18888,7 +19016,8 @@ type receiveItem struct {
 func (self *receiveItem) messagePoolReturn() {
 	// The decoded owner embeds this item and may be recycled by release().
 	// Capture its claim first, then release only after all roots are returned.
-	if budget := self.memoryBudget; budget != nil {
+	if budget := self.memoryBudget; budget != nil &&
+		(self.decodedOwner == nil || !self.decodedOwner.receivePack.receiveMemoryOwned) {
 		self.memoryBudget = nil
 		defer budget.Release(self.queueByteCount)
 	}
@@ -18979,11 +19108,15 @@ type sequenceAck struct {
 }
 
 type sequenceContract struct {
-	log                        Logger
-	localId                    Id
-	tag                        string
-	contract                   *protocol.Contract
-	contractId                 Id
+	log        Logger
+	localId    Id
+	tag        string
+	contract   *protocol.Contract
+	contractId Id
+	// Receive-only fingerprint of a proof already verified for this contract.
+	// It permits scalar pressure checks to recognize exact legacy repetitions.
+	verifiedReceiveProof       [32]byte
+	verifiedReceiveProofSet    bool
 	transferByteCount          ByteCount
 	effectiveTransferByteCount ByteCount
 	provideMode                protocol.ProvideMode
